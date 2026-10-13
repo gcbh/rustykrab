@@ -55,3 +55,10 @@ test('recording a decision uses its canonical question endpoint and preserves a 
 test('a late discussion response cannot append to a different item dialog', async () => {
   const c=client({comments:[],activity:[],questions:[],total_comments:0}); c.c.detailRequest=2; await c.c.renderDiscussion('i1',c.body,1,1); assert.equal(c.body.children.length,0);
 });
+
+test('a work approval stays in the central start control while its question remains in history',async()=>{
+  const c=client({comments:[],activity:[],questions:[{...question(),kind:'approval'}],total_comments:0});c.body.dataset.startOptions='true';
+  await c.c.renderDiscussion('i1',c.body,1,1);
+  assert.equal(all(c.body).filter(n=>n.tag==='textarea').length,1);
+  assert(all(c.body).some(n=>String(n.textContent).includes('Choose Start once')));
+});

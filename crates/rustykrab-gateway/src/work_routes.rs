@@ -64,6 +64,8 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/work", get(list_items).post(file_one))
         .route("/api/work/ready", get(ready_items))
+        .route("/api/work/preferences", get(work_preferences))
+        .route("/api/work/{id}/start", post(start_work))
         .route("/api/work/events", get(event_stream))
         .route("/api/work/plan", post(file_plan))
         .route("/api/work/import", post(import_slice))
@@ -193,6 +195,47 @@ pub struct PlanPreview {
     pub plan: WorkPlanRow,
     pub graph: GraphView,
     pub held: Vec<WorkItemId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartBody {
+    #[serde(default)]
+    mode: rustykrab_core::work_preference::WorkStartMode,
+    #[serde(default = "default_daily_limit")]
+    daily_limit: u32,
+    #[serde(default)]
+    note: String,
+}
+fn default_daily_limit() -> u32 {
+    3
+}
+async fn start_work(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<StartBody>,
+) -> Result<Json<rustykrab_core::work_preference::WorkStartReply>, WorkApiError> {
+    control(&state)?
+        .start_work(
+            &id,
+            body.mode,
+            body.daily_limit,
+            &body.note,
+            &actor_of(principal),
+        )
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+async fn work_preferences(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, WorkApiError> {
+    let rows = state.agent.store.judgment_list(true).await?;
+    let data = Json(
+        json!({"schema_version":1,"matching":"exact_reviewed_template","preferences":rows.into_iter().filter(|r|r.scope=="work_template").collect::<Vec<_>>() }),
+    );
+    Ok(([("cache-control", "no-store")], data))
 }
 
 async fn review_proposal(

@@ -475,3 +475,232 @@ async fn accepting_project_proposal_preserves_its_native_runtime_and_repository(
         ["repo:/tmp/project-review-fixture"]
     );
 }
+
+use rustykrab_core::work_preference::WorkStartMode;
+
+#[tokio::test]
+async fn automatic_template_starts_matching_proposals_and_records_authority() {
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("Read-only cleanup", Some("skill:cleanup"), None);
+    let first = accepted_root(file_rest(&h, d.clone()).await);
+    let result = ControlHandle::start_work(
+        &h.ctl,
+        &first,
+        WorkStartMode::Automatic,
+        3,
+        "Do these without interrupting me",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    assert!(result.implementation.is_some());
+    let code = result.implementation.as_ref().unwrap();
+    assert!(h
+        .item(code)
+        .await
+        .constraints
+        .iter()
+        .any(|c| c.contains("Do these without interrupting me")));
+    assert!(h
+        .store()
+        .work_events(code)
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == EventKind::Comment
+            && e.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("Do these without interrupting me"))));
+    let stored = h.store().judgment_list(false).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].scope, "work_template");
+    let next = accepted_root(file_rest(&h, d).await);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(h.item(&next).await.status, Status::Done);
+    let implementations = h
+        .store()
+        .work_list(&rustykrab_store::WorkFilter {
+            kind: Some(WorkKind::Code),
+            include_closed: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(implementations.iter().all(|c| c
+        .constraints
+        .iter()
+        .any(|v| v.contains("Do these without interrupting me"))));
+    let events = h.store().work_events(&next).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.actor == format!("policy:{}", result.preference_id)
+            && e.kind == EventKind::Review));
+}
+
+#[tokio::test]
+async fn once_examples_do_not_grant_future_permission() {
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("One-off cleanup", None, None);
+    let first = accepted_root(file_rest(&h, d.clone()).await);
+    ControlHandle::start_work(
+        &h.ctl,
+        &first,
+        WorkStartMode::Once,
+        3,
+        "Just this one",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    let next = accepted_root(file_rest(&h, d).await);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(
+        h.item(&next).await.status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+}
+
+#[tokio::test]
+async fn template_drift_requires_another_decision() {
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("Bounded cleanup", None, None);
+    let first = accepted_root(file_rest(&h, d.clone()).await);
+    ControlHandle::start_work(
+        &h.ctl,
+        &first,
+        WorkStartMode::Automatic,
+        3,
+        "Same scope only",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    let mut variants = Vec::new();
+    let mut goal = d.clone();
+    goal.objective.push_str(" and contact someone");
+    variants.push(goal);
+    let mut scope = d.clone();
+    scope.writable_resources = vec!["calendar".into()];
+    variants.push(scope);
+    let mut tools = d.clone();
+    tools.required_tools = vec!["exec".into()];
+    variants.push(tools);
+    let mut project = d.clone();
+    project.artifact_refs = vec![rustykrab_core::work::ArtifactRef {
+        kind: "project".into(),
+        value: "other-project".into(),
+    }];
+    variants.push(project);
+    let mut budget = d.clone();
+    let mut b = rustykrab_core::work::Budget::default();
+    b.tokens += 1;
+    budget.budget = Some(b);
+    variants.push(budget);
+    let mut constraints = d;
+    constraints.constraints.clear();
+    variants.push(constraints);
+    for changed in variants {
+        let next = accepted_root(file_rest(&h, changed).await);
+        h.ctl.start_matching_templates_locked().await.unwrap();
+        assert_eq!(
+            h.item(&next).await.status,
+            Status::Blocked(BlockedReason::NeedsConsent)
+        );
+    }
+}
+
+#[tokio::test]
+async fn automatic_starts_obey_daily_limit_and_revocation() {
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("Limited cleanup", None, None);
+    let first = accepted_root(file_rest(&h, d.clone()).await);
+    let pref = ControlHandle::start_work(
+        &h.ctl,
+        &first,
+        WorkStartMode::Automatic,
+        1,
+        "At most one per day",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    let a = accepted_root(file_rest(&h, d.clone()).await);
+    let b = accepted_root(file_rest(&h, d.clone()).await);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    let statuses = [h.item(&a).await.status, h.item(&b).await.status];
+    assert_eq!(statuses.iter().filter(|s| **s == Status::Done).count(), 1);
+    ControlHandle::revoke_judgment(&h.ctl, &pref.preference_id, "user:master")
+        .await
+        .unwrap();
+    h.clock.advance(chrono::TimeDelta::hours(25));
+    let c = accepted_root(file_rest(&h, d).await);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(
+        h.item(&c).await.status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+}
+
+#[tokio::test]
+async fn workers_and_failed_starts_cannot_leave_permissions() {
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("Human-owned cleanup", None, None);
+    let id = accepted_root(file_rest(&h, d).await);
+    assert!(ControlHandle::start_work(
+        &h.ctl,
+        &id,
+        WorkStartMode::Automatic,
+        3,
+        "",
+        "worker:pinch"
+    )
+    .await
+    .is_err());
+    assert!(
+        ControlHandle::start_work(&h.ctl, &id, WorkStartMode::Automatic, 0, "", "user:master")
+            .await
+            .is_err()
+    );
+    assert!(h.store().judgment_list(false).await.unwrap().is_empty());
+    let protected = accepted_root(
+        file_rest(
+            &h,
+            proposal("Policy change", Some("policy"), Some(ReviewTier::Highest)),
+        )
+        .await,
+    );
+    assert!(ControlHandle::start_work(
+        &h.ctl,
+        &protected,
+        WorkStartMode::Automatic,
+        3,
+        "",
+        "user:master"
+    )
+    .await
+    .is_err());
+    assert!(h.store().judgment_list(false).await.unwrap().is_empty());
+    assert_eq!(
+        h.item(&id).await.status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+}
+
+#[tokio::test]
+async fn accepted_proposal_preserves_reviewed_execution_limits() {
+    let h = Harness::new(&["pinch"]);
+    let mut d = proposal("Small cleanup", None, None);
+    let budget = rustykrab_core::work::Budget {
+        tokens: 100,
+        ..Default::default()
+    };
+    d.budget = Some(budget);
+    d.required_tools = vec!["web_fetch".into()];
+    let id = accepted_root(file_rest(&h, d).await);
+    let result = ControlHandle::start_work(&h.ctl, &id, WorkStartMode::Once, 3, "", "user:master")
+        .await
+        .unwrap();
+    let execution = h.item(&result.implementation.unwrap()).await;
+    assert_eq!(execution.budget, budget);
+    assert_eq!(execution.required_tools, vec!["web_fetch"]);
+}

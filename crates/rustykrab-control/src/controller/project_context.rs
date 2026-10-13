@@ -19,7 +19,11 @@ use crate::workspace::{Workspace, WORKSPACE_EVIDENCE};
 const CONTEXT_BYTES: usize = 128 * 1024;
 
 impl Controller {
-    async fn project_id(&self, snap: &Snapshot, item: &WorkItem) -> Result<Option<String>, Error> {
+    pub(super) async fn project_id(
+        &self,
+        snap: &Snapshot,
+        item: &WorkItem,
+    ) -> Result<Option<String>, Error> {
         let ancestors = snap.ancestors(&item.id);
         let explicit =
             binding(std::iter::once(item).chain(ancestors.iter().filter_map(|id| snap.item(id))))

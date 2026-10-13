@@ -393,6 +393,8 @@ pub enum WorkOp {
     /// A question row written with the transition that parks or resumes
     /// its item (plan section 7; `questions.rs`).
     Question(crate::QuestionWrite),
+    /// A human preference recorded atomically with starting work.
+    Judgment(Box<crate::JudgmentRow>),
     /// A notice with a send time, merged into a waiting one for the same
     /// parent when it names it (plan section 6.6; `questions.rs`).
     Notice(crate::NoticeDraft),

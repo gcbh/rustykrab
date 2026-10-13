@@ -329,6 +329,7 @@ impl Controller {
         self.reconcile_all(now, &mut report, &mut noticed).await?;
         // Draining for shutdown: nothing new starts, what runs finishes.
         if !self.is_draining() {
+            self.start_matching_templates_locked().await?;
             self.select_and_lease(&mut report).await?;
         }
         self.age(now, &mut report).await?;

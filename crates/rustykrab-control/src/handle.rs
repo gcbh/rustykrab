@@ -157,6 +157,19 @@ pub trait ControlHandle: Send + Sync {
     /// Returns the released ids.
     async fn approve(&self, root: &str, actor: &str) -> Result<Vec<WorkItemId>, Error>;
 
+    /// Start work and record the human's one-time/automatic preference atomically.
+    async fn start_work(
+        &self,
+        item: &str,
+        mode: rustykrab_core::work_preference::WorkStartMode,
+        daily_limit: u32,
+        note: &str,
+        actor: &str,
+    ) -> Result<rustykrab_core::work_preference::WorkStartReply, Error> {
+        let _ = (item, mode, daily_limit, note, actor);
+        Err(unsupported("reviewed work templates"))
+    }
+
     /// Decline a pending plan: the held items under `root` become
     /// `cancelled(requested)` and cascade (plan section 4.5). Returns the
     /// cancelled ids.

@@ -168,6 +168,11 @@ impl Controller {
                 "a grant needs words: what may be decided without asking",
             ));
         }
+        if !scope.trim().is_empty() && scope.trim() != "all" {
+            return Err(invalid(
+                "scoped freeform grants are not supported; use a reviewed work template",
+            ));
+        }
         let compiled = compile(text);
         let row = JudgmentRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -366,7 +371,7 @@ impl Controller {
     }
 
     /// The questions an item asked before, oldest first.
-    async fn questions_of(&self, item: &str) -> Result<Vec<QuestionRow>, Error> {
+    pub(super) async fn questions_of(&self, item: &str) -> Result<Vec<QuestionRow>, Error> {
         let mut rows = self
             .store
             .questions_list(&QuestionFilter {

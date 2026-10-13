@@ -138,3 +138,17 @@ resolve. They now form one atomic post-task graph. Gated-worker tests exercise
 independent parallel work, ordered verified inputs, current-slice completion and
 the follow-up group's final roll-up. Native process tests check selective context
 rendering and full-history file inspection for both Claude and Codex.
+
+
+## Work-preference follow-up (base 1784ce3)
+
+The standing-judgment fold previously applied every unrevoked grant globally,
+although judgment_policies stored a scope. The new unsupported-scope regression
+shows a project-only grant contributes no global resource authority; non-global
+freeform intake is now refused. Reviewed work templates use a separately matched
+scope with exact task/tool/resource/project/budget checks, human provenance and
+revocation. Accepted proposal code now inherits the reviewed execution budget
+and required tools/MCP, trigger and preconditions. Controller tests demonstrate
+one-time approvals, changed scopes, daily limits and revocation remain held while
+matching automatic proposals use an audited policy actor. These tests establish
+permission behavior, not the usefulness of future self-generated work.

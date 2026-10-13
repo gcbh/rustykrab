@@ -37,6 +37,7 @@ pub mod tool;
 pub mod tool_block;
 pub mod types;
 pub mod work;
+pub mod work_preference;
 
 pub use active_tools::{
     with_session_context, ActiveToolsRegistry, Callable, LateToolBinding, SearchMiss,

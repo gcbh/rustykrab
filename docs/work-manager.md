@@ -122,3 +122,39 @@ Use **Post comment** to leave direction or context. User/agent authorship is rec
 Agents can read or comment with work_discuss. In Telegram, use `/comment <work id> <text>`; `/answer <question id> <answer>` records a decision. The next worker receives recent discussion in a bounded prompt, with full native discussion retained in a private file for selective reading. Refresh the discussion to see new updates; drafts are preserved on refresh and errors.
 
 The bounded discussion excerpt prioritizes recent user comments across parent and item history before filling the remaining space with agent updates. Selected entries are presented chronologically; omitted discussion remains available in the frozen snapshot. The 8 KiB total includes framing.
+
+
+## Choosing how to start work
+
+The monitor now has five separate views: **Attention** for decisions and
+failures, **In progress** for queued/assigned/executing/verifying work,
+**Results** for completed work and briefings, **Automatic work** for your
+reviewed-task dataset, and **Systems** for agents/infrastructure/schedules.
+Attention is the default view. Every item still opens its discussion and receipt.
+
+When starting a proposal or approving a task, choose **Start once**, or select
+**Allow this exact work template to start automatically in future**. Add your
+reason/direction and set the maximum automatic starts per 24 hours (default 3).
+The controller captures the actual goal, completion criteria, constraints,
+resolved project identity and artifact references, tools, resources, trigger, inputs, preconditions,
+review facets and budget. Future work must match those fields exactly. Changes
+need another decision. Plans with multiple held items and protected changes
+require individual review. One-time decisions supply examples without future
+permission; this dataset is not yet semantic model training.
+
+Automatic work lists the examples, scope and who approved them. Download the
+versioned JSON dataset or revoke an automatic entry. Revocation affects future
+starts; existing work remains tracked. Results show execution work rather than
+mistaking an accepted proposal for a completed implementation. Quality metrics
+based on closed tasks exclude the blocked backlog.
+
+Telegram supports `/startwork <work id> once [note]` and
+`/startwork <work id> automatic [note]`; automatic defaults to 3 starts per day.
+Use `/revoke <preference id>` to stop future automatic matching. Browser and
+Telegram use the same authenticated controller command. Chat still captures
+and files goals; use the resulting work link to inspect and choose its start
+permission. Natural-language similarity alone never creates a permission.
+
+Preference notes are recorded in the owning discussion and copied to accepted
+implementation comments/constraints. Automatic starts carry the saved direction
+with the policy actor; recording notes does not widen tool/resource authority.

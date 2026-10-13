@@ -644,27 +644,8 @@ impl Store {
 
     /// Record a grant.
     pub async fn judgment_grant(&self, row: JudgmentRow) -> Result<(), WorkStoreError> {
-        self.question_call(move |conn| {
-            conn.execute(
-                &format!(
-                    "INSERT INTO judgment_policies ({JUDGMENT_COLUMNS}) VALUES \
-                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
-                ),
-                params![
-                    row.id,
-                    row.scope,
-                    row.text,
-                    json(&row.checks)?,
-                    json(&row.policy)?,
-                    json(&row.unrecognised)?,
-                    row.granted_by,
-                    ts(&row.granted_at),
-                    row.revoked_at.as_ref().map(ts),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
+        self.question_call(move |conn| apply_judgment(conn, &row))
+            .await
     }
 
     /// Grants, oldest first; revoked ones only when asked.
@@ -1026,4 +1007,26 @@ mod consolidation_tests {
             .unwrap()
             .contains("repeat"));
     }
+}
+
+/// Insert a grant within the caller's transaction.
+pub(crate) fn apply_judgment(conn: &Connection, row: &JudgmentRow) -> Result<(), WorkStoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO judgment_policies ({JUDGMENT_COLUMNS}) VALUES \
+                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+        ),
+        params![
+            &row.id,
+            &row.scope,
+            &row.text,
+            json(&row.checks)?,
+            json(&row.policy)?,
+            json(&row.unrecognised)?,
+            &row.granted_by,
+            ts(&row.granted_at),
+            row.revoked_at.as_ref().map(ts),
+        ],
+    )?;
+    Ok(())
 }

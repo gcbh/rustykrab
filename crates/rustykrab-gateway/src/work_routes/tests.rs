@@ -71,6 +71,13 @@ enum Call {
         actor: String,
     },
     Tick,
+    Start {
+        item: String,
+        mode: rustykrab_core::work_preference::WorkStartMode,
+        actor: String,
+        note: String,
+        daily_limit: u32,
+    },
 }
 
 /// Records every command and answers from the seeded store. `file_plan`
@@ -148,6 +155,29 @@ impl ControlHandle for StubControl {
         }))
     }
 
+    async fn start_work(
+        &self,
+        item: &str,
+        mode: rustykrab_core::work_preference::WorkStartMode,
+        daily_limit: u32,
+        note: &str,
+        actor: &str,
+    ) -> Result<rustykrab_core::work_preference::WorkStartReply, Error> {
+        self.record(Call::Start {
+            item: item.into(),
+            mode,
+            actor: actor.into(),
+            note: note.into(),
+            daily_limit,
+        });
+        Ok(rustykrab_core::work_preference::WorkStartReply {
+            item: item.into(),
+            mode,
+            preference_id: "pref-test".into(),
+            released: vec![item.into()],
+            implementation: None,
+        })
+    }
     async fn approve(&self, root: &str, actor: &str) -> Result<Vec<WorkItemId>, Error> {
         self.record(Call::Approve {
             root: root.into(),
@@ -1269,4 +1299,56 @@ fn rungs_are_read_from_rung_events_in_first_climbed_order() {
             rustykrab_core::work::Rung::Retry
         ]
     );
+}
+
+#[tokio::test]
+async fn work_start_defaults_once_and_uses_authenticated_actor() {
+    let h = harness().await;
+    let (status, body) = h
+        .post(
+            "/api/work/t/start",
+            Some(json!({"note":"Keep this example"})),
+        )
+        .await;
+    assert_eq!(status, Http::OK);
+    assert_eq!(body["mode"], "once");
+    assert_eq!(
+        h.control.calls(),
+        vec![Call::Start {
+            item: "t".into(),
+            mode: rustykrab_core::work_preference::WorkStartMode::Once,
+            actor: "user:master".into(),
+            note: "Keep this example".into(),
+            daily_limit: 3
+        }]
+    );
+    let (status, _) = h
+        .post(
+            "/api/work/t/start",
+            Some(json!({"mode":"automatic","actor":"user:owner"})),
+        )
+        .await;
+    assert_eq!(status, Http::UNPROCESSABLE_ENTITY);
+    assert_eq!(h.control.calls().len(), 1);
+}
+#[tokio::test]
+async fn work_start_requires_authentication_and_origin() {
+    let h = harness().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/work/t/start", h.base))
+        .json(&json!({"mode":"automatic"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(h.control.calls().is_empty());
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/work/t/start", h.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"mode":"automatic"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(h.control.calls().is_empty());
 }
