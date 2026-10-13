@@ -47,6 +47,7 @@ pub fn is_planning(item: &WorkItem) -> bool {
 mod aging;
 mod cascade;
 mod order;
+mod priority;
 mod ready;
 mod rollup;
 mod snapshot;
@@ -60,6 +61,7 @@ pub use aging::aging_candidates;
 pub use cascade::{
     cancel_subtree, cascade, cascade_from, hold_recompute, hold_recompute_all, settle, step,
 };
+pub use priority::{scheduling_priorities, SchedulingPriority};
 pub use ready::{
     due_expiries, edge_summary, is_ready, readiness, stale_ready, CascadeCancel, EdgeSummary, Hold,
 };

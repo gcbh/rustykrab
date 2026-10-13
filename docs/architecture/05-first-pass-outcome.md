@@ -168,3 +168,28 @@ questions without inventing user answers. Real-Git/SQLite regression tests cover
 history preservation and replay, legacy-hold recovery, retained oversized current
 requirements and independent user decisions. Actual conflicts and missing commits
 remain unresolved. No table, execution backend or permission grant is added.
+
+
+## Failure prerequisites and inherited urgency (2026-10-13)
+
+Against local handoff-recovery base `c4c7d27`, an order-3 internal item was
+background work: it could be reused but the failing original immediately
+continued the ladder. Ready selection used only each item's stored priority.
+The follow-up creates or reuses the internal prerequisite and validates its
+blocking edge atomically; the original waits until completion and resumes with
+the prerequisite's evidence. Unknown failures first request diagnosis, while
+known recurring failures request a cause repair.
+
+Priority is derived transitively from interested open dependents and parent
+gates, with distinct waiter count breaking ties. Stored priorities are unchanged;
+closing or disabling a waiter removes its donation. Real-store controller
+regressions cover creation, reuse, concurrent failures, restart persistence,
+self-dependency rejection and scheduling ahead of unrelated work. Pure graph
+regressions cover transitive urgency, distinct diamond fan-in, parent gates,
+inactive donors and corrupt-cycle termination. This is local regression
+evidence; it does not claim a production deployment.
+
+The review also corrected older prose that claimed an internal repair receives
+a controller-created code worktree. `plan_workspace` currently applies only to
+`WorkKind::Code`; internal work inherits repository scope and constraints. The
+new prerequisite behavior does not change that existing workspace boundary.

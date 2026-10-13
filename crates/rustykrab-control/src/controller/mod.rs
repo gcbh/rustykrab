@@ -27,7 +27,8 @@
 //!    rung climbed and no repair counted.
 //! 3. **Select, match, lease and run** (steps 1 to 4), skipped while the
 //!    controller is draining ([`ControlHandle::set_draining`]): ready leaves by
-//!    priority, the single-writer rule over every active item, the
+//!    effective priority inherited from open dependents, then the number of
+//!    distinct waiters, the single-writer rule over every active item, the
 //!    local-model rule of 12.1 (one run per local model, and none while
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
 //!    tier of healthy workers that cover the item and that routing

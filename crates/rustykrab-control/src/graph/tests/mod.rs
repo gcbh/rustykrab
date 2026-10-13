@@ -18,6 +18,7 @@ use super::{
 };
 
 mod lisbon;
+mod priority;
 mod rejections;
 mod rollup_table;
 mod rules;

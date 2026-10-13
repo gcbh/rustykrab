@@ -203,6 +203,15 @@ evaluation now reads the actual question record through `StoreQuestions`.
 
 ## Native subscription runtime follow-up (2026-10-02)
 
+Failure recovery uses the same work graph: named missing capabilities and
+recurring/unknown failure diagnoses create or reuse prerequisites instead of
+filing independent background improvements. Original work waits for the
+prerequisite; its next attempt carries the completed prerequisite's evidence.
+The deterministic scheduler propagates priority through unmet ordering edges
+and parent gates, with distinct waiter count as the next tie-breaker. Base
+priorities, authorization, worker eligibility and resource locks remain separate
+gates. This adds no queue, persistence table or model-controlled status field.
+
 The `claude-cli` model provider hands Rust model turns to a selected Max
 login with native tools disabled, then returns structured calls to the
 existing Rust harness. Native execution workers select a Max profile each

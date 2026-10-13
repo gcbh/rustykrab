@@ -375,6 +375,13 @@ pub fn unnamed_gap(err: &WorkError) -> Option<GapKind> {
 /// (section 10).
 pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkItemDraft {
     let mut artifact_refs = err.artifact_refs.clone();
+    let identity = ArtifactRef {
+        kind: "failure_fingerprint".into(),
+        value: err.fingerprint.clone(),
+    };
+    if !artifact_refs.contains(&identity) {
+        artifact_refs.push(identity);
+    }
     for r in evidence {
         if !artifact_refs.contains(&r) {
             artifact_refs.push(r);
@@ -502,8 +509,15 @@ mod tests {
         );
         assert!(d.objective.contains("flux capacitor desynchronised"));
         assert!(d.done_when.contains("other than unknown"));
-        assert_eq!(d.artifact_refs.len(), 2);
-        assert_eq!(d.artifact_refs[1].value, "/var/log/worker.log");
+        assert_eq!(d.artifact_refs.len(), 3);
+        assert!(d
+            .artifact_refs
+            .iter()
+            .any(|r| r.value == "/var/log/worker.log"));
+        assert!(d
+            .artifact_refs
+            .iter()
+            .any(|r| r.kind == "failure_fingerprint" && r.value == e.fingerprint));
         assert_eq!(d.constraints.len(), 2);
         assert!(d.constraints[1].contains("`classifier_rule` artifact"));
         // The model proposes, code transitions: nothing here is a status,
