@@ -819,7 +819,11 @@ impl Controller {
 
     /// The items under `root` held on an approval question that a plan row
     /// really asked, not yet answered.
-    async fn held_under(&self, snap: &Snapshot, root: &str) -> Result<Vec<WorkItem>, Error> {
+    pub(super) async fn held_under(
+        &self,
+        snap: &Snapshot,
+        root: &str,
+    ) -> Result<Vec<WorkItem>, Error> {
         let mut out = Vec::new();
         for item in snap.items() {
             let Some(question) = &item.held_by else {
@@ -849,8 +853,31 @@ impl Controller {
         root: &str,
         actor: &str,
     ) -> Result<Vec<WorkItemId>, Error> {
+        self.approve_with_preference_locked(root, actor, None, None)
+            .await
+    }
+
+    pub(super) async fn approve_with_preference_locked(
+        &self,
+        root: &str,
+        actor: &str,
+        preference: Option<rustykrab_store::JudgmentRow>,
+        direction: Option<String>,
+    ) -> Result<Vec<WorkItemId>, Error> {
         let now = self.clock.now();
         let mut b = Batch::new(self.load().await?, now);
+        let direction = direction
+            .or_else(|| preference.as_ref().map(|r| r.text.clone()))
+            .filter(|s| !s.trim().is_empty());
+        if let Some(row) = preference {
+            b.ops.push(WorkOp::Judgment(Box::new(row)));
+        }
+        b.note(
+            root,
+            EventKind::Review,
+            actor,
+            "started: approved work".into(),
+        );
         if !b.snap.contains(root) {
             return Err(Error::NotFound(format!("work item {root}")));
         }
@@ -860,6 +887,14 @@ impl Controller {
             .await?;
         let mut released = Vec::new();
         for item in held {
+            if let Some(text) = &direction {
+                b.note(
+                    &item.id,
+                    EventKind::Comment,
+                    actor,
+                    format!("Direction from the recorded work permission: {text}"),
+                );
+            }
             let question = item.held_by.clone().unwrap_or_default();
             let marker = approval_marker(&question);
             if item.status == Status::Blocked(BlockedReason::NeedsConsent) {

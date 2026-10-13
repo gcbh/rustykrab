@@ -288,3 +288,13 @@ process exit results and test success remain distinct facts.
 ## Work-item discussions (base 54f82f3)
 
 ControlHandle exposes comment/discussion to authenticated transports; WorkBackend exposes the same seam to the model-facing work_discuss tool. Host provenance binds the author and a worker’s current lease. Brief.discussion is provider-neutral context, with a bounded prompt excerpt and a full private native snapshot. Comments grant no lifecycle or acceptance-changing authority.
+
+
+## Reviewed work permissions (base 1784ce3)
+
+ControlHandle::start_work is a default-refusing authenticated transport command.
+It is intentionally absent from WorkBackend: a model cannot turn its own work
+proposal into a permission grant. The controller reuses judgment storage and
+ordinary review/approval transactions; its existing tick applies exact reviewed
+templates before worker selection. No new trait, dependency, scheduler or table
+is introduced. Exact matching and explicit revocation remain host decisions.

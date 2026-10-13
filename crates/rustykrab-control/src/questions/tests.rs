@@ -362,3 +362,12 @@ fn classes_map_to_the_projects_vocabulary_and_back() {
         None
     );
 }
+
+#[test]
+fn unsupported_scope_never_becomes_global_authority() {
+    let mut scoped = grant("project-only", "You may edit my calendar without asking.");
+    scoped.scope = "project:private".into();
+    let j = Judgment::from_grants(baseline(), &[scoped]);
+    assert!(j.delegated.is_empty());
+    assert_eq!(j.approval, baseline());
+}

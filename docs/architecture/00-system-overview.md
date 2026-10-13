@@ -296,3 +296,14 @@ crate dependency, scheduler, channel owner or durable work ledger.
 ## Work-item discussions (base 54f82f3)
 
 Work-item discussions reuse the controller event ledger. The work item owns comments, questions and explicit answers; the monitor attention inbox is a grouped projection of those items. No second queue or comment store was introduced. Host-authored user direction and agent reports travel in future bounded worker handoffs; native execution retains a full frozen discussion file for selective reading.
+
+
+## Prioritized work and explicit delegation (base 1784ce3)
+
+The browser separates owner attention, current execution, results, automatic
+work preferences and systems. Explicit human starts produce a durable reviewed
+example and optionally a bounded exact-template permission. The same controller
+tick, fleet and verification paths carry future matching work; automatic starts
+record the permission id. This connects user delegation to execution while
+preserving decisions, blockers and result evidence on the work item. It does
+not add a dreaming incident detector or infer authority from similar text.

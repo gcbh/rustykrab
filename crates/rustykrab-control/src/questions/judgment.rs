@@ -329,7 +329,10 @@ impl Judgment {
     /// Fold `grants` (oldest first; revoked ones are skipped) over `base`.
     pub fn from_grants(base: ApprovalPolicy, grants: &[JudgmentRow]) -> Judgment {
         let mut j = Judgment::new(base);
-        for grant in grants.iter().filter(|g| g.revoked_at.is_none()) {
+        for grant in grants
+            .iter()
+            .filter(|g| g.revoked_at.is_none() && (g.scope.is_empty() || g.scope == "all"))
+        {
             for check in &grant.checks {
                 j.apply(check, &grant.id);
             }
@@ -344,6 +347,7 @@ impl Judgment {
     fn apply(&mut self, check: &JudgmentCheck, policy: &str) {
         let tag = |s: &str| (s.to_string(), policy.to_string());
         match check {
+            JudgmentCheck::WorkTemplate { .. } => {}
             JudgmentCheck::PlanItemsAtMost { items } => self.approval.max_items = Some(*items),
             JudgmentCheck::PlanTokensAtMost { tokens } => {
                 self.approval.max_total_tokens = Some(*tokens)

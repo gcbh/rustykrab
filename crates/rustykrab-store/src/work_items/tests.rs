@@ -1369,3 +1369,32 @@ async fn conversation_notice_history_is_bounded_and_remains_readable_after_consu
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn a_failed_start_batch_rolls_back_its_human_preference() {
+    let store = seeded(vec![item("a", Status::Queued)], vec![]).await;
+    let row = crate::JudgmentRow {
+        id: "pref".into(),
+        scope: "work_template".into(),
+        text: "This example".into(),
+        checks: vec![],
+        policy: Default::default(),
+        unrecognised: vec![],
+        granted_by: Some("user:master".into()),
+        granted_at: at(0),
+        revoked_at: None,
+    };
+    assert!(store
+        .work_apply(vec![
+            WorkOp::Judgment(Box::new(row.clone())),
+            WorkOp::ReleaseHold("missing".into())
+        ])
+        .await
+        .is_err());
+    assert!(store.judgment_list(true).await.unwrap().is_empty());
+    store
+        .work_apply(vec![WorkOp::Judgment(Box::new(row))])
+        .await
+        .unwrap();
+    assert_eq!(store.judgment_list(true).await.unwrap().len(), 1);
+}

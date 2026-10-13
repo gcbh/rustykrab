@@ -27,19 +27,45 @@
 <div class="heading"><div><p class="eyebrow">OPERATIONS</p><h1>Work manager</h1><p id="updated">Connecting…</p></div><div class="controls"><span id="health" class="badge">Connecting</span><button id="refresh">Refresh</button><button id="pause" aria-pressed="false">Pause updates</button></div></div>
 <div id="error" class="error" role="alert" hidden></div>
 <div class="stats" id="stats"></div>
-<section id="alerts" class="card" aria-labelledby="alertsTitle"><h2 id="alertsTitle">Attention</h2><div id="alertRows"></div></section>
-<section class="card"><div class="section-heading"><h2>Infrastructure</h2><a href="/">Assign work in chat</a></div><p id="managerMode" class="note"></p><div id="serviceRows"></div></section>
-<section class="card"><h2>Saved briefings</h2><p class="note">Private Markdown reports saved by the integration worker.</p><div id="briefingRows"></div></section>
-<section class="card"><h2>Scheduled work</h2><p class="note">Ask the manager in chat to schedule a task. Each firing enters the work queue and is assigned using its resource requirements.</p><div id="scheduleRows"></div></section>
-<div class="columns"><section aria-labelledby="agentsTitle"><div class="section-heading"><h2 id="agentsTitle">Agents</h2><span id="agentCount"></span></div><div id="agents"></div></section>
-<section aria-labelledby="workTitle"><div class="section-heading"><h2 id="workTitle">Work</h2><span id="workCount"></span></div><div class="card work">
-<div class="filters"><label class="sr-only" for="search">Search work</label><input id="search" placeholder="Search title, agent, or item ID"><label class="sr-only" for="status">Filter status</label><select id="status"><option value="open">Open work</option><option value="all">All displayed work</option><option>running</option><option>verifying</option><option>blocked</option><option>done</option><option>failed</option></select></div>
+<nav class="view-nav" aria-label="Work manager views">
+<button type="button" data-view="attention" aria-pressed="true">Attention</button>
+<button type="button" data-view="progress" aria-pressed="false">In progress</button>
+<button type="button" data-view="results" aria-pressed="false">Results</button>
+<button type="button" data-view="automatic" aria-pressed="false">Automatic work</button>
+<button type="button" data-view="systems" aria-pressed="false">Systems</button>
+</nav>
+<section data-pane="attention">
+<div class="view-intro"><h2>Decisions and failures</h2><p>Give direction on a work item, or inspect what needs recovery. Comments and decisions stay with the work.</p></div>
+<section id="alerts" class="card" aria-labelledby="alertsTitle"><h2 id="alertsTitle">System failures</h2><div id="alertRows"></div></section>
+<section id="questions" class="card" hidden><h2>Needs your direction</h2><div id="questionRows"></div></section>
+<section class="card"><h2>Proposals to start</h2><p class="note">Review the goal and scope, then start once or record automatic permission.</p><div id="proposalRows"></div></section>
+<section class="card"><h2>Work needing recovery</h2><p class="note">Technical blocks that need investigation or resources.</p><div id="recoveryRows"></div></section>
+</section>
+<section data-pane="progress" hidden>
+<div class="view-intro"><h2>In progress</h2><p>Assigned, executing, verifying, and queued work. Decisions and failures are in Attention.</p></div>
+<section aria-labelledby="workTitle"><div class="section-heading"><h2 id="workTitle">Current work</h2><span id="workCount"></span></div><div class="card work">
+<div class="filters"><label class="sr-only" for="search">Search current work</label><input id="search" placeholder="Search title, agent, or item ID"><label class="sr-only" for="status">Filter current work</label><select id="status"><option value="progress">All current work</option><option value="running">Running</option><option value="leased">Assigned</option><option value="verifying">Verifying</option><option value="ready">Ready</option><option value="queued">Queued</option></select></div>
 <div class="table-wrap"><table><thead><tr><th>Work item</th><th>Status</th><th>Agent</th><th>Evidence</th><th>Recorded usage</th></tr></thead><tbody id="workRows"></tbody></table></div><p id="workNote" class="note"></p>
-</div></section></div>
+</div></section>
+</section>
+<section data-pane="results" hidden>
+<div class="view-intro"><h2>Results</h2><p>Completed work and saved reports. Open a receipt to inspect what was verified.</p></div>
+<section class="card"><h2>Recent results</h2><div id="resultRows"></div></section>
+<section class="card"><h2>Saved briefings</h2><div id="briefingRows"></div></section>
+</section>
+<section data-pane="automatic" hidden>
+<div class="view-intro"><h2>Automatic work</h2><p>Your dataset of reviewed tasks. One-time decisions are examples; automatic entries permit the exact reviewed template to start again.</p></div>
+<section class="card"><div class="section-heading"><h2>Work preferences</h2><button id="exportPreferences" type="button">Download dataset</button></div><p class="note">Record a preference when you start a proposal or approve a task. Changes to the goal, project, tools, resources, constraints or budget require a new decision.</p><div id="preferenceRows"></div></section>
+</section>
+<section data-pane="systems" hidden>
+<div class="view-intro"><h2>Systems</h2><p>Available agents, infrastructure, schedules, and the dreaming loop.</p></div>
+<section class="card"><div class="section-heading"><h2>Infrastructure</h2><a href="/">Assign work in chat</a></div><p id="managerMode" class="note"></p><div id="serviceRows"></div></section>
+<section class="card"><h2>Scheduled work</h2><p class="note">Each firing enters the work queue and is assigned using its resource requirements.</p><div id="scheduleRows"></div></section>
+<section aria-labelledby="agentsTitle"><div class="section-heading"><h2 id="agentsTitle">Agents</h2><span id="agentCount"></span></div><div id="agents" class="agent-grid"></div></section>
 <section class="card"><div class="section-heading"><h2>Dreaming and meta-evaluation</h2><button id="dreamNow">Review projects now</button></div><p id="dreamStatus" class="note"></p><div id="dreamMetrics"></div><div id="dreamRows"></div></section>
-<section class="card"><h2>Project handoffs</h2><p class="note">Context delivered to the latest runs in this view. Revisions, verified code bases, and producing agents survive a runtime switch.</p><div id="projectRows"></div></section>
-<section id="questions" class="card" hidden><h2>Questions waiting on you</h2><div id="questionRows"></div></section>
-<div class="bottom"><section class="card"><h2>Recent activity</h2><ol id="events" class="timeline"></ol></section><section class="card"><h2>Quality over time</h2><p class="note">From the latest evaluation. Values include their sample size and observation window.</p><div id="quality"></div></section></div>
+<section class="card"><h2>Project handoffs</h2><p class="note">Context delivered to the latest runs. Revisions, verified code bases, and producing agents survive a runtime switch.</p><div id="projectRows"></div></section>
+<div class="bottom"><section class="card"><h2>Recent activity</h2><ol id="events" class="timeline"></ol></section><section class="card"><h2>Quality over time</h2><p class="note">Closed-task metrics exclude work still blocked. Values include their sample size and observation window.</p><div id="quality"></div></section></div>
+</section>
 <footer id="build"></footer>
 </div>
 </main>

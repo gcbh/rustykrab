@@ -60,6 +60,7 @@ mod filing;
 mod load;
 mod notice;
 mod planning;
+mod preferences;
 mod project_context;
 mod questions;
 mod reattach;
@@ -774,6 +775,19 @@ impl ControlHandle for Controller {
     ) -> Result<AnswerReply, Error> {
         let _loop = self.loop_lock.lock().await;
         self.answer_locked(question, answer, actor).await
+    }
+
+    async fn start_work(
+        &self,
+        item: &str,
+        mode: rustykrab_core::work_preference::WorkStartMode,
+        daily_limit: u32,
+        note: &str,
+        actor: &str,
+    ) -> Result<rustykrab_core::work_preference::WorkStartReply, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.start_work_locked(item, mode, daily_limit, note, actor)
+            .await
     }
 
     async fn grant_judgment(

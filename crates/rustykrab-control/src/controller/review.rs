@@ -89,8 +89,34 @@ impl Controller {
         decision: ReviewDecision,
         actor: &str,
     ) -> Result<ReviewOutcome, Error> {
+        self.review_with_preference_locked(proposal, decision, actor, None, None)
+            .await
+    }
+
+    pub(super) async fn review_with_preference_locked(
+        &self,
+        proposal: &str,
+        decision: ReviewDecision,
+        actor: &str,
+        preference: Option<rustykrab_store::JudgmentRow>,
+        direction: Option<String>,
+    ) -> Result<ReviewOutcome, Error> {
         let now = self.clock.now();
         let mut b = Batch::new(self.load().await?, now);
+        let direction = direction
+            .or_else(|| preference.as_ref().map(|r| r.text.clone()))
+            .filter(|s| !s.trim().is_empty());
+        if let Some(text) = &direction {
+            b.note(
+                proposal,
+                EventKind::Comment,
+                actor,
+                format!("Direction recorded with work permission: {text}"),
+            );
+        }
+        if let Some(row) = preference {
+            b.ops.push(WorkOp::Judgment(Box::new(row)));
+        }
         let item = b
             .snap
             .item(proposal)
@@ -173,7 +199,12 @@ impl Controller {
                 Ok(outcome(Status::Done, None, Some(moved)))
             }
             ReviewDecision::Accept => {
-                let amendments = self.amendments_of(proposal).await?;
+                let mut amendments = self.amendments_of(proposal).await?;
+                if let Some(text) = &direction {
+                    amendments.push(format!(
+                        "User direction from the recorded work permission: {text}"
+                    ));
+                }
                 let plan = code_plan(&item, &amendments);
                 let provenance = Provenance {
                     conversation_id: item.origin_conversation_id.clone(),
@@ -193,6 +224,14 @@ impl Controller {
                     .get(CODE_TMP)
                     .cloned()
                     .unwrap_or_else(|| accepted.root.clone());
+                if let Some(text) = &direction {
+                    b.note(
+                        &code,
+                        EventKind::Comment,
+                        actor,
+                        format!("Direction from the recorded work permission: {text}"),
+                    );
+                }
                 b.note(
                     proposal,
                     EventKind::Review,
@@ -279,6 +318,11 @@ fn code_plan(proposal: &WorkItem, amendments: &[String]) -> WorkPlan {
         done_when: proposal.done_when.clone(),
         constraints,
         decisions_made: proposal.decisions_made.clone(),
+        budget: Some(proposal.budget),
+        required_tools: proposal.required_tools.clone(),
+        required_mcp_servers: proposal.required_mcp_servers.clone(),
+        trigger: proposal.trigger.clone(),
+        preconditions: proposal.preconditions.clone(),
         worker_kind: proposal.worker_kind,
         writable_resources: proposal.writable_resources.clone(),
         artifact_refs,

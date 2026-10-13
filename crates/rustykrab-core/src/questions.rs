@@ -250,6 +250,13 @@ pub struct DelegatedDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "check", rename_all = "snake_case")]
 pub enum JudgmentCheck {
+    /// An authenticated human's reviewed work example. Only Automatic grants
+    /// permit matching future work; Once rows are dataset examples only.
+    WorkTemplate {
+        mode: crate::work_preference::WorkStartMode,
+        daily_limit: u32,
+        template: Box<crate::work_preference::WorkTemplate>,
+    },
     /// A plan of at most this many new items needs no approval (6.1).
     PlanItemsAtMost { items: u32 },
     /// A plan whose leaves budget at most this many tokens needs no
@@ -272,6 +279,10 @@ impl JudgmentCheck {
     /// One line a person can read back.
     pub fn describe(&self) -> String {
         match self {
+            JudgmentCheck::WorkTemplate { mode, daily_limit, template } => match mode {
+                crate::work_preference::WorkStartMode::Once => format!("one-time approval example: {}", template.title),
+                crate::work_preference::WorkStartMode::Automatic => format!("start the exact template {} automatically, at most {daily_limit} times per day", template.title),
+            },
             JudgmentCheck::PlanItemsAtMost { items } => {
                 format!("plans of up to {items} items run without asking")
             }

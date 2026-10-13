@@ -670,8 +670,7 @@ question is refused, so an answer is given once. `answered_by` is
 why it fell inside authority, how to revisit it); `delivered_via` names the
 channel an open question was sent on. Rows are never deleted: the settled
 record is what the evaluation of section 10 reads for avoidable escalations
-(Phase 6: a surfaced question whose answer equals `default_answer`, or a
-blocking-now question answered with its first option, is a candidate).
+(Phase 6: a surfaced question whose answer equals `default_answer`, is a candidate).
 Unreadable values parse to the conservative case: an unknown class reads as
 `blocking_now`, an unknown status as `open`.
 
@@ -986,3 +985,14 @@ row and the existing dependency/input relations, inserted as one validated batch
 Comments are work_item_events rows with kind=comment, host actor, timestamp and text in reason. They are append-only and change no status. No separate comments table exists. questions.superseded_by is an optional enforced foreign key to a canonical question; it is added idempotently to legacy schemas. Consolidation marks a repetition obsolete, preserves its words/history, and supplies no answer. A duplicate ID resolves to its canonical decision; on_answer references to that ID become satisfied only after the canonical question receives an answer. Scope/choices/default/class differences prevent consolidation.
 
 Nonempty discussion is frozen as controller-authored work_discussion input evidence on the lease; reattachment restores that snapshot rather than injecting comments added during the run. This attests the input record, not the truth of an agent’s claims. Reconciled worker summaries append bounded, explicitly labeled agent-report comments with the actual worker actor, including native Claude/Codex reports.
+
+
+## Reviewed work examples (base 1784ce3)
+
+judgment_policies scope work_template records a typed WorkTemplate checklist,
+explicit once/automatic choice, daily limit, authenticated grantor, note and
+revocation time. WorkOp::Judgment inserts it atomically with the work decision.
+Once rows are examples only; revoked rows remain in the exported dataset.
+Unsupported older freeform scopes no longer apply globally. The schema is
+unchanged; work_item_events review actors name automatic permissions and supply
+the per-24-hour start counter. No training or fuzzy authorization is performed.

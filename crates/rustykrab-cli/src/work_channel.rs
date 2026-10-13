@@ -356,6 +356,39 @@ impl WorkCommands {
         }
     }
 
+    async fn start_work(&self, id: &str, rest: &str) -> String {
+        let (mode, note) = match rest.trim().split_once(' ') {
+            Some(v) => v,
+            None => (rest.trim(), ""),
+        };
+        let mode = match mode {
+            "once" => rustykrab_core::work_preference::WorkStartMode::Once,
+            "automatic" => rustykrab_core::work_preference::WorkStartMode::Automatic,
+            _ => return "Usage: /startwork <work id> once|automatic [your note]".into(),
+        };
+        let item = match self.resolve(id).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        match self
+            .control
+            .start_work(&item.id, mode, 3, note, &self.actor)
+            .await
+        {
+            Ok(r) => format!(
+                "Work started. {} Preference {} recorded. Revoke with /revoke {}.",
+                if mode == rustykrab_core::work_preference::WorkStartMode::Automatic {
+                    "This exact template may start automatically up to 3 times per day."
+                } else {
+                    "This approval grants no future permission."
+                },
+                short(&r.preference_id),
+                r.preference_id
+            ),
+            Err(e) => format!("Could not start work: {e}"),
+        }
+    }
+
     async fn questions(&self) -> String {
         let waiting = match self
             .store
@@ -405,6 +438,7 @@ impl CommandHook for WorkCommands {
             "/cancel" => self.cancel(first).await,
             "/answer" => self.answer(first, &rest).await,
             "/comment" => self.comment(first, &rest).await,
+            "/startwork" => self.start_work(first, &rest).await,
             "/questions" => self.questions().await,
             "/judgment" => self.judgment().await,
             "/grant" => {
@@ -424,6 +458,8 @@ impl CommandHook for WorkCommands {
             "/cancel <id>: cancel an item and what is open under it".to_string(),
             "/questions, /answer <question> <answer>: questions waiting on you".to_string(),
             "/comment <work id> <text>: leave direction on a work item".to_string(),
+            "/startwork <work id> once|automatic [note]: start work and record your preference"
+                .to_string(),
             "/judgment, /grant <words>, /revoke <id>: standing judgment".to_string(),
         ]
     }

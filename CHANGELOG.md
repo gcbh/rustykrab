@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.9] - 2026-10-13
+
+- Prioritize owner views and record bounded automatic-work preferences (#683)
+
 ## [6.4.8] - 2026-10-12
 
 - fix: preserve user direction in work handoffs (#682)

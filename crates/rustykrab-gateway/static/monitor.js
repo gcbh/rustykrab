@@ -77,7 +77,7 @@
         return;
       }
       $('accessStatus').textContent = access.message(result);
-      generation++; pending = false; lastQuestions = ''; paused = false;
+      generation++; pending = false; lastQuestions = ''; preferenceSignature = ''; paused = false;
       $('pause').textContent = 'Pause updates'; $('pause').setAttribute('aria-pressed', 'false');
       clearInterval(interval);
       await refresh();
@@ -207,8 +207,8 @@
       stat(0, 'Work needing direction', 'Loading pending decisions')
     );
     $('alertRows').replaceChildren();
-    if (!reply.alerts.length) $('alertRows').append(node('p', 'No warning or critical condition observed.', 'note'));
-    for (const a of reply.alerts) {
+    if (!reply.alerts.some(a => a.severity !== 'info')) $('alertRows').append(node('p', 'No warning or critical condition observed.', 'note'));
+    for (const a of reply.alerts.filter(a => a.severity !== 'info')) {
       const row = node('div', undefined, 'alert');
       row.append(badge(a.severity, a.severity === 'warning' ? 'degraded' : a.severity), node('p', a.message));
       if (a.item) row.append(itemButton(a.item, 'View'));
@@ -268,6 +268,7 @@
       $('agents').append(card);
     }
     renderWork();
+    renderPriorityViews(reply);
     $('events').replaceChildren();
     for (const row of [...w.events].reverse()) {
       const e = row.event, li = node('li'), time = node('time', age(e.at));
@@ -294,7 +295,7 @@
     const w = snapshot.work, needle = $('search').value.trim().toLowerCase(), filter = $('status').value;
     const selected = w.items.filter(row => {
       const s = status(row.item);
-      return (filter === 'all' || filter === 'open' && !closed.has(s) || s === filter) &&
+      return progressStates.has(s) && (filter === 'progress' || s === filter) &&
         (!needle || [row.item.id, row.item.title, row.last_worker].join(' ').toLowerCase().includes(needle));
     });
     $('workCount').textContent = num(selected.length) + ' displayed';
@@ -318,6 +319,103 @@
     }
     $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Open an item to discuss direction, answer decisions, and inspect progress.';
   }
+  const progressStates = new Set(['queued', 'ready', 'leased', 'running', 'verifying']);
+  const views = new Set(['attention', 'progress', 'results', 'automatic', 'systems']);
+  let currentView = views.has(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'attention';
+  let preferences = null, preferenceSignature = '', preferencePending = false;
+  const startDrafts = new Map();
+  function selectView(view, updateLocation = true) {
+    currentView = views.has(view) ? view : 'attention';
+    for (const pane of document.querySelectorAll('[data-pane]')) pane.hidden = pane.dataset.pane !== currentView;
+    for (const button of document.querySelectorAll('[data-view]')) button.setAttribute('aria-pressed', String(button.dataset.view === currentView));
+    if (updateLocation) window.history.replaceState(null, '', window.location.pathname + window.location.search + '#' + currentView);
+    if (currentView === 'automatic' && access.connected) void refreshPreferences(generation);
+  }
+  function renderPriorityViews(reply) {
+    const rows = reply.work.items;
+    $('proposalRows').replaceChildren(); $('recoveryRows').replaceChildren(); $('resultRows').replaceChildren();
+    const proposals = rows.filter(r => r.item.kind === 'proposal' && !closed.has(status(r.item)));
+    const recovery = rows.filter(r => r.item.kind !== 'proposal' && (status(r.item) === 'failed' || status(r.item) === 'blocked' && !['needs_decision','needs_consent','needs_credential','needs_tool'].includes(reason(r.item))));
+    const results = rows.filter(r => r.item.kind !== 'proposal' && !(r.item.artifact_refs || []).some(a => a.kind === 'dream_review_job') && status(r.item) === 'done').sort((a,b) => Date.parse(b.item.updated_at) - Date.parse(a.item.updated_at)).slice(0,20);
+    for (const [target, list, empty] of [['proposalRows', proposals, 'No proposals waiting to start.'], ['recoveryRows', recovery, 'No technical recovery blocks in this observation.'], ['resultRows', results, 'No completed execution results in this observation.']]) {
+      if (!list.length) $(target).append(node('p', empty, 'empty'));
+      for (const r of list) {
+        const card = node('article', undefined, 'work-summary');
+        card.append(itemButton(r.item.id, r.item.title), badge(reason(r.item) || status(r.item)), node('p', r.item.objective.length > 420 ? r.item.objective.slice(0,420) + '…' : r.item.objective), node('small', (r.last_worker || 'Unassigned') + ' · ' + age(r.item.updated_at)));
+        if (target === 'resultRows') card.append(node('small', 'Open receipt for verification and execution evidence.'));
+        $(target).append(card);
+      }
+    }
+    if (reply.work.items_truncated) for (const target of ['proposalRows','recoveryRows','resultRows']) $(target).append(node('p','This is a bounded observation. Counts cover all work; some older items are not displayed.','note'));
+  }
+  async function refreshPreferences(g) {
+    if (preferencePending || !access.connected) return;
+    preferencePending = true;
+    try {
+      const data = await api('/api/work/preferences');
+      if (g !== generation) return;
+      preferences = data;
+      const signature = JSON.stringify(data);
+      if (signature === preferenceSignature) return;
+      preferenceSignature = signature; $('preferenceRows').replaceChildren();
+      if (!data.preferences.length) $('preferenceRows').append(node('p', 'No work preferences recorded yet. Open a work item and choose how to start it.', 'empty'));
+      for (const p of [...data.preferences].reverse()) {
+        const check = p.checks.find(c => c.check === 'work_template'); if (!check) continue;
+        const t = check.template, card = node('article', undefined, 'work-summary');
+        card.append(itemButton(t.example_item,t.title), badge(p.revoked_at ? 'revoked' : check.mode === 'automatic' ? 'automatic' : 'once', p.revoked_at ? 'cancelled' : 'idle'));
+        card.append(node('p', check.mode === 'automatic' ? 'Exact template · Up to ' + check.daily_limit + ' automatic starts per 24 hours' : 'One-time approval example · Grants no future permission'));
+        if (p.text) card.append(node('p', p.text));
+        const scope = node('details'); scope.append(node('summary', 'Reviewed scope'), node('pre', JSON.stringify(t,null,2))); card.append(scope, node('small', p.granted_by + ' · ' + at(p.granted_at)));
+        if (check.mode === 'automatic' && !p.revoked_at) {
+          const revoke = node('button', 'Revoke automatic permission');
+          revoke.addEventListener('click', async () => {
+            revoke.disabled = true;
+            try { await api('/api/judgment/' + encodeURIComponent(p.id) + '/revoke', {}); if (g !== generation) return; preferenceSignature = ''; await refreshPreferences(g); }
+            catch (e) { if (g === generation) card.append(node('p',e.message,'error')); }
+            finally { revoke.disabled = false; }
+          }); card.append(revoke);
+        }
+        $('preferenceRows').append(card);
+      }
+    } catch (e) { if (g === generation) { preferences = null; preferenceSignature = ''; $('preferenceRows').replaceChildren(node('p', 'Preferences could not be refreshed: ' + e.message, 'error')); } }
+    finally { preferencePending = false; }
+  }
+  function renderStartOptions(d, body, g, request) {
+    const item = d.item;
+    if (closed.has(status(item)) || !(item.kind === 'proposal' || item.held_by || progressStates.has(status(item)))) return;
+    body.dataset.startOptions = 'true';
+    const key = item.id, draft = startDrafts.get(key) || {automatic:false,note:'',limit:3};
+    const form = node('form',undefined,'start-options'), title = node('h3', item.kind === 'proposal' ? 'Start this proposal' : item.held_by ? 'Approve and start this work' : 'Record how to handle this work');
+    const checkbox = node('input'); checkbox.type = 'checkbox'; checkbox.checked = draft.automatic;
+    const choice = node('label'); choice.append(checkbox, node('span','Allow this exact work template to start automatically in future'));
+    const scope = node('p', 'Same goal, completion criteria, constraints, project references, tools, resources and budget. Changed work needs another decision.', 'note');
+    const note = node('textarea'); note.maxLength = 4096; note.value = draft.note; note.placeholder = 'Why this work matters, or how you want it handled'; note.setAttribute('aria-label','Work preference note');
+    const limit = node('input'); limit.type = 'number'; limit.min = '1'; limit.max = '50'; limit.value = draft.limit; limit.setAttribute('aria-label','Maximum automatic starts per day');
+    const limitLabel = node('label','Maximum automatic starts per 24 hours'); limitLabel.append(limit); limitLabel.hidden = !checkbox.checked;
+    const button = node('button', checkbox.checked ? 'Start and allow this template' : 'Start once', 'primary'), error = node('p','','note'); error.setAttribute('role','alert');
+    const save = () => {startDrafts.set(key,{automatic:checkbox.checked,note:note.value,limit:Number(limit.value)}); limitLabel.hidden = !checkbox.checked; button.textContent = checkbox.checked ? 'Start and allow this template' : 'Start once';};
+    checkbox.addEventListener('change',save); note.addEventListener('input',save); limit.addEventListener('input',save);
+    form.append(title,choice,scope,note,limitLabel,button,error);
+    if (item.held_by) {
+      const reject=node('button','Reject this plan'); reject.type='button';
+      reject.addEventListener('click',async()=>{
+        reject.disabled=true;
+        try {await api('/api/work/'+encodeURIComponent(item.id)+'/reject',{reason:note.value || 'Rejected by the owner'}); if (g!==generation || request!==detailRequest) return; startDrafts.delete(key); await refresh(); await showDetail(item.id);}
+        catch(e){if(g===generation && request===detailRequest) error.textContent=e.message;}
+        finally {reject.disabled=false;}
+      }); form.append(reject);
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); button.disabled = true;
+      try {
+        await api('/api/work/' + encodeURIComponent(item.id) + '/start',{mode:checkbox.checked ? 'automatic' : 'once',daily_limit:Number(limit.value),note:note.value});
+        if (g !== generation || request !== detailRequest) return;
+        startDrafts.delete(key); preferenceSignature = ''; await refresh(); await showDetail(item.id);
+      } catch (e) { if (g === generation && request === detailRequest) error.textContent = e.message; }
+      finally { button.disabled = false; }
+    }); body.append(form);
+  }
   const discussionDrafts = new Map();
   function questionsByWork(questions) {
     const groups = new Map();
@@ -333,7 +431,8 @@
       if (requestGeneration !== generation) return;
       const groups = questionsByWork(data.questions);
       const card = $('stats').lastElementChild;
-      if (card) { card.querySelector('.number').textContent = num(groups.size); card.querySelector('.caption').textContent = num(data.questions.length) + ' pending decisions · Open an item to respond'; }
+      const proposals = snapshot?.work.items.filter(r => r.item.kind === 'proposal' && !closed.has(status(r.item))).map(r => r.item.id) || [];
+      if (card) { card.querySelector('.number').textContent = num(new Set([...groups.keys(),...proposals]).size); card.querySelector('.caption').textContent = num(data.questions.length) + ' pending decisions · ' + num(proposals.length) + ' displayed proposals'; }
       const signature = JSON.stringify(data.questions);
       if (signature === lastQuestions) return;
       lastQuestions = signature;
@@ -377,7 +476,8 @@
       row.append(node('small', (entry.author?.startsWith('user:') ? 'You' : entry.author?.startsWith('worker:') ? entry.author.slice(7) : entry.author === 'agent' ? 'Manager' : entry.author) + ' · ' + at(entry.at) + ' · ' + human(entry.type)), node('p', entry.text));
       const q = entry.question;
       if (q?.status === 'open') {
-        if (q.kind === 'credential') row.append(node('p', 'Provide credentials through the secure request linked in your notification.', 'note'));
+        if (q.kind === 'approval' && body.dataset.startOptions === 'true') row.append(node('p', 'Choose Start once or automatic permission above to approve this work.', 'note'));
+        else if (q.kind === 'credential') row.append(node('p', 'Provide credentials through the secure request linked in your notification.', 'note'));
         else {
           if (q.options.length) row.append(node('p', q.options.map((o,i) => (i+1) + '. ' + o).join(' · '), 'note'));
           const form = node('form'), input = node('textarea'), button = node('button', 'Record decision', 'primary'), error = node('p', '', 'note');
@@ -424,6 +524,7 @@
       if (g !== generation) return;
       snapshot = reply; render(reply);
       await refreshQuestions(g);
+      if (currentView === 'automatic') await refreshPreferences(g);
     } catch (e) {
       if (g !== generation) return;
       if (snapshot) {
@@ -440,11 +541,11 @@
       const d = await api('/api/work/' + encodeURIComponent(id));
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
       $('detailTitle').textContent = d.item.title;
-      const body = $('detailBody'); body.replaceChildren(badge(status(d.item)), node('p', id, 'note'));
+      const body = $('detailBody'); delete body.dataset.startOptions; body.replaceChildren(badge(status(d.item)), node('p', id, 'note'));
       if (d.item.parent) body.append(itemButton(d.item.parent, 'View parent work'));
       if (d.item.kind === 'proposal' && !closed.has(status(d.item))) {
         const controls = node('div', undefined, 'controls');
-        for (const [label, decision] of [['Accept for implementation', 'accept'], ['Decline', 'decline']]) {
+        for (const [label, decision] of [['Decline', 'decline']]) {
           const b = node('button', label);
           b.addEventListener('click', async () => { b.disabled = true; try { await api('/api/work/' + encodeURIComponent(id) + '/review', { decision }); await refresh(); await showDetail(id); } catch (e) { b.disabled = false; body.append(node('p', e.message, 'error')); } });
           controls.append(b);
@@ -453,6 +554,8 @@
       const section = (title, value) => { body.append(node('h3', title), node('pre', value)); };
       section('Objective', d.item.objective);
       section('Done when', d.item.done_when);
+      section('Resources and tools', [...d.item.writable_resources, ...d.item.required_tools, ...d.item.required_mcp_servers].join('\n') || 'No write resources or required tools declared.');
+      renderStartOptions(d, body, g, request);
       if (d.item.constraints.length) section('Constraints', d.item.constraints.join('\n'));
       await renderDiscussion(id, body, g, request);
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
@@ -492,6 +595,16 @@
     if (snapshot) render(snapshot);
     if (!paused) refresh();
   });
+  for (const button of document.querySelectorAll('[data-view]')) button.addEventListener('click', () => selectView(button.dataset.view));
+  window.addEventListener('hashchange', () => selectView(window.location.hash.slice(1), false));
+  $('exportPreferences').addEventListener('click', async () => {
+    try {
+      await refreshPreferences(generation); if (!preferences || !access.connected) return;
+      const url = URL.createObjectURL(new Blob([JSON.stringify(preferences,null,2)],{type:'application/json'}));
+      const link = node('a'); link.href = url; link.download = 'rustykrab-work-preferences.json'; link.click(); URL.revokeObjectURL(url);
+    } catch (e) { $('preferenceRows').append(node('p',e.message,'error')); }
+  });
+  selectView(currentView, false);
   $('search').addEventListener('input', renderWork); $('status').addEventListener('change', renderWork);
   $('closeDetail').addEventListener('click', () => $('detail').close());
   document.addEventListener('visibilitychange', () => { if (!document.hidden && !paused) refresh(); });

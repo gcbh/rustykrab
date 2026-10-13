@@ -37,6 +37,7 @@ jobs:
       - run: node scripts/test_webchat_submit.mjs
       - run: node scripts/test_monitor_links.mjs
       - run: node scripts/test_work_discussions.mjs
+      - run: node scripts/test_work_preferences.mjs
       - run: cargo test --workspace
 
   docs:

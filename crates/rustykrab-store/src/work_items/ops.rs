@@ -78,6 +78,7 @@ pub(super) fn apply(
         WorkOp::ReleaseHold(item) => release_hold(conn, item, now),
         WorkOp::AddArtifactRef { item, artifact } => add_artifact_ref(conn, item, artifact, now),
         WorkOp::Question(write) => crate::questions::apply_question(conn, write),
+        WorkOp::Judgment(row) => crate::questions::apply_judgment(conn, row),
         WorkOp::Notice(notice) => {
             applied
                 .outbox_ids
