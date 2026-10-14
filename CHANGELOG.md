@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix: a repository-scoped run that changed nothing verifies as unchanged
+  after its adapter has removed its worktree, instead of failing as
+  `incomplete`.
+
 ## [6.5.4] - 2026-10-14
 
 - Allow general agent execution and prioritize shared blockers (#688)

@@ -207,6 +207,16 @@ pub fn verify(ws: &Workspace, claim: CodeClaim<'_>) -> Result<CodeVerdict, Strin
                         ws.branch
                     )));
                 }
+                // The adapters remove the worktree once a run has a result,
+                // before the controller gets here. The branch is still at
+                // its parent and whatever was uncommitted went with the
+                // directory, so the repository is unchanged; only a
+                // worktree that is still there can hold unreported edits.
+                if !ws.path.exists() {
+                    return Ok(CodeVerdict::Unchanged {
+                        base: ws.base.clone(),
+                    });
+                }
                 let status = git(
                     &ws.path,
                     &[
@@ -591,6 +601,33 @@ pub(crate) mod tests {
     fn workspace(repo: &Repo, root: &Path) -> Workspace {
         let base = head(repo.path()).unwrap();
         Workspace::plan(root, repo.path(), &base, "item-0001-abcd", "run-9f8e7d6c")
+    }
+
+    /// The adapters remove a run's worktree once it has a result, before
+    /// the controller verifies it. A run that committed nothing and claims
+    /// nothing is then still an unchanged repository, not an unverifiable
+    /// claim.
+    #[test]
+    fn a_run_that_changed_nothing_verifies_after_its_worktree_is_removed() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        ws.remove().unwrap();
+        assert!(!ws.path.exists());
+        let verdict = verify(
+            &ws,
+            CodeClaim {
+                commit: None,
+                changed_paths: &[],
+            },
+        );
+        assert_eq!(
+            verdict,
+            Ok(CodeVerdict::Unchanged {
+                base: ws.base.clone()
+            })
+        );
     }
 
     #[test]
