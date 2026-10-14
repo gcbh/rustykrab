@@ -82,7 +82,8 @@ pub struct WorkerSpec {
     /// Require Sign in with ChatGPT and exclude API/provider fallback.
     #[serde(default)]
     pub require_chatgpt: bool,
-    /// The agent's own tool allowlist; empty takes the adapter's default.
+    /// Tools added to the adapter's default toolset (Claude Code's own
+    /// default working tools). They add to it and never replace it.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     /// Rules denied on top of the adapter's own deny list, such as
