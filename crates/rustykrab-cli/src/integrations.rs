@@ -582,6 +582,32 @@ impl Worker for IntegrationWorker {
     fn run_log(&self, run: &str) -> Option<std::path::PathBuf> {
         self.worker.run_log(run)
     }
+    /// The local worker's effective access, plus what this wrapper narrows
+    /// it to: the resources it may write and the model it runs.
+    fn access_profile(&self) -> Value {
+        serde_json::json!({
+            "local": Worker::access_profile(&self.worker),
+            "resources": self.resources,
+            "model": self.model,
+        })
+    }
+    /// The local worker's own probe scope: probes run through the same tool
+    /// ceiling, directory binding and sandbox as this wrapper's runs.
+    fn probe_scope(
+        &self,
+        bound_dir: Option<std::path::PathBuf>,
+    ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
+        Worker::probe_scope(&self.worker, bound_dir)
+    }
+    /// Probes take the same serial slot as runs, then go to the local
+    /// worker, which performs the registered action itself.
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        let _serial = self.serial.lock().await;
+        Worker::probe(&self.worker, request).await
+    }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
     }

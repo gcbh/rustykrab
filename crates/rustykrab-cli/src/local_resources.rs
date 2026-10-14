@@ -185,6 +185,21 @@ impl Worker for CodingWorker {
     fn run_log(&self, run: &str) -> Option<PathBuf> {
         self.worker.run_log(run)
     }
+    fn access_profile(&self) -> Value {
+        self.worker.access_profile()
+    }
+    fn probe_scope(
+        &self,
+        bound_dir: Option<PathBuf>,
+    ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
+        self.worker.probe_scope(bound_dir)
+    }
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        self.worker.probe(request).await
+    }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
     }
@@ -264,6 +279,60 @@ mod tests {
     }
     /// The local coding worker's toolset is a shell plus the file, web and
     /// task-list tools the host has, not the shell alone.
+    /// The production wrapper hands probes to its local worker: a scope, an
+    /// observation from the local worker itself (not the trait's
+    /// "cannot observe" default), and an access profile that is more than
+    /// its advertised capabilities.
+    #[tokio::test]
+    async fn local_coding_forwards_probes_to_its_local_worker() {
+        use rustykrab_control::capability_proof::{
+            probe_inputs_digest, ExpectedOperation, ProbeRequest, RegisteredAction,
+        };
+        let mut c = config("http://127.0.0.1:11434");
+        c.repositories = vec![PathBuf::from("/fixture")];
+        let host: Vec<Arc<dyn Tool>> = vec![Arc::new(rustykrab_tools::ExecTool::new())];
+        let worker = CodingWorker::new(
+            &c,
+            Arc::new(NoModel),
+            host,
+            Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
+            Arc::new(Discard),
+            Arc::new(Semaphore::new(1)),
+        );
+        let scope = worker
+            .probe_scope(None)
+            .expect("the wrapper has its local worker's probe scope");
+        assert_eq!(scope.worker, worker.name());
+        assert_ne!(
+            worker.access_profile(),
+            serde_json::to_value(worker.capabilities()).unwrap(),
+            "the wrapper's access profile is its local worker's, not the advertised default"
+        );
+        let action = RegisteredAction::BinaryAvailable {
+            binary: "node".into(),
+        };
+        let expected = ExpectedOperation {
+            operation: action.operation(),
+            executor: worker.name().to_string(),
+            inputs_digest: probe_inputs_digest(&action, &scope),
+            generation: "fixture:1".into(),
+            run: "probe-fixture".into(),
+        };
+        let probe = worker
+            .probe(&ProbeRequest {
+                expected,
+                action,
+                scope,
+                deadline: std::time::Duration::from_secs(10),
+            })
+            .await;
+        assert!(
+            !probe.observation.contains("cannot observe"),
+            "the local worker observed it, whatever the host has: {}",
+            probe.observation
+        );
+    }
+
     #[test]
     fn local_coding_gets_file_web_and_task_tools_beside_its_shell() {
         let mut c = config("http://127.0.0.1:11434");
