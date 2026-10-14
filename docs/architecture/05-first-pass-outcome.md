@@ -204,3 +204,16 @@ A raw-timeout fixture trigger also matched notification text outside a worker
 run, replacing the expected human message. The final trigger matches the
 generated recurring-repair objective; the isolated restart/cascade/notification
 scenario passes with its original assertions.
+
+
+## General agents and blocker-first scheduling (base 65e335b)
+
+The October 2 review recorded an explicit planning-only role as a requirement
+separate from tool availability. That restriction is now retired at the owner's
+request. Every agent can plan and execute within its actual tool and resource
+grants, regardless of legacy role/category metadata. Native subscription
+resources share the host-tool path as well as repository execution. This closes
+a routing restriction; it does not establish that every model will succeed on
+every objective. Distinct transitive waiter count now precedes explicit urgency
+in selection. The same derived ranks reach the monitor without rewriting work
+priorities or introducing another ledger.

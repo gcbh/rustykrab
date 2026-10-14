@@ -36,6 +36,7 @@ use crate::RegistryCatalog;
 /// their registry spec.
 pub(crate) struct AgentFactory {
     data_dir: PathBuf,
+    host: RwLock<Option<crate::native_resources::HostTools>>,
 }
 
 #[async_trait::async_trait]
@@ -45,6 +46,13 @@ impl WorkerFactory for AgentFactory {
             return crate::peers::build(name, spec);
         }
         let config = ExternalConfig::from_spec(spec, &self.data_dir)?;
+        if config.require_max || config.require_chatgpt {
+            if let Some(host) = self.host.read().unwrap_or_else(|e| e.into_inner()).clone() {
+                return Ok(Arc::new(crate::native_resources::NativeWorker::new(
+                    name, config, host,
+                )?));
+            }
+        }
         Ok(Arc::new(ExternalWorker::new(name, config)))
     }
 
@@ -216,6 +224,7 @@ pub(crate) struct Fleet {
     /// The local worker's registry name, stable across restarts.
     pub local_name: String,
     data_dir: PathBuf,
+    factory: Arc<AgentFactory>,
 }
 
 impl Fleet {
@@ -227,11 +236,11 @@ impl Fleet {
         skill_registry: Arc<SkillRegistry>,
         boot_tools: &[Arc<dyn Tool>],
     ) -> anyhow::Result<Fleet> {
-        let registry = Arc::new(WorkerRegistry::new(store.clone()).with_factory(Arc::new(
-            AgentFactory {
-                data_dir: data_dir.to_path_buf(),
-            },
-        )));
+        let factory = Arc::new(AgentFactory {
+            data_dir: data_dir.to_path_buf(),
+            host: RwLock::new(None),
+        });
+        let registry = Arc::new(WorkerRegistry::new(store.clone()).with_factory(factory.clone()));
         registry.load().await?;
         let local_name = registry.local_name().await?;
         let routing = Arc::new(RecordRouting::new(registry.clone()));
@@ -242,6 +251,7 @@ impl Fleet {
             skills: Arc::new(RuntimeSkills::new(skills_dir, skill_registry, boot_tools)),
             local_name,
             data_dir: data_dir.to_path_buf(),
+            factory,
         })
     }
 
@@ -263,6 +273,10 @@ impl Fleet {
 
     pub(crate) fn routing(&self) -> Arc<dyn Routing> {
         self.routing.clone()
+    }
+
+    pub(crate) fn share_host_tools(&self, tools: crate::native_resources::HostTools) {
+        *self.factory.host.write().unwrap_or_else(|e| e.into_inner()) = Some(tools);
     }
 
     /// Register the local worker, if there is one, and rebuild the stored

@@ -35,8 +35,8 @@
 
 use rustykrab_core::work::{Edge, EdgeKind, EventKind, Status, WorkItem, WorkItemId};
 
-/// The tool that defines a planning item: only a worker holding it (the
-/// `planner`) covers one, and a graph it files waits on it (section 6.1).
+/// The tool that defines a planning item: any agent holding it can file its
+/// graph, and that graph waits on the planning item (section 6.1).
 pub const PLAN_TOOL: &str = "work_plan";
 
 /// Whether `item` is a planning item: it requires [`PLAN_TOOL`].

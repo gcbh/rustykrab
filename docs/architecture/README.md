@@ -79,3 +79,11 @@ all delete paths, trait-implementor counts, duplication measurement by
 normalised diff, and env-var reads per crate. No code was changed and no
 benchmark was run. Where a claim is a measurement it is stated as one; where it
 is taste it is marked as taste.
+
+
+The general-agent follow-up against 65e335b retires planning reservations and
+shares existing host-tool grants with local and native subscription resources.
+Blocker impact leads queue ordering; the monitor reads that same derived rank.
+The affected control, agent, CLI, provider and gateway write-ups describe the
+execution paths and permissions; the data-model and outcome documents retain
+priority and role history.

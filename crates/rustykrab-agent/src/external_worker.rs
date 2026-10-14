@@ -466,8 +466,8 @@ impl ExternalConfig {
 pub struct ExternalWorker {
     name: String,
     config: ExternalConfig,
-    max_runtime: Option<rustykrab_providers::ClaudeMaxRuntime>,
-    codex_runtime: Option<rustykrab_providers::CodexChatGptRuntime>,
+    max_runtime: Option<Arc<rustykrab_providers::ClaudeMaxRuntime>>,
+    codex_runtime: Option<Arc<rustykrab_providers::CodexChatGptRuntime>>,
     /// What each run spent, by the brief's run id ([`Worker::usage`]).
     usage: Mutex<HashMap<String, RunUsage>>,
     /// The commands the last run of each item was seen to run, handed from
@@ -496,17 +496,19 @@ impl ExternalWorker {
         ExternalWorker {
             name: name.into(),
             max_runtime: config.require_max.then(|| {
-                rustykrab_providers::ClaudeMaxRuntime::new(
-                    config.command.clone(),
-                    config.claude_config_dir.clone(),
+                Arc::new(
+                    rustykrab_providers::ClaudeMaxRuntime::new(
+                        config.command.clone(),
+                        config.claude_config_dir.clone(),
+                    )
+                    .with_model(config.model.as_deref()),
                 )
-                .with_model(config.model.as_deref())
             }),
             codex_runtime: config.require_chatgpt.then(|| {
-                rustykrab_providers::CodexChatGptRuntime::new(
+                Arc::new(rustykrab_providers::CodexChatGptRuntime::new(
                     config.command.clone(),
                     config.codex_home.clone(),
-                )
+                ))
             }),
             config,
             usage: Mutex::new(HashMap::new()),
@@ -519,6 +521,17 @@ impl ExternalWorker {
     /// set.
     pub fn with_groups(mut self, groups: Arc<RunGroups>) -> ExternalWorker {
         self.groups = groups;
+        self
+    }
+
+    /// Native and host-tool execution share one account/quota observation.
+    pub fn with_subscription_runtimes(
+        mut self,
+        claude: Option<Arc<rustykrab_providers::ClaudeMaxRuntime>>,
+        codex: Option<Arc<rustykrab_providers::CodexChatGptRuntime>>,
+    ) -> Self {
+        self.max_runtime = claude;
+        self.codex_runtime = codex;
         self
     }
 

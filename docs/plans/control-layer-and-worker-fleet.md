@@ -595,7 +595,7 @@ gets one planning item, which this loop runs like any other (6.1).
    whose routing record qualifies it for the item's class of work; a `code`
    item is matched the same way as any other, so a local worker takes it when
    its record says it can; escalate the tier on failed verification, not on
-   the item's kind. A planning item matches only a `planner` worker.
+   the actual tool and writable scope requirements. Any agent holding work_plan can plan; legacy agent roles and task labels do not gate selection.
 3. **Lease** with a TTL; a lease that expires without a heartbeat returns the
    item to `ready` with a repair note. Readiness is re-read inside the lease
    transaction, so a `conditional_on_failure` item is never leased while its
@@ -982,8 +982,8 @@ Rules:
   validation and approval policy.
 - Scheduling uses effective priority: prerequisites inherit the highest base
   priority of interested open dependents, transitively through unmet ordering
-  edges and parent gates. Distinct waiter count breaks equal-priority ties before
-  age and id. Stored priorities are unchanged; boosts disappear when their
+  edges and parent gates. Distinct waiter count is the primary queue rank;
+  inherited explicit urgency, age and id break ties. Stored priorities are unchanged; boosts disappear when their
   waiters close, expire, are held for approval or are no longer due. This does
   not preempt running work or bypass readiness, worker eligibility or resource
   locks.

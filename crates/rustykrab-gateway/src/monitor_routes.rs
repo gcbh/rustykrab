@@ -64,6 +64,9 @@ pub struct MonitorReply {
     pub controller: Option<LoopStatus>,
     pub workers: Vec<WorkerView>,
     pub work: WorkMonitorSnapshot,
+    #[serde(default)]
+    pub queue_priorities:
+        std::collections::HashMap<String, rustykrab_control::graph::SchedulingPriority>,
     pub expectation_metrics: Vec<MetricValue>,
     #[serde(default)]
     pub dreaming: Option<rustykrab_core::dream_review::DreamingView>,
@@ -332,6 +335,15 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         None => Vec::new(),
     };
     let controller = state.control.as_ref().and_then(|c| c.loop_status());
+    let mut queue_priorities = match &state.control {
+        Some(control) => control
+            .queue_priorities()
+            .await
+            .map_err(|e| e.to_string())?,
+        None => std::collections::HashMap::new(),
+    };
+    let displayed: std::collections::HashSet<_> = work.items.iter().map(|r| &r.item.id).collect();
+    queue_priorities.retain(|id, _| displayed.contains(id));
     let mut alerts = assess(controller.as_ref(), &workers, &work, Utc::now());
     let dreaming = match state.evaluation.as_ref() {
         Some(h) => h.dreaming_status().await.ok(),
@@ -469,6 +481,7 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         controller,
         workers,
         work,
+        queue_priorities,
         alerts,
         health,
         stale_after_seconds: STALE_SECONDS,

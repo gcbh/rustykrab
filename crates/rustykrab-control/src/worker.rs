@@ -144,8 +144,7 @@ pub trait Worker: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> WorkerKind;
     fn capabilities(&self) -> WorkerCapabilities;
-    /// This worker is reserved for planning work. Merely advertising the
-    /// work_plan tool (for example on a peer node) does not reserve a worker.
+    /// Legacy role metadata. The scheduler ignores it; tools and scope decide.
     fn planning_only(&self) -> bool {
         false
     }

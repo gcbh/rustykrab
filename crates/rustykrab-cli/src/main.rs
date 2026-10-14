@@ -11,6 +11,7 @@ mod fleet;
 mod integrations;
 mod local_resources;
 mod monitor_cmd;
+mod native_resources;
 mod overseer;
 mod peers;
 mod prompt_log;
@@ -1463,6 +1464,21 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let local_resources = local_resources::Config::from_env()?;
+    let local_repositories: Vec<String> = local_resources
+        .as_ref()
+        .map(|c| {
+            c.repositories
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    fleet.share_host_tools(native_resources::HostTools {
+        tools: tools.clone(),
+        backend: deferred_work_backend.clone(),
+        transcripts: scheduled_work::transcripts(&store, skill_registry.clone()),
+        integrations: integrations::enabled(),
+    });
     // One KV slot per model (plan 12.1): the local worker and the runs of
     // a peer's briefs on this node (peers.rs) wait on the same one.
     let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1544,15 +1560,29 @@ async fn main() -> anyhow::Result<()> {
         fleet
             .registry
             .register(
-                work_channel::planner_worker(
-                    agent_defs::planner_definition(&agent_definitions),
-                    provider.clone(),
-                    tools.clone(),
-                    deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
-                    scheduled_work::transcripts(&store, skill_registry.clone()),
-                    model_slot.clone(),
-                ),
-                serde_json::json!({ "role": "planner" }),
+                if matches!(provider.name(), "claude-cli" | "ollama") {
+                    Arc::new(integrations::IntegrationWorker::general(
+                        "planner",
+                        None,
+                        provider.clone(),
+                        tools.clone(),
+                        deferred_work_backend.clone(),
+                        scheduled_work::transcripts(&store, skill_registry.clone()),
+                        model_slot.clone(),
+                        &local_repositories,
+                        integrations::enabled(),
+                    )?) as Arc<dyn rustykrab_control::worker::Worker>
+                } else {
+                    work_channel::planner_worker(
+                        agent_defs::planner_definition(&agent_definitions),
+                        provider.clone(),
+                        tools.clone(),
+                        deferred_work_backend.clone(),
+                        scheduled_work::transcripts(&store, skill_registry.clone()),
+                        model_slot.clone(),
+                    )
+                },
+                serde_json::json!({ "role": "general-agent", "resource_slot": true }),
                 None,
             )
             .await?;
@@ -1561,14 +1591,18 @@ async fn main() -> anyhow::Result<()> {
         fleet
             .registry
             .register(
-                Arc::new(integrations::IntegrationWorker::new(
+                Arc::new(integrations::IntegrationWorker::general(
+                    "integrations",
+                    None,
                     provider.clone(),
                     tools.clone(),
                     deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
                     scheduled_work::transcripts(&store, skill_registry.clone()),
                     model_slot.clone(),
+                    &local_repositories,
+                    true,
                 )?),
-                serde_json::json!({"role":"integrations"}),
+                serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 local_resources.as_ref().map(|_| 1),
             )
             .await?;
@@ -1587,15 +1621,29 @@ async fn main() -> anyhow::Result<()> {
                     scheduled_work::transcripts(&store, skill_registry.clone()),
                     local_slot.clone(),
                 )),
-                serde_json::json!({"role":"local-code", "preferred_for":"basic coding"}),
+                serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 Some(0),
             )
             .await?;
         if integrations::enabled() {
-            fleet.registry.register(
-                Arc::new(integrations::IntegrationWorker::new_named(local_resources::INTEGRATION_NAME, Some(config.model.clone()), local_provider, tools.clone(), deferred_work_backend.clone(), scheduled_work::transcripts(&store, skill_registry.clone()), local_slot)?),
-                serde_json::json!({"role":"integrations", "preferred_for":"routine email, calendar, news"}), Some(0),
-            ).await?;
+            fleet
+                .registry
+                .register(
+                    Arc::new(integrations::IntegrationWorker::general(
+                        local_resources::INTEGRATION_NAME,
+                        Some(config.model.clone()),
+                        local_provider,
+                        tools.clone(),
+                        deferred_work_backend.clone(),
+                        scheduled_work::transcripts(&store, skill_registry.clone()),
+                        local_slot,
+                        &local_repositories,
+                        true,
+                    )?),
+                    serde_json::json!({"role":"general-agent", "resource_slot":true}),
+                    Some(0),
+                )
+                .await?;
         }
     }
 

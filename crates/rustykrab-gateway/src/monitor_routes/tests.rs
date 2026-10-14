@@ -210,6 +210,70 @@ async fn real_router_enforces_auth_origin_and_observation_is_read_only() {
 }
 
 #[tokio::test]
+async fn bounded_monitor_ranks_count_waiters_outside_the_display_limit() {
+    use rustykrab_core::work::{DraftEdge, EdgeKind, ItemRef, PlanOutcome, WorkItemDraft};
+    let (base, client, _store, control, task) = serve().await;
+    let mut repair = String::new();
+    for title in [
+        "Shared repair",
+        "First waiter",
+        "Second waiter",
+        "Independent",
+    ] {
+        let edges = if title.contains("waiter") {
+            vec![DraftEdge {
+                kind: EdgeKind::Blocks,
+                depends_on: ItemRef::Id(repair.clone()),
+            }]
+        } else {
+            vec![]
+        };
+        let outcome = control
+            .file_draft(
+                WorkItemDraft {
+                    title: title.into(),
+                    objective: title.into(),
+                    done_when: "completed".into(),
+                    edges,
+                    ..Default::default()
+                },
+                rustykrab_control::Provenance {
+                    actor: "user".into(),
+                    conversation_id: None,
+                    filed_by_item: None,
+                },
+            )
+            .await
+            .unwrap();
+        let PlanOutcome::Accepted(accepted) = outcome else {
+            panic!("fixture draft rejected: {outcome:?}");
+        };
+        if repair.is_empty() {
+            repair = accepted.root;
+        }
+    }
+    let reply: MonitorReply = client
+        .get(format!("{base}/api/monitor?limit=3"))
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reply.work.items.len(), 3);
+    assert!(reply.work.items_truncated);
+    assert_eq!(reply.queue_priorities[&repair].waiters, 2);
+    assert!(reply.queue_priorities.keys().all(|id| reply
+        .work
+        .items
+        .iter()
+        .any(|row| &row.item.id == id)));
+    task.abort();
+}
+
+#[tokio::test]
 async fn failures_stale_ticks_and_expected_cutover_waits_have_distinct_verdicts() {
     let (_, _, store, _, task) = serve().await;
     let work = store.work_monitor_snapshot(1, 1).await.unwrap();

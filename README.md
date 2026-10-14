@@ -944,3 +944,19 @@ Repository scope permits inspection without edits. When no Git changes are
 claimed, a clean worktree at its starting commit records `repository_unchanged`
 evidence rather than requiring an invented commit. Unreported edits and false
 commit/path claims still fail verification.
+
+
+### General agents and queue priority
+
+Any agent can plan or execute work within its available tools and granted
+resources. Legacy specialty names, task categories and backend pins do not
+restrict assignment. Claude and Codex subscription workers can use the host
+planning and integration tools as well as their native repository executor.
+The existing restricted email/calendar and note actions keep their permissions.
+
+The queue runs work needed by the most distinct open tasks first, counting
+indirect blockers once per task. Inherited explicit urgency, age and id break
+ties. Held, expired, completed, future-triggered and unreleased fallback work
+do not increase priority. Running jobs finish normally. If no compatible
+resource has free subscription capacity, the work stays queued for recovery.
+The monitor displays the same derived blocking impact for the current queue.

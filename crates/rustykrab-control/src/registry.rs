@@ -310,6 +310,8 @@ impl WorkerRegistry {
         let rows = self.store.workers().list().await?;
         if let Some(row) = rows.iter().find(|r| {
             r.kind() == Some(WorkerKind::Local)
+                && r.config["resource_slot"] != true
+                && r.config["role"] != "local-code"
                 && r.config["role"] != "planner"
                 && r.config["role"] != "infrastructure"
                 && r.config["role"] != "integrations"
@@ -1159,10 +1161,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_adapters_do_not_take_the_local_execution_name() {
+    async fn resource_slots_keep_the_default_execution_name_after_restart() {
         let (_dir, store) = temp_store();
         let registry = WorkerRegistry::new(store.clone());
-        for role in ["planner", "infrastructure", "integrations"] {
+        for role in [
+            "planner",
+            "infrastructure",
+            "integrations",
+            "local-code",
+            "general-agent",
+        ] {
             registry
                 .register(
                     Arc::new(Named {
@@ -1172,7 +1180,7 @@ mod tests {
                         token: None,
                         refreshes: std::sync::atomic::AtomicUsize::new(0),
                     }),
-                    serde_json::json!({"role":role}),
+                    serde_json::json!({"role":role, "resource_slot":role == "general-agent"}),
                     None,
                 )
                 .await

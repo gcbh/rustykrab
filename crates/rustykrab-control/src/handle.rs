@@ -200,6 +200,14 @@ pub trait ControlHandle: Send + Sync {
     /// `GET /api/work/{id}/graph`.
     async fn graph(&self, root: &str) -> Result<GraphView, Error>;
 
+    /// Current derived queue ranks, using the scheduler's complete snapshot.
+    async fn queue_priorities(
+        &self,
+    ) -> Result<std::collections::HashMap<WorkItemId, crate::graph::SchedulingPriority>, Error>
+    {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// The loop's own state, or `None` for a handle that runs no loop.
     fn loop_status(&self) -> Option<LoopStatus> {
         None

@@ -208,7 +208,8 @@ recurring/unknown failure diagnoses create or reuse prerequisites instead of
 filing independent background improvements. Original work waits for the
 prerequisite; its next attempt carries the completed prerequisite's evidence.
 The deterministic scheduler propagates priority through unmet ordering edges
-and parent gates, with distinct waiter count as the next tie-breaker. Base
+and parent gates. Distinct waiter count is the primary queue rank; inherited
+explicit urgency, age and id break ties. Base
 priorities, authorization, worker eligibility and resource locks remain separate
 gates. This adds no queue, persistence table or model-controlled status field.
 

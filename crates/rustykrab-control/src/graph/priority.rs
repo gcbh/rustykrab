@@ -1,4 +1,4 @@
-//! Temporary urgency inherited through unmet prerequisites and parent gates.
+//! Blocker impact and temporary urgency through prerequisites and parent gates.
 //! Derived on every scheduling pass; the stored priority never changes.
 
 use std::collections::{HashMap, HashSet};
@@ -8,11 +8,21 @@ use rustykrab_core::work::{EdgeKind, Status, WorkItem, WorkItemId};
 
 use super::Snapshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulingPriority {
     pub priority: i32,
     /// Distinct open items that need this work; diamonds count once.
     pub waiters: usize,
+}
+
+impl SchedulingPriority {
+    /// Queue order: blocking impact first, inherited explicit urgency second.
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .waiters
+            .cmp(&self.waiters)
+            .then_with(|| other.priority.cmp(&self.priority))
+    }
 }
 
 /// A prerequisite inherits the highest base priority of interested open work.
@@ -35,11 +45,21 @@ pub fn scheduling_priorities(
             )
         })
         .collect();
+    let unreleased_alternative = |item: &WorkItem| {
+        snap.edges_held_by(&item.id).any(|edge| {
+            edge.kind == EdgeKind::ConditionalOnFailure
+                && !matches!(
+                    super::ready::verdict(snap, edge),
+                    super::ready::Verdict::Satisfied
+                )
+        })
+    };
     let interested = |item: &WorkItem| {
         !item.status.is_closed()
             && item.held_by.is_none()
             && item.expires_at.is_none_or(|t| t > now)
             && snap.trigger_fired(&item.id, now)
+            && !unreleased_alternative(item)
     };
     for source in snap.items().iter().filter(|i| interested(i)) {
         if snap
@@ -59,6 +79,9 @@ pub fn scheduling_priorities(
             let Some(item) = snap.item(&id).filter(|i| !i.status.is_closed()) else {
                 continue;
             };
+            if unreleased_alternative(item) {
+                continue;
+            }
             if id != source.id {
                 let rank = ranks.get_mut(&id).expect("snapshot item has rank");
                 rank.priority = rank.priority.max(source.priority);
