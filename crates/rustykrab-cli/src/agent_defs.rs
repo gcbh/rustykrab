@@ -41,15 +41,9 @@ pub fn worker_definition(all: &AgentRegistry, name: &str) -> AgentDefinition {
     }
 }
 
-/// Controller-only planner, kept separate from the read-only planning subagent.
+/// The legacy planner slot uses the same general definition as other agents.
 pub fn planner_definition(all: &AgentRegistry) -> AgentDefinition {
-    let mut definition = match all.get(WORK_PLANNER) {
-        Some(def) => rustykrab_agent::LocalWorker::named_definition(&def, "planner"),
-        None => rustykrab_agent::LocalWorker::planner_definition(),
-    };
-    // The host assigns this role, including to older data-dir overrides.
-    definition.planning_only = true;
-    definition
+    worker_definition(all, "planner")
 }
 
 #[cfg(test)]
@@ -74,10 +68,10 @@ mod tests {
         let all = load(&dir);
         let planner = planner_definition(&all);
         assert_eq!(planner.id, "planner");
-        assert!(planner.planning_only);
-        assert_eq!(planner.system_prompt, "You are planner, my planner.");
-        assert_eq!(planner.tools, ["work_plan", "work_status"]);
-        assert_eq!(planner.allowed_tools.unwrap(), ["work_plan", "work_status"]);
+        assert!(!planner.planning_only);
+        assert_eq!(planner.system_prompt, "You are planner, mine.");
+        assert_eq!(planner.tools, ["caldav"]);
+        assert!(planner.allowed_tools.is_none());
 
         let worker = worker_definition(&all, "pinch");
         assert_eq!(worker.id, "pinch");
