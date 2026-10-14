@@ -8,17 +8,17 @@ controller integration belongs to Claude's coordinated recovery slice.
 ## Contract
 
 `rustykrab_control::capability_proof` exports `OPERATION_PROBE`,
-`CapabilityRef`, `OperationProbe`, `ProbeOutcome`, `Proof`, `Missing` and:
+`ExpectedOperation`, `OperationProbe`, `ProbeOutcome`, `Proof`, `Missing` and:
 
 ```rust
 pub fn capability_proven(
     item: &WorkItem,
     evidence: &[Evidence],
-    need: &CapabilityRef,
+    need: &ExpectedOperation,
 ) -> Result<Proof, Missing>
 ```
 
-The controller constructs `CapabilityRef` from expected operation/executor,
+The controller constructs `ExpectedOperation` from expected operation/executor,
 canonical lowercase SHA-256 over inputs plus effective access/configuration,
 the relevant repair/configuration generation and the host probe invocation
 `run`. Secret values and incidental invocation paths stay out of that digest.

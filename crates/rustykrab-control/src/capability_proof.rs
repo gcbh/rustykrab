@@ -23,7 +23,7 @@ const MAX_OBSERVATION_BYTES: usize = 4_096;
 /// `run` identifies the expected host probe invocation, not arbitrary CLI text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CapabilityRef {
+pub struct ExpectedOperation {
     pub operation: String,
     pub executor: String,
     pub inputs_digest: String,
@@ -126,7 +126,7 @@ fn digest(value: &str) -> bool {
 pub fn capability_proven(
     item: &WorkItem,
     evidence: &[Evidence],
-    need: &CapabilityRef,
+    need: &ExpectedOperation,
 ) -> Result<Proof, Missing> {
     for (field, valid) in [
         ("operation", identity(&need.operation, 1_024)),
@@ -200,7 +200,7 @@ mod tests {
     use super::*;
     use rustykrab_core::work::{BlockedReason, Budget, Status, Trigger, WorkKind};
 
-    fn fixture() -> (WorkItem, CapabilityRef, Evidence) {
+    fn fixture() -> (WorkItem, ExpectedOperation, Evidence) {
         let at = DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -233,7 +233,7 @@ mod tests {
             updated_at: at,
             closed_at: None,
         };
-        let need = CapabilityRef {
+        let need = ExpectedOperation {
             operation: "repository.read".into(),
             executor: "max-fieldkit".into(),
             inputs_digest: "a".repeat(64),
