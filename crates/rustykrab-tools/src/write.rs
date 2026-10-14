@@ -9,11 +9,32 @@ use crate::security;
 ///
 /// Security: Validates paths to prevent traversal attacks and blocks
 /// writes to sensitive system directories.
-pub struct WriteTool;
+pub struct WriteTool {
+    /// The directory this tool is bound to instead of the daemon's
+    /// workspace: a run's own checkout. Paths are taken from it and may
+    /// not leave it.
+    root: Option<std::path::PathBuf>,
+}
 
 impl WriteTool {
     pub fn new() -> Self {
-        Self
+        Self { root: None }
+    }
+
+    /// The tool bound to `dir`: a relative path is taken from it, and no
+    /// path outside it is accepted. A worker run in a worktree gets its
+    /// file tools this way, as it gets `exec`.
+    pub fn in_dir(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            root: Some(dir.into()),
+        }
+    }
+
+    fn validate(&self, path: &str) -> std::result::Result<std::path::PathBuf, String> {
+        match &self.root {
+            Some(root) => security::validate_path_in(root, path),
+            None => security::validate_path(path),
+        }
     }
 }
 
@@ -70,7 +91,7 @@ impl Tool for WriteTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing content".into()))?;
 
         // Validate path for traversal and blocked directories
-        let safe_path = security::validate_path(path).map_err(|e| {
+        let safe_path = self.validate(path).map_err(|e| {
             rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
         })?;
 

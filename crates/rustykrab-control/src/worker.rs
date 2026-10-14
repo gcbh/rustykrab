@@ -137,6 +137,10 @@ pub fn discussion_excerpt(brief: &Brief) -> String {
 /// "the named checks ran").
 pub const COMMAND_RUN: &str = "command_run";
 
+/// The evidence kind for a run's session log: its ref is the path of the
+/// file [`Worker::run_log`] named, `verified_by` the worker that wrote it.
+pub const RUN_LOG: &str = "run_log";
+
 /// A worker the controller can lease an item to.
 #[async_trait]
 pub trait Worker: Send + Sync {
@@ -183,6 +187,16 @@ pub trait Worker: Send + Sync {
     /// the worker keeps no such numbers, and the controller records its own
     /// wall time with no token count.
     fn usage(&self, _run: &str) -> Option<RunUsage> {
+        None
+    }
+
+    /// Where the full session log of the run with this id is, once the run
+    /// has ended or been stopped: a file with everything the agent said,
+    /// called and was answered, kept whether the run reported or not. The
+    /// controller records it as the item's [`RUN_LOG`] evidence, which is
+    /// what a later attempt or an investigation of the failure reads.
+    /// `None`: the worker left no log.
+    fn run_log(&self, _run: &str) -> Option<std::path::PathBuf> {
         None
     }
 

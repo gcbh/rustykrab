@@ -13,11 +13,32 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 ///
 /// Security: Validates paths to prevent traversal attacks and blocks
 /// access to sensitive system directories.
-pub struct ReadTool;
+pub struct ReadTool {
+    /// The directory this tool is bound to instead of the daemon's
+    /// workspace: a run's own checkout. Paths are taken from it and may
+    /// not leave it.
+    root: Option<std::path::PathBuf>,
+}
 
 impl ReadTool {
     pub fn new() -> Self {
-        Self
+        Self { root: None }
+    }
+
+    /// The tool bound to `dir`: a relative path is taken from it, and no
+    /// path outside it is accepted. A worker run in a worktree gets its
+    /// file tools this way, as it gets `exec`.
+    pub fn in_dir(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            root: Some(dir.into()),
+        }
+    }
+
+    fn validate(&self, path: &str) -> std::result::Result<std::path::PathBuf, String> {
+        match &self.root {
+            Some(root) => security::validate_path_in(root, path),
+            None => security::validate_path(path),
+        }
     }
 }
 
@@ -75,7 +96,7 @@ impl Tool for ReadTool {
             .ok_or_else(|| rustykrab_core::Error::ToolExecution("missing path".into()))?;
 
         // Validate path for traversal and blocked directories
-        let safe_path = security::validate_path(path).map_err(|e| {
+        let safe_path = self.validate(path).map_err(|e| {
             rustykrab_core::Error::ToolExecution(format!("path rejected: {e}").into())
         })?;
 
@@ -186,6 +207,96 @@ mod tests {
 
     fn numbered_lines(count: usize) -> String {
         (0..count).map(|i| format!("line {i}\n")).collect()
+    }
+
+    /// A run's own checkout, outside the daemon's workspace, as a worker's
+    /// worktree is.
+    fn checkout() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("bound-tool-test-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        dir
+    }
+
+    /// Bound to a directory, the file tools work there by relative path,
+    /// where the unbound ones refuse it as outside the workspace.
+    #[tokio::test]
+    async fn bound_to_a_directory_the_file_tools_work_inside_it() {
+        let dir = checkout();
+        let inside = dir.path().join("src/lib.rs").to_string_lossy().into_owned();
+        let unbound = ReadTool::new().execute(json!({ "path": inside })).await;
+        assert!(
+            unbound
+                .unwrap_err()
+                .to_string()
+                .contains("outside the workspace boundary"),
+            "the daemon's own read tool does not reach a worktree"
+        );
+
+        let read = ReadTool::in_dir(dir.path());
+        let got = read.execute(json!({ "path": "src/lib.rs" })).await.unwrap();
+        assert_eq!(got["content"], "pub fn a() {}");
+        let got = read.execute(json!({ "path": inside })).await.unwrap();
+        assert_eq!(got["lines"], 1, "an absolute path inside it reads too");
+
+        crate::WriteTool::in_dir(dir.path())
+            .execute(json!({ "path": "src/new.rs", "content": "pub fn b() {}\n" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/new.rs")).unwrap(),
+            "pub fn b() {}\n"
+        );
+        crate::EditTool::in_dir(dir.path())
+            .execute(json!({
+                "path": "src/lib.rs",
+                "old_string": "fn a()",
+                "new_string": "fn renamed()"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+            "pub fn renamed() {}\n"
+        );
+    }
+
+    /// The bound is a boundary: nothing outside the directory, by an
+    /// absolute path, `..`, or a symlink that leaves it.
+    #[tokio::test]
+    async fn bound_to_a_directory_the_file_tools_do_not_leave_it() {
+        let dir = checkout();
+        let other = checkout();
+        let outside = other.path().join("src/lib.rs");
+        let read = ReadTool::in_dir(dir.path());
+        for path in [outside.to_string_lossy().into_owned(), "../x".to_string()] {
+            let err = read.execute(json!({ "path": path })).await.unwrap_err();
+            assert!(err.to_string().contains("path rejected"), "{path}: {err}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, dir.path().join("escape.rs")).unwrap();
+            let err = read
+                .execute(json!({ "path": "escape.rs" }))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("outside the workspace boundary"),
+                "{err}"
+            );
+        }
+        let err = crate::WriteTool::in_dir(dir.path())
+            .execute(json!({
+                "path": other.path().join("planted.rs").to_string_lossy(),
+                "content": "x"
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path rejected"), "{err}");
+        assert!(!other.path().join("planted.rs").exists());
     }
 
     #[tokio::test]

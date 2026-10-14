@@ -622,7 +622,9 @@ compaction writes the item's total into the archive's `cost`.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
-`error`, `run`, and `classifier_rule` (a `<subclass>: <pattern>` row an
+`error`, `run`, `run_log` (the path of the run's session log, `hash` its run
+id, `verified_by` the worker that wrote it; what an investigation of a failed
+run opens), and `classifier_rule` (a `<subclass>: <pattern>` row an
 `internal` item landed, `verified_by = 'replay'` once the controller replayed
 the failure through it). The last is reloaded across items on start
 (`work_evidence_of_kind`), which is how a landed rule survives restarts and
