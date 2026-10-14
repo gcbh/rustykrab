@@ -970,3 +970,271 @@ async fn a_failure_that_comes_back_after_a_done_fix_says_so_and_carries_what_it_
         assert!(recurrence.basis.contains("contains the fix commit"));
     }
 }
+
+// ── a fix in the daemon's own source ────────────────────────────────────
+
+/// A repository that is RustyKrab's as far as the check can tell (the
+/// build's commit is in it and has the control crate), the build made from
+/// it, and a later commit on its `main`: the checkout has moved on since
+/// the running daemon was built.
+fn daemon_source() -> (Repo, String, BuildId, String) {
+    let source = Repo::new();
+    std::fs::create_dir_all(source.path().join("crates/rustykrab-control")).unwrap();
+    std::fs::write(
+        source.path().join("crates/rustykrab-control/Cargo.toml"),
+        "[package]\nname = \"rustykrab-control\"\n",
+    )
+    .unwrap();
+    let built = commit_all(source.path(), "the running build");
+    let build = BuildId {
+        commit: built[..7].to_string(),
+        dirty: false,
+    };
+    std::fs::write(source.path().join("LATER.md"), "work after the build\n").unwrap();
+    let later = commit_all(source.path(), "later work on main");
+    (source, built, build, later)
+}
+
+/// The evidence rows a later slice reads to take a fix to the daemon's own
+/// source further: the `workspace` row written at lease time and the
+/// `commit` row git verified, exactly as a repository-scoped item has them.
+async fn landed_rows(
+    h: &Harness,
+    item: &str,
+) -> (
+    rustykrab_core::work::Evidence,
+    rustykrab_core::work::Evidence,
+) {
+    let evidence = h.store().work_evidence_list(item).await.unwrap();
+    let workspace = evidence
+        .iter()
+        .rev()
+        .find(|e| e.kind == crate::workspace::WORKSPACE_EVIDENCE)
+        .cloned()
+        .expect("a workspace row");
+    let commit = evidence
+        .iter()
+        .rev()
+        .find(|e| e.kind == "commit" && e.verified_by.as_deref() == Some("git"))
+        .cloned()
+        .expect("a commit row git verified");
+    (workspace, commit)
+}
+
+#[tokio::test]
+async fn a_failure_in_the_daemons_own_code_is_fixed_in_its_source_at_the_running_build() {
+    let data = Data::new();
+    let (source, built, build, later) = daemon_source();
+    let agent = Agent::new("pinch", Some(&source), data.run_logs());
+    let h = Harness::on_wall_clock(data.config(Some(build)), vec![agent.clone()]);
+    // An item that names no repository fails in a way nothing classifies:
+    // the cause is in the daemon, not in a repository of the user's.
+    agent.on(
+        "Reconcile",
+        &[Act::Unrecognised("flux capacitor desynchronised")],
+    );
+    agent.on(
+        "Classify unknown failure",
+        &[Act::Commit(
+            "Root cause in the verifier; fixed and committed.",
+        )],
+    );
+    let ledger = h.file_one(draft("ledger", "Reconcile the ledger")).await;
+    h.drain().await;
+
+    let fix = fix_items(&h).await.pop().expect("a fix item was filed");
+    let resource = format!("{REPO_PREFIX}{}", source.path().display());
+    assert_eq!(fix.writable_resources, vec![resource]);
+    assert!(fix
+        .artifact_refs
+        .iter()
+        .any(|r| r.kind == crate::investigate::DAEMON_SOURCE
+            && r.value == source.path().display().to_string()));
+
+    // It ran in a worktree of the daemon's source at the commit the running
+    // build was made from, not at the checkout's later HEAD.
+    let brief = agent.briefs_for("Classify unknown failure").pop().unwrap();
+    let ws = brief
+        .workspace
+        .expect("an own-source fix item gets a worktree");
+    assert_eq!(ws.repo, source.path());
+    assert_eq!(ws.base, built);
+    assert_ne!(ws.base, later);
+    assert!(ws.branch.starts_with("rustykrab/work/"));
+    let kit = brief.investigation.expect("a kit");
+    assert!(kit.own_source);
+    let section = crate::investigate::bundle::brief_section(&kit);
+    assert!(
+        section.contains("your working directory is a worktree of its source"),
+        "{section}"
+    );
+
+    // It landed a commit git verified, and it is done.
+    assert_eq!(h.status(&fix.id).await, Status::Done);
+    let (workspace, commit) = landed_rows(&h, &fix.id).await;
+    let recorded: crate::workspace::Workspace = serde_json::from_str(&workspace.reference).unwrap();
+    assert_eq!(recorded.repo, source.path());
+    assert_eq!(recorded.base, built);
+    assert_eq!(recorded.branch, ws.branch);
+    assert_eq!(workspace.hash.as_deref(), Some(built.as_str()));
+    assert_eq!(workspace.verified_by, None);
+    assert_eq!(commit.reference.len(), 40);
+    assert_eq!(commit.hash, None);
+    assert_eq!(
+        run_git(source.path(), &["cat-file", "-t", &commit.reference]),
+        "commit"
+    );
+    assert_eq!(
+        run_git(
+            source.path(),
+            &["rev-parse", &format!("{}^", commit.reference)]
+        ),
+        built,
+        "the fix is a commit on the running build"
+    );
+    // It stays on its own branch: nothing moved main or anything else.
+    assert_eq!(run_git(source.path(), &["rev-parse", "main"]), later);
+    assert_eq!(
+        run_git(
+            source.path(),
+            &[
+                "branch",
+                "--contains",
+                &commit.reference,
+                "--format=%(refname:short)"
+            ]
+        ),
+        ws.branch
+    );
+    assert_eq!(
+        run_git(source.path(), &["remote"]),
+        "",
+        "nothing to push to"
+    );
+    // The item that waited on it goes on, with the fix as its input.
+    assert_eq!(h.status(&ledger).await, Status::Done);
+}
+
+#[tokio::test]
+async fn a_failure_in_a_repository_that_is_the_daemons_source_starts_from_the_build() {
+    let data = Data::new();
+    let (source, built, build, later) = daemon_source();
+    let agent = Agent::new("pinch", Some(&source), data.run_logs());
+    let h = Harness::on_wall_clock(data.config(Some(build)), vec![agent.clone()]);
+    agent.on(
+        "Stop recurring",
+        &[Act::Commit("Fixed the path bookkeeping.")],
+    );
+    let (first, _) = two_claim_mismatches(&h, &agent, &source).await;
+    h.drain().await;
+
+    // The failing runs started from the checkout's HEAD, which is later
+    // than the build; the fix item starts from the build.
+    let failed = h
+        .ctl
+        .workspace_of(&first)
+        .await
+        .unwrap()
+        .expect("the failing item had a workspace");
+    assert_eq!(failed.base, later);
+    let fix = fix_items(&h).await.pop().unwrap();
+    assert!(fix
+        .artifact_refs
+        .iter()
+        .any(|r| r.kind == crate::investigate::DAEMON_SOURCE));
+    let ws = agent
+        .briefs_for("Stop recurring")
+        .pop()
+        .and_then(|b| b.workspace)
+        .unwrap();
+    assert_eq!(ws.base, built);
+    assert_eq!(h.status(&fix.id).await, Status::Done);
+    let (workspace, commit) = landed_rows(&h, &fix.id).await;
+    assert_eq!(workspace.hash.as_deref(), Some(built.as_str()));
+    assert_eq!(commit.verified_by.as_deref(), Some("git"));
+}
+
+#[tokio::test]
+async fn a_failure_elsewhere_stays_in_its_repository_and_without_a_source_nothing_changes() {
+    let (source, _, _, _) = daemon_source();
+    let other = Repo::new();
+    let found = crate::investigate::SourceCheckout {
+        repo: source.path().to_path_buf(),
+        commit: run_git(source.path(), &["rev-parse", "HEAD"]),
+        version: rustykrab_core::VERSION.to_string(),
+        dirty: false,
+    };
+    let h = Harness::new(&[]);
+    let error = rustykrab_core::work::WorkError {
+        class: ErrorClass::Unknown,
+        subclass: ErrorSubclass::Unclassified,
+        fingerprint: "elsewhere-fingerprint".into(),
+        detail: "unclassified failure".into(),
+        observed_by: "test".into(),
+        artifact_refs: vec![],
+    };
+    let in_other = h
+        .file_one(code_draft("Work in another repository", &other))
+        .await;
+    let nowhere = h
+        .file_one(draft("nowhere", "Work with no repository"))
+        .await;
+    for (failing, source, want_repo, own) in [
+        (&in_other, Some(&found), other.path(), false),
+        (&nowhere, None, std::path::Path::new(""), false),
+    ] {
+        let mut batch =
+            crate::controller::batch::Batch::new(h.ctl.load().await.unwrap(), chrono::Utc::now());
+        let item = batch.snap.item(failing).unwrap().clone();
+        let fix = h
+            .ctl
+            .file_internal(&mut batch, &item, &error, source)
+            .unwrap();
+        let fix = batch.snap.item(&fix).unwrap();
+        let repos: Vec<&str> = fix
+            .writable_resources
+            .iter()
+            .filter_map(|r| r.strip_prefix(REPO_PREFIX))
+            .collect();
+        if want_repo.as_os_str().is_empty() {
+            assert!(repos.is_empty(), "{repos:?}");
+        } else {
+            assert_eq!(repos, vec![want_repo.display().to_string().as_str()]);
+        }
+        assert_eq!(
+            fix.artifact_refs
+                .iter()
+                .any(|r| r.kind == crate::investigate::DAEMON_SOURCE),
+            own
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_own_source_fix_falls_back_to_head_when_the_build_is_not_in_the_source() {
+    let (source, _, _, later) = daemon_source();
+    let config = ControllerConfig {
+        build: Some(BuildId {
+            commit: "0badc0de".into(),
+            dirty: true,
+        }),
+        ..ControllerConfig::default()
+    };
+    let h = Harness::with(config, crate::controller::StaticCatalog::default(), &[]);
+    let mut d = draft("fix", "Classify unknown failure fallback");
+    d.kind = Some(WorkKind::Internal);
+    d.writable_resources = vec![format!("{REPO_PREFIX}{}", source.path().display())];
+    d.artifact_refs = vec![
+        ArtifactRef {
+            kind: FAILURE_FINGERPRINT.into(),
+            value: "fallback-fingerprint".into(),
+        },
+        ArtifactRef {
+            kind: crate::investigate::DAEMON_SOURCE.into(),
+            value: source.path().display().to_string(),
+        },
+    ];
+    let id = h.file_one(d).await;
+    let item = h.item(&id).await;
+    assert_eq!(h.ctl.fix_base(&item, source.path()).await, Some(later));
+}

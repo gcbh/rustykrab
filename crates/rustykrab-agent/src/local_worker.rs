@@ -1909,6 +1909,7 @@ mod tests {
             read_dirs: vec![dir.clone()],
             dir,
             source: None,
+            own_source: false,
             items: 2,
             runs: 3,
             failed_runs: 3,

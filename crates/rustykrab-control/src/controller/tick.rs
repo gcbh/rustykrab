@@ -1381,7 +1381,10 @@ impl Controller {
                         "controller",
                         "waiting for failure resolution",
                     );
-                    match self.file_internal(b, item, &error) {
+                    // A failure in the daemon's own code is fixed in its
+                    // own source, when the daemon knows where that is.
+                    let source = self.source_checkout(&[]).await;
+                    match self.file_internal(b, item, &error, source.as_ref()) {
                         Ok(filed) => {
                             self.rung(
                                 b,
@@ -1921,9 +1924,10 @@ impl Controller {
     }
 
     /// Pin project code to the newest verified ancestor chain, otherwise
-    /// repository HEAD. A fix item is pinned to the commit the failing run
-    /// started from ([`Self::failing_base`]), and to HEAD only when no
-    /// failing run recorded one.
+    /// repository HEAD. A fix item is pinned by [`Self::fix_base`]: in the
+    /// daemon's own source to the running build's commit, elsewhere to the
+    /// commit the failing run started from, and to HEAD only when neither
+    /// is on record.
     pub(super) async fn plan_workspace(
         &self,
         item: &WorkItem,
@@ -1936,10 +1940,10 @@ impl Controller {
         let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
             return Ok(None);
         };
-        // A fix item reads the code the failure ran on: its worktree starts
-        // from the commit the failing run started from, not from wherever
-        // the repository has moved to since.
-        if let Some(base) = self.failing_base(item, &repo).await {
+        // A fix item reads the code the failure ran on: the running build in
+        // the daemon's own source, else the commit the failing run started
+        // from, not wherever the repository has moved to since.
+        if let Some(base) = self.fix_base(item, &repo).await {
             return Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)));
         }
         let commits: Vec<(String, String)> = context

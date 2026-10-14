@@ -97,6 +97,10 @@ pub struct Kit {
     pub read_dirs: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceCheckout>,
+    /// The run works in a worktree of the daemon's own source: the failure
+    /// is in RustyKrab's own code, and a fix to it is committed there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_source: bool,
     pub items: usize,
     pub runs: usize,
     pub failed_runs: usize,
@@ -115,6 +119,8 @@ pub struct Request<'a> {
     /// The daemon's rolling log directory, when it has one.
     pub log_dir: Option<&'a Path>,
     pub source: Option<&'a SourceCheckout>,
+    /// The fix item's worktree is a checkout of `source`.
+    pub own_source: bool,
     /// Bytes of daemon log kept per failed run.
     pub max_log_bytes: usize,
 }
@@ -376,6 +382,7 @@ pub fn write(request: &Request<'_>, mut history: FailureHistory) -> std::io::Res
         bundle: bundle_path,
         read_dirs,
         source: request.source.cloned(),
+        own_source: request.own_source && request.source.is_some(),
         items: history.occurrences.len(),
         runs: runs.len(),
         failed_runs: runs.iter().filter(|r| r.hit).count(),
@@ -641,7 +648,7 @@ pub fn brief_section(kit: &Kit) -> String {
             "RustyKrab's own source: {}. The daemon that recorded these failures runs version \
              {} built from commit {}{}. To read the verifier or the controller as it runs, read \
              that commit (`git -C {} show {}:<path>`, `git -C {} grep -n <pattern> {}`); the \
-             checkout's files may be at another commit. Do not edit that checkout.",
+             checkout's files may be at another commit. Do not edit that checkout itself.",
             source.repo.display(),
             source.version,
             source.commit,
@@ -654,6 +661,15 @@ pub fn brief_section(kit: &Kit) -> String {
             source.commit,
             source.repo.display(),
             source.commit
+        );
+    }
+    if kit.own_source {
+        out.push_str(
+            "This failure is in RustyKrab's own code, and your working directory is a worktree \
+             of its source at the commit the running daemon was built from. Fix the cause there \
+             and commit it on your branch, with the checks you ran; the controller verifies the \
+             commit against git. Nothing you commit is pushed, merged or deployed by this run: \
+             it stays on your branch until a person or the release process takes it further.\n",
         );
     }
     for fix in &kit.earlier_fixes {

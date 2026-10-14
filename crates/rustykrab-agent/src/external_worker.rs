@@ -3172,6 +3172,7 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             ],
             dir,
             source: None,
+            own_source: false,
             items: 3,
             runs: 5,
             failed_runs: 4,

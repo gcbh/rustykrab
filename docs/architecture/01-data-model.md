@@ -644,7 +644,12 @@ autoincrement `id` (`work_events_after`), not by time.
 item for a recurring or unknown failure is an `internal` item whose
 `artifact_refs` hold `failure_fingerprint: <fingerprint>`; each failing item it
 was filed or reused for is an `item` ref, and one filed after an earlier fix
-item closed `done` holds `previous_fix: <that item's id>`. The refs go when
+item closed `done` holds `previous_fix: <that item's id>`. One for a failure in
+the daemon's own code holds `daemon_source: <source repository path>`, and its
+`repo:` writable resource is that repository: what it lands is recorded like
+any repository-scoped item's (a `workspace` row at lease time, `commit` and
+`changed_path` rows `verified_by = 'git'`), which is what a release process
+reads to take the fix further. The refs go when
 the item is compacted, so a history also finds an aged-out fix item through
 the `improve` rung events of the items that waited on it, which outlive
 compaction. Two things about it live on disk beside the store, both under the

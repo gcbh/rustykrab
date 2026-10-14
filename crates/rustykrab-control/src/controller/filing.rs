@@ -29,7 +29,7 @@ use crate::graph::{
     Rejection, Snapshot, Validation,
 };
 use crate::handle::{GraphNode, GraphView};
-use crate::investigate::{FAILURE_FINGERPRINT, PREVIOUS_FIX};
+use crate::investigate::{same_repo, DAEMON_SOURCE, FAILURE_FINGERPRINT, PREVIOUS_FIX};
 use crate::ladder::CapabilityNeed;
 use rustykrab_core::questions::QuestionKind;
 
@@ -711,17 +711,47 @@ impl Controller {
     /// Order 3: create or reuse the failure's prerequisite, with a validated
     /// blocking edge and the failing item as evidence. An open repair for the
     /// same fingerprint and repository is shared by every waiting item.
+    ///
+    /// `source` is the daemon's own source checkout, when it is known. A
+    /// failure in the daemon's own code (the failing item names no
+    /// repository, or names that one) is investigated there: the item is
+    /// scoped to `repo:<source>` and marked [`DAEMON_SOURCE`], so it runs in
+    /// a worktree of the daemon's source and a commit it lands is checked by
+    /// git like any repository-scoped item's.
     pub(super) fn file_internal(
         &self,
         b: &mut Batch,
         item: &WorkItem,
         error: &WorkError,
+        source: Option<&crate::investigate::SourceCheckout>,
     ) -> Result<WorkItemId, String> {
         let evidence = vec![ArtifactRef {
             kind: "item".to_string(),
             value: item.id.clone(),
         }];
         let mut draft = inherit_internal(item, &internal_item_draft(error, evidence));
+        if let Some(source) = source {
+            let named = repos_of(&draft.writable_resources);
+            let own = match named.as_slice() {
+                [] => true,
+                repos => repos.iter().all(|r| {
+                    r.strip_prefix(crate::workspace::REPO_PREFIX)
+                        .is_some_and(|p| same_repo(std::path::Path::new(p.trim()), &source.repo))
+                }),
+            };
+            if own {
+                let resource =
+                    format!("{}{}", crate::workspace::REPO_PREFIX, source.repo.display());
+                draft
+                    .writable_resources
+                    .retain(|r| !r.starts_with(crate::workspace::REPO_PREFIX));
+                draft.writable_resources.insert(0, resource);
+                draft.artifact_refs.push(ArtifactRef {
+                    kind: DAEMON_SOURCE.into(),
+                    value: source.repo.display().to_string(),
+                });
+            }
+        }
         let repos = repos_of(&draft.writable_resources);
         let names_failure = |i: &WorkItem| {
             i.artifact_refs

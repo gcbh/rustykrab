@@ -234,7 +234,13 @@ item runs in a worktree of the failing item's repository at the commit the
 failing run started from, and its agent is given read access to the bundle,
 the session logs, any failed run's kept worktree and, when one of the
 repositories a worker was added for is the repository the daemon was built
-from, the daemon's own source at the running commit.
+from, the daemon's own source at the running commit. A failure in the daemon's
+own code (the failing item names no repository, or names that one) is fixed in
+the daemon's source itself: the fix item runs in a worktree of it at the
+running build's commit and may land a commit there, which git verifies and
+which stays on the item's own branch. Nothing here pushes, merges or deploys
+it; that is the release process's, which reads the item's `workspace` and
+`commit` evidence.
 
 *Its conclusion is checked.* A fix item is `done` only when it landed a commit
 git verified or a classifier rule that replayed. Otherwise its report is kept

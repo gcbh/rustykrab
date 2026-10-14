@@ -9,8 +9,9 @@
 //! - **The kit.** When a fix item is leased, [`Controller::investigation_kit`]
 //!   writes that history as the run's investigation bundle and returns the
 //!   kit its brief carries.
-//! - **The code.** [`Controller::failing_base`] is the commit a fix item's
-//!   worktree is pinned to: the one the failing run started from.
+//! - **The code.** [`Controller::fix_base`] is the commit a fix item's
+//!   worktree is pinned to: the running build's commit in the daemon's own
+//!   source, otherwise the one the failing run started from.
 //! - **The check.** A fix item is `done` only when it landed something the
 //!   controller checked. [`Controller::park_unlanded_fix`] is what happens
 //!   otherwise: its findings are kept as evidence, it parks for the owner
@@ -30,8 +31,8 @@ use rustykrab_store::WorkOp;
 
 use crate::investigate::bundle::{self, Kit};
 use crate::investigate::{
-    self, daemon_log, fix_fingerprint, BuildId, FailureHistory, HistoryContext, SourceCheckout,
-    DAEMON_BUILD, INVESTIGATION_BUNDLE,
+    self, daemon_log, fix_fingerprint, same_repo, BuildId, FailureHistory, HistoryContext,
+    SourceCheckout, DAEMON_BUILD, DAEMON_SOURCE, INVESTIGATION_BUNDLE,
 };
 use crate::workspace::{self, Workspace, REPO_PREFIX};
 
@@ -121,13 +122,33 @@ impl Controller {
         investigate::failure_history(&self.store, target, &ctx).await
     }
 
-    /// The commit a fix item's worktree in `repo` starts from: the one the
-    /// run that failed started from, read from the failing items it names
-    /// (the one that filed it first). `None` when no failing run recorded a
-    /// workspace in `repo`, or its commit is gone: the caller falls back to
+    /// The commit a fix item's worktree in `repo` starts from.
+    ///
+    /// In the daemon's own source (the item is marked [`DAEMON_SOURCE`]),
+    /// the commit the running build was made from, so the fix is made to the
+    /// code that failed; that repository's `HEAD` when the build's commit is
+    /// not in it. Anywhere else, the one the run that failed started from,
+    /// read from the failing items it names (the one that filed it first).
+    /// `None` for any other item, or when no failing run recorded a
+    /// workspace in `repo` or its commit is gone: the caller falls back to
     /// the repository's `HEAD`.
-    pub(super) async fn failing_base(&self, item: &WorkItem, repo: &Path) -> Option<String> {
+    pub(super) async fn fix_base(&self, item: &WorkItem, repo: &Path) -> Option<String> {
         fix_fingerprint(item.kind, &item.artifact_refs)?;
+        let own = item
+            .artifact_refs
+            .iter()
+            .any(|r| r.kind == DAEMON_SOURCE && same_repo(Path::new(&r.value), repo));
+        if own {
+            let build = self.config.build.as_ref().map(|b| b.commit.clone());
+            let at = repo.to_path_buf();
+            return tokio::task::spawn_blocking(move || {
+                let built = build.and_then(|c| workspace::resolve_commit(&at, &c).ok().flatten());
+                built.or_else(|| workspace::head(&at).ok())
+            })
+            .await
+            .ok()
+            .flatten();
+        }
         for failing in item.artifact_refs.iter().filter(|r| r.kind == "item") {
             let Ok(Some(ws)) = self.workspace_of(&failing.value).await else {
                 continue;
@@ -167,6 +188,12 @@ impl Controller {
             .into_iter()
             .collect();
         let source = self.source_checkout(&also).await;
+        let own_source = item.artifact_refs.iter().any(|r| {
+            r.kind == DAEMON_SOURCE
+                && source
+                    .as_ref()
+                    .is_some_and(|s| same_repo(Path::new(&r.value), &s.repo))
+        });
         let ctx = HistoryContext {
             build: Some(self.build_label()),
             source: source.clone(),
@@ -185,6 +212,7 @@ impl Controller {
                             fingerprint: &fp,
                             log_dir: log_dir.as_deref(),
                             source: source.as_ref(),
+                            own_source,
                             max_log_bytes: daemon_log::DEFAULT_MAX_BYTES,
                         },
                         history,

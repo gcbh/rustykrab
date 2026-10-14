@@ -133,7 +133,10 @@ async fn a_resolution_cannot_become_its_own_prerequisite() {
         .await;
     let mut batch = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
     let item = batch.snap.item(&resolution).unwrap().clone();
-    let why = h.ctl.file_internal(&mut batch, &item, &error).unwrap_err();
+    let why = h
+        .ctl
+        .file_internal(&mut batch, &item, &error, None)
+        .unwrap_err();
     assert!(why.contains("cycle"), "{why}");
     assert!(batch.ops.is_empty());
 }
@@ -157,7 +160,9 @@ async fn an_existing_resolution_is_reused_by_identity_across_work_kinds_and_titl
     let mut batch = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
     let item = batch.snap.item(&waiter).unwrap().clone();
     assert_eq!(
-        h.ctl.file_internal(&mut batch, &item, &error).unwrap(),
+        h.ctl
+            .file_internal(&mut batch, &item, &error, None)
+            .unwrap(),
         known
     );
     assert_eq!(batch.snap.items().len(), 2);

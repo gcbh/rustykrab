@@ -346,7 +346,9 @@ impl ClaudeCodeStandIn {
             .replace("{CLAIM_WRONGLY}", INVESTIGATION_CLAIM_WRONGLY)
             .replace("{LAND_THE_FIX}", INVESTIGATION_LAND_THE_FIX)
             .replace("{NOT_DONE}", INVESTIGATION_NOT_DONE)
-            .replace("{LANDED}", INVESTIGATION_LANDED);
+            .replace("{LANDED}", INVESTIGATION_LANDED)
+            .replace("{FAIL_IN_DAEMON}", INVESTIGATION_FAIL_IN_DAEMON)
+            .replace("{DAEMON_FAILURE}", INVESTIGATION_DAEMON_FAILURE);
         let path = dir.path().join("claude");
         std::fs::write(&path, script)?;
         #[cfg(unix)]
@@ -364,6 +366,14 @@ pub const INVESTIGATION_CLAIM_WRONGLY: &str = "e2e-investigation: claim a path w
 /// In an answer to a fix item's question: the investigator lands a commit
 /// on its next run instead of reporting that nothing changed.
 pub const INVESTIGATION_LAND_THE_FIX: &str = "e2e-investigation: land the fix";
+/// In an item's objective: the investigation stand-in fails the item with
+/// an error no classifier recognises, [`INVESTIGATION_DAEMON_FAILURE`].
+pub const INVESTIGATION_FAIL_IN_DAEMON: &str = "e2e-investigation: fail in the daemon";
+/// The unclassified failure [`INVESTIGATION_FAIL_IN_DAEMON`] reports. It
+/// carries [`INVESTIGATION_LAND_THE_FIX`], so the fix item filed for it
+/// (whose objective quotes the failure) lands a commit.
+pub const INVESTIGATION_DAEMON_FAILURE: &str =
+    "E2E-OWN-SOURCE the verifier refused a step it should have taken; e2e-investigation: land the fix";
 /// How the investigator's report starts when it changed nothing.
 pub const INVESTIGATION_NOT_DONE: &str = "Not done: no fix is committed";
 /// How the investigator's report starts when it landed a commit.
@@ -392,9 +402,14 @@ emit() {
   escaped=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
   printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$escaped"
 }
+# The file a change goes in: the fixture repository's src/lib.rs, or a new
+# file at the root of a checkout that has none (RustyKrab's own source).
+target() {
+  if [ -f src/lib.rs ]; then echo src/lib.rs; else echo e2e-investigator-fix.md; fi
+}
 commit_change() {
-  echo "// $1" >> src/lib.rs
-  git add src/lib.rs
+  echo "// $1" >> "$2"
+  git add "$2"
   git -c user.name=e2e -c user.email=e2e@rustykrab.invalid commit -q --no-gpg-sign -m "e2e: $1"
   git rev-parse HEAD
 }
@@ -433,20 +448,28 @@ case "$prompt" in
     fi
     case "$prompt" in
       *"{LAND_THE_FIX}"*)
-        sha=$(commit_change "bookkeeping fixed by the e2e investigator")
-        emit "{\"summary\":\"{LANDED}; fixed the bookkeeping and committed it.\",\"artifacts\":[],\"changed_paths\":[\"src/lib.rs\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
+        file=$(target)
+        sha=$(commit_change "bookkeeping fixed by the e2e investigator" "$file")
+        landed="{LANDED}; fixed the bookkeeping and committed it."
+        if [ "$file" != src/lib.rs ]; then
+          landed="Root cause in RustyKrab's own code; fixed it in the daemon's source and committed it."
+        fi
+        emit "{\"summary\":\"$landed\",\"artifacts\":[],\"changed_paths\":[\"$file\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
         ;;
       *)
         emit "{\"summary\":\"{NOT_DONE}. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.\",\"artifacts\":[],\"changed_paths\":[],\"commit\":null,\"checks_run\":[],\"known_limits\":[\"read the records only; changed nothing\"],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
         ;;
     esac
     ;;
+  *"{FAIL_IN_DAEMON}"*)
+    emit "{\"summary\":\"Stopped: the daemon refused the step.\",\"artifacts\":[],\"changed_paths\":[],\"commit\":null,\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"detail\":\"{DAEMON_FAILURE}\"},\"questions\":[],\"discovered\":[]}"
+    ;;
   *"{CLAIM_WRONGLY}"*)
-    sha=$(commit_change "touched by the e2e investigation stand-in")
+    sha=$(commit_change "touched by the e2e investigation stand-in" src/lib.rs)
     emit "{\"summary\":\"Touched src/lib.rs\",\"artifacts\":[],\"changed_paths\":[\"src/elsewhere.rs\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
     ;;
   *)
-    sha=$(commit_change "touched by the e2e investigation stand-in")
+    sha=$(commit_change "touched by the e2e investigation stand-in" src/lib.rs)
     emit "{\"summary\":\"Touched src/lib.rs\",\"artifacts\":[],\"changed_paths\":[\"src/lib.rs\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
     ;;
 esac

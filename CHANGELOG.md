@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replays; otherwise it parks with its conclusion as a question to its owner
   and releases what waited on it. A failure that comes back after a `done`
   fix names that fix, what it concluded and landed, and whether the fix was in
-  what ran. Local workers leave session logs like external ones.
+  what ran. Local workers leave session logs like external ones. A failure
+  in RustyKrab's own code is fixed in a worktree of its own source at the
+  running build's commit, and the commit stays on the fix item's branch.
 - fix: the Telegram channel no longer writes the bot token to the daemon log
   when a Bot API request fails.
 - fix: a repository-scoped run that changed nothing verifies as unchanged

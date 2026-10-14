@@ -104,8 +104,9 @@ use rustykrab_core::work::{
 
 use crate::fixture_repo::{
     stack_manifest, ClaudeCodeStandIn, FixtureRepo, CLAIM_WRONGLY, INVESTIGATION_CLAIM_WRONGLY,
-    INVESTIGATION_LANDED, INVESTIGATION_LAND_THE_FIX, INVESTIGATION_NOT_DONE,
-    INVESTIGATOR_CAPTURES, KEEPS_ITS_OWN_TRACKER,
+    INVESTIGATION_DAEMON_FAILURE, INVESTIGATION_FAIL_IN_DAEMON, INVESTIGATION_LANDED,
+    INVESTIGATION_LAND_THE_FIX, INVESTIGATION_NOT_DONE, INVESTIGATOR_CAPTURES,
+    KEEPS_ITS_OWN_TRACKER,
 };
 use crate::transcript::Transcript;
 use crate::{Ctx, Expected, ScenarioFn};
@@ -279,6 +280,13 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             ("control/investigation-kit-for-a-recurring-failure", |ctx| {
                 Box::pin(investigation_kit(ctx))
             }),
+        ),
+        (
+            Expected::Pass,
+            (
+                "control/fix-item-lands-a-commit-in-the-daemons-own-source",
+                |ctx| Box::pin(own_source_fix(ctx)),
+            ),
         ),
     ]
 }
@@ -2473,6 +2481,264 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
     // The bundle as the controller wrote it for the first run.
     keep_evidence_file("bundle/bundle.json", &cap.join("bundle/bundle.json"))?;
     keep_evidence_file("bundle/index.md", &cap.join("bundle/index.md"))?;
+    Ok(())
+}
+
+/// Run git in `dir`, with no user or system configuration, and return its
+/// trimmed stdout.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()?;
+    ensure!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A fix item for a failure in the daemon's own code lands a commit in the
+/// daemon's own source, on a daemon of its own whose only worker is the
+/// investigation stand-in.
+///
+/// The daemon's source is modelled by a repository holding exactly the
+/// commit the daemon under test was built from (`GET /api/version`), fetched
+/// from this checkout by its full hash with no remote left behind, plus a
+/// later commit on its `main`, so the checkout has moved on since the build.
+/// The stand-in is registered for that repository, which is how the daemon
+/// finds its own source (it holds the build's commit, with
+/// `crates/rustykrab-control/Cargo.toml` in it). An item that names no
+/// repository fails with an error no classifier recognises; its fix item is
+/// scoped to the daemon's source, runs in a worktree of it at the build's
+/// commit, and lands a commit there that git verifies. The scenario checks
+/// the `workspace` and `commit` evidence rows a release slice will read, and
+/// that nothing moved the source's `main`.
+async fn own_source_fix(shared: &Ctx) -> Result<()> {
+    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let ctx = &daemon.ctx;
+    let version = get(ctx, "/api/version").await?;
+    let built = version["commit"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_end_matches("-dirty")
+        .to_string();
+    ensure!(
+        !built.is_empty() && built != "unknown",
+        "the daemon under test records no build commit ({}); this scenario needs a build \
+         made from a git checkout",
+        version["commit"]
+    );
+    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let full = git_in(
+        &checkout,
+        &["rev-parse", "--verify", &format!("{built}^{{commit}}")],
+    )
+    .with_context(|| {
+        format!(
+            "the build's commit {built} is not in {}",
+            checkout.display()
+        )
+    })?;
+    let source = tempfile::Builder::new()
+        .prefix("rustykrab-e2e-daemon-source-")
+        .tempdir()?;
+    git_in(source.path(), &["init", "-q", "--initial-branch=main", "."])?;
+    git_in(
+        source.path(),
+        &[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", checkout.canonicalize()?.display()),
+            &full,
+        ],
+    )?;
+    git_in(source.path(), &["update-ref", "refs/heads/main", &full])?;
+    let tree = git_in(source.path(), &["rev-parse", &format!("{full}^{{tree}}")])?;
+    let later = git_in(
+        source.path(),
+        &[
+            "-c",
+            "user.name=e2e",
+            "-c",
+            "user.email=e2e@rustykrab.invalid",
+            "commit-tree",
+            &tree,
+            "-p",
+            &full,
+            "-m",
+            "later work on main, after the build",
+        ],
+    )?;
+    git_in(source.path(), &["update-ref", "refs/heads/main", &later])?;
+    ensure!(
+        git_in(source.path(), &["remote"])?.is_empty(),
+        "the stand-in source has a remote to push to"
+    );
+
+    let stand_in = ClaudeCodeStandIn::investigator()?;
+    post(
+        ctx,
+        WORKERS,
+        json!({
+            "name": "pinch-own",
+            "kind": "claude_code",
+            "repos": [source.path()],
+            "command": stand_in.path(),
+        }),
+    )
+    .await?;
+    let failing = file(
+        ctx,
+        draft(
+            "task",
+            "Reconcile the daemon's report",
+            "[e2e-control own source]",
+            INVESTIGATION_FAIL_IN_DAEMON,
+        ),
+    )
+    .await?;
+    let error = wait_error(ctx, &failing).await?;
+    ensure!(
+        error.class == ErrorClass::Unknown && error.detail.contains("E2E-OWN-SOURCE"),
+        "the seeded failure is unclassified: {}/{} {}",
+        error.class.as_str(),
+        error.subclass.as_str(),
+        error.detail
+    );
+    let fix = wait_fix_item(ctx, &failing, None).await?;
+    let landed = wait_status(ctx, &fix, Status::Done).await?;
+
+    // Scoped to the daemon's own source, and marked so.
+    let resource = format!("repo:{}", source.path().display());
+    ensure!(
+        body(&landed)["writable_resources"] == json!([resource]),
+        "the fix item is not scoped to the daemon's source: {}",
+        body(&landed)["writable_resources"]
+    );
+    ensure!(
+        body(&landed)["artifact_refs"]
+            .as_array()
+            .is_some_and(|refs| refs.iter().any(|r| r["kind"] == "daemon_source"
+                && r["value"] == source.path().display().to_string().as_str())),
+        "the fix item is not marked as a fix in the daemon's source: {}",
+        body(&landed)["artifact_refs"]
+    );
+
+    // The two rows a release slice reads, exactly as a repository-scoped
+    // item has them.
+    let rows = evidence(&landed);
+    let workspace = rows
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "workspace")
+        .cloned()
+        .ok_or_else(|| anyhow!("no workspace row: {}", evidence_text(&landed)))?;
+    let recorded: Value = serde_json::from_str(workspace["reference"].as_str().unwrap_or("{}"))?;
+    ensure!(
+        recorded["repo"] == source.path().display().to_string().as_str()
+            && recorded["base"] == full.as_str()
+            && workspace["hash"] == full.as_str()
+            && workspace["verified_by"].is_null(),
+        "the workspace row does not name the daemon's source at the build's commit {full}: \
+         {workspace}"
+    );
+    let commit = rows
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "commit" && e["verified_by"] == "git")
+        .cloned()
+        .ok_or_else(|| anyhow!("no commit row git verified: {}", evidence_text(&landed)))?;
+    let sha = commit["reference"].as_str().unwrap_or_default().to_string();
+    ensure!(
+        sha.len() == 40 && commit["hash"].is_null(),
+        "the commit row is not a full verified sha: {commit}"
+    );
+    ensure!(
+        git_in(source.path(), &["rev-parse", &format!("{sha}^")])? == full,
+        "the fix is not a commit on the build's commit"
+    );
+    let branch = recorded["branch"].as_str().unwrap_or_default();
+    ensure!(
+        git_in(
+            source.path(),
+            &["branch", "--contains", &sha, "--format=%(refname:short)"]
+        )? == branch,
+        "the fix commit is on more than its own branch {branch}"
+    );
+    ensure!(
+        git_in(source.path(), &["rev-parse", "main"])? == later,
+        "something moved the daemon source's main"
+    );
+
+    // What the investigator was given: a checkout of RustyKrab at the
+    // build's commit, and a brief that says so.
+    let cap = ctx.data_dir.join(INVESTIGATOR_CAPTURES).join("run-1");
+    let head = std::fs::read_to_string(cap.join("head.txt"))?;
+    ensure!(
+        head.trim() == full,
+        "the investigator ran at {}, not the build's commit {full}",
+        head.trim()
+    );
+    let listing = std::fs::read_to_string(cap.join("working-directory.txt"))?;
+    ensure!(
+        listing.contains("crates") && listing.contains("Cargo.toml"),
+        "the investigator's working directory is not RustyKrab's source: {listing}"
+    );
+    let brief = std::fs::read_to_string(cap.join("brief.txt"))?;
+    for wanted in [
+        "This failure is in RustyKrab's own code",
+        "Nothing you commit is pushed, merged or deployed",
+        INVESTIGATION_DAEMON_FAILURE,
+    ] {
+        ensure!(
+            brief.contains(wanted),
+            "the brief lacks {wanted:?}: {brief}"
+        );
+    }
+
+    let trail = event_trail(ctx, &fix).await?;
+    keep_evidence("own-source-fix.events.txt", trail_text(&trail))?;
+    keep_evidence(
+        "own-source-fix.evidence.json",
+        serde_json::to_string_pretty(&rows)?,
+    )?;
+    keep_evidence(
+        "own-source-fix.item.json",
+        serde_json::to_string_pretty(body(&landed))?,
+    )?;
+    keep_evidence(
+        "own-source-fix.git.txt",
+        format!(
+            "$ git rev-parse main\n{}\n$ git log --oneline -2 {branch}\n{}\n\
+             $ git branch --contains {sha}\n{}\n$ git show --stat --format=%H%n%P%n%s {sha}\n{}\n",
+            git_in(source.path(), &["rev-parse", "main"])?,
+            git_in(source.path(), &["log", "--oneline", "-2", branch])?,
+            git_in(
+                source.path(),
+                &["branch", "--contains", &sha, "--format=%(refname:short)"]
+            )?,
+            git_in(
+                source.path(),
+                &["show", "--stat", "--format=%H%n%P%n%s", &sha]
+            )?,
+        ),
+    )?;
+    keep_evidence_file(
+        "own-source-fix.investigator/brief.txt",
+        &cap.join("brief.txt"),
+    )?;
+    keep_evidence_file(
+        "own-source-fix.investigator/working-directory.txt",
+        &cap.join("working-directory.txt"),
+    )?;
     Ok(())
 }
 

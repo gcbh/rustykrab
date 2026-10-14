@@ -992,7 +992,10 @@ Rules:
   leased with an investigation bundle (every occurrence run by run, each
   failed run's session log and daemon-log window) in a worktree at the commit
   the failing run started from (`crates/rustykrab-control/ARCHITECTURE.md`,
-  `investigate/`).
+  `investigate/`). A failure in the daemon's own code is resolved in a
+  worktree of the daemon's own source at the running build's commit, when
+  that source is known; its commit stays on the item's branch for a release
+  process to take further.
 - Scheduling uses effective priority: prerequisites inherit the highest base
   priority of interested open dependents, transitively through unmet ordering
   edges and parent gates. Distinct waiter count is the primary queue rank;

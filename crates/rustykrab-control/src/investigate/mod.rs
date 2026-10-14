@@ -71,6 +71,13 @@ pub const INVESTIGATION_BUNDLE: &str = "investigation_bundle";
 /// behind a fix item; the fix item's id follows.
 pub const RESOLUTION_WAIT: &str = "waiting on resolution item ";
 
+/// The artifact ref a fix item carries when the failure it investigates is
+/// in the daemon's own code: its value is the daemon's source repository,
+/// which is also the item's `repo:` writable resource. Such an item runs in
+/// a worktree of that repository at the running build's commit, and what it
+/// commits stays on its own `rustykrab/work/<item>-<run>` branch there.
+pub const DAEMON_SOURCE: &str = "daemon_source";
+
 /// Occurrences returned unless the caller asks for another number.
 pub const DEFAULT_LIMIT: usize = 50;
 
@@ -783,7 +790,7 @@ fn inclusion(
     (verdict, basis.join("; "))
 }
 
-fn same_repo(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_repo(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     a == b || canon(a) == canon(b)
 }
