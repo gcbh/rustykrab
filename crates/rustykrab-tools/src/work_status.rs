@@ -5,6 +5,7 @@
 //! model's context: id, kind, status with its reason and cascade origin,
 //! title, parent, edges in words, and roll-up counts for a parent.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,8 +21,6 @@ use crate::work_file::{check_keys, Problem, POINTER_MAX};
 
 /// Lines per call. A policy-capped graph (12 items) and its parent fit.
 pub(crate) const STATUS_CAP: usize = 15;
-/// Ids per call.
-const IDS_MAX: usize = 20;
 /// Title characters per line.
 const TITLE_CLIP: usize = 60;
 /// Ids named per edge phrase.
@@ -143,11 +142,22 @@ fn parse_id(v: &Value, field: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-fn parse_query(args: &Value) -> Result<StatusQuery> {
+struct StatusRequest {
+    query: StatusQuery,
+    offset: usize,
+    limit: usize,
+}
+
+fn parse_request(args: &Value) -> Result<StatusRequest> {
     let empty = serde_json::Map::new();
     let obj = args.as_object().unwrap_or(&empty);
     let mut problems: Vec<Problem> = Vec::new();
-    check_keys(obj, &["ids", "root", "include_closed"], "", &mut problems);
+    check_keys(
+        obj,
+        &["ids", "root", "include_closed", "offset", "limit"],
+        "",
+        &mut problems,
+    );
     if !problems.is_empty() {
         let lines: Vec<String> = problems.iter().map(|p| p.detail.clone()).collect();
         return Err(invalid(lines.join("; ")));
@@ -173,25 +183,39 @@ fn parse_query(args: &Value) -> Result<StatusQuery> {
             if arr.is_empty() {
                 return Err(invalid("ids is empty; name at least one item"));
             }
-            if arr.len() > IDS_MAX {
-                return Err(invalid(format!(
-                    "ids has {} entries; read at most {IDS_MAX} at a time",
-                    arr.len()
-                )));
-            }
+            let mut seen = HashSet::new();
             let mut out: Vec<String> = Vec::new();
             for (i, v) in arr.iter().enumerate() {
                 let id = parse_id(v, &format!("ids[{i}]"))?;
-                if !out.contains(&id) {
+                if seen.insert(id.clone()) {
                     out.push(id);
                 }
             }
             StatusSelector::Ids(out)
         }
     };
-    Ok(StatusQuery {
-        select,
-        include_closed,
+    let offset = match obj.get("offset") {
+        None => 0,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| invalid("offset must be a nonnegative integer"))?,
+    };
+    let limit = match obj.get("limit") {
+        None => STATUS_CAP,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n > 0)
+            .map(|n| n.min(STATUS_CAP as u64) as usize)
+            .ok_or_else(|| invalid("limit must be a positive integer"))?,
+    };
+    Ok(StatusRequest {
+        query: StatusQuery {
+            select,
+            include_closed,
+        },
+        offset,
+        limit,
     })
 }
 
@@ -205,7 +229,9 @@ impl Tool for WorkStatusTool {
         "Read work items you may see. Pass ids, or root for an item and everything under \
          it. Each line: id, kind, status (with the item that caused a cascade after <-), \
          title, parent, edges in words, and done counts for a parent. Closed items under a \
-         root are hidden unless include_closed is true."
+         root are hidden unless include_closed is true. Send the full ids list; the host \
+         pages it, returning at most 15 lines. If next_offset is non-null, repeat the same \
+         ids/root and include_closed with offset=next_offset. A null next_offset ends the read."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -218,7 +244,7 @@ impl Tool for WorkStatusTool {
                     "ids": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": format!("Item ids to read (max {IDS_MAX}).")
+                        "description": "Full list of item ids to read, in order. The host normalizes and deduplicates it before paging; do not split it into batches."
                     },
                     "root": {
                         "type": "string",
@@ -227,6 +253,16 @@ impl Tool for WorkStatusTool {
                     "include_closed": {
                         "type": "boolean",
                         "description": "Include done, failed, cancelled and expired items under root. Default false."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Start at 0. For another page, reuse the same selector and copy next_offset from the previous result."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Page size, default 15. Larger values are capped at 15."
                     }
                 },
                 "additionalProperties": false
@@ -237,24 +273,51 @@ impl Tool for WorkStatusTool {
     async fn execute(&self, args: Value) -> Result<Value> {
         let schema = self.schema();
         validate_tool_args(&schema.parameters, &args).map_err(Error::ToolExecution)?;
-        let query = parse_query(&args)?;
-        let asked: Vec<String> = match &query.select {
-            StatusSelector::Ids(ids) => ids.clone(),
-            StatusSelector::Root(_) => Vec::new(),
+        let request = parse_request(&args)?;
+        let mut query = request.query;
+        // Explicit ids advance by requested positions, not by visible results:
+        // an absent/inaccessible item must not shift the next page or cause
+        // unchecked later ids to be reported as missing. Only this page reaches
+        // the backend, so an arbitrarily long id list still makes a bounded read.
+        let (asked, total_ids) = match &query.select {
+            StatusSelector::Ids(ids) => {
+                let start = request.offset.min(ids.len());
+                let end = start.saturating_add(request.limit).min(ids.len());
+                (ids[start..end].to_vec(), Some(ids.len()))
+            }
+            StatusSelector::Root(_) => (Vec::new(), None),
         };
-
-        let views = self
-            .backend
-            .status(query, &host_principal())
-            .await
-            .map_err(|e| {
-                Error::ToolExecution(ToolError::internal(format!("work_status failed: {e}")))
-            })?;
-
-        let lines: Vec<String> = views.iter().take(STATUS_CAP).map(render_line).collect();
-        let mut out = json!({ "items": lines });
-        if views.len() > STATUS_CAP {
-            out["more"] = json!(views.len() - STATUS_CAP);
+        if total_ids.is_some() {
+            query.select = StatusSelector::Ids(asked.clone());
+        }
+        let views = if total_ids.is_some() && asked.is_empty() {
+            Vec::new()
+        } else {
+            self.backend
+                .status(query, &host_principal())
+                .await
+                .map_err(|e| {
+                    Error::ToolExecution(ToolError::internal(format!("work_status failed: {e}")))
+                })?
+        };
+        let total = total_ids.unwrap_or(views.len());
+        let start = request.offset.min(total);
+        let end = start.saturating_add(request.limit).min(total);
+        let page = if total_ids.is_some() {
+            views.as_slice()
+        } else {
+            &views[start..end]
+        };
+        let lines: Vec<String> = page.iter().map(render_line).collect();
+        let mut out = json!({
+            "items": lines,
+            "offset": request.offset,
+            "limit": request.limit,
+            "total": total,
+            "next_offset": (end < total).then_some(end)
+        });
+        if end < total {
+            out["more"] = json!(total - end);
         }
         let missing: Vec<&String> = asked
             .iter()
@@ -295,13 +358,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_takes_ids_or_root_and_nothing_else() {
+    fn schema_exposes_selectors_and_pagination() {
         let schema = WorkStatusTool::new(Arc::new(StubWorkBackend::new())).schema();
         assert_eq!(schema.name, "work_status");
         let props = schema.parameters["properties"].as_object().unwrap();
         let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
         keys.sort();
-        assert_eq!(keys, ["ids", "include_closed", "root"]);
+        assert_eq!(keys, ["ids", "include_closed", "limit", "offset", "root"]);
+        assert!(props["ids"].get("maxItems").is_none());
         assert_eq!(schema.parameters["additionalProperties"], json!(false));
     }
 
@@ -316,12 +380,152 @@ mod tests {
             (json!({ "ids": [] }), "ids is empty"),
             (json!({ "ids": [7] }), "ids[0] must be an item id"),
             (json!({ "root": "r", "status": "done" }), "not yours to set"),
-            (json!({ "ids": vec!["x"; IDS_MAX + 1] }), "at most"),
+            (json!({ "ids": ["a"], "offset": -1 }), "nonnegative"),
+            (
+                json!({ "ids": ["a"], "offset": 1.5 }),
+                "'offset' must be integer",
+            ),
+            (json!({ "ids": ["a"], "limit": 0 }), "positive"),
+            (json!({ "ids": ["a"], "limit": -1 }), "positive"),
+            (
+                json!({ "ids": ["a"], "limit": "many" }),
+                "'limit' must be integer",
+            ),
         ] {
             let err = t.execute(args.clone()).await.unwrap_err();
             assert_eq!(err.kind(), ToolErrorKind::InvalidInput, "{args}");
             assert!(err.to_string().contains(needle), "{args}: {err}");
         }
+        assert!(stub.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_id_requests_page_without_dropping_or_repeating_items() {
+        // Actual failed batch sizes from the production conversation; also
+        // cover the old accepted-20 / returned-15 mismatch.
+        for n in [20, 21, 22, 40] {
+            let ids: Vec<String> = (0..n).map(|i| format!("item-{i}")).collect();
+            let mut stub = StubWorkBackend::new();
+            for id in &ids {
+                stub = stub.with_item(fixture_view(id, "inspect", Status::Ready));
+            }
+            let stub = Arc::new(stub);
+            let tool = WorkStatusTool::new(stub.clone());
+            let mut offset = 0;
+            let mut seen = Vec::new();
+            loop {
+                let out = tool
+                    .execute(json!({"ids": ids, "offset": offset}))
+                    .await
+                    .unwrap();
+                assert_eq!(out["total"], n);
+                assert_eq!(out["offset"], offset);
+                let lines = out["items"].as_array().unwrap();
+                assert!(lines.len() <= STATUS_CAP);
+                assert!(out.get("missing").is_none());
+                seen.extend(lines.iter().map(|l| {
+                    l.as_str()
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .to_string()
+                }));
+                match out["next_offset"].as_u64() {
+                    Some(next) => {
+                        assert!(next as usize > offset);
+                        offset = next as usize;
+                        assert_eq!(out["more"], n - offset);
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(seen, ids);
+            let mut read_ids = Vec::new();
+            for call in stub.calls() {
+                let WorkCall::Status { query, .. } = call else {
+                    panic!("unexpected backend call")
+                };
+                let StatusSelector::Ids(page) = query.select else {
+                    panic!("unexpected selector")
+                };
+                assert!(page.len() <= STATUS_CAP);
+                read_ids.extend(page);
+            }
+            assert_eq!(read_ids, ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_page_advances_without_misclassifying_unread_ids() {
+        let ids: Vec<String> = (0..40).map(|i| format!("item-{i}")).collect();
+        let mut stub = StubWorkBackend::new();
+        for id in &ids[STATUS_CAP..] {
+            // Explicit id reads retain closed items regardless of include_closed.
+            stub = stub.with_item(fixture_view(id, "done", Status::Done));
+        }
+        let tool = WorkStatusTool::new(Arc::new(stub));
+        let first = tool.execute(json!({"ids": ids})).await.unwrap();
+        assert_eq!(first["items"], json!([]));
+        assert_eq!(first["missing"], json!(ids[..STATUS_CAP]));
+        assert_eq!(first["next_offset"], STATUS_CAP);
+        assert_eq!(first["more"], 25);
+        let second = tool
+            .execute(json!({"ids": ids, "offset": first["next_offset"]}))
+            .await
+            .unwrap();
+        assert_eq!(second["items"].as_array().unwrap().len(), STATUS_CAP);
+        assert!(second.get("missing").is_none());
+        assert_eq!(second["next_offset"], 30);
+        let last = tool
+            .execute(json!({"ids": ids, "offset": second["next_offset"]}))
+            .await
+            .unwrap();
+        assert_eq!(last["items"].as_array().unwrap().len(), 10);
+        assert!(last["next_offset"].is_null());
+    }
+
+    #[tokio::test]
+    async fn normalized_duplicates_and_page_size_use_one_consistent_order() {
+        let stub = Arc::new(
+            StubWorkBackend::new()
+                .with_item(fixture_view("a", "one", Status::Ready))
+                .with_item(fixture_view("b", "two", Status::Ready)),
+        );
+        let tool = WorkStatusTool::new(stub.clone());
+        let args = json!({"ids": [" #a ", "a", "b", "#b"], "limit": 1});
+        let first = tool.execute(args.clone()).await.unwrap();
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["next_offset"], 1);
+        assert!(first["items"][0].as_str().unwrap().starts_with("a "));
+        let mut next = args;
+        next["offset"] = first["next_offset"].clone();
+        let last = tool.execute(next).await.unwrap();
+        assert!(last["items"][0].as_str().unwrap().starts_with("b "));
+        assert!(last["next_offset"].is_null());
+        let clamped = tool
+            .execute(json!({"ids": ["a", "b"], "limit": 100}))
+            .await
+            .unwrap();
+        assert_eq!(clamped["limit"], STATUS_CAP);
+        let before = stub.calls().len();
+        let beyond = tool
+            .execute(json!({"ids": ["a", "b"], "offset": u64::MAX}))
+            .await
+            .unwrap();
+        assert_eq!(beyond["items"], json!([]));
+        assert!(beyond["next_offset"].is_null());
+        assert_eq!(stub.calls().len(), before);
+    }
+
+    #[tokio::test]
+    async fn malformed_id_on_a_later_page_rejects_the_read_before_backend_io() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let tool = WorkStatusTool::new(stub.clone());
+        let mut ids: Vec<Value> = (0..40).map(|i| json!(format!("item-{i}"))).collect();
+        ids[39] = json!(7);
+        let error = tool.execute(json!({"ids": ids})).await.unwrap_err();
+        assert!(error.to_string().contains("ids[39]"));
         assert!(stub.calls().is_empty());
     }
 
@@ -370,16 +574,48 @@ mod tests {
             v.item.title = "a very long title that keeps going ".repeat(10);
             stub = stub.with_item(v);
         }
-        let out = WorkStatusTool::new(Arc::new(stub))
-            .execute(json!({ "root": "root" }))
-            .await
-            .unwrap();
+        let tool = WorkStatusTool::new(Arc::new(stub));
+        let out = tool.execute(json!({ "root": "root" })).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), STATUS_CAP);
         assert_eq!(out["more"], json!(n + 1 - STATUS_CAP));
+        assert_eq!(out["next_offset"], STATUS_CAP);
         for line in items {
             assert!(line.as_str().unwrap().len() < 200, "{line}");
         }
+        let mut all: Vec<String> = items
+            .iter()
+            .map(|l| {
+                l.as_str()
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let mut next = out["next_offset"].clone();
+        while !next.is_null() {
+            let page = tool
+                .execute(json!({"root": "root", "offset": next}))
+                .await
+                .unwrap();
+            let items = page["items"].as_array().unwrap();
+            assert!(items.len() <= STATUS_CAP);
+            all.extend(items.iter().map(|l| {
+                l.as_str()
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            }));
+            next = page["next_offset"].clone();
+        }
+        let expected: Vec<String> = std::iter::once("root".to_string())
+            .chain((0..n).map(|i| format!("c{i}")))
+            .collect();
+        assert_eq!(all, expected);
     }
 
     #[tokio::test]

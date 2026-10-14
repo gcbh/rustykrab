@@ -204,3 +204,27 @@ A raw-timeout fixture trigger also matched notification text outside a worker
 run, replacing the expected human message. The final trigger matches the
 generated recurring-repair objective; the isolated restart/cascade/notification
 scenario passes with its original assertions.
+
+## Work-status pagination (base 7d65c3c, 2026-10-13)
+
+A read-only audit of one production conversation found status requests with
+21, 21, 22 and 40 explicit IDs rejected by the tool's 20-ID parser limit.
+Even accepted 20-ID calls returned at most 15 status lines, leaving the model
+to reconstruct the unread portion from a `more` count. This was a separate
+source of extra turns from the conversation's failed model summarizations.
+
+The tool now accepts a full ID list, normalizes and deduplicates it in input
+order, and sends only the requested page to the existing status backend.
+`offset`, bounded `limit` and `next_offset` make continuation explicit for both
+ID lists and subtree reads. Missing/inaccessible IDs consume their requested
+position, so an empty page still advances and unchecked IDs are never labeled
+missing. Responses retain the 15-line bound; there is no new state, table,
+backend method or authority. Root pages remain live reads rather than snapshots.
+
+Regressions replay the observed batch sizes and the accepted-20/returned-15
+mismatch, empty/missing pages, normalization, terminal offsets and malformed
+IDs outside the first page. The registered tool is also exercised over the
+real controller/SQLite store for a 40-item list plus a missing boundary ID,
+and for a multi-page subtree. This establishes interface continuity; it does
+not repair the independent empty/truncated-summary model failures or claim
+that a model will always choose to read the next page.

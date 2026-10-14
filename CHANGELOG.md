@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.3] - 2026-10-14
+
+- fix: accept bulk work status reads with bounded pagination (#689)
+
 ## [6.5.2] - 2026-10-14
 
 - feat: default toolsets for every worker, session logs and resume at the turn cap (#690)
