@@ -16,6 +16,7 @@ mod paths;
 mod peers;
 mod priority;
 mod project_context;
+mod proof;
 mod questions;
 mod resolution;
 mod review;

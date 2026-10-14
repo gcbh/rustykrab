@@ -73,9 +73,9 @@ pub(super) const CIRCUIT_OPEN: &str = "circuit_open";
 /// any artifact kind, and a report's artifacts are stored as evidence; one
 /// of these is never stored from a report. Read back, it would let a model
 /// mint controller evidence: an allotment of budget, a breaker state, a
-/// run or its log, a build, an investigation, an error or a summary, or a
-/// host-observed operation probe.
-pub(super) const CONTROLLER_KINDS: [&str; 15] = [
+/// run or its log, a build, an investigation, an error or a summary, a
+/// host-observed operation probe or the repair generation it is bound to.
+pub(super) const CONTROLLER_KINDS: [&str; 16] = [
     super::brief::RUN,
     crate::worker::RUN_LOG,
     "workspace",
@@ -90,7 +90,8 @@ pub(super) const CONTROLLER_KINDS: [&str; 15] = [
     super::spend::BUDGET_GRANT,
     super::brief::ERROR,
     super::brief::SUMMARY,
-    "operation_probe",
+    crate::capability_proof::OPERATION_PROBE,
+    super::proof::REPAIR_GENERATION,
 ];
 
 /// The artifacts of `worker`'s report on `item` that may be stored: all but

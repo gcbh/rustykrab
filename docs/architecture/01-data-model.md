@@ -648,7 +648,14 @@ judged failed attempt: its run, fingerprint and class as JSON, `hash` its
 attempt state), `circuit_open` (the repeated-outcome breaker tripped: the
 runs and the attempt state as JSON, `hash` the fingerprint), `budget_grant`
 (one more allotment of a leaf's budget: `reference` the question whose answer
-released it, `verified_by` who answered; each row adds one allotment), and `classifier_rule` (a `<subclass>: <pattern>` row an
+released it, `verified_by` who answered; each row adds one allotment),
+`repair_generation` (on an item parked behind a capability with a registered
+probe, written before the probes that judge it: `{n, cause, source_item,
+permission_digest, probes}` as JSON, `hash` `<item>:<n>`, `verified_by =
+'controller'`), `operation_probe` (on that capability item: the receipt a
+worker's `Worker::probe` returned, `hash` the expected inputs digest,
+`verified_by = 'executor:<worker>'`; what `capability_proof::capability_proven`
+judges a capability's `done` and its waiter's revival by), and `classifier_rule` (a `<subclass>: <pattern>` row an
 `internal` item landed, `verified_by = 'replay'` once the controller replayed
 the failure through it). The last is reloaded across items on start
 (`work_evidence_of_kind`), which is how a landed rule survives restarts and
