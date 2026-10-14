@@ -69,6 +69,61 @@ pub(super) const ATTEMPT_FAILURE: &str = "attempt_failure";
 /// The evidence kind of a tripped breaker.
 pub(super) const CIRCUIT_OPEN: &str = "circuit_open";
 
+/// Evidence kinds only the controller writes. A worker's report may name
+/// any artifact kind, and a report's artifacts are stored as evidence; one
+/// of these is never stored from a report. Read back, it would let a model
+/// mint controller evidence: an allotment of budget, a breaker state, a
+/// run or its log, a build, an investigation, an error or a summary, or a
+/// host-observed operation probe.
+pub(super) const CONTROLLER_KINDS: [&str; 15] = [
+    super::brief::RUN,
+    crate::worker::RUN_LOG,
+    "workspace",
+    crate::handoff::PROJECT_CONTEXT,
+    "work_discussion",
+    crate::investigate::DAEMON_BUILD,
+    crate::investigate::INVESTIGATION_BUNDLE,
+    "resolution_outcome",
+    ATTEMPT_STATE,
+    ATTEMPT_FAILURE,
+    CIRCUIT_OPEN,
+    super::spend::BUDGET_GRANT,
+    super::brief::ERROR,
+    super::brief::SUMMARY,
+    "operation_probe",
+];
+
+/// The artifacts of `worker`'s report on `item` that may be stored: all but
+/// those naming a [`CONTROLLER_KINDS`] kind. What is dropped is said once,
+/// as a warning event on the item, so whoever investigates it sees that a
+/// report tried.
+pub(super) fn reported_artifacts<'a>(
+    b: &mut super::batch::Batch,
+    item: &str,
+    worker: &str,
+    artifacts: &'a [rustykrab_core::work::ArtifactRef],
+) -> Vec<&'a rustykrab_core::work::ArtifactRef> {
+    let (kept, dropped): (Vec<_>, Vec<_>) = artifacts
+        .iter()
+        .partition(|a| !CONTROLLER_KINDS.contains(&a.kind.as_str()));
+    if !dropped.is_empty() {
+        let mut kinds: Vec<&str> = dropped.iter().map(|a| a.kind.as_str()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        b.note(
+            item,
+            rustykrab_core::work::EventKind::Warning,
+            "controller",
+            format!(
+                "dropped {} reported artifact(s) of kinds only the controller writes ({}) from {worker}'s report",
+                dropped.len(),
+                kinds.join(", ")
+            ),
+        );
+    }
+    kept
+}
+
 /// What a tripped breaker's rung outcome and transition say.
 pub(super) const BREAKER_TRIPPED: &str = "circuit breaker tripped";
 

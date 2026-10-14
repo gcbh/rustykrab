@@ -14,9 +14,10 @@
 //! The totals are read once, on the first load, and kept current here as
 //! runs end: the controller is the only writer of `work_spend`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
+use rustykrab_core::questions::QuestionStatus;
 use rustykrab_core::work::{Budget, EventKind, Evidence, WorkEvent, WorkItem, WorkItemId};
 use rustykrab_core::Error;
 use rustykrab_store::{RunSpend, Spend};
@@ -159,16 +160,39 @@ impl Controller {
     }
 
     /// How many allotments of its budget `item` has had: one, and one per
-    /// [`BUDGET_GRANT`] row an answer recorded.
+    /// [`BUDGET_GRANT`] row an owner's answer recorded. A row counts only
+    /// when its provenance holds: it names a question on this item that its
+    /// owner (`verified_by`, `user` or `user:<who>`) answered, at most once
+    /// per question. A row nothing answered (a report's artifact stored
+    /// before reports were filtered, or any other forgery) buys nothing.
     pub(super) async fn allotments(&self, item: &str) -> Result<u32, Error> {
-        let grants = self
-            .store
-            .work_evidence_list(item)
-            .await?
-            .iter()
-            .filter(|e| e.kind == BUDGET_GRANT)
-            .count();
-        Ok(u32::try_from(grants).unwrap_or(u32::MAX).saturating_add(1))
+        let mut questions: HashSet<String> = HashSet::new();
+        let mut grants: u32 = 0;
+        for row in self.store.work_evidence_list(item).await? {
+            if row.kind != BUDGET_GRANT {
+                continue;
+            }
+            let Some(actor) = row.verified_by.as_deref() else {
+                continue;
+            };
+            if !super::questions::is_owner(actor) || questions.contains(&row.reference) {
+                continue;
+            }
+            let answered = self
+                .store
+                .question_get(&row.reference)
+                .await?
+                .is_some_and(|q| {
+                    q.item == item
+                        && q.status == QuestionStatus::Answered
+                        && q.answered_by.as_deref() == Some(actor)
+                });
+            if answered {
+                questions.insert(row.reference.clone());
+                grants = grants.saturating_add(1);
+            }
+        }
+        Ok(grants.saturating_add(1))
     }
 
     /// What `item` has left to spend over all its attempts (4.2 for a

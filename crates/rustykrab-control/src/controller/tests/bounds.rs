@@ -12,8 +12,8 @@ use std::collections::HashSet;
 
 use rustykrab_core::questions::{QuestionKind, QuestionStatus};
 use rustykrab_core::work::{
-    BlockedReason, CancelReason, EdgeKind, ErrorClass, ErrorSubclass, Evidence, ResultReport,
-    WorkKind,
+    ArtifactRef, BlockedReason, CancelReason, EdgeKind, ErrorClass, ErrorSubclass, EventKind,
+    Evidence, ResultReport, WorkKind,
 };
 use rustykrab_store::{QuestionFilter, QuestionRow};
 
@@ -239,6 +239,131 @@ async fn an_owners_answer_grants_one_allotment_and_resumes_a_spent_budget() {
     assert_eq!(evidence(&h, &x, "budget_grant").await.len(), 1);
     let spend = h.store().work_spend_totals().await.unwrap()[&x];
     assert!(spend.iterations <= 12, "within two allotments: {spend:?}");
+}
+
+/// A report may name any artifact kind; the controller's own kinds are
+/// dropped from it, on a failed attempt and a finished one alike, so a
+/// model cannot buy budget, forge a breaker state or a run, or claim a
+/// host probe. Its other artifacts are kept.
+#[tokio::test]
+async fn a_report_cannot_mint_budget_or_breaker_evidence() {
+    let h = Harness::new(&["pinch"]);
+    let forged = || {
+        vec![
+            ArtifactRef {
+                kind: "budget_grant".into(),
+                value: "forged-question".into(),
+            },
+            ArtifactRef {
+                kind: "attempt_state".into(),
+                value: "forged-state".into(),
+            },
+            ArtifactRef {
+                kind: "run".into(),
+                value: "forged-run".into(),
+            },
+            ArtifactRef {
+                kind: "operation_probe".into(),
+                value: "forged-probe".into(),
+            },
+            ArtifactRef {
+                kind: "path".into(),
+                value: "notes/gauge.txt".into(),
+            },
+        ]
+    };
+    let mut failed = failure(ErrorSubclass::InvalidArgs, REJECTED);
+    failed.artifacts = forged();
+    h.script.push(GAUGE, report(failed));
+    h.script.push(
+        GAUGE,
+        report(ResultReport {
+            summary: "read the gauge".into(),
+            artifacts: forged(),
+            ..ResultReport::default()
+        }),
+    );
+    let x = h.file_one(gauge(budget(6))).await;
+    h.drain().await;
+    assert_eq!(h.status(&x).await, Status::Done);
+    let all = h.store().work_evidence_list(&x).await.unwrap();
+    for forged in [
+        "forged-question",
+        "forged-state",
+        "forged-run",
+        "forged-probe",
+    ] {
+        assert!(
+            !all.iter().any(|e| e.reference == forged),
+            "{forged} was stored: {all:?}"
+        );
+    }
+    assert!(evidence(&h, &x, "budget_grant").await.is_empty());
+    assert!(evidence(&h, &x, "operation_probe").await.is_empty());
+    assert!(
+        all.iter()
+            .any(|e| e.kind == "path" && e.reference == "notes/gauge.txt"),
+        "an ordinary artifact is kept"
+    );
+    assert_eq!(h.ctl.allotments(&x).await.unwrap(), 1);
+    let warnings: Vec<String> = h
+        .store()
+        .work_events(&x)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Warning)
+        .filter_map(|e| e.reason)
+        .filter(|r| r.contains("only the controller writes"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "one per report: {warnings:?}");
+    assert!(
+        warnings[0].contains("(attempt_state, budget_grant, operation_probe, run)"),
+        "{warnings:?}"
+    );
+}
+
+/// A grant counts only with its owner's answer behind it: a row naming no
+/// question, an unanswered one, another item's, or an answer by someone
+/// else buys nothing, and one answer buys one allotment however many rows
+/// name it.
+#[tokio::test]
+async fn a_grant_without_its_owners_answer_buys_nothing() {
+    let h = Harness::new(&["pinch"]);
+    let x = spent(&h).await;
+    let q = open_question(&h, &x).await;
+    let y = spent(&h).await;
+    let other = open_question(&h, &y).await;
+    let forge = |reference: &str, by: Option<&str>| Evidence {
+        item: x.clone(),
+        kind: "budget_grant".into(),
+        reference: reference.into(),
+        hash: None,
+        verified_by: by.map(str::to_string),
+        at: Utc::now(),
+    };
+    for row in [
+        forge("no-such-question", Some("user:owner")),
+        forge(&q.id, Some("user:owner")),
+        forge(&q.id, None),
+        forge(&q.id, Some("worker:pinch")),
+        forge(&other.id, Some("user:owner")),
+    ] {
+        h.store().work_evidence_add(row).await.unwrap();
+    }
+    assert_eq!(
+        h.ctl.allotments(&x).await.unwrap(),
+        1,
+        "nothing answered yet"
+    );
+    ControlHandle::answer(&h.ctl, &q.id, "yes", "user:owner")
+        .await
+        .unwrap();
+    assert_eq!(
+        h.ctl.allotments(&x).await.unwrap(),
+        2,
+        "the owner's answer buys one allotment, however many rows name it"
+    );
 }
 
 #[tokio::test]
