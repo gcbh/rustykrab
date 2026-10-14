@@ -655,7 +655,11 @@ impl Worker for LocalWorker {
     }
 
     fn capabilities(&self) -> WorkerCapabilities {
-        let (_, ceiling) = self.catalog();
+        let (tools, ceiling) = self.catalog();
+        let can_act = tools.iter().any(|tool| {
+            ceiling.iter().any(|name| name == tool.name())
+                && tool.sandbox_requirements().has_side_effects()
+        });
         let mut mcp_servers: Vec<String> = ceiling
             .iter()
             .filter_map(|n| mcp_server_of(n))
@@ -672,7 +676,11 @@ impl Worker for LocalWorker {
             // ones it may. Who may write a resource at once is the
             // controller's single-writer rule, not a capability.
             writable_resources: if self.definition.writable_resources.is_empty() {
-                vec!["*".to_string()]
+                if can_act {
+                    vec!["*".to_string()]
+                } else {
+                    Vec::new()
+                }
             } else {
                 self.definition.writable_resources.clone()
             },
@@ -2010,6 +2018,10 @@ mod tests {
         );
 
         let caps = w.capabilities();
+        assert!(
+            caps.writable_resources.is_empty(),
+            "context-only tools grant no external write scope"
+        );
         assert_eq!(w.name(), "pinch");
         assert_eq!(w.kind(), WorkerKind::Local);
         assert_eq!(w.concurrency(), 1);
@@ -2019,9 +2031,8 @@ mod tests {
         assert!(caps.tools.iter().any(|t| t == "browser"));
         assert!(caps.tools.iter().any(|t| t == "result_report"));
         assert!(!caps.tools.iter().any(|t| t == "task_complete"));
-        // Any resource: the controller's single-writer rule serialises
-        // writers; a capability that listed none would lease no writer.
-        assert_eq!(caps.writable_resources, ["*"]);
+        // These stand-ins declare no side effects, so they grant no writes.
+        assert!(caps.writable_resources.is_empty());
     }
 
     #[tokio::test]
@@ -2108,6 +2119,20 @@ mod tests {
         );
         worker.run(brief("analysis")).await.unwrap();
         assert!(provider.requests()[0].1.iter().all(|t| t != "exec"));
+    }
+
+    #[test]
+    fn a_real_execution_tool_grants_default_write_scope_without_a_specialty() {
+        let w = LocalWorker::new(
+            "general",
+            LocalWorker::default_definition("general"),
+            Recording::new(Vec::new()),
+            vec![Arc::new(rustykrab_tools::ExecTool::new())],
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+        assert_eq!(w.capabilities().writable_resources, ["*"]);
+        assert!(w.capabilities().tools.iter().any(|t| t == "work_plan"));
     }
 
     #[tokio::test]

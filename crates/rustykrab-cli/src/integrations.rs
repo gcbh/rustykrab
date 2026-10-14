@@ -39,8 +39,11 @@ const EXECUTION_TOOLS: &[&str] = &["gmail", "caldav", "obsidian", "web_search", 
 const CONTEXT_TOOLS: &[&str] = &[
     "memory_search",
     "recall_search",
-    "recall_detail",
-    "todo",
+    "recall_info",
+    "recall_peek",
+    "recall_sub_query",
+    "todo_read",
+    "todo_write",
     "tools_list",
     "tools_load",
 ];
