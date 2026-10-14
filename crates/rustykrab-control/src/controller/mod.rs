@@ -62,6 +62,7 @@ mod brief;
 mod commit;
 mod credentials;
 mod discussion;
+mod dispatchability;
 mod filing;
 mod investigation;
 mod load;
