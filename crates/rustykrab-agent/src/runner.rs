@@ -249,6 +249,10 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 /// learn to call `task_complete` thus degrade to the legacy behavior.
 const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
 
+/// Replies in a row the provider could not parse (a tool call cut off)
+/// that the runner answers with a notice before the error ends the run.
+const MALFORMED_REPLY_RETRY_LIMIT: usize = 3;
+
 /// Maximum consecutive `MaxTokens` responses before the runner gives up
 /// rather than re-prompting "Continue." again. Each retry re-sends the
 /// whole prompt, and when the cutoff was caused by the context *window*
@@ -2322,6 +2326,7 @@ impl AgentRunner {
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut max_tokens_retries: usize = 0;
+        let mut malformed_replies: usize = 0;
         let mut task_complete_retries: usize = 0;
         // A worker run (the caller scoped `WORK_RUN_CONTEXT`) ends only on
         // its `result_report`: text alone never ends it, and `task_complete`
@@ -2475,12 +2480,31 @@ impl AgentRunner {
                 on_event(AgentEvent::Done);
                 return Ok(());
             }
+            // A reply the provider could not parse (a tool call cut off
+            // mid-arguments) is the model's to fix, as any tool error is:
+            // told what failed, it can send it again.
+            if let Err(Error::ModelMalformedOutput(detail)) = &response {
+                malformed_replies += 1;
+                if malformed_replies <= MALFORMED_REPLY_RETRY_LIMIT {
+                    tracing::warn!(iteration, %detail, "model reply could not be parsed; telling the model");
+                    self.push_message(
+                        conv,
+                        runner_notice(format!(
+                            "Your last reply could not be read ({detail}). If you were calling a \
+                             tool, call it again with complete arguments; put long content such as \
+                             a file body in smaller pieces across calls."
+                        )),
+                    );
+                    continue;
+                }
+            }
             let ModelResponse {
                 message,
                 usage,
                 stop_reason,
                 ..
             } = response?;
+            malformed_replies = 0;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
                 iteration,
@@ -7307,6 +7331,8 @@ mod task_complete_tests {
         /// Once the script runs out, answer with the error Ollama raises
         /// for a generation of zero tokens instead of panicking.
         silent_when_exhausted: bool,
+        /// Answered before the script: the first calls fail with these.
+        failures: Mutex<Vec<Error>>,
     }
 
     impl ScriptedProvider {
@@ -7315,6 +7341,14 @@ mod task_complete_tests {
                 script: Mutex::new(script),
                 chat_count: Mutex::new(0),
                 silent_when_exhausted: false,
+                failures: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_first(failures: Vec<Error>, script: Vec<ModelResponse>) -> Self {
+            Self {
+                failures: Mutex::new(failures),
+                ..Self::new(script)
             }
         }
 
@@ -7328,6 +7362,10 @@ mod task_complete_tests {
         fn next(&self) -> Result<ModelResponse> {
             let mut s = self.script.lock().unwrap();
             *self.chat_count.lock().unwrap() += 1;
+            let mut failures = self.failures.lock().unwrap();
+            if !failures.is_empty() {
+                return Err(failures.remove(0));
+            }
             if s.is_empty() {
                 if self.silent_when_exhausted {
                     return Err(Error::ModelEmptyResponse("scripted silence".into()));
@@ -7781,6 +7819,40 @@ mod task_complete_tests {
             .await
             .expect_err("nothing to fall back on");
         assert!(matches!(err, Error::ModelEmptyResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_reply_is_answered_with_a_notice() {
+        let malformed =
+            || Error::ModelMalformedOutput("XML syntax error on line 41: unexpected EOF".into());
+        let provider = Arc::new(ScriptedProvider::failing_first(
+            vec![malformed()],
+            vec![text_response("The answer is 4.")],
+        ));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+        assert_eq!(*provider.chat_count.lock().unwrap(), 2);
+        assert!(conv
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_text())
+            .any(|t| t.contains("could not be read") && t.contains("unexpected EOF")));
+
+        // Past the limit in a row, the error ends the run.
+        let provider = Arc::new(ScriptedProvider::failing_first(
+            (0..=MALFORMED_REPLY_RETRY_LIMIT)
+                .map(|_| malformed())
+                .collect(),
+            Vec::new(),
+        ));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+        let err = runner.run(&mut conv, &session).await.unwrap_err();
+        assert!(matches!(err, Error::ModelMalformedOutput(_)), "{err:?}");
     }
 
     #[tokio::test]

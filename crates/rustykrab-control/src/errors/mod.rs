@@ -95,6 +95,10 @@ impl FailureInput {
                 problem: ProviderProblem::Empty,
                 detail: m.clone(),
             },
+            Error::ModelMalformedOutput(m) => FailureInput::Provider {
+                problem: ProviderProblem::Format,
+                detail: m.clone(),
+            },
             Error::ContentPolicy => FailureInput::Provider {
                 problem: ProviderProblem::Refusal,
                 detail: err.to_string(),

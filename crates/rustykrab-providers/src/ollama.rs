@@ -493,9 +493,11 @@ impl OllamaProvider {
                 error_body = %error_body,
                 "Ollama API error"
             );
-            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
             // Fix #186: map status codes to specific error variants.
-            last_err = Some(Self::map_status_error(status, &error_body));
+            let error = Self::map_status_error(status, &error_body);
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
+                && !matches!(error, Error::ModelMalformedOutput(_));
+            last_err = Some(error);
 
             if !is_retryable {
                 break;
@@ -1056,6 +1058,20 @@ impl OllamaProvider {
 
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
+        // Ollama answers 500 when it cannot parse the model's own output as a
+        // tool call. Typed, so the agent loop can tell the model rather than
+        // resend a request that would fail the same way.
+        if status.as_u16() == 500
+            && [
+                "XML syntax error",
+                "error parsing tool call",
+                "failed to parse tool call",
+            ]
+            .iter()
+            .any(|marker| body.contains(marker))
+        {
+            return Error::ModelMalformedOutput(format!("Ollama API: {body}"));
+        }
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("Ollama API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("Ollama API: {body}")),
@@ -1292,8 +1308,10 @@ impl ModelProvider for OllamaProvider {
                     error_body = %error_body,
                     "Ollama streaming API error"
                 );
-                let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-                last_err = Some(Self::map_status_error(status, &error_body));
+                let error = Self::map_status_error(status, &error_body);
+                let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
+                    && !matches!(error, Error::ModelMalformedOutput(_));
+                last_err = Some(error);
                 if !is_retryable {
                     break;
                 }
@@ -1939,6 +1957,23 @@ mod tests {
         );
         assert!(matches!(err, Error::NotFound(ref m) if m.contains("llama9")));
         assert_eq!(err.kind(), rustykrab_core::ToolErrorKind::NotFound);
+    }
+
+    #[test]
+    fn an_unparseable_reply_maps_to_malformed_output() {
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"XML syntax error on line 41: unexpected EOF"}"#,
+        );
+        assert!(matches!(err, Error::ModelMalformedOutput(ref m) if m.contains("line 41")));
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"llama runner process has terminated"}"#,
+        );
+        assert!(
+            matches!(err, Error::ModelProvider(_)),
+            "an ordinary 500 stays retryable"
+        );
     }
 
     fn user_msg(content: &str) -> OllamaMessage {

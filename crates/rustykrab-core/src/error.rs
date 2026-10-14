@@ -145,6 +145,13 @@ pub enum Error {
     #[error("model provider bad request: {0}")]
     ModelBadRequest(String),
 
+    /// The provider could not read what the model generated as a reply, most
+    /// often a tool call cut off or malformed (Ollama's "XML syntax error …
+    /// unexpected EOF"). The same request would fail the same way, so it is
+    /// not retried as sent; the agent loop tells the model instead.
+    #[error("model reply could not be parsed: {0}")]
+    ModelMalformedOutput(String),
+
     /// Refused before dispatch; no messages have been silently removed.
     #[error("model input requires approximately {estimated_input_tokens} tokens but only {input_budget_tokens} are available; compact history or reduce the active tool schemas")]
     ContextBudgetExceeded {
@@ -214,9 +221,9 @@ impl Error {
             Error::ToolExecution(te) => te.kind,
             Error::ModelRateLimit(_) | Error::ModelOverloaded(_) => ToolErrorKind::RateLimited,
             Error::ModelAuthError(_) | Error::Auth(_) => ToolErrorKind::PermissionDenied,
-            Error::ModelBadRequest(_) | Error::ContextBudgetExceeded { .. } => {
-                ToolErrorKind::InvalidInput
-            }
+            Error::ModelBadRequest(_)
+            | Error::ModelMalformedOutput(_)
+            | Error::ContextBudgetExceeded { .. } => ToolErrorKind::InvalidInput,
             Error::NotFound(_) => ToolErrorKind::NotFound,
             Error::AlreadyExists(_) => ToolErrorKind::InvalidInput,
             // The agent asked for something it isn't allowed to do
