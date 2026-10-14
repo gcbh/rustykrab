@@ -1,0 +1,66 @@
+[
+  {
+    "at": "2026-10-14T16:45:47.464434Z",
+    "hash": null,
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "run",
+    "reference": "ea7b4d55-7375-4e61-b7e2-4a917403e190",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:47.464437Z",
+    "hash": "ea7b4d55-7375-4e61-b7e2-4a917403e190",
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "daemon_build",
+    "reference": "6.5.4+b6605c6",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:47.468867Z",
+    "hash": "e06d57d8e6b8c608",
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "investigation_bundle",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-MXrc07/investigations/68c8767e-ea7b4d55/bundle.json",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:47.468881Z",
+    "hash": "b6605c6b6aeecc8586843c3127c3574854b1656d",
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "workspace",
+    "reference": "{\"repo\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-daemon-source-88SCWa\",\"base\":\"b6605c6b6aeecc8586843c3127c3574854b1656d\",\"branch\":\"rustykrab/work/68c8767e-ea7b4d55\",\"path\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-MXrc07/worktrees/68c8767e-ea7b4d55\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:48.430014Z",
+    "hash": null,
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "summary",
+    "reference": "Root cause in RustyKrab's own code; fixed it in the daemon's source and committed it.",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:48.430014Z",
+    "hash": null,
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "commit",
+    "reference": "9960f9938040806866a41e6b1c363f48a6ce7b72",
+    "verified_by": "git"
+  },
+  {
+    "at": "2026-10-14T16:45:48.430014Z",
+    "hash": null,
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "changed_path",
+    "reference": "e2e-investigator-fix.md",
+    "verified_by": "git"
+  },
+  {
+    "at": "2026-10-14T16:45:48.430751Z",
+    "hash": "ea7b4d55-7375-4e61-b7e2-4a917403e190",
+    "item": "68c8767e-b44e-4475-99b7-638706c2b75f",
+    "kind": "run_log",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-MXrc07/run-logs/ea7b4d55-7375-4e61-b7e2-4a917403e190.jsonl",
+    "verified_by": "worker:pinch-own"
+  }
+]

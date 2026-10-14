@@ -1,0 +1,71 @@
+{
+  "artifact_refs": [
+    {
+      "kind": "failure_fingerprint",
+      "value": "e06d57d8e6b8c608"
+    },
+    {
+      "kind": "item",
+      "value": "f7ff8cac-e204-4ae8-93df-ff75cd7f1c17"
+    },
+    {
+      "kind": "daemon_source",
+      "value": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-daemon-source-88SCWa"
+    },
+    {
+      "kind": "resolution_depth",
+      "value": "1"
+    }
+  ],
+  "budget": {
+    "iterations": 25,
+    "repairs": 2,
+    "rungs": {
+      "acquisitions": 1,
+      "builds": 1,
+      "improvements": 1,
+      "repairs": 2,
+      "replans": 1,
+      "requests": 1,
+      "retries": 2,
+      "worker_switches": 1
+    },
+    "tokens": 200000,
+    "wall_seconds": 3600
+  },
+  "closed_at": "2026-10-14T16:45:48.492057Z",
+  "constraints": [
+    "Add measurement only; change no behaviour beyond classification.",
+    "A message rule may land as a `classifier_rule` artifact, `<subclass>: <pattern>`; it counts once the failure replays through it as classified.",
+    "This item is done only when it lands something the controller can check: a commit on its branch in its worktree, or a `classifier_rule` artifact that replays. If you cannot land one, say plainly in the summary what you found, what you could not determine and what you need; that conclusion goes to the owner as a question, and nothing is marked done."
+  ],
+  "created_at": "2026-10-14T16:45:47.430404Z",
+  "decisions_made": [],
+  "done_when": "Replaying the attached evidence through the classifier yields a class other than unknown, and a test pins that classification for fingerprint e06d57d8e6b8c608.",
+  "expires_at": null,
+  "held_by": null,
+  "id": "68c8767e-b44e-4475-99b7-638706c2b75f",
+  "inputs_from": [],
+  "kind": "internal",
+  "objective": "Add the probe, log line, check or parser that would have classified this failure. It was recorded as unknown (observed_by unclassified): E2E-OWN-SOURCE the verifier refused a step it should have taken; e2e-investigation: land the fix",
+  "origin_conversation_id": null,
+  "parent": null,
+  "plan_id": "0b617b26-8de3-4979-ae3c-30f31cdc0dbd",
+  "preconditions": [],
+  "priority": 0,
+  "required_mcp_servers": [],
+  "required_tools": [],
+  "status": {
+    "status": "done"
+  },
+  "status_origin": null,
+  "title": "Classify unknown failure e06d57d8e6b8c608",
+  "trigger": {
+    "kind": "now"
+  },
+  "updated_at": "2026-10-14T16:45:48.492057Z",
+  "worker_kind": "any",
+  "writable_resources": [
+    "repo:/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-daemon-source-88SCWa"
+  ]
+}

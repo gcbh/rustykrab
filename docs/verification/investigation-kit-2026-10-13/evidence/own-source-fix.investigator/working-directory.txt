@@ -1,0 +1,35 @@
+$ pwd
+/private/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-MXrc07/worktrees/68c8767e-ea7b4d55
+$ git rev-parse HEAD
+b6605c6b6aeecc8586843c3127c3574854b1656d
+$ git status --short --branch
+## rustykrab/work/68c8767e-ea7b4d55
+$ git log --oneline -3
+b6605c6 feat: fix a failure in RustyKrab's own code in its own source
+$ ls -la
+total 752
+drwxr-xr-x  23 geoffrey  staff     736 Oct 14 09:45 .
+drwxr-xr-x   3 geoffrey  staff      96 Oct 14 09:45 ..
+drwxr-xr-x   3 geoffrey  staff      96 Oct 14 09:45 .cargo
+drwxr-xr-x   3 geoffrey  staff      96 Oct 14 09:45 .claude
+-rw-r--r--   1 geoffrey  staff     133 Oct 14 09:45 .git
+drwxr-xr-x   3 geoffrey  staff      96 Oct 14 09:45 .github
+-rw-r--r--   1 geoffrey  staff     352 Oct 14 09:45 .gitignore
+-rw-r--r--   1 geoffrey  staff    1873 Oct 14 09:45 AGENTS.md
+-rw-r--r--   1 geoffrey  staff   38805 Oct 14 09:45 CHANGELOG.md
+-rw-r--r--   1 geoffrey  staff    6424 Oct 14 09:45 CLAUDE.md
+-rw-r--r--   1 geoffrey  staff  165751 Oct 14 09:45 Cargo.lock
+-rw-r--r--   1 geoffrey  staff    3820 Oct 14 09:45 Cargo.toml
+-rw-r--r--   1 geoffrey  staff   38766 Oct 14 09:45 DREAMING.md
+-rw-r--r--   1 geoffrey  staff   12210 Oct 14 09:45 MEMORY_ARCHITECTURE.md
+-rw-r--r--   1 geoffrey  staff    2192 Oct 14 09:45 Makefile
+-rw-r--r--   1 geoffrey  staff   63770 Oct 14 09:45 README.md
+drwxr-xr-x  17 geoffrey  staff     544 Oct 14 09:45 crates
+drwxr-xr-x  12 geoffrey  staff     384 Oct 14 09:45 docs
+-rw-r--r--   1 geoffrey  staff     471 Oct 14 09:45 entitlements.plist
+-rw-r--r--   1 geoffrey  staff      66 Oct 14 09:45 rust-toolchain.toml
+drwxr-xr-x  24 geoffrey  staff     768 Oct 14 09:45 scripts
+drwxr-xr-x   3 geoffrey  staff      96 Oct 14 09:45 skills
+-rw-r--r--   1 geoffrey  staff   19863 Oct 14 09:45 sweep.log
+$ ls -la src
+ls: src: No such file or directory
