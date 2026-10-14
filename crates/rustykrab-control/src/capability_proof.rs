@@ -9,7 +9,10 @@
 //! Producers must strip model-authored `operation_probe` artifacts before
 //! forwarding reports and write these evidence rows through a trusted path.
 use chrono::{DateTime, Utc};
-use rustykrab_core::work::{Evidence, WorkItem};
+use rustykrab_core::{
+    types::ToolCall,
+    work::{Evidence, WorkItem},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
@@ -66,7 +69,59 @@ pub enum RegisteredAction {
     },
 }
 
+/// Shared need-to-operation registry for controller selection and adapter
+/// invocation. Unsupported needs remain availability-only; arbitrary action
+/// strings and arguments cannot expand this registry.
+pub fn registered_action(need: &crate::routing::CapabilityRef) -> Option<RegisteredAction> {
+    use crate::errors::GapKind;
+    match (need.gap, need.subject.as_str()) {
+        (GapKind::Tool | GapKind::Install, binary @ ("cargo" | "node")) => {
+            Some(RegisteredAction::BinaryAvailable {
+                binary: binary.into(),
+            })
+        }
+        (GapKind::Tool, "work_resources") => Some(RegisteredAction::ToolCallable {
+            tool: need.subject.clone(),
+            args: serde_json::json!({}),
+        }),
+        _ => None,
+    }
+}
+
 impl RegisteredAction {
+    /// Fixed invocation data for a registered action. This does not execute a
+    /// tool or grant access: the adapter still enforces its real tool boundary.
+    /// Canonical equality rejects changed args, shell text and mismatched action
+    /// variants through the same registry used by controller need selection.
+    pub fn tool_call(&self, run: &str) -> Option<ToolCall> {
+        use crate::{errors::GapKind, routing::CapabilityRef};
+        let (gap, subject) = match self {
+            Self::BinaryAvailable { binary } => (GapKind::Install, binary),
+            Self::ToolCallable { tool, .. } => (GapKind::Tool, tool),
+        };
+        let canonical = registered_action(&CapabilityRef {
+            gap,
+            subject: subject.clone(),
+        })?;
+        if canonical != *self {
+            return None;
+        }
+        let (name, arguments) = match canonical {
+            Self::BinaryAvailable { binary } => (
+                "exec".into(),
+                serde_json::json!({
+                    "command": format!("{binary} --version"), "timeout_secs": 30
+                }),
+            ),
+            Self::ToolCallable { tool, args } => (tool, args),
+        };
+        Some(ToolCall {
+            id: run.into(),
+            name,
+            arguments,
+        })
+    }
+
     pub fn operation(&self) -> String {
         match self {
             Self::BinaryAvailable { binary } => format!("binary.available/{binary}"),
@@ -233,6 +288,31 @@ pub fn capability_proven(
     validate_latest(item, evidence, need)
 }
 
+/// Validate within the exact controller-selected generation. A shared capability
+/// may serve several waiting items, whose generations do not compete. This
+/// selection is meaningful only when `need` comes from the controller's durable
+/// generation record. Malformed/oversized rows are retained and fail closed;
+/// they cannot disappear merely because their generation cannot be read. Within
+/// the selected generation the same latest/provenance/binding rules apply.
+pub fn capability_proven_in_generation(
+    item: &WorkItem,
+    evidence: &[Evidence],
+    need: &ExpectedOperation,
+) -> Result<Proof, Missing> {
+    valid_expected(need)?;
+    let selected: Vec<_> = evidence
+        .iter()
+        .filter(|e| {
+            e.kind == OPERATION_PROBE
+                && (e.reference.len() > MAX_REFERENCE_BYTES
+                    || serde_json::from_str::<OperationProbe>(&e.reference)
+                        .map_or(true, |p| p.generation == need.generation))
+        })
+        .cloned()
+        .collect();
+    validate_latest(item, &selected, need)
+}
+
 fn valid_expected(need: &ExpectedOperation) -> Result<(), Missing> {
     for (field, valid) in [
         ("operation", identity(&need.operation, 1_024)),
@@ -313,6 +393,113 @@ fn validate_latest(
 mod tests {
     use super::*;
     use rustykrab_core::work::{BlockedReason, Budget, Status, Trigger, WorkKind};
+
+    #[test]
+    fn one_registry_maps_needs_and_rejects_unregistered_invocations() {
+        use crate::{errors::GapKind, routing::CapabilityRef};
+        for gap in [GapKind::Tool, GapKind::Install] {
+            for binary in ["cargo", "node"] {
+                let action = registered_action(&CapabilityRef {
+                    gap,
+                    subject: binary.into(),
+                })
+                .unwrap();
+                let call = action.tool_call("probe-id").unwrap();
+                assert_eq!(call.id, "probe-id");
+                assert_eq!(call.name, "exec");
+                assert_eq!(
+                    call.arguments,
+                    serde_json::json!({"command":format!("{binary} --version"),"timeout_secs":30})
+                );
+            }
+        }
+        let action = registered_action(&CapabilityRef {
+            gap: GapKind::Tool,
+            subject: "work_resources".into(),
+        })
+        .unwrap();
+        assert_eq!(action.tool_call("probe-id").unwrap().name, "work_resources");
+        for (gap, subject) in [
+            (GapKind::Install, "work_resources"),
+            (GapKind::Tool, "unknown"),
+            (GapKind::Tool, "node; touch forbidden"),
+        ] {
+            assert!(registered_action(&CapabilityRef {
+                gap,
+                subject: subject.into()
+            })
+            .is_none());
+        }
+        for action in [
+            RegisteredAction::BinaryAvailable {
+                binary: "node; touch forbidden".into(),
+            },
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: serde_json::json!({"project_id":"other"}),
+            },
+            RegisteredAction::ToolCallable {
+                tool: "node".into(),
+                args: serde_json::json!({}),
+            },
+            RegisteredAction::BinaryAvailable {
+                binary: "work_resources".into(),
+            },
+        ] {
+            assert!(action.tool_call("probe-id").is_none());
+        }
+    }
+
+    #[test]
+    fn shared_capability_generations_do_not_hide_failure_or_malformed_receipts() {
+        let (item, need, success) = fixture();
+        let mut other = change(&success, |p| {
+            p.generation = "another-waiter:8".into();
+            p.run = "other-probe".into();
+        });
+        other.at += chrono::Duration::seconds(10);
+        assert!(
+            capability_proven_in_generation(&item, &[success.clone(), other.clone()], &need)
+                .is_ok()
+        );
+        assert_eq!(
+            capability_proven(&item, &[success.clone(), other.clone()], &need),
+            Err(Missing::StaleGeneration)
+        );
+        assert_eq!(
+            capability_proven_in_generation(&item, &[other.clone()], &need),
+            Err(Missing::NoProbe)
+        );
+        let mut failed = change(&success, |p| p.outcome = ProbeOutcome::Failed);
+        failed.at += chrono::Duration::seconds(1);
+        assert_eq!(
+            capability_proven_in_generation(
+                &item,
+                &[success.clone(), other.clone(), failed],
+                &need
+            ),
+            Err(Missing::Failed)
+        );
+        for reference in ["{broken".into(), "x".repeat(MAX_REFERENCE_BYTES + 1)] {
+            let invalid = Evidence {
+                reference,
+                ..other.clone()
+            };
+            assert_eq!(
+                capability_proven_in_generation(&item, &[success.clone(), invalid], &need),
+                Err(Missing::MalformedProbe)
+            );
+        }
+        let untrusted = Evidence {
+            at: other.at,
+            verified_by: Some("model".into()),
+            ..success.clone()
+        };
+        assert_eq!(
+            capability_proven_in_generation(&item, &[success, untrusted], &need),
+            Err(Missing::Untrusted)
+        );
+    }
 
     #[test]
     fn probe_request_binds_action_args_executor_and_effective_ceiling() {

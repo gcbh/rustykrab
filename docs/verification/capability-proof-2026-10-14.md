@@ -146,8 +146,10 @@ same method returns Unobserved for native Claude/Codex; it invokes no process
 or model and makes no claim about a native runtime's access. Fixed receipts
 omit raw tool outputs, stdout/stderr and private resource data. Both methods
 return observation data only; only controller-owned storage plus the pure
-validator may construct Proof. Worker trait overrides are now wired; lease dispatch, durable receipts and
-capability judgment/revival remain Claude's integration slice.
+validator may construct Proof. Worker trait overrides are wired. This component branch supplies producers and
+validation; Claude's local a19223c integration requests/stores receipts and
+gates judgment/revival. That integration has separate execution evidence and
+is not part of this component branch's standalone test claim.
 
 Exec cancellation now kills its own process group on Unix, including ordinary
 descendants. A real Python/sleep fixture verifies cancellation. Deliberately
@@ -185,5 +187,44 @@ dispatch too. Default implementations report unknown rather than proof.
 
 Full workspace after wiring: 2,253 passed, zero failed, 31 ignored with two
 test threads; warnings-denied workspace/all-target clippy, formatting and both
-documentation checks passed. The controller has not yet requested/stored these
-observations or replaced its catalog gate. No live deployment is claimed.
+documentation checks passed. These checks cover this component branch. Claude's separate local a19223c
+integration requests/stores observations and replaces the gate for registered
+needs; see its capability-proof-integration-2026-10-14 evidence. No live
+deployment is claimed.
+
+## Shared registry and per-generation selection
+
+capability_proof::registered_action(&routing::CapabilityRef) is the single
+need-to-action mapping. RegisteredAction::tool_call(run) validates canonical
+action equality through that registry and returns only the fixed invocation
+data; LocalWorker uses it before the same real schema/capability/sandbox tool
+boundary. It neither executes nor grants permission. Claude owns replacing the
+mirrored controller registry in controller/proof.rs with this shared function.
+
+capability_proven keeps its strict latest-item rule. The explicit
+capability_proven_in_generation variant selects only the durable expected
+generation (which includes the waiting item identity), retaining every
+unreadable/oversized row to fail closed. Multiple waiters can share a capability
+without their receipts hiding each other's outcomes. Within one generation,
+newer failure/unobserved/untrusted/malformed receipts still defeat old success;
+operation/executor/input/access/run bindings and independent holds still apply.
+The caller must obtain expected bindings from controller state, not the model.
+
+Follow-up restored-source workspace: 2,255 passed, zero failed, 31 ignored
+(one test thread); workspace/all-target warnings-denied clippy, formatting,
+architecture and environment checks pass. The registry and generation negative
+controls each fail their exact new regression (exit 101); the source hash was
+restored and all 11 pure-proof tests passed again. Final host-context tests
+include existing process-group inspection that the restrictive sandbox blocks.
+The agent architecture metrics were regenerated after the final test import;
+that mechanical correction changes no execution.
+
+## Linear review base
+
+The capability PR is restacked on exact #696 head 1a4f23d (which contains #694).
+The proof, local/native adapters, worker trait and exec sources match the
+previously verified e8145c0 combined tree byte-for-byte. Whole workspace after
+restacking: 2,263 passed, zero failed, 31 ignored; required warnings-denied
+lint/format/architecture/environment checks pass. Replayed additive architecture
+passages were preserved and final generated metrics regenerated. Controller
+bounds/gates and resource-wrapper fixes remain separate subsequent stack layers.

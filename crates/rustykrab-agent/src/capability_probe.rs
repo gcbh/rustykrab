@@ -5,33 +5,9 @@ use crate::sandbox::Sandbox;
 use rustykrab_control::capability_proof::{
     OperationProbe, ProbeOutcome, ProbeRequest, RegisteredAction,
 };
-use rustykrab_core::{capability::CapabilitySet, types::ToolCall, Tool};
-use serde_json::{json, Value};
+use rustykrab_core::{capability::CapabilitySet, Tool};
+use serde_json::Value;
 use std::sync::Arc;
-
-fn call(request: &ProbeRequest) -> Option<ToolCall> {
-    let (name, arguments) = match &request.action {
-        RegisteredAction::BinaryAvailable { binary }
-            if ["cargo", "node"].contains(&binary.as_str()) =>
-        {
-            (
-                "exec",
-                json!({"command":format!("{binary} --version"),"timeout_secs":30}),
-            )
-        }
-        RegisteredAction::ToolCallable { tool, args }
-            if tool == "work_resources" && *args == json!({}) =>
-        {
-            ("work_resources", args.clone())
-        }
-        _ => return None,
-    };
-    Some(ToolCall {
-        id: request.expected.run.clone(),
-        name: name.into(),
-        arguments,
-    })
-}
 
 fn version_line(stdout: &str, binary: &str) -> bool {
     let prefix = match binary {
@@ -73,7 +49,7 @@ pub(crate) async fn observe(
     sandbox: &Arc<dyn Sandbox>,
 ) -> OperationProbe {
     let report = |outcome, observation| request.expected.observation(outcome, observation);
-    let Some(call) = call(request) else {
+    let Some(call) = request.action.tool_call(&request.expected.run) else {
         return report(
             ProbeOutcome::Unobserved,
             "operation/arguments have no registered probe",
@@ -126,6 +102,7 @@ pub(crate) async fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn registered_postconditions_require_observed_success_not_rust_ok() {
         for (binary, line) in [("cargo", "cargo 1.90.0 (fixture)"), ("node", "v24.21.0")] {
