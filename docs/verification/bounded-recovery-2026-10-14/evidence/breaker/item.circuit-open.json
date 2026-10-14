@@ -1,0 +1,10 @@
+[
+  {
+    "at": "2026-10-14T21:23:11.817434Z",
+    "hash": "e69d1e56500ffb87",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "circuit_open",
+    "reference": "{\"attempt_state\":\"509082d610d3cded\",\"error\":\"unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"fingerprint\":\"e69d1e56500ffb87\",\"repeats\":3,\"runs\":[\"d6f7850d-675a-4d02-8659-e79432db20cc\",\"8f85490c-80e7-4ced-9b03-2ed7d828cda3\",\"722a9ae5-7584-4950-8d2c-c2b0b268857d\"]}",
+    "verified_by": null
+  }
+]

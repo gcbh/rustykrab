@@ -1,0 +1,42 @@
+[
+  {
+    "at": "2026-10-14T21:23:07.819206Z",
+    "hash": "ccd82966f4ce3642",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "attempt_state",
+    "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"other\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T21:23:08.820962Z",
+    "hash": "509082d610d3cded",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "attempt_state",
+    "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T21:23:09.823487Z",
+    "hash": "509082d610d3cded",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "attempt_state",
+    "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T21:23:10.820185Z",
+    "hash": "509082d610d3cded",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "attempt_state",
+    "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T21:23:12.820605Z",
+    "hash": "e1a8d4d7ae0bd505",
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "attempt_state",
+    "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[{\"item\":\"fa4158f2-ff31-42d2-bb60-5a277c617b23\",\"status\":\"done\",\"commits\":[]}],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[{\"item\":\"fa4158f2-ff31-42d2-bb60-5a277c617b23\",\"kind\":\"internal\",\"edge\":\"blocks\",\"closed_at\":\"2026-10-14T21:23:12.818353+00:00\"}],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"other\"}",
+    "verified_by": null
+  }
+]

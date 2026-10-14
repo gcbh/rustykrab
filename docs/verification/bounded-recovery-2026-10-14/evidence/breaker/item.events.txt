@@ -1,0 +1,35 @@
+2026-10-14T21:23:07.292916Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:07.819208Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:07.819474Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:08.818558Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+2026-10-14T21:23:08.818799Z  comment  [worker:snapper]  Agent reported: The tide gauge frame failed its checksum again.
+2026-10-14T21:23:08.818799Z  rung  [controller]  rung repair: repair with the failure evidence and a diagnosis step
+2026-10-14T21:23:08.819242Z  transition -> queued  [controller]  repair
+2026-10-14T21:23:08.819242Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:08.820983Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:08.821211Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:09.817564Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+2026-10-14T21:23:09.818700Z  comment  [worker:snapper]  Agent reported: The tide gauge frame failed its checksum again.
+2026-10-14T21:23:09.818700Z  rung  [controller]  rung repair: repair with the failure evidence and a diagnosis step
+2026-10-14T21:23:09.820141Z  transition -> queued  [controller]  repair
+2026-10-14T21:23:09.820141Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:09.823515Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:09.823978Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:10.816563Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 5 ms
+2026-10-14T21:23:10.816895Z  comment  [worker:snapper]  Agent reported: The tide gauge frame failed its checksum again.
+2026-10-14T21:23:10.816895Z  rung  [controller]  rung repair: repair with the failure evidence and a diagnosis step
+2026-10-14T21:23:10.817657Z  transition -> queued  [controller]  repair
+2026-10-14T21:23:10.817657Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:10.820222Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:10.820570Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:11.818655Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+2026-10-14T21:23:11.818893Z  comment  [worker:snapper]  Agent reported: The tide gauge frame failed its checksum again.
+2026-10-14T21:23:11.818893Z  rung  [controller]  rung improve: waiting on resolution item fa4158f2-ff31-42d2-bb60-5a277c617b23; circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d)
+2026-10-14T21:23:11.819960Z  transition -> queued  [controller]  circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d); waiting for an investigation
+2026-10-14T21:23:12.818353Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:12.820645Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:12.820941Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:13.818542Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+2026-10-14T21:23:13.818803Z  comment  [worker:snapper]  Agent reported: Read the tide gauge once its probe had landed.
+2026-10-14T21:23:13.819280Z  transition -> verifying  [controller]  checking the result report
+2026-10-14T21:23:13.819280Z  transition -> done  [controller]  verified on snapper: 1 artifact(s); Read the tide gauge once its probe had landed.

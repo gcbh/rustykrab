@@ -1,0 +1,8 @@
+{
+  "artifact_refs": [],
+  "class": "budget",
+  "detail": "iterations budget spent: 2 of 2 iterations used over 2 run(s) (1 allotment(s) of 2, counted across every attempt); 0 left, under the 1 a run needs",
+  "fingerprint": "40024d321e814c1e",
+  "observed_by": "cumulative_budget_guard",
+  "subclass": "iterations"
+}

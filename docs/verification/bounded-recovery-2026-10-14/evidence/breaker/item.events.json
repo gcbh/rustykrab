@@ -1,0 +1,506 @@
+[
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:07.292916Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:07.819208Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:07.819474Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:08.818558Z",
+    "evidence_ref": "587f7034-8134-4ee2-9353-cf0b9ba6d876",
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:08.818799Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The tide gauge frame failed its checksum again.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:08.818799Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T21:23:08.817571Z\",\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"fingerprint\":\"e69d1e56500ffb87\",\"detail\":\"E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"artifact_refs\":[],\"observed_by\":\"unclassified\"},\"outcome\":\"repair with the failure evidence and a diagnosis step\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:08.819242Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:08.819242Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:08.820983Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:08.821211Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:09.817564Z",
+    "evidence_ref": "d6f7850d-675a-4d02-8659-e79432db20cc",
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:09.818700Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The tide gauge frame failed its checksum again.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:09.818700Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T21:23:09.815429Z\",\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"fingerprint\":\"e69d1e56500ffb87\",\"detail\":\"E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"artifact_refs\":[],\"observed_by\":\"unclassified\"},\"outcome\":\"repair with the failure evidence and a diagnosis step\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:09.820141Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:09.820141Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:09.823515Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:09.823978Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:10.816563Z",
+    "evidence_ref": "8f85490c-80e7-4ced-9b03-2ed7d828cda3",
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 5 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:10.816895Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The tide gauge frame failed its checksum again.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:10.816895Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T21:23:10.815181Z\",\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"fingerprint\":\"e69d1e56500ffb87\",\"detail\":\"E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"artifact_refs\":[],\"observed_by\":\"unclassified\"},\"outcome\":\"repair with the failure evidence and a diagnosis step\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:10.817657Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:10.817657Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:10.820222Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:10.820570Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:11.818655Z",
+    "evidence_ref": "722a9ae5-7584-4950-8d2c-c2b0b268857d",
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:11.818893Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The tide gauge frame failed its checksum again.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:11.818893Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"improve\",\"at\":\"2026-10-14T21:23:11.817434Z\",\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"fingerprint\":\"e69d1e56500ffb87\",\"detail\":\"E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"artifact_refs\":[],\"observed_by\":\"unclassified\"},\"outcome\":\"waiting on resolution item fa4158f2-ff31-42d2-bb60-5a277c617b23; circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d)\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:11.819960Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d); waiting for an investigation",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:12.818353Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:12.820645Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:12.820941Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:13.818542Z",
+    "evidence_ref": "bf520b04-6fd2-476a-bf92-0789d4856e64",
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:13.818803Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: Read the tide gauge once its probe had landed.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:13.819280Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "checking the result report",
+    "to": {
+      "status": "verifying"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:13.819280Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "verifying"
+    },
+    "item": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+    "kind": "transition",
+    "origin": null,
+    "reason": "verified on snapper: 1 artifact(s); Read the tide gauge once its probe had landed.",
+    "to": {
+      "status": "done"
+    },
+    "upstream": null
+  }
+]
