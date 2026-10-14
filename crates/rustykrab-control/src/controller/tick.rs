@@ -16,7 +16,7 @@ use rustykrab_tools::work_backend::{ToolState, WorkRunContext, WORK_RUN_CONTEXT}
 
 use crate::errors::{
     apply_learned, classify, fingerprint, gap_of, Context, FailureInput, GapKind, LearnedRule,
-    VerifierVerdict, CLASSIFIER_RULE,
+    PolicyStop, VerifierVerdict, CLASSIFIER_RULE,
 };
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
@@ -134,6 +134,38 @@ fn normalise_reported(error: &WorkError, kind: WorkerKind) -> WorkError {
         out.observed_by = "worker_report".to_string();
     }
     out
+}
+
+/// Who stops a read-only review's report that carries more than a review
+/// may: a typed `policy/scope` failure observed by this guard.
+pub(super) const READ_ONLY_GUARD: &str = "read_only_guard";
+
+/// Whether `item` is a read-only review job: an artifact ref
+/// `read_only_review=true` (`rustykrab_core::dream_review::REVIEW_ONLY`),
+/// as dreaming files its project-review jobs.
+pub(super) fn read_only_review(item: &WorkItem) -> bool {
+    item.artifact_refs
+        .iter()
+        .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
+}
+
+/// The fields of a read-only review's report that carry authority a review
+/// does not have: follow-up work, questions, artifacts (a classifier rule
+/// among them), a commit, changed paths, checks it says ran, or a block.
+/// Its summary, known limits and error are what a review reports.
+pub(super) fn review_overreach(result: &rustykrab_core::work::ResultReport) -> Vec<&'static str> {
+    [
+        ("discovered", !result.discovered.is_empty()),
+        ("questions", !result.questions.is_empty()),
+        ("artifacts", !result.artifacts.is_empty()),
+        ("commit", result.commit.is_some()),
+        ("changed_paths", !result.changed_paths.is_empty()),
+        ("checks_run", !result.checks_run.is_empty()),
+        ("blocked", result.blocked.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, set)| set.then_some(field))
+    .collect()
 }
 
 /// A claimed check as the verifier compares it: lower case, whitespace
@@ -725,7 +757,8 @@ impl Controller {
                 self.judge(b, &item, worker, result).await?
             }
         };
-        if let Ok(result) = &finished.outcome {
+        // A read-only review files nothing: its guard failed it above.
+        if let (Ok(result), false) = (&finished.outcome, read_only_review(&item)) {
             changed.extend(
                 self.file_discovered(b, &item, worker, &result.discovered)
                     .await,
@@ -759,6 +792,28 @@ impl Controller {
             tool: None,
             worker_kind: Some(kind),
         };
+        // A read-only review reports a summary, known limits or an error;
+        // a report that carries more is stopped before any of it is stored
+        // or acted on (whatever the worker type: its adapter's read-only
+        // flags stop host writes, not what the report claims).
+        if read_only_review(item) {
+            let overreach = review_overreach(result);
+            if !overreach.is_empty() {
+                let mut error = classify(
+                    &FailureInput::Policy {
+                        stop: PolicyStop::Scope,
+                        detail: format!(
+                            "a read-only review's report may carry only a summary, known limits \
+                             or an error; it carried {}",
+                            overreach.join(", ")
+                        ),
+                    },
+                    &ctx,
+                );
+                error.observed_by = READ_ONLY_GUARD.to_string();
+                return self.fail(b, item, worker, error, &[]).await;
+            }
+        }
         if let Some(error) = &result.error {
             let error = normalise_reported(error, kind);
             return self.fail(b, item, worker, error, &result.artifacts).await;

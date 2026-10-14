@@ -20,6 +20,7 @@ mod proof;
 mod questions;
 mod resolution;
 mod review;
+mod review_guard;
 mod scenarios;
 mod waits;
 mod workers;
