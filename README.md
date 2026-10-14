@@ -917,6 +917,12 @@ rustykrab-cli worker add codex --name codex-one --repos /absolute/path/to/repo \
   --require-chatgpt
 ```
 
+Subscription workers can also receive exact host-file output grants with
+`--writable-files /absolute/path/to/audit.json`. Each file's parent directory must
+already exist. These grants use scoped host read/edit/write tools; they authorize
+neither neighboring files nor a shell outside a controller-owned worktree.
+The default remains no additional file grants.
+
 The daemon client must target that service's gateway and bearer credentials.
 Each profile requires its own Sign in with ChatGPT login; multiple directories
 for one account share limits. ChatGPT mode clears API credentials, ignores
@@ -961,3 +967,10 @@ ties. Held, expired, completed, future-triggered and unreleased fallback work
 do not increase priority. Running jobs finish normally. If no compatible
 resource has free subscription capacity, the work stays queued for recovery.
 The monitor displays the same derived blocking impact for the current queue.
+
+The separate default-empty `readable_files` worker option grants exact read-only
+inputs (`worker add --readable-files PATH[,PATH...]`). Reads may use those inputs;
+write/edit calls still require a requested exact output grant or the run's own
+repository worktree. Input grants do not advertise writable resources and remain
+out of native shell arguments. The native host path preserves both grant arrays
+from its stored spec.

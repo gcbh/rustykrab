@@ -57,6 +57,75 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 impl Controller {
+    /// Recover historical controller-created waits when a prerequisite has
+    /// stopped for its owner. Ordinary user/worker dependencies remain intact.
+    pub(super) async fn recover_resolution_waiters(
+        &self,
+        b: &mut Batch,
+    ) -> Result<Vec<WorkItemId>, Error> {
+        let edges: Vec<_> = b.snap.items().iter()
+            .filter(|i| i.held_by.is_none()
+                && matches!(i.status, Status::Blocked(r) if (r.needs_user() || r == BlockedReason::BudgetExhausted) && r != BlockedReason::NeedsConsent)
+                && i.kind != rustykrab_core::work::WorkKind::Proposal
+                && i.artifact_refs.iter().any(|r| r.kind == crate::investigate::FAILURE_FINGERPRINT))
+            .flat_map(|fix| b.snap.edges_naming(&fix.id))
+            .filter(|e| e.kind == EdgeKind::Blocks)
+            .filter(|e| b.snap.item(&e.item).is_some_and(|i| i.status == Status::Queued && i.held_by.is_none()))
+            .cloned().collect();
+        let mut changed = Vec::new();
+        for edge in edges {
+            let proofs = self.store.work_evidence_list(&edge.depends_on).await?;
+            if proofs.iter().any(|e| {
+                e.kind == "commit" && e.verified_by.as_deref() == Some("git")
+                    || e.kind == crate::errors::CLASSIFIER_RULE
+                        && e.verified_by.as_deref() == Some("replay")
+            }) {
+                continue;
+            }
+            let events = self.store.work_events(&edge.item).await?;
+            let canonical = events
+                .iter()
+                .rposition(|event| {
+                    event.actor == "controller"
+                        && crate::ladder::rung_event(event).is_some_and(|r| {
+                            r.rung == Rung::Improve
+                                && r.outcome
+                                    == format!("waiting on resolution item {}", edge.depends_on)
+                        })
+                })
+                .is_some_and(|position| {
+                    !events[position + 1..]
+                        .iter()
+                        .any(|e| matches!(e.kind, EventKind::Lease | EventKind::Resume))
+                });
+            if !canonical {
+                continue;
+            }
+            b.snap.remove_edge(&edge);
+            b.ops.push(WorkOp::RemoveEdge(edge.clone()));
+            b.note(
+                &edge.item,
+                EventKind::Resume,
+                "controller",
+                format!(
+                    "resolution item {} is waiting for its owner; recover the previous ladder wait",
+                    edge.depends_on
+                ),
+            );
+            b.evidence(
+                &edge.item,
+                "resolution_outcome",
+                format!(
+                    "{}: prerequisite stopped for its owner without a verified resolution",
+                    edge.depends_on
+                ),
+                Some("controller"),
+            );
+            changed.push(edge.item);
+        }
+        Ok(changed)
+    }
+
     /// This daemon's build as every run records it.
     pub(super) fn build_label(&self) -> String {
         BuildId::label(self.config.build.as_ref())

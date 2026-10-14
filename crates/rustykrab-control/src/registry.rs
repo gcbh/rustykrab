@@ -65,6 +65,12 @@ pub struct WorkerSpec {
     /// writable resource it covers.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Exact output files delegated to the subscription worker through host tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_files: Vec<String>,
+    /// Exact read-only input files available to the scoped host tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readable_files: Vec<String>,
     /// The executable (`claude`, `codex`, or a path).
     #[serde(default)]
     pub command: Option<String>,

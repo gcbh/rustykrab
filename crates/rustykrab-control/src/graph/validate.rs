@@ -180,6 +180,8 @@ pub struct FilingContext {
     /// (`already_planned`).
     pub already_planned: bool,
     pub approval: ApprovalPolicy,
+    /// Repository writers may execute independently in controller-owned worktrees.
+    pub isolated_repo_writes: bool,
     /// The budget of a new item that names none and sits under no parent,
     /// and the per-item ceiling of a share of a parent's remainder.
     pub default_budget: Budget,
@@ -211,6 +213,7 @@ impl FilingContext {
             supersede_limit: 2,
             already_planned: false,
             approval: ApprovalPolicy::default(),
+            isolated_repo_writes: false,
             default_budget: Budget::default(),
             remaining_budget: BTreeMap::new(),
             origin_conversation_id: None,
@@ -1511,12 +1514,14 @@ impl<'a> Run<'a> {
                 if !self.fresh.contains(&a.id) && !self.fresh.contains(&b.id) {
                     continue;
                 }
-                let shared: Vec<&str> = a
-                    .writable_resources
-                    .iter()
-                    .filter(|r| b.writable_resources.contains(r))
-                    .map(String::as_str)
-                    .collect();
+                let shared: Vec<&str> = crate::workspace::shared_resources(
+                    &a.writable_resources,
+                    &b.writable_resources,
+                    self.ctx.isolated_repo_writes,
+                )
+                .into_iter()
+                .map(String::as_str)
+                .collect();
                 if shared.is_empty() {
                     continue;
                 }

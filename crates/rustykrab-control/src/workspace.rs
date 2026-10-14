@@ -42,6 +42,21 @@ pub const WORKSPACE_EVIDENCE: &str = "workspace";
 /// Where a namespaced run branch starts.
 const BRANCH_PREFIX: &str = "rustykrab/work/";
 
+/// Shared writes, excluding only the first repository when both executions
+/// receive isolated checkouts. Extra repositories and external resources remain shared.
+pub(crate) fn shared_resources<'a>(
+    a: &'a [String],
+    b: &[String],
+    isolated_repos: bool,
+) -> Vec<&'a String> {
+    let first_a = a.iter().find(|r| r.starts_with(REPO_PREFIX));
+    let first_b = b.iter().find(|r| r.starts_with(REPO_PREFIX));
+    a.iter()
+        .filter(|r| b.contains(r))
+        .filter(|r| !isolated_repos || first_a != Some(*r) || first_b != Some(*r))
+        .collect()
+}
+
 /// One run's isolated checkout of a repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {

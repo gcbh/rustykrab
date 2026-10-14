@@ -1,6 +1,7 @@
 pub mod compaction;
 pub mod delegated;
 pub mod external_worker;
+mod file_scope;
 pub mod harness;
 pub mod local_worker;
 mod metered;

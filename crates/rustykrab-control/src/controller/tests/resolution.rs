@@ -1,6 +1,6 @@
 use super::*;
 use crate::controller::batch::Batch;
-use rustykrab_core::work::{ErrorClass, WorkKind};
+use rustykrab_core::work::{BlockedReason, ErrorClass, WorkKind};
 
 #[tokio::test]
 async fn shared_blockers_run_before_independent_work_even_with_lower_explicit_priority() {
@@ -202,4 +202,58 @@ async fn failing_diagnoses_cannot_spawn_an_unbounded_resolution_chain() {
         .reason
         .as_deref()
         .is_some_and(|r| r.contains("depth limit reached"))));
+}
+
+#[tokio::test]
+async fn restart_recovers_only_controller_resolution_waits_on_a_stopped_prerequisite() {
+    use rustykrab_store::{TransitionSpec, WorkOp};
+    let h = Harness::new(&["worker"]);
+    h.script.push(
+        "waiting work",
+        Step::Fail(Error::Internal("flux capacitor desynchronised".into())),
+    );
+    let waiter = h.file_one(draft("waiter", "waiting work")).await;
+    h.tick().await;
+    h.ctl.set_draining(true);
+    h.step().await;
+    let fix = h.of_kind(WorkKind::Internal).await.pop().unwrap();
+    let mut other = draft("ordinary", "ordinary dependency");
+    other.edges.push(DraftEdge {
+        kind: EdgeKind::Blocks,
+        depends_on: ItemRef::Id(fix.id.clone()),
+    });
+    let other = h.file_one(other).await;
+    let mut parked = TransitionSpec::new(
+        &fix.id,
+        Status::Blocked(BlockedReason::BudgetExhausted),
+        "controller",
+    );
+    parked.reason = Some("repair budget exhausted".into());
+    h.store()
+        .work_apply(vec![WorkOp::Transition(parked)])
+        .await
+        .unwrap();
+    let h = h.restart(&[]);
+    h.ctl.set_draining(true);
+    h.tick().await;
+    assert_eq!(h.status(&waiter).await, Status::Ready);
+    assert_eq!(h.status(&other).await, Status::Queued);
+    assert_eq!(
+        h.status(&fix.id).await,
+        Status::Blocked(BlockedReason::BudgetExhausted)
+    );
+    let snap = h.ctl.load().await.unwrap();
+    assert!(!snap
+        .edges_held_by(&waiter)
+        .any(|e| e.kind == EdgeKind::Blocks));
+    assert!(snap.edges_held_by(&other).any(|e| e.depends_on == fix.id));
+    h.tick().await;
+    assert_eq!(
+        h.events(&waiter)
+            .await
+            .iter()
+            .filter(|e| e.kind == EventKind::Resume)
+            .count(),
+        1
+    );
 }

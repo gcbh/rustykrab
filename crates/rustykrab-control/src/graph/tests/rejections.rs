@@ -553,3 +553,26 @@ fn validation_returns_every_failed_check_at_once() {
     }
     assert_eq!(s.items().len(), base().items().len());
 }
+
+#[test]
+fn isolated_repo_filings_accept_independent_writers_but_reject_shared_external_writes() {
+    for extra in [None, Some("calendar:shared"), Some("repo:/second")] {
+        let mut a = draft("a");
+        let mut b = draft("b");
+        a.writable_resources = vec!["repo:/first".into()];
+        b.writable_resources = a.writable_resources.clone();
+        if let Some(resource) = extra {
+            a.writable_resources.push(resource.into());
+            b.writable_resources.push(resource.into());
+        }
+        let mut context = planner();
+        context.isolated_repo_writes = true;
+        let mut snapshot = base();
+        if extra.is_none() {
+            accept(&mut snapshot, &under_p(vec![a, b]), &context);
+        } else {
+            let rejected = reject(&snapshot, &under_p(vec![a, b]), &context);
+            assert!(!only(&rejected, RejectionReason::SingleWriterConflict).is_empty());
+        }
+    }
+}

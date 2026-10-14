@@ -293,6 +293,7 @@ pub struct LocalWorker {
     stall_steps: u32,
     full_reports: bool,
     repository_shell: bool,
+    readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
@@ -350,10 +351,30 @@ impl LocalWorker {
             stall_steps: DEFAULT_STALL_STEPS,
             full_reports: false,
             repository_shell: false,
+            readable_files: Vec::new(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
             model: Mutex::new(None),
         }
+    }
+
+    /// Add exact operator-delegated input files, without write authority.
+    pub fn with_readable_files(mut self, files: &[String]) -> Self {
+        self.readable_files = files.iter().map(std::path::PathBuf::from).collect();
+        self
+    }
+
+    /// Add operator-delegated exact files to this worker's existing write scope.
+    pub fn with_writable_files(mut self, files: &[String]) -> Self {
+        let mut definition = (*self.definition).clone();
+        for file in files {
+            let resource = format!("file:{file}");
+            if !definition.writable_resources.contains(&resource) {
+                definition.writable_resources.push(resource);
+            }
+        }
+        self.definition = Arc::new(definition);
+        self
     }
 
     /// Accept complete bounded report content for a host-owned deliverable.
@@ -857,15 +878,46 @@ impl Worker for LocalWorker {
         self.log_path(run).filter(|path| path.is_file())
     }
 
+    fn isolates_worktree(&self) -> bool {
+        self.repository_shell
+    }
+
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         let (mut host_tools, mut ceiling) = self.catalog();
-        if self.repository_shell && brief.workspace.is_none() {
-            host_tools.retain(|t| !["exec", "read", "edit", "write"].contains(&t.name()));
-            ceiling.retain(|t| !["exec", "read", "edit", "write"].contains(&t.as_str()));
+        let files: Vec<std::path::PathBuf> = brief
+            .writable_resources
+            .iter()
+            .filter(|r| self.definition.writable_resources.contains(r))
+            .filter_map(|r| r.strip_prefix("file:").map(std::path::PathBuf::from))
+            .collect();
+        if brief
+            .writable_resources
+            .iter()
+            .filter(|r| r.starts_with("file:"))
+            .count()
+            != files.len()
+        {
+            return Err(Error::Auth("run requests an undelegated file write".into()));
         }
-        let activate = self
+        if self.repository_shell && brief.workspace.is_none() {
+            let denied = |name: &str| {
+                name == "exec"
+                    || name == "read" && files.is_empty() && self.readable_files.is_empty()
+                    || files.is_empty() && ["edit", "write"].contains(&name)
+            };
+            host_tools.retain(|t| !denied(t.name()));
+            ceiling.retain(|t| !denied(t));
+        }
+        let mut activate = self
             .activation(&brief, &ceiling)
             .map_err(RunFailure::into_error)?;
+        if !files.is_empty() || !self.readable_files.is_empty() {
+            for name in ["read", "edit", "write"] {
+                if ceiling.iter().any(|n| n == name) && !activate.iter().any(|n| n == name) {
+                    activate.push(name.into());
+                }
+            }
+        }
         let entry = self.runs.enter();
         let _slot = tokio::select! {
             slot = self.slot.acquire() => {
@@ -873,6 +925,24 @@ impl Worker for LocalWorker {
             }
             e = entry.interrupted() => return Err(e),
         };
+
+        if !files.is_empty() || !self.readable_files.is_empty() {
+            host_tools = host_tools
+                .into_iter()
+                .map(|inner| {
+                    if ["read", "edit", "write"].contains(&inner.name()) {
+                        Arc::new(crate::file_scope::ScopedFileTool {
+                            inner,
+                            workspace: brief.workspace.as_ref().map(|w| w.path.clone()),
+                            files: files.clone(),
+                            readable_files: self.readable_files.clone(),
+                        }) as Arc<dyn Tool>
+                    } else {
+                        inner
+                    }
+                })
+                .collect();
+        }
 
         // A `code` run works in its own worktree: created now, `exec`
         // bound to it, removed when the run ends (the branch stays).
@@ -929,10 +999,16 @@ impl LocalWorker {
         tools.extend(rustykrab_tools::question_tools(recorder.clone()));
         tools.extend(rustykrab_tools::plan_tools(recorder.clone()));
         let workdir = brief.workspace.as_ref().map(|ws| ws.path.clone());
+        let exact_files = brief
+            .writable_resources
+            .iter()
+            .any(|r| r.starts_with("file:"))
+            || !self.readable_files.is_empty();
         // A run in a worktree works there and nowhere else: its shell and
         // its file tools are bound to that directory, where the host's own
         // are bound to the daemon's workspace.
         tools.extend(host_tools.into_iter().map(|t| match &workdir {
+            Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
             Some(dir) => match t.name() {
                 "exec" => Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>,
                 "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone())) as Arc<dyn Tool>,
@@ -2317,6 +2393,51 @@ mod tests {
             Arc::new(StubWorkBackend::new()),
         );
         assert_eq!(w.capabilities().writable_resources, ["calendar"]);
+    }
+
+    #[tokio::test]
+    async fn an_exact_file_grant_executes_without_a_workspace_or_ambient_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("audit.json");
+        let input = root.path().join("previous.json");
+        std::fs::write(&input, "previous audit").unwrap();
+        let provider = Recording::new(vec![
+            call("read", json!({"path":input})),
+            call(
+                "write",
+                json!({"path":file,"content":"{\"verified\":true}"}),
+            ),
+            report("audit saved"),
+        ]);
+        let (worker, _) = worker(
+            provider.clone(),
+            vec![
+                Arc::new(rustykrab_tools::WriteTool::new()),
+                Arc::new(rustykrab_tools::ReadTool::new()),
+                Arc::new(Named("exec")),
+            ],
+        );
+        let worker = worker
+            .with_repository_shell()
+            .with_writable_files(&[file.to_string_lossy().into_owned()])
+            .with_readable_files(&[input.to_string_lossy().into_owned()]);
+        let mut task = brief("audit");
+        task.writable_resources = vec![format!("file:{}", file.display())];
+        worker.run(task.clone()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"verified\":true}"
+        );
+        let names = &provider.requests()[0].1;
+        assert!(names.iter().any(|name| name == "write"));
+        assert!(!names.iter().any(|name| name == "exec"));
+        task.writable_resources = vec![format!(
+            "file:{}",
+            root.path().join("sibling.json").display()
+        )];
+        assert!(worker.run(task).await.is_err());
+        assert_eq!(std::fs::read_to_string(input).unwrap(), "previous audit");
+        assert_eq!(provider.requests().len(), 3);
     }
 
     #[tokio::test]

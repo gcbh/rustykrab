@@ -165,6 +165,11 @@ pub trait Worker: Send + Sync {
     fn accepts(&self, _item: &rustykrab_core::work::WorkItem) -> bool {
         true
     }
+    /// Repository execution is confined to the supplied controller-owned worktree.
+    /// Default executors retain the repository-wide writer lock.
+    fn isolates_worktree(&self) -> bool {
+        false
+    }
     /// How many items it may run at once.
     fn concurrency(&self) -> usize {
         1

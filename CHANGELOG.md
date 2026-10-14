@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.7] - 2026-10-14
+
+- fix: restore parallel worker execution and queue progress (#693)
+
 ## [6.5.6] - 2026-10-14
 
 - feat: an investigation kit for failures, a check on fixes, and fixes in RustyKrab's own source (#691)

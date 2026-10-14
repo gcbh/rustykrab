@@ -547,6 +547,7 @@ impl Controller {
         // Availability is queue waiting, never a failed attempt. Recover
         // historical holds without requiring a resource to be available yet.
         changed.extend(self.recover_worker_waits(&mut b, &waiting));
+        changed.extend(self.recover_resolution_waiters(&mut b).await?);
 
         // Step 7 for subtrees: a stalled parent re-plans, then surfaces
         // once; a chain open past the digest window gets its digest (6.6).
@@ -1757,17 +1758,21 @@ impl Controller {
                 .then_with(|| a.id.cmp(&b.id))
         });
         // The single-writer rule, over every active item whatever its tree.
-        let mut busy: HashSet<String> = snap
+        let mut busy: Vec<(Vec<String>, Option<String>)> = snap
             .items()
             .iter()
             .filter(|i| i.status.is_active() && !snap.has_children(&i.id))
-            .flat_map(|i| i.writable_resources.iter().cloned())
+            .map(|i| {
+                let isolated = self
+                    .state()
+                    .runs
+                    .get(&i.id)
+                    .and_then(|r| r.isolated_repo.clone());
+                (i.writable_resources.clone(), isolated)
+            })
             .collect();
         let (mut load, mut models) = self.load_by_worker();
         for item in ready {
-            if item.writable_resources.iter().any(|r| busy.contains(r)) {
-                continue;
-            }
             if !item
                 .preconditions
                 .iter()
@@ -1781,15 +1786,8 @@ impl Controller {
                 WorkKind::Capability => self.capability_mode(&item.id).await?,
                 _ => None,
             };
-            let class = work_class(&item, mode);
-            let Some(worker) = self.pick(
-                &item,
-                class.as_deref(),
-                &hist.excluded,
-                hist.floor,
-                &load,
-                &models,
-            ) else {
+            let Some(worker) = self.pick(&item, &hist.excluded, hist.floor, &load, &models, &busy)
+            else {
                 // No eligible/free resource: keep the ready item queued.
                 // No attempt has started, so spend no failure/retry budget.
                 continue;
@@ -1902,6 +1900,7 @@ impl Controller {
             }
             let name = worker.name().to_string();
             let run = spawn(worker.clone(), brief, self.clock.now());
+            let isolated_repo = run.isolated_repo.clone();
             self.state().runs.insert(item.id.clone(), run);
             let mut spec = TransitionSpec::new(&item.id, Status::Running, format!("worker:{name}"));
             spec.expected_from = Some(Status::Leased);
@@ -1913,7 +1912,7 @@ impl Controller {
                     tracing::warn!(item = %item.id, error = %e, "running not recorded");
                 }
             }
-            busy.extend(item.writable_resources.iter().cloned());
+            busy.push((item.writable_resources.clone(), isolated_repo));
             *load.entry(name).or_default() += 1;
             if self.config.serialise_local && worker.kind() == WorkerKind::Local {
                 models.extend(worker.capabilities().models);
@@ -2002,11 +2001,11 @@ impl Controller {
     fn pick(
         &self,
         item: &WorkItem,
-        _class: Option<&str>,
         excluded: &HashSet<String>,
         floor: Option<u32>,
         load: &HashMap<String, usize>,
         models: &HashSet<String>,
+        busy: &[(Vec<String>, Option<String>)],
     ) -> Option<Arc<dyn Worker>> {
         let workers = self.registry.workers();
         workers
@@ -2016,6 +2015,19 @@ impl Controller {
                 self.dispatch_available(w.as_ref())
                     && !excluded.contains(w.name())
                     && covers(w.as_ref(), item)
+                    && !busy.iter().any(|(resources, isolated)| {
+                        let own = (self.config.worktree_root.is_some() && w.isolates_worktree())
+                            .then(|| {
+                                item.writable_resources
+                                    .iter()
+                                    .find(|r| r.starts_with(crate::workspace::REPO_PREFIX))
+                            })
+                            .flatten();
+                        item.writable_resources.iter().any(|r| {
+                            resources.contains(r)
+                                && !(own == Some(r) && isolated.as_ref() == Some(r))
+                        })
+                    })
                     && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
                     && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
                     && !(self.config.serialise_local
@@ -2062,6 +2074,14 @@ impl Controller {
 pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
     let run_id = brief.run.clone().unwrap_or_default();
+    let isolated_repo = if worker.isolates_worktree() {
+        brief
+            .workspace
+            .as_ref()
+            .map(|ws| format!("{}{}", crate::workspace::REPO_PREFIX, ws.repo.display()))
+    } else {
+        None
+    };
     let binding = WorkRunContext {
         item: brief.item.clone(),
         actor: format!("worker:{name}"),
@@ -2070,6 +2090,7 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
         tokio::spawn(WORK_RUN_CONTEXT.scope(binding, async move { worker.run(brief).await }));
     Run {
         worker: name,
+        isolated_repo,
         run_id,
         started: std::time::Instant::now(),
         handle,

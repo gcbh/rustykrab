@@ -395,6 +395,8 @@ type RunResult = Result<ResultReport, Error>;
 /// A spawned worker run.
 struct Run {
     worker: String,
+    /// Repository resource isolated by this run; other writes remain exclusive.
+    isolated_repo: Option<String>,
     /// The id the controller gave the run (the brief's `run`), which the
     /// worker's [`Worker::usage`] answers for.
     run_id: String,

@@ -538,3 +538,40 @@ async fn peer_advertising_plan_tool_still_runs_ordinary_work() {
     assert_eq!(row.status, Status::Done);
     assert!(!h.script.briefs().is_empty());
 }
+
+#[tokio::test]
+async fn an_old_capability_success_cannot_reawaken_a_new_failure_forever() {
+    let h = Harness::new(&[]);
+    let id = h.file_one(draft("task", "requires a tool")).await;
+    let cap = h.file_one(draft("cap", "capability prerequisite")).await;
+    let mut waiting = h.item(&id).await;
+    let mut capability = h.item(&cap).await;
+    let now = Utc::now();
+    waiting.status = Status::Blocked(BlockedReason::NeedsTool);
+    waiting.updated_at = now;
+    capability.kind = WorkKind::Capability;
+    capability.status = Status::Done;
+    capability.closed_at = Some(now - TimeDelta::seconds(1));
+    let edge = rustykrab_core::work::Edge {
+        item: id.clone(),
+        kind: EdgeKind::Blocks,
+        depends_on: cap,
+    };
+    let snapshot = crate::graph::Snapshot::new(
+        vec![waiting.clone(), capability.clone()],
+        vec![edge.clone()],
+    );
+    assert!(crate::controller::filing::parked_on_landed_capability(&snapshot).is_empty());
+    capability.closed_at = Some(now + TimeDelta::seconds(1));
+    let snapshot = crate::graph::Snapshot::new(
+        vec![waiting.clone(), capability.clone()],
+        vec![edge.clone()],
+    );
+    assert_eq!(
+        crate::controller::filing::parked_on_landed_capability(&snapshot),
+        vec![id]
+    );
+    waiting.updated_at = now + TimeDelta::seconds(2);
+    let snapshot = crate::graph::Snapshot::new(vec![waiting, capability], vec![edge]);
+    assert!(crate::controller::filing::parked_on_landed_capability(&snapshot).is_empty());
+}

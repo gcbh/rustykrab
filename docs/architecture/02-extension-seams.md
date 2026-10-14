@@ -302,3 +302,10 @@ proposal into a permission grant. The controller reuses judgment storage and
 ordinary review/approval transactions; its existing tick applies exact reviewed
 templates before worker selection. No new trait, dependency, scheduler or table
 is introduced. Exact matching and explicit revocation remain host decisions.
+
+The default-false `Worker::isolates_worktree` lets an adapter opt into parallel
+first-repository execution only when it confines work to the supplied isolated
+checkout. Local repository-shell and native adapters opt in, their CLI wrappers
+forward the guarantee, and peers/default executors retain shared repository
+locks. File grants reuse WorkerSpec and capabilities; the agent's scoped host
+file wrapper enforces exact paths without a new executor or queue.

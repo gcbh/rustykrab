@@ -683,7 +683,7 @@ ids or every failed check with a typed reason:
 | no cycle over `blocks`, `waits_for` and `conditional_on_failure` edges and parent links; no such edge between an item and its own ancestor or descendant | `cycle` |
 | depth and item count within policy caps (for example 3 levels, 12 items) | `depth_exceeded`, `too_many_items` |
 | children's budgets sum to no more than the parent's remaining budget | `over_budget` |
-| two items in the subtree that write the same resource are ordered by a path of `blocks` or `waits_for` edges | `single_writer_conflict` |
+| two items in the subtree that write the same non-isolated resource are ordered by a path of `blocks` or `waits_for` edges | `single_writer_conflict` |
 | no edge split only for sequence: sole downstream of its upstream, sole upstream of its downstream, same worker kind and writable resources, no approval point, downstream trigger `now` | accepted by default as small execution slices; explicit legacy policy may warn or reject with `sequential_split` |
 | a `conditional_on_failure` item has no other upstream edge | `plan_b_edges` |
 | an ordering edge onto an existing item only while that item is waiting; every `inputs_from` entry an item the downstream is ordered after; no filing of an item already cancelled or held (4.3, 4.4) | `edge_onto_active`, `input_unordered`, `dead_filing` |
@@ -1475,7 +1475,7 @@ with its reason, so the planner can fix the graph in one pass.
 | no cycle over all edge kinds and parent links together | `cycle`, offending = the temp ids on the cycle |
 | parent tree depth and item count within the policy caps | `depth_exceeded`, `too_many_items` |
 | children's budgets sum within the root's budget (or an existing parent's remaining budget) | `over_budget` |
-| no two unordered items in the graph write the same resource | `single_writer_conflict` |
+| no two unordered items in the graph write the same non-isolated resource | `single_writer_conflict` |
 | no `blocks` link joins steps that belong in one worker: the downstream has no other upstream, the upstream no other downstream, and the downstream adds no kind, trigger, precondition, worker constraint or writable resource the upstream lacks | accepted by default as small execution slices; explicit legacy policy may warn or reject with `sequential_split` |
 | a `conditional_on_failure` item has no other upstream edge | `plan_b_edges` |
 | an ordering edge onto an existing item only while that item is `queued`, `ready` or `blocked` | `edge_onto_active` |
@@ -1965,3 +1965,19 @@ reason to create small tasks. Root-level multi-draft post-tasks are one atomic
 graph under a follow-up group, preserving sibling temporary references and
 verified input dependencies. Existing code authorization, graph caps, finite
 budgets and writable-resource ordering still apply.
+
+### Isolated repository scheduling follow-up (base 5bc3309)
+
+The single-writer rule applies to actual shared writable state. First-repository
+execution in controller-owned worktrees may overlap on adapters explicitly
+advertising isolation. An extra repository or an external file/calendar/mailbox
+remains shared and requires exclusivity. Explicit graph dependencies remain
+ordering constraints; merely sharing a repository is not an implicit dependency
+for independent isolated tasks. Verified branch integration remains coordinated
+by the controller's existing continuation-base logic and refuses conflicts.
+
+Operator `writable_files` worker grants cover exact files through scoped host
+read/edit/write tools, never an ambient shell or parent directory. Historical
+controller-created failure waits on stopped prerequisites recover through the
+sweep only with a matching improve-rung receipt; approvals and ordinary ordering
+edges remain independent. Capacity and budget ceilings are unchanged.
