@@ -894,7 +894,25 @@ impl Worker for LocalWorker {
     }
 
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
-        let (mut host_tools, mut ceiling) = self.catalog();
+        let review = is_read_only_review(&brief);
+        if review
+            && (brief.workspace.is_some()
+                || !brief.writable_resources.is_empty()
+                || !brief.required_mcp_servers.is_empty()
+                || brief
+                    .required_tools
+                    .iter()
+                    .any(|name| name != "result_report"))
+        {
+            return Err(Error::Auth(
+                "read-only review requests execution or writable scope".into(),
+            ));
+        }
+        let (mut host_tools, mut ceiling) = if review {
+            (Vec::new(), vec!["result_report".to_string()])
+        } else {
+            self.catalog()
+        };
         let files: Vec<std::path::PathBuf> = brief
             .writable_resources
             .iter()
@@ -919,9 +937,12 @@ impl Worker for LocalWorker {
             host_tools.retain(|t| !denied(t.name()));
             ceiling.retain(|t| !denied(t));
         }
-        let mut activate = self
-            .activation(&brief, &ceiling)
-            .map_err(RunFailure::into_error)?;
+        let mut activate = if review {
+            ceiling.clone()
+        } else {
+            self.activation(&brief, &ceiling)
+                .map_err(RunFailure::into_error)?
+        };
         if !files.is_empty() || !self.readable_files.is_empty() {
             for name in ["read", "edit", "write"] {
                 if ceiling.iter().any(|n| n == name) && !activate.iter().any(|n| n == name) {
@@ -999,7 +1020,10 @@ impl LocalWorker {
     ) -> Result<ResultReport> {
         // Fresh `work_*` tools per run, over a recorder, so the run returns
         // exactly the report the backend accepted and nothing else.
-        let recorder = Arc::new(RecordingBackend::new(self.backend.clone()));
+        let review = is_read_only_review(&brief);
+        let mut backend = RecordingBackend::new(self.backend.clone());
+        backend.read_only = review;
+        let recorder = Arc::new(backend);
         let mut tools = rustykrab_tools::work_tools(recorder.clone());
         if self.full_reports {
             tools.retain(|tool| tool.name() != "result_report");
@@ -1039,6 +1063,9 @@ impl LocalWorker {
                 None => t,
             }
         }));
+        if review {
+            tools.retain(|tool| tool.name() == "result_report");
+        }
         // Every call is a step in the progress ledger (section 6, step 7).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
         let tools: Vec<Arc<dyn Tool>> = tools
@@ -1098,7 +1125,7 @@ impl LocalWorker {
         let mut runner = AgentRunner::new(provider, tools, self.sandbox.clone())
             .with_config(config)
             .with_active_tools(active);
-        if let Some(recall) = &self.recall {
+        if let Some(recall) = self.recall.as_ref().filter(|_| !review) {
             runner = runner.with_recall_store(recall.clone());
         }
 
@@ -1289,6 +1316,13 @@ fn report_from_text(text: &str, full_report: bool) -> ResultReport {
         summary,
         ..ResultReport::default()
     }
+}
+
+fn is_read_only_review(brief: &Brief) -> bool {
+    brief
+        .artifact_refs
+        .iter()
+        .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
 }
 
 /// The last non-empty text the model wrote, if any.
@@ -1725,6 +1759,7 @@ struct RecordingBackend {
     inner: Arc<dyn WorkBackend>,
     reports: Mutex<Vec<ResultReport>>,
     commands: Arc<Mutex<Vec<String>>>,
+    read_only: bool,
 }
 
 impl RecordingBackend {
@@ -1733,6 +1768,7 @@ impl RecordingBackend {
             inner,
             reports: Mutex::new(Vec::new()),
             commands: Arc::new(Mutex::new(Vec::new())),
+            read_only: false,
         }
     }
 
@@ -1779,6 +1815,21 @@ impl WorkBackend for RecordingBackend {
         report: ResultReport,
         provenance: Provenance,
     ) -> Result<()> {
+        // A report is the sole local review tool, not an alternate route to
+        // file work, ask questions, install classifiers or claim execution.
+        if self.read_only
+            && (!report.artifacts.is_empty()
+                || !report.changed_paths.is_empty()
+                || report.commit.is_some()
+                || !report.checks_run.is_empty()
+                || report.blocked.is_some()
+                || !report.questions.is_empty()
+                || !report.discovered.is_empty())
+        {
+            return Err(Error::Auth(
+                "read-only review may report only its summary, known limits and failure".into(),
+            ));
+        }
         let mut report = report;
         report
             .artifacts
@@ -2486,6 +2537,121 @@ mod tests {
             (ErrorClass::CapabilityGap, ErrorSubclass::ToolGap),
             "{err}"
         );
+    }
+
+    fn review_brief() -> Brief {
+        let mut b = brief("review-fixture");
+        b.artifact_refs.push(ArtifactRef {
+            kind: rustykrab_core::dream_review::REVIEW_ONLY.into(),
+            value: "true".into(),
+        });
+        b
+    }
+    #[tokio::test]
+    async fn read_only_local_review_cannot_write_or_file_work_but_returns_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist");
+        let provider = Recording::new(vec![
+            batch(vec![
+                tool_call(
+                    "write",
+                    json!({"path":target.display().to_string(),"content":"unexpected mutation"}),
+                ),
+                tool_call(
+                    "work_file",
+                    json!({"title":"Unauthorized discovered work","objective":"execute a new task","done_when":"finished"}),
+                ),
+            ]),
+            report("frozen review result"),
+        ]);
+        let (mut worker, backend) = worker(
+            provider.clone(),
+            vec![Arc::new(rustykrab_tools::WriteTool::in_dir(dir.path()))],
+        );
+        let mut definition = (*worker.definition).clone();
+        definition.tools.push("write".into());
+        worker.definition = Arc::new(definition);
+        let got = worker.run(review_brief()).await.unwrap();
+        assert_eq!(got.summary, "frozen review result");
+        assert!(!target.exists(), "review invoked a host write");
+        assert_eq!(
+            backend.calls().len(),
+            1,
+            "only the result report reaches the work backend"
+        );
+        for (_, schemas) in provider.requests() {
+            assert_eq!(schemas, vec!["result_report"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_local_review_rejects_authority_in_report_before_forwarding() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let mut recorder = RecordingBackend::new(stub.clone());
+        recorder.read_only = true;
+        let provenance = Provenance {
+            conversation_id: None,
+            filed_by_item: None,
+            actor: "worker:pinch".into(),
+        };
+        for report in [
+            ResultReport {
+                summary: "claim".into(),
+                discovered: vec![WorkItemDraft {
+                    title: "new work".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ResultReport {
+                summary: "claim".into(),
+                artifacts: vec![ArtifactRef {
+                    kind: "classifier_rule".into(),
+                    value: "invented authority".into(),
+                }],
+                ..Default::default()
+            },
+            ResultReport {
+                summary: "claim".into(),
+                commit: Some("fake-commit".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(recorder
+                .report("review-fixture".into(), report, provenance.clone())
+                .await
+                .is_err());
+        }
+        assert!(stub.calls().is_empty());
+        assert!(recorder.take().is_empty());
+        recorder
+            .report(
+                "review-fixture".into(),
+                ResultReport {
+                    summary: "legitimate JSON review".into(),
+                    ..Default::default()
+                },
+                provenance,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stub.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_local_review_rejects_conflicting_scope_before_model_execution() {
+        for conflict in 0..3 {
+            let provider = Recording::new(vec![report("must not run")]);
+            let (worker, _) = worker(provider.clone(), vec![Arc::new(Named("exec"))]);
+            let mut b = review_brief();
+            match conflict {
+                0 => b.writable_resources = vec!["repo:/tmp/fixture".into()],
+                1 => b.required_tools = vec!["exec".into()],
+                _ => b.required_mcp_servers = vec!["external".into()],
+            }
+            assert!(matches!(worker.run(b).await, Err(Error::Auth(_))));
+            assert!(provider.requests().is_empty());
+        }
     }
 
     #[tokio::test]
