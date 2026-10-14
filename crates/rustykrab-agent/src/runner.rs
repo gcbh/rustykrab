@@ -579,6 +579,131 @@ fn portable_shape(conv: &mut Conversation) -> usize {
     changed
 }
 
+/// Give every tool call that has no result one that says so, placed where
+/// its batch's results belong. A run that ended mid-step (its wall budget,
+/// a crash) leaves such calls in a kept conversation, and a provider that
+/// pairs calls with results (Ollama) refused the whole history, so the
+/// next run on it failed before its first model call (a scheduled job's
+/// conversation, 2026-10-13). Answered, the model reads what happened and
+/// goes on. Returns how many results it added.
+fn answer_unresolved_calls(conv: &mut Conversation) -> usize {
+    fn unresolved(call_id: String) -> Message {
+        Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id,
+                output: serde_json::json!({
+                    "error": "this call did not return: the run that made it ended first",
+                    "outcome": "unknown",
+                    "next_step": "Inspect the state before retrying; the action may already have happened.",
+                }),
+                is_error: true,
+                images: Vec::new(),
+            }),
+        )
+    }
+    let mut added = 0;
+    let mut pending: Vec<String> = Vec::new();
+    let mut messages = Vec::with_capacity(conv.messages.len());
+    for message in std::mem::take(&mut conv.messages) {
+        if let MessageContent::ToolResult(result) = &message.content {
+            pending.retain(|id| *id != result.call_id);
+            messages.push(message);
+            continue;
+        }
+        added += pending.len();
+        messages.extend(pending.drain(..).map(unresolved));
+        pending.extend(message.content.tool_calls().iter().map(|c| c.id.clone()));
+        messages.push(message);
+    }
+    added += pending.len();
+    messages.extend(pending.drain(..).map(unresolved));
+    conv.messages = messages;
+    added
+}
+
+#[cfg(test)]
+mod unresolved_call_tests {
+    use super::*;
+
+    fn calls(ids: &[&str]) -> Message {
+        Message::stamped(
+            Role::Assistant,
+            MessageContent::MultiToolCall(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: (*id).into(),
+                        name: "noop".into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    fn result(id: &str) -> Message {
+        Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id: id.into(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        )
+    }
+
+    fn shape(conv: &Conversation) -> Vec<String> {
+        conv.messages
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.is_error => format!("unresolved:{}", r.call_id),
+                MessageContent::ToolResult(r) => format!("result:{}", r.call_id),
+                MessageContent::MultiToolCall(c) => format!("calls:{}", c.len()),
+                _ => "text".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_left_without_a_result_is_answered_where_its_batch_ends() {
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        conv.messages = vec![
+            Message::stamped(Role::User, MessageContent::Text("brief".into())),
+            calls(&["a", "b"]),
+            result("a"),
+            // The run ended here; the next one appended its brief.
+            Message::stamped(Role::User, MessageContent::Text("again".into())),
+            calls(&["c"]),
+        ];
+        assert_eq!(answer_unresolved_calls(&mut conv), 2);
+        assert_eq!(
+            shape(&conv),
+            [
+                "text",
+                "calls:2",
+                "result:a",
+                "unresolved:b",
+                "text",
+                "calls:1",
+                "unresolved:c"
+            ]
+        );
+        assert_eq!(answer_unresolved_calls(&mut conv), 0, "idempotent");
+    }
+}
+
 /// Whether `message` is a completion reminder the runner sent: the
 /// `task_complete` reminder, or a worker run's `result_report` one.
 fn is_completion_reminder(message: &Message) -> bool {
@@ -2169,11 +2294,11 @@ impl AgentRunner {
         // And notices stored as system messages by older builds become the
         // user turns every notice is now, so no request of this run carries
         // a system message after the first (plan section 12.1).
-        let reshaped = portable_shape(conv);
+        let reshaped = portable_shape(conv) + answer_unresolved_calls(conv);
         if reshaped > 0 {
             tracing::debug!(
                 reshaped,
-                "stored non-leading system messages sent as [System notice] user turns"
+                "stored history reshaped: system notices as user turns, unresolved calls answered"
             );
             // Edited in place: the incremental estimate and the usage
             // anchor no longer describe this history.
