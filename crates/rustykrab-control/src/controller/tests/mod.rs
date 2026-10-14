@@ -8,6 +8,7 @@
 mod bounds;
 mod checks;
 mod closeout;
+mod dispatchability;
 mod drain;
 mod investigation;
 mod loop_status;
