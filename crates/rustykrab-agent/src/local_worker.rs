@@ -30,11 +30,10 @@
 //!   run and removed after it, with `exec` bound to it, so the run works
 //!   and commits in the isolated checkout the controller verifies
 //!   (section 5);
-//! - the brief's token budget enforced at the provider (`metered.rs`): once
-//!   the run's calls have used it, the next call is refused with a typed
-//!   `budget/tokens` failure, and what the run spent is kept for the
-//!   controller's [`Worker::usage`] (tokens, wall time, iterations and
-//!   completion reminders).
+//! - what the run spends counted at the provider (`metered.rs`) and kept
+//!   for the controller's [`Worker::usage`] (tokens, wall time, iterations
+//!   and completion reminders). Tokens are counted, never refused: the
+//!   prompt's size is compaction's to manage.
 //!
 //! A run whose id names a conversation the host keeps (a scheduled job's
 //! persistent conversation, [`RunTranscripts::resume`]) continues it
@@ -1054,10 +1053,9 @@ impl LocalWorker {
         // Kept to read the run's tool gaps once it ends.
         let registry = active.clone();
 
-        // What the run spends, kept for the controller whatever happens to
-        // it, and its token budget enforced at the provider.
+        // What the run spends, kept for the controller whatever happens to it.
         let spending = Arc::new(Spending {
-            meter: Arc::new(Meter::new(brief.budget.tokens)),
+            meter: Arc::new(Meter::new()),
             tracer: Arc::new(ExecutionTracer::new()),
             started: Instant::now(),
             wall: Mutex::new(None),
@@ -2928,44 +2926,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_token_budget_stops_the_run_at_its_next_model_call() {
+    async fn tokens_are_counted_but_never_stop_the_run() {
         let provider = Recording::new(vec![
             costing(call("noop", json!({})), 700),
             costing(call("noop", json!({})), 700),
-            costing(report("too late"), 700),
+            costing(report("done"), 700),
         ]);
-        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
         let mut b = brief("item-20");
+        b.required_tools = vec!["noop".into()];
         b.budget.tokens = 1_000;
         b.run = Some(Uuid::new_v4().to_string());
         let run = b.run.clone().unwrap();
 
-        let err = w.run(b).await.unwrap_err();
+        let report = w.run(b).await.unwrap();
 
-        assert!(
-            matches!(
-                RunFailure::from_error(&err),
-                Some(RunFailure::Budget {
-                    budget: BudgetKind::Tokens,
-                    ..
-                })
-            ),
-            "{err}"
-        );
-        assert_eq!(
-            classified(&err),
-            (ErrorClass::Budget, ErrorSubclass::Tokens)
-        );
-        assert_eq!(
-            provider.requests().len(),
-            2,
-            "the third call never went out"
-        );
-        assert!(stub.calls().is_empty());
-
+        assert_eq!(report.summary, "done");
+        assert_eq!(provider.requests().len(), 3);
         let usage = w.usage(&run).expect("the run's spend");
-        assert_eq!(usage.tokens, 1_400);
-        // The third turn began and was refused at its model call.
+        assert_eq!(usage.tokens, 2_100);
         assert_eq!(usage.iterations, 3);
         assert_eq!(w.usage(&run), None, "taken once");
     }
