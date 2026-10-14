@@ -11,6 +11,9 @@ const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100KB
 /// All other commands are rejected to prevent arbitrary command injection.
 const ALLOWED_COMMANDS: &[&str] = &[
     "ls",
+    "cd",
+    "rm",
+    "rg",
     "cat",
     "head",
     "tail",
@@ -168,31 +171,40 @@ fn truncate_output(s: String) -> String {
     }
 }
 
-/// Split a shell command on control operators that occur outside quotes.
+/// Split a shell command into the commands it runs, on the control
+/// operators and newlines that occur outside quotes.
 ///
 /// This is intentionally narrower than a complete shell parser: command
 /// execution still belongs to `sh -c`, while this pass only identifies the
 /// command boundaries that must be checked against the allowlist. Treating
 /// quoted operators as boundaries would turn a grep pattern such as
-/// `'GMAIL|EMAIL|PASSWORD'` into three apparent commands.
+/// `'GMAIL|EMAIL|PASSWORD'` into three apparent commands. An `&` inside a
+/// redirect (`2>&1`, `>&2`, `&>file`) is part of that redirect, not a
+/// boundary, and a here-document's body (`<<EOF` … `EOF`) is the input of
+/// its command, not commands of its own.
 fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
     #[derive(Clone, Copy)]
     enum Quote {
         Single,
         Double,
     }
-
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut segments = Vec::new();
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
-
-    for (index, ch) in command.char_indices() {
+    // Here-document delimiters opened on the current line, in order.
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let (index, ch) = chars[i];
+        let prev = i.checked_sub(1).map(|p| chars[p].1);
+        let next = chars.get(i + 1).map(|&(_, c)| c);
         if escaped {
             escaped = false;
+            i += 1;
             continue;
         }
-
         match quote {
             Some(Quote::Single) => {
                 if ch == '\'' {
@@ -208,24 +220,97 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                 '\'' => quote = Some(Quote::Single),
                 '"' => quote = Some(Quote::Double),
                 '\\' => escaped = true,
+                '&' if matches!(prev, Some('>' | '<')) || next == Some('>') => {}
+                '<' if next == Some('<') && chars.get(i + 2).map(|&(_, c)| c) != Some('<') => {
+                    let (delimiter, strip_tabs, after) = heredoc_delimiter(&chars, i + 2)?;
+                    heredocs.push((delimiter, strip_tabs));
+                    i = after;
+                    continue;
+                }
                 '|' | ';' | '&' => {
                     segments.push(&command[start..index]);
                     start = index + ch.len_utf8();
                 }
+                '\n' => {
+                    segments.push(&command[start..index]);
+                    start = index + 1;
+                    // The lines after a here-document's line are its body,
+                    // up to the line that is exactly its delimiter.
+                    for (delimiter, strip_tabs) in std::mem::take(&mut heredocs) {
+                        loop {
+                            let Some(&(line_start, _)) = chars.get(i + 1) else {
+                                // Unterminated: the rest is input, not commands.
+                                return Ok(segments);
+                            };
+                            let line_end = command[line_start..]
+                                .find('\n')
+                                .map_or(command.len(), |n| line_start + n);
+                            let line = &command[line_start..line_end];
+                            let line = if strip_tabs {
+                                line.trim_start_matches('\t')
+                            } else {
+                                line
+                            };
+                            while chars.get(i + 1).is_some_and(|&(at, _)| at <= line_end) {
+                                i += 1;
+                            }
+                            if line == delimiter {
+                                break;
+                            }
+                        }
+                        start = chars.get(i + 1).map_or(command.len(), |&(at, _)| at);
+                    }
+                }
                 _ => {}
             },
         }
+        i += 1;
     }
-
     if escaped {
         return Err("command ends with an incomplete escape".into());
     }
     if quote.is_some() {
         return Err("command contains an unterminated quote".into());
     }
-
     segments.push(&command[start..]);
     Ok(segments)
+}
+
+/// Read a here-document's delimiter word starting at `chars[at]` (just past
+/// `<<`): an optional `-` (strip leading tabs), optional blanks, then the
+/// word, bare or quoted. Returns the word, the tab flag, and the index after.
+fn heredoc_delimiter(
+    chars: &[(usize, char)],
+    mut at: usize,
+) -> std::result::Result<(String, bool, usize), String> {
+    let strip_tabs = chars.get(at).is_some_and(|&(_, c)| c == '-');
+    if strip_tabs {
+        at += 1;
+    }
+    while chars.get(at).is_some_and(|&(_, c)| c == ' ' || c == '\t') {
+        at += 1;
+    }
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    while let Some(&(_, c)) = chars.get(at) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
+                break
+            }
+            None => word.push(c),
+        }
+        at += 1;
+    }
+    if quote.is_some() {
+        return Err("here-document delimiter has an unterminated quote".into());
+    }
+    if word.is_empty() {
+        return Err("here-document has no delimiter".into());
+    }
+    Ok((word, strip_tabs, at))
 }
 
 /// Validate that all commands in a potentially piped command are allowed.
@@ -235,9 +320,10 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
 /// via `sh -c` and the agent needs these for real-world tasks (e.g.
 /// `echo $HOME`, `python3 script.py > output.txt`).
 fn validate_command(command: &str) -> std::result::Result<(), String> {
-    // Block newline injection (could bypass allowlist via multi-line commands).
-    if command.contains('\n') || command.contains('\r') {
-        return Err("command contains newline characters".into());
+    // Newlines separate commands, and each is checked below. A carriage
+    // return separates nothing and has no use here.
+    if command.contains('\r') {
+        return Err("command contains carriage return characters".into());
     }
 
     // Block shell substitution patterns that bypass the allowlist.
@@ -258,8 +344,8 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
             continue;
         }
 
-        // Skip redirect-only fragments (e.g. "> file", "2>&1").
-        if segment.starts_with('>') || segment.starts_with('<') {
+        // Skip redirect-only fragments (e.g. "> file") and comment lines.
+        if segment.starts_with('>') || segment.starts_with('<') || segment.starts_with('#') {
             continue;
         }
 
@@ -411,6 +497,54 @@ mod validation_tests {
     }
 
     #[test]
+    fn permits_directory_changes_removal_and_ripgrep() {
+        validate_command("cd src && ls").unwrap();
+        validate_command("rm -f build/out.txt").unwrap();
+        validate_command("rg -n 'fn main' src").unwrap();
+    }
+
+    #[test]
+    fn an_ampersand_in_a_redirect_is_not_a_boundary() {
+        validate_command("cargo test 2>&1 | tail -20").unwrap();
+        validate_command("echo warning >&2").unwrap();
+        validate_command("python3 run.py &> out.log").unwrap();
+        validate_command("python3 run.py &>> out.log").unwrap();
+        validate_command("cat <&3").unwrap();
+        // Background and `&&` still split.
+        let error = validate_command("sleep 1 & definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        let error = validate_command("ls && definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+    }
+
+    #[test]
+    fn newlines_separate_commands_that_are_each_checked() {
+        validate_command("cd src\nls -la\n# a comment\npwd").unwrap();
+        validate_command("python3 -c \"import sys\nprint(sys.version)\"").unwrap();
+        let error = validate_command("ls\ndefinitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        assert!(validate_command("ls\r\npwd").is_err());
+    }
+
+    #[test]
+    fn a_heredoc_body_is_input_not_commands() {
+        validate_command("cat > f.py <<'EOF'\nimport os\nnot-a-command here\nEOF\npython3 f.py")
+            .unwrap();
+        validate_command("cat <<EOF > notes.md\n# Title\nbody\nEOF").unwrap();
+        validate_command("cat <<-\"END\"\n\tindented\n\tEND\nls").unwrap();
+        // The command after the body is still checked.
+        let error = validate_command("cat <<EOF\nbody\nEOF\ndefinitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        // The command that reads the body is checked too.
+        let error = validate_command("bash <<EOF\nls\nEOF").unwrap_err();
+        assert!(error.contains("bash"));
+        // Substitution stays blocked, in a body as anywhere else.
+        assert!(validate_command("cat <<EOF\n$(definitely-not-allowed)\nEOF").is_err());
+        // A here-string is not a here-document.
+        validate_command("grep x <<< 'x y'").unwrap();
+    }
+
+    #[test]
     fn rejects_incomplete_shell_quoting() {
         assert!(validate_command("echo 'unterminated").is_err());
         assert!(validate_command("echo incomplete\\").is_err());
@@ -445,6 +579,28 @@ mod error_typing_tests {
             pwd.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn multi_line_scripts_run_as_the_shell_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let out = ExecTool::in_dir(dir.path())
+            .execute(json!({
+                "command": "cd sub\ncat > note.txt <<'EOF'\nline $HOME\nEOF\ncat note.txt missing.txt 2>&1\nrm note.txt\nls"
+            }))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("line $HOME"),
+            "quoted body kept literal: {stdout}"
+        );
+        assert!(
+            stdout.contains("missing.txt"),
+            "stderr joined to stdout: {stdout}"
+        );
+        assert!(!dir.path().join("sub/note.txt").exists());
     }
 
     #[tokio::test]
