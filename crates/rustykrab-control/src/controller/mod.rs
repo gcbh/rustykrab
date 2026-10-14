@@ -33,8 +33,12 @@
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
 //!    available compatible resource by cost, without category gates; the
 //!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a repository-scoped
-//!    item, its workspace, and the run is spawned under tokio. A run that
-//!    ends or is stopped has its spend recorded (`spend.rs`).
+//!    item, its workspace, and the run is spawned under tokio. A leaf whose
+//!    cumulative budget is spent is not leased: it fails `budget/*` and
+//!    surfaces for its owner (`spend.rs`). Each lease records the attempt's
+//!    state, and a failure judged later is compared with the item's last
+//!    ones by the repeated-outcome breaker (`breaker.rs`). A run that ends
+//!    or is stopped has its spend recorded (`spend.rs`).
 //! 4. **Aging** (4.6), when nothing is running.
 //!
 //! Every transaction that closes a root, expires an item or surfaces a
@@ -45,13 +49,15 @@
 //! Layout: `batch.rs` builds one transaction over a working snapshot;
 //! `load.rs` reads the store back (the snapshot, rung histories, a
 //! firing's conversation); `spend.rs` records what runs spend and gives
-//! parents their remaining budgets; `reattach.rs` keeps a run that
+//! parents their remaining budgets and leaves their cumulative one;
+//! `breaker.rs` is the repeated-outcome circuit breaker; `reattach.rs` keeps a run that
 //! outlived a restart (a peer's task) on its lease;
 //! `brief.rs` builds a run's inputs and brief; `filing.rs` is every filing
 //! path and the user's approve, reject and cancel; `tick.rs` is the loop;
 //! `notice.rs` renders the 6.6 message.
 
 mod batch;
+mod breaker;
 mod brief;
 mod commit;
 mod credentials;
@@ -350,7 +356,16 @@ pub struct ControllerConfig {
     /// Recorded with every run (`daemon_build` evidence), and what tells
     /// the daemon's own source checkout from any other repository.
     pub build: Option<crate::investigate::BuildId>,
+    /// Failed attempts in a row with the same failure fingerprint and the
+    /// same attempt state that trip the repeated-outcome circuit breaker
+    /// (`breaker.rs`): the item gets no further identical attempt and waits
+    /// on one investigation of the failure. Zero turns the breaker off.
+    /// The daemon reads `RUSTYKRAB_BREAKER_REPEATS`.
+    pub breaker_repeats: u32,
 }
+
+/// [`ControllerConfig::breaker_repeats`] unless configured.
+pub const DEFAULT_BREAKER_REPEATS: u32 = 3;
 
 impl Default for ControllerConfig {
     fn default() -> Self {
@@ -384,6 +399,7 @@ impl Default for ControllerConfig {
             investigation_root: None,
             daemon_log_dir: None,
             build: None,
+            breaker_repeats: DEFAULT_BREAKER_REPEATS,
         }
     }
 }

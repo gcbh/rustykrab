@@ -12,7 +12,8 @@
 //! copied set is stored with the lease, so the brief can be rebuilt.
 
 use rustykrab_core::work::{
-    ArtifactRef, EdgeKind, EventKind, Evidence, InputRef, Status, WorkItem, WorkItemId, WorkKind,
+    ArtifactRef, Budget, EdgeKind, EventKind, Evidence, InputRef, Status, WorkItem, WorkItemId,
+    WorkKind,
 };
 use rustykrab_core::Error;
 
@@ -132,7 +133,12 @@ impl Controller {
                     }
                     continue;
                 }
-                if ev.kind == ERROR || ev.verified_by.is_none() {
+                // A budget grant is the owner's say on this item's spend,
+                // not a result to hand on.
+                if ev.kind == ERROR
+                    || ev.kind == super::spend::BUDGET_GRANT
+                    || ev.verified_by.is_none()
+                {
                     continue;
                 }
                 push_ref(
@@ -180,13 +186,16 @@ impl Controller {
 
 /// The brief for one run (plan section 6, step 4): the item's typed fields,
 /// its inputs, and for a repair run its own evidence and last error. Tools
-/// a capability rung acquired are activated up front.
+/// a capability rung acquired are activated up front. `budget` is what is
+/// left of the item's cumulative budget ([`Controller::cumulative_budget`]),
+/// not a fresh allotment: every attempt draws on the same one.
 pub(super) fn brief_for(
     item: &WorkItem,
     inputs: Vec<InputRef>,
     more_inputs: Vec<WorkItemId>,
     prior_evidence: Vec<Evidence>,
     history: &History,
+    budget: Budget,
 ) -> Brief {
     let mut required_tools = item.required_tools.clone();
     for tool in &history.activate {
@@ -211,7 +220,7 @@ pub(super) fn brief_for(
         more_inputs,
         prior_evidence,
         last_error: history.repair.clone(),
-        budget: item.budget,
+        budget,
         origin_conversation_id: item.origin_conversation_id.clone(),
         run: None,
         workspace: None,

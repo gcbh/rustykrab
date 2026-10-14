@@ -1981,3 +1981,21 @@ read/edit/write tools, never an ambient shell or parent directory. Historical
 controller-created failure waits on stopped prerequisites recover through the
 sweep only with a matching improve-rung receipt; approvals and ordinary ordering
 edges remain independent. Capacity and budget ceilings are unchanged.
+
+### Bounded recovery follow-up (base 619d476)
+
+A leaf's budget (4.2) is cumulative: every attempt, restart and revival draws
+on `budget × (1 + grants) − spent` in iterations, tokens and wall time, from
+`work_spend`. A leaf with too little left is not leased; it fails
+`budget/<dimension>` observed by the controller and surfaces
+`blocked(budget_exhausted)`. Answering that question, or a surfaced
+`verification_failed` one, resumes the item when its owner or a delegate
+answers; the answer that releases a spent budget grants one allotment, at most
+one per question, and a no cancels. Other open questions and approval holds
+still hold it. Each lease records the attempt's state; the same failure
+fingerprint in the same state on the last three counted attempts (budget
+failures do not count) trips a circuit breaker, which files or reuses one
+investigation through the order-3 path instead of another identical attempt
+and surfaces once when none can be filed. The ladder rung that queued an
+attempt is part of its state, so the ladder's own bounded retries and repairs
+stay as section 8 describes them.

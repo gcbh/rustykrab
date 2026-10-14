@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- feat: bounded recovery. A work item's budget is cumulative over all its
+  attempts, restarts and revivals; one whose budget is spent is not leased and
+  asks its owner, whose answer grants one more allotment. Answers now resume
+  items stopped on a spent budget or a failed verification. A failure that
+  comes back three times running with nothing changed trips a circuit breaker
+  that queues the item behind one investigation instead of another identical
+  attempt (`RUSTYKRAB_BREAKER_REPEATS`, default 3).
+
 ## [6.5.7] - 2026-10-14
 
 - fix: restore parallel worker execution and queue progress (#693)

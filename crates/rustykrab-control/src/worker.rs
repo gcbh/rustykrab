@@ -188,6 +188,18 @@ pub trait Worker: Send + Sync {
     fn runtime_status(&self) -> Option<serde_json::Value> {
         None
     }
+    /// What this worker's runs are allowed to do, as a stable value: the
+    /// settings that change an agent's authority (its tool ceiling or its
+    /// allowed and denied tool lists, permission mode, repositories,
+    /// delegated files and extra directories, model). The controller hashes
+    /// it into each attempt's identity (`attempt_state`), so an access
+    /// repair is a change the repeated-outcome breaker sees. Never a secret
+    /// value or an environment value, and nothing that differs run to run
+    /// (a run id, a temporary path, a process). Default: the advertised
+    /// [`Worker::capabilities`].
+    fn access_profile(&self) -> serde_json::Value {
+        serde_json::to_value(self.capabilities()).unwrap_or_default()
+    }
     /// Run one brief to its typed result. The controller verifies the result
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;

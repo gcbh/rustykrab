@@ -1545,6 +1545,19 @@ async fn main() -> anyhow::Result<()> {
     {
         control_config.aging_max_gap = chrono::TimeDelta::seconds(secs.max(1));
     }
+    // Failed attempts in a row, same failure in the same state, before the
+    // repeated-outcome breaker stops retrying an item and files one
+    // investigation instead; 0 turns it off.
+    if let Ok(raw) = std::env::var("RUSTYKRAB_BREAKER_REPEATS") {
+        match raw.trim().parse::<u32>() {
+            Ok(n) => control_config.breaker_repeats = n,
+            Err(_) => tracing::warn!(
+                value = %raw,
+                default = rustykrab_control::controller::DEFAULT_BREAKER_REPEATS,
+                "RUSTYKRAB_BREAKER_REPEATS is not a whole number; using the default"
+            ),
+        }
+    }
     // A self-building daemon holds its workers' follow-up items for a
     // person (plan 6.1's approval hold), so they never run on a base that
     // lacks their siblings' unmerged work.

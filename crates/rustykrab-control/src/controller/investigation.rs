@@ -89,8 +89,8 @@ impl Controller {
                     event.actor == "controller"
                         && crate::ladder::rung_event(event).is_some_and(|r| {
                             r.rung == Rung::Improve
-                                && r.outcome
-                                    == format!("waiting on resolution item {}", edge.depends_on)
+                                && crate::investigate::resolution_item(&r.outcome)
+                                    == Some(edge.depends_on.as_str())
                         })
                 })
                 .is_some_and(|position| {
