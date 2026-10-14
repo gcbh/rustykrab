@@ -187,6 +187,7 @@ fn brief(required: &[&str]) -> Brief {
         workspace: None,
         capability: None,
         project_context: None,
+        investigation: None,
     }
 }
 

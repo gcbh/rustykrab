@@ -81,6 +81,14 @@ pub struct Brief {
     /// Durable, provider-neutral project state frozen at lease time.
     #[serde(default)]
     pub project_context: Option<crate::handoff::ProjectContext>,
+    /// For a fix item (the ladder's item for a recurring or unknown
+    /// failure): where the controller wrote the failure's history for this
+    /// run, what the run may read outside its working directory, and what
+    /// earlier fix items concluded (see [`crate::investigate::bundle`]). An
+    /// adapter gives its agent read access to `read_dirs` and renders
+    /// [`crate::investigate::bundle::brief_section`] into the prompt.
+    #[serde(default)]
+    pub investigation: Option<crate::investigate::bundle::Kit>,
 }
 
 /// Bounded discussion excerpt. Full comments remain in the work ledger and frozen brief.

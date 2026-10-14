@@ -980,6 +980,19 @@ Rules:
   makes the original wait; rejection continues its remaining ladder. Recursive
   diagnosis creation uses the graph depth cap, and all filings retain normal
   validation and approval policy.
+- A resolution item is `done` only when it lands something the controller
+  checks: a commit git verifies in its worktree, or a classifier rule that
+  turns the unknown failure into a classified one on replay. One that reports
+  without landing either is kept as evidence and parks `needs_decision` with
+  its conclusion as the question; the work that waited on it is released to
+  continue its own ladder, and a later failure of the same fingerprint does not
+  wait behind it. When the fingerprint recurs after a resolution item closed
+  `done`, the next one names it and is given its conclusion, what it landed
+  and whether each later failing run contained that fix. A resolution item is
+  leased with an investigation bundle (every occurrence run by run, each
+  failed run's session log and daemon-log window) in a worktree at the commit
+  the failing run started from (`crates/rustykrab-control/ARCHITECTURE.md`,
+  `investigate/`).
 - Scheduling uses effective priority: prerequisites inherit the highest base
   priority of interested open dependents, transitively through unmet ordering
   edges and parent gates. Distinct waiter count is the primary queue rank;

@@ -49,11 +49,17 @@ async fn a_failure_creates_a_prerequisite_and_schedules_it_before_routine_work()
     let repairs = h.of_kind(WorkKind::Internal).await;
     assert_eq!(repairs.len(), 1);
     let repair = &repairs[0];
+    // The prerequisite lands something the controller checks: a classifier
+    // rule that classifies the unknown failure on replay. One that landed
+    // nothing would park for its owner instead (`tests/investigation.rs`).
+    let mut landed = done("repair");
+    landed.artifacts.push(ArtifactRef {
+        kind: crate::errors::CLASSIFIER_RULE.into(),
+        value: "process: flux capacitor".into(),
+    });
     let gate = Arc::new(Notify::new());
-    h.script.push(
-        &repair.title,
-        Step::Wait(gate.clone(), Box::new(done("repair"))),
-    );
+    h.script
+        .push(&repair.title, Step::Wait(gate.clone(), Box::new(landed)));
     h.ctl.set_draining(false);
     assert_eq!(h.tick().await.leased, vec![repair.id.clone()]);
     assert_eq!(h.script.briefs_for("urgent task").len(), 1);

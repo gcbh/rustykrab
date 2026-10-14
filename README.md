@@ -314,6 +314,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_UPDATE_APPLY_UNREVIEWED` | unset | `1` lets `rustykrab update apply` run with the launchd service, which is held until what it still needs is built (`docs/plans/update-flow.md`, "Slice 6: status"); otherwise it refuses and exits 3. It does not gate `--service script:<cmd>`, which is only for a bare binary launchd does not run and refuses an `--installed` inside a `.app` or under `~/Applications`, and a staged app |
 | `RUSTYKRAB_BIN` | `target/debug/rustykrab-cli` | Daemon binary the evaluation harness (`rustykrab-e2e`) boots. Harness only |
 | `RUSTYKRAB_E2E_SOURCE_REVISION` | `unrecorded` | Source revision recorded in the evaluation harness's report. Harness only |
+| `RUSTYKRAB_E2E_EVIDENCE_DIR` | unset | Directory the control suite's investigation scenarios copy what they read into (the investigation bundle, the investigator's brief and working directory, event trails, a local worker's session log), as the daemon and its worker produced them. Unset, nothing is copied. Harness only |
 | `RUSTYKRAB_COMPACTION_STUDY_ARM` | unset | `message-tail` runs only the structured message-tail arm of the harness's compaction study. Harness only |
 | `RUSTYKRAB_CONTEXT_BROWSER_READY` | unset | `1` tells the harness's context eval that its browser fixture is ready. Harness only |
 | `RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY` | default strategy | Compaction strategy the harness's context eval runs under, by its serialized name. Harness only |

@@ -29,6 +29,7 @@ use crate::graph::{
     Rejection, Snapshot, Validation,
 };
 use crate::handle::{GraphNode, GraphView};
+use crate::investigate::{FAILURE_FINGERPRINT, PREVIOUS_FIX};
 use crate::ladder::CapabilityNeed;
 use rustykrab_core::questions::QuestionKind;
 
@@ -722,20 +723,73 @@ impl Controller {
         }];
         let mut draft = inherit_internal(item, &internal_item_draft(error, evidence));
         let repos = repos_of(&draft.writable_resources);
-        let existing =
-            b.snap
+        let names_failure = |i: &WorkItem| {
+            i.artifact_refs
+                .iter()
+                .any(|r| r.kind == FAILURE_FINGERPRINT && r.value == error.fingerprint)
+        };
+        let existing = b
+            .snap
+            .items()
+            .iter()
+            .find(|i| {
+                i.kind != WorkKind::Proposal
+                    && !i.status.is_closed()
+                    && (names_failure(i)
+                        || (i.kind == WorkKind::Internal && i.title == draft.title))
+                    && repos_of(&i.writable_resources) == repos
+            })
+            .cloned();
+        // A fix item waiting on its owner (it landed nothing and asked, or
+        // it surfaced) is not something to park more work behind: the
+        // failing item is added to its evidence and goes on with its own
+        // ladder.
+        if let Some(parked) = existing.as_ref().filter(|i| {
+            i.held_by.is_none() && matches!(i.status, Status::Blocked(r) if r.needs_user())
+        }) {
+            let artifact = ArtifactRef {
+                kind: "item".to_string(),
+                value: item.id.clone(),
+            };
+            if !parked.artifact_refs.contains(&artifact) {
+                if let Some(row) = b.snap.item_mut(&parked.id) {
+                    row.artifact_refs.push(artifact.clone());
+                }
+                b.ops.push(WorkOp::AddArtifactRef {
+                    item: parked.id.clone(),
+                    artifact,
+                });
+            }
+            return Err(format!(
+                "resolution item {} is waiting on its owner ({}) with no fix landed; continue \
+                 the remaining ladder",
+                parked.id, parked.status
+            ));
+        }
+        if existing.is_none() {
+            // The failure came back after an earlier fix item for it closed
+            // `done`: the new one says so, and its bundle carries what that
+            // one concluded and landed.
+            let earlier = b
+                .snap
                 .items()
                 .iter()
-                .find(|i| {
-                    i.kind != WorkKind::Proposal
-                        && !i.status.is_closed()
-                        && (i.artifact_refs.iter().any(|r| {
-                            r.kind == "failure_fingerprint" && r.value == error.fingerprint
-                        }) || (i.kind == WorkKind::Internal && i.title == draft.title))
-                        && repos_of(&i.writable_resources) == repos
-                })
-                .cloned();
-        if existing.is_none() {
+                .filter(|i| i.kind == WorkKind::Internal && i.status == Status::Done)
+                .filter(|i| names_failure(i))
+                .max_by_key(|i| (i.closed_at, i.id.clone()))
+                .map(|i| i.id.clone());
+            if let Some(earlier) = earlier {
+                draft.objective.push_str(&format!(
+                    " This failure came back after an earlier fix item, #{earlier}, closed \
+                     done: what it concluded, what it landed and the runs that failed since \
+                     are in the investigation bundle. Do not start cold; find why that fix did \
+                     not hold, or whether it was ever in what ran."
+                ));
+                draft.artifact_refs.push(ArtifactRef {
+                    kind: PREVIOUS_FIX.into(),
+                    value: earlier,
+                });
+            }
             let depth = item
                 .artifact_refs
                 .iter()

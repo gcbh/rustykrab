@@ -260,6 +260,8 @@ impl Fleet {
     pub(crate) fn config(&self, base: ControllerConfig) -> ControllerConfig {
         ControllerConfig {
             worktree_root: Some(self.data_dir.join("worktrees")),
+            investigation_root: Some(self.data_dir.join("investigations")),
+            daemon_log_dir: Some(self.data_dir.join("logs")),
             ..base
         }
     }

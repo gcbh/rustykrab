@@ -453,6 +453,36 @@ async fn repoint_rewrites_in_place_and_logs_the_old_value() {
 }
 
 #[tokio::test]
+async fn removing_one_edge_leaves_the_items_other_edges() {
+    let store = seeded(
+        vec![item("t", Status::Queued)],
+        vec![
+            edge("t", EdgeKind::Blocks, "a"),
+            edge("t", EdgeKind::Blocks, "fix"),
+            edge("t", EdgeKind::WaitsFor, "fix"),
+        ],
+    )
+    .await;
+    store
+        .work_apply(vec![WorkOp::RemoveEdge(edge("t", EdgeKind::Blocks, "fix"))])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.work_edges_of("t").await.unwrap(),
+        vec![
+            edge("t", EdgeKind::Blocks, "a"),
+            edge("t", EdgeKind::WaitsFor, "fix"),
+        ]
+    );
+    // A row that is not there is left alone, not an error.
+    store
+        .work_apply(vec![WorkOp::RemoveEdge(edge("t", EdgeKind::Blocks, "fix"))])
+        .await
+        .unwrap();
+    assert_eq!(store.work_edges_of("t").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn removing_an_items_edges_keeps_its_history() {
     let store = seeded(
         vec![item("t", Status::Cancelled(CancelReason::Superseded))],

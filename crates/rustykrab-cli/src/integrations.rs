@@ -451,6 +451,13 @@ fn attest(
     }
     report
 }
+impl IntegrationWorker {
+    /// Keep each run's session log in `dir` (`LocalWorker::with_run_logs`).
+    pub(crate) fn with_run_logs(mut self, dir: std::path::PathBuf) -> Self {
+        self.worker = self.worker.with_run_logs(dir);
+        self
+    }
+}
 #[async_trait]
 impl Worker for IntegrationWorker {
     fn name(&self) -> &str {
@@ -498,6 +505,9 @@ impl Worker for IntegrationWorker {
     }
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.worker.usage(run)
+    }
+    fn run_log(&self, run: &str) -> Option<std::path::PathBuf> {
+        self.worker.run_log(run)
     }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
@@ -819,6 +829,7 @@ mod tests {
                 workspace: None,
                 capability: None,
                 project_context: None,
+                investigation: None,
             };
             let returned = worker.run(brief).await.unwrap();
             let reports = backend

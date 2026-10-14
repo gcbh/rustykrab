@@ -79,7 +79,7 @@ impl Controller {
                     (matches!(u.kind, WorkKind::Capability | WorkKind::Internal)
                         || u.artifact_refs
                             .iter()
-                            .any(|r| r.kind == "failure_fingerprint"))
+                            .any(|r| r.kind == crate::investigate::FAILURE_FINGERPRINT))
                         && u.status == Status::Done
                 })
             })
@@ -217,5 +217,6 @@ pub(super) fn brief_for(
         workspace: None,
         capability: None,
         project_context: None,
+        investigation: None,
     }
 }

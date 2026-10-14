@@ -103,7 +103,9 @@ use rustykrab_core::work::{
 };
 
 use crate::fixture_repo::{
-    stack_manifest, ClaudeCodeStandIn, FixtureRepo, CLAIM_WRONGLY, KEEPS_ITS_OWN_TRACKER,
+    stack_manifest, ClaudeCodeStandIn, FixtureRepo, CLAIM_WRONGLY, INVESTIGATION_CLAIM_WRONGLY,
+    INVESTIGATION_LANDED, INVESTIGATION_LAND_THE_FIX, INVESTIGATION_NOT_DONE,
+    INVESTIGATOR_CAPTURES, KEEPS_ITS_OWN_TRACKER,
 };
 use crate::transcript::Transcript;
 use crate::{Ctx, Expected, ScenarioFn};
@@ -264,6 +266,18 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             Expected::Pass,
             ("control/two-daemons-one-data-dir-only-one-ticks", |ctx| {
                 Box::pin(two_daemons_one_data_dir(ctx))
+            }),
+        ),
+        (
+            Expected::Pass,
+            ("control/local-worker-run-leaves-a-session-log", |ctx| {
+                Box::pin(local_worker_session_log(ctx))
+            }),
+        ),
+        (
+            Expected::Pass,
+            ("control/investigation-kit-for-a-recurring-failure", |ctx| {
+                Box::pin(investigation_kit(ctx))
             }),
         ),
     ]
@@ -1906,6 +1920,559 @@ async fn local_worker_off(shared: &Ctx) -> Result<()> {
             .any(|w| w["kind"] == "local" && w["live"] == true),
         "GET /api/workers lists a live local worker: {after:?}"
     );
+    Ok(())
+}
+
+// ── the investigation kit ────────────────────────────────────────────
+
+/// Where a run of the suite leaves what it captured, when the caller asks
+/// for it (`RUSTYKRAB_E2E_EVIDENCE_DIR`): the outputs a reviewer reads,
+/// copied as the daemon and its worker produced them.
+fn evidence_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("RUSTYKRAB_E2E_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// Save one captured output under the evidence directory, if there is one.
+fn keep_evidence(name: &str, contents: impl AsRef<[u8]>) -> Result<()> {
+    let Some(dir) = evidence_dir() else {
+        return Ok(());
+    };
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Copy one file a run left behind under the evidence directory, if there
+/// is one, as it stands.
+fn keep_evidence_file(name: &str, from: &std::path::Path) -> Result<()> {
+    if evidence_dir().is_none() {
+        return Ok(());
+    }
+    let contents = std::fs::read(from).with_context(|| format!("reading {}", from.display()))?;
+    keep_evidence(name, contents)
+}
+
+/// A local worker's run leaves its whole session as a file, and the item's
+/// `run_log` evidence names it: a marker line, then one JSON message per
+/// line, readable by its owner only.
+async fn local_worker_session_log(ctx: &Ctx) -> Result<()> {
+    let task = file(
+        ctx,
+        draft("personal", "Leave a session log", &tag(0), W_SUCCEED),
+    )
+    .await?;
+    let done = wait_status(ctx, &task, Status::Done).await?;
+    let log = evidence(&done)
+        .into_iter()
+        .find(|e| e["kind"] == "run_log")
+        .ok_or_else(|| anyhow!("no run_log evidence: {}", evidence_text(&done)))?;
+    let path = std::path::PathBuf::from(log["reference"].as_str().unwrap_or_default());
+    ensure!(
+        path.starts_with(ctx.data_dir.join("run-logs")),
+        "the session log is not under <data dir>/run-logs: {}",
+        path.display()
+    );
+    let run = log["hash"].as_str().unwrap_or_default();
+    ensure!(
+        path.file_name().and_then(|n| n.to_str()) == Some(&format!("{run}.jsonl")),
+        "the session log is not named after its run {run}: {}",
+        path.display()
+    );
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading the session log {}", path.display()))?;
+    let lines: Vec<Value> = text
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .context("every line of the session log is one JSON value")?;
+    ensure!(
+        lines[0]["type"] == "rustykrab.invocation"
+            && lines[0]["kind"] == "local"
+            && lines[0]["run"] == run,
+        "the session log starts with its marker: {}",
+        lines[0]
+    );
+    ensure!(
+        lines[0]["messages"] == lines.len() - 1 && lines.len() > 3,
+        "the session log holds the whole run: {} line(s)",
+        lines.len()
+    );
+    ensure!(
+        text.contains(W_SUCCEED) && text.contains("result_report"),
+        "the session log carries the brief and the report call"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        ensure!(mode == 0o600, "the session log is mode {mode:o}, not 600");
+    }
+    keep_evidence("local-worker-run-log.jsonl", &text)?;
+    keep_evidence(
+        "local-worker-run-log.evidence.json",
+        serde_json::to_string_pretty(&log)?,
+    )?;
+    Ok(())
+}
+
+/// A fake token in the shape of a real one, for the daemon log fixture.
+const FAKE_BOT_TOKEN: &str = "7000000001:AAFakeFakeFakeFakeFakeFakeFakeFake_0";
+
+/// The item's events, as `GET /api/work/{id}/events` returns them.
+async fn event_trail(ctx: &Ctx, id: &str) -> Result<Vec<Value>> {
+    let reply = get(ctx, &format!("{WORK}/{id}/events")).await?;
+    reply["events"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("GET {WORK}/{id}/events has no events: {reply}"))
+}
+
+/// One event as a line a reader can follow: when, what kind, the status
+/// it moved to, who, and why.
+fn trail_line(event: &Value) -> String {
+    let to = match moved_to(event) {
+        Some(status) => format!(" -> {status}"),
+        None => String::new(),
+    };
+    let reason = event["reason"].as_str().unwrap_or_default();
+    // A rung's reason is its record as JSON: show the rung and its outcome.
+    let reason = match serde_json::from_str::<Value>(reason) {
+        Ok(rung) if rung["rung"].is_string() => format!(
+            "rung {}: {}",
+            rung["rung"].as_str().unwrap_or_default(),
+            rung["outcome"].as_str().unwrap_or_default()
+        ),
+        _ => reason.to_string(),
+    };
+    format!(
+        "{}  {}{to}  [{}]  {}",
+        event["at"].as_str().unwrap_or_default(),
+        event["kind"].as_str().unwrap_or_default(),
+        event["actor"].as_str().unwrap_or_default(),
+        excerpt(&reason),
+    )
+}
+
+fn trail_text(events: &[Value]) -> String {
+    events.iter().map(trail_line).collect::<Vec<_>>().join("\n") + "\n"
+}
+
+/// The fix item filed for a failure of `failing`, other than `not`.
+async fn wait_fix_item(ctx: &Ctx, failing: &str, not: Option<&str>) -> Result<String> {
+    let found = wait_listed(ctx, "kind=internal", "a fix item for the failure", |v| {
+        v.to_string().contains(failing) && not.is_none_or(|other| id(v) != other)
+    })
+    .await?;
+    Ok(id(&found))
+}
+
+/// The investigation kit, end to end, on a daemon of its own whose only
+/// worker is an external agent CLI stand-in.
+///
+/// Three items in one repository fail the same way (the worker claims a
+/// path its commit did not touch, which the controller's own verification
+/// catches), so the third files the failure's fix item. The stand-in, as
+/// the investigator, records what it was actually given, and the scenario
+/// asserts on that and on how the fix item closes:
+///
+/// - it ran in a worktree of the failing item's repository at the commit
+///   the failing run started from;
+/// - its brief names the investigation bundle and how to read it in
+///   portions, and its CLI was given the bundle and the session logs with
+///   `--add-dir` (a failed run's kept worktree too, when one is kept; these
+///   runs handed in a result, so theirs were removed and their commits stay
+///   on their branches);
+/// - the bundle holds all three occurrences run by run, the same records
+///   `rustykrab work investigate` prints, and the daemon's log for a failed
+///   run's window with the bot token redacted;
+/// - it reported that nothing changed, so the fix item is not `done`: it
+///   parks with that conclusion as its question, and the item that waited
+///   on it goes on with its own ladder;
+/// - answered, it lands a commit git verifies and closes `done`;
+/// - the failure then recurs, and the second fix item's brief names the
+///   first, what it concluded, the commit it landed and the run that
+///   failed since, with whether that run's code had the fix in it.
+async fn investigation_kit(shared: &Ctx) -> Result<()> {
+    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let ctx = &daemon.ctx;
+    let repo = FixtureRepo::create()?;
+    let stand_in = ClaudeCodeStandIn::investigator()?;
+    register_claude_code(ctx, "pinch-inv", &repo, &stand_in).await?;
+    let tag = "[e2e-control investigation]";
+    let failing = |name: &str| code_draft(name, tag, INVESTIGATION_CLAIM_WRONGLY, &repo);
+
+    // Two items fail the same way and surface once their ladders are spent.
+    let first = file(ctx, failing("Add the first helper")).await?;
+    wait_question(ctx, &first).await?;
+    let second = file(ctx, failing("Add the second helper")).await?;
+    wait_question(ctx, &second).await?;
+    let error = wait_error(ctx, &first).await?;
+    ensure!(
+        error.class == ErrorClass::Verification,
+        "the seeded failure is the controller's own verification, not {}",
+        error.class.as_str()
+    );
+    let fingerprint = error.fingerprint.clone();
+
+    // A build before the Telegram fix logged the bot token on every failed
+    // poll. Put such a line in the daemon's log, stamped inside the first
+    // item's first failed run.
+    let before: Value = get(ctx, &format!("{WORK}/investigate/{first}")).await?;
+    let failed_run = &before["occurrences"][0]["runs"][0];
+    let started = time(&failed_run["started_at"])
+        .ok_or_else(|| anyhow!("the first failed run has no start: {failed_run}"))?;
+    let leaked = format!(
+        "{} ERROR rustykrab_channels::telegram: Telegram getUpdates network error: error sending \
+         request for url (https://api.telegram.org/bot{FAKE_BOT_TOKEN}/getUpdates?timeout=30) \
+         consecutive_errors=1 delay_secs=2\n",
+        (started + chrono::TimeDelta::milliseconds(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    );
+    {
+        use std::io::Write as _;
+        let log = ctx
+            .data_dir
+            .join("logs")
+            .join(format!("rustykrab.log.{}", started.format("%Y-%m-%d")));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log)?
+            .write_all(leaked.as_bytes())?;
+    }
+
+    // The third item's failure is the recurrence that files the fix item.
+    let third = file(ctx, failing("Add the third helper")).await?;
+    let fix = wait_fix_item(ctx, &third, None).await?;
+    let parked = wait_status(ctx, &fix, Status::Blocked(BlockedReason::NeedsDecision)).await?;
+
+    // ── what the investigator was given ──────────────────────────────
+    let captures = ctx.data_dir.join(INVESTIGATOR_CAPTURES);
+    let cap = captures.join("run-1");
+    let read = |name: &str| -> Result<String> {
+        std::fs::read_to_string(cap.join(name))
+            .with_context(|| format!("the investigator left no {name}"))
+    };
+    let bundle: Value = serde_json::from_str(&read("bundle/bundle.json")?)?;
+    let history = &bundle["history"];
+    let occurrences = history["occurrences"]
+        .as_array()
+        .context("the bundle has occurrences")?;
+    let ids: Vec<&str> = occurrences
+        .iter()
+        .filter_map(|o| o["item"]["id"].as_str())
+        .collect();
+    ensure!(
+        ids == [first.as_str(), second.as_str(), third.as_str()],
+        "the bundle holds every item that hit the failure: {ids:?}"
+    );
+    ensure!(
+        bundle["bundle"]["fingerprint"] == fingerprint.as_str()
+            && bundle["bundle"]["for_item"] == fix.as_str(),
+        "the bundle is for this fix item and fingerprint: {}",
+        bundle["bundle"]
+    );
+    // Each failed run carries its worker, its typed error, its workspace
+    // and its session log.
+    let third_run = &occurrences[2]["runs"][0];
+    ensure!(
+        third_run["hit"] == true
+            && third_run["worker"] == "pinch-inv"
+            && third_run["rungs"][0]["error"]["fingerprint"] == fingerprint.as_str()
+            && third_run["run_log"]["exists"] == true,
+        "a failed run's record is complete: {third_run}"
+    );
+    // The code: a checkout of the failing item's repository at the commit
+    // the failing run started from.
+    let head = read("head.txt")?;
+    let base = third_run["workspace"]["base"].as_str().unwrap_or_default();
+    ensure!(
+        !base.is_empty() && head.trim() == base,
+        "the investigator's worktree is at {}, not the failing run's base {base}",
+        head.trim()
+    );
+    let listing = read("working-directory.txt")?;
+    ensure!(
+        listing.contains("lib.rs") && listing.contains("Cargo.toml"),
+        "the investigator's working directory is a checkout, not an empty directory: {listing}"
+    );
+    ensure!(
+        listing.contains(&ctx.data_dir.join("worktrees").display().to_string()),
+        "the investigator ran in a worktree under the daemon's data directory: {listing}"
+    );
+    // The brief: where the bundle is and how to read it in portions.
+    let brief = read("brief.txt")?;
+    let bundle_dir = bundle["bundle"]["dir"].as_str().unwrap_or_default();
+    for wanted in [
+        format!("investigation: this item investigates failure {fingerprint}"),
+        format!("{bundle_dir}/index.md"),
+        format!("{bundle_dir}/bundle.json"),
+        "a portion at a time".to_string(),
+        "readable outside your working directory".to_string(),
+        "This item is done only when it lands something the controller can check".to_string(),
+    ] {
+        ensure!(
+            brief.contains(&wanted),
+            "the brief lacks {wanted:?}: {brief}"
+        );
+    }
+    // Read access outside the worktree: the bundle, the session logs and a
+    // failed run's kept worktree, and nothing gated.
+    let args = read("args.txt")?;
+    let lines: Vec<&str> = args.lines().collect();
+    let added: Vec<&str> = lines
+        .windows(2)
+        .filter(|pair| pair[0] == "--add-dir")
+        .map(|pair| pair[1])
+        .collect();
+    for wanted in [
+        bundle_dir.to_string(),
+        ctx.data_dir.join("run-logs").display().to_string(),
+    ] {
+        ensure!(
+            added.contains(&wanted.as_str()),
+            "the investigator's CLI was not given {wanted} with --add-dir: {added:?}"
+        );
+    }
+    // These runs handed in a result, so the adapter removed their
+    // worktrees: the record says so, names the branch their commit is
+    // still on, and no directory that is gone is offered.
+    ensure!(
+        third_run["workspace"]["worktree_exists"] == false
+            && third_run["workspace"]["branch"]
+                .as_str()
+                .is_some_and(|b| repo.git(&["rev-parse", "--verify", b]).is_ok()),
+        "a failed run's commit stays on its branch: {}",
+        third_run["workspace"]
+    );
+    ensure!(
+        !added.iter().any(|dir| !std::path::Path::new(dir).exists()),
+        "the investigator was offered a directory that does not exist: {added:?}"
+    );
+    ensure!(
+        added.len() == 2 && !args.contains("--tools"),
+        "nothing else was added and its toolset is untouched: {args}"
+    );
+    ensure!(
+        read("read-index.txt")?.contains(&format!("failure `{fingerprint}`"))
+            && read("read-session-log.txt")?.contains("\"type\":\"result\""),
+        "the investigator read the index and a failed run's session log"
+    );
+    // The daemon log for the failed run's window, with the token gone.
+    let slice_path = occurrences[0]["runs"][0]["daemon_log"]["path"]
+        .as_str()
+        .context("the first failed run has a daemon log slice")?;
+    let slice = std::fs::read_to_string(
+        cap.join("bundle/daemon-log").join(
+            std::path::Path::new(slice_path)
+                .file_name()
+                .context("the slice has a file name")?,
+        ),
+    )?;
+    ensure!(
+        slice.contains("https://api.telegram.org/bot<redacted>/getUpdates?timeout=30"),
+        "the slice holds the fixture line, redacted: {slice}"
+    );
+    ensure!(
+        !slice.contains("AAFake") && !read("bundle/bundle.json")?.contains("AAFake"),
+        "the bot token reached the bundle"
+    );
+
+    // ── the same history for an operator ─────────────────────────────
+    let printed = cli_stdout(ctx, &["work", "investigate", &fingerprint, "--json"])?;
+    let investigated: Value = serde_json::from_str(&printed)?;
+    ensure!(
+        investigated["fingerprints"][0]["fingerprint"] == fingerprint.as_str()
+            && investigated["fingerprints"][0]["items"] == 3
+            && investigated["occurrences"].as_array().map(Vec::len) == Some(3),
+        "work investigate prints every occurrence: {}",
+        investigated["fingerprints"]
+    );
+    let record = &investigated["fixes"][0];
+    ensure!(
+        record["item"]["id"] == fix.as_str()
+            && record["landed"].as_array().is_some_and(Vec::is_empty)
+            && record["conclusion"]
+                .as_str()
+                .is_some_and(|c| c.starts_with(INVESTIGATION_NOT_DONE)),
+        "the fix item's record says what it concluded and that it landed nothing: {record}"
+    );
+    let text = cli_stdout(ctx, &["work", "investigate", &fingerprint])?;
+    ensure!(
+        text.contains(&format!(
+            "failure {fingerprint}  verification/claim_mismatch"
+        )) && text.contains("landed nothing the controller checked"),
+        "work investigate renders the history: {text}"
+    );
+
+    // ── the check on the conclusion ──────────────────────────────────
+    let unlanded = event_trail(ctx, &fix).await?;
+    ensure!(
+        !unlanded.iter().any(|e| moved_to(e) == Some(Status::Done)),
+        "a fix item that landed nothing was marked done"
+    );
+    ensure!(
+        unlanded.iter().filter_map(moved_to).next_back()
+            == Some(Status::Blocked(BlockedReason::NeedsDecision)),
+        "it parks for its owner"
+    );
+    let question = wait_question(ctx, &fix).await?;
+    ensure!(
+        question["status"] == "open"
+            && question["text"]
+                .as_str()
+                .is_some_and(|t| t.contains(INVESTIGATION_NOT_DONE) && t.contains(&fingerprint)),
+        "its conclusion is the question the owner is asked: {question}"
+    );
+    ensure!(
+        evidence(&parked)
+            .iter()
+            .any(|e| e["kind"] == "summary" && e["verified_by"].is_null()),
+        "its findings are kept as evidence, unverified: {}",
+        evidence_text(&parked)
+    );
+    // The item that waited on it goes on with its own ladder.
+    let released = wait_for(ctx, &third, "the third item is released", |v| {
+        events(v).iter().any(|e| {
+            e["kind"] == "resume"
+                && e["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains(&fix) && r.contains("without landing a fix"))
+        })
+    })
+    .await?;
+    ensure!(
+        !has_edge(&released, EdgeKind::Blocks, &fix),
+        "the third item still waits on the parked fix item"
+    );
+
+    keep_evidence("work-investigate.json", &printed)?;
+    keep_evidence("work-investigate.txt", &text)?;
+    keep_evidence("daemon-log-fixture-line.unredacted.txt", &leaked)?;
+    keep_evidence("daemon-log-slice.redacted.log", &slice)?;
+    keep_evidence("fix-item-nothing-changed.events.txt", trail_text(&unlanded))?;
+    keep_evidence(
+        "fix-item-nothing-changed.events.json",
+        serde_json::to_string_pretty(&unlanded)?,
+    )?;
+    keep_evidence(
+        "fix-item-nothing-changed.question.json",
+        serde_json::to_string_pretty(&question)?,
+    )?;
+
+    // ── answered, it lands a commit and is done ──────────────────────
+    let question_id = question["id"].as_str().unwrap_or_default();
+    post(
+        ctx,
+        &format!("{QUESTIONS}/{question_id}/answer"),
+        json!({ "answer": INVESTIGATION_LAND_THE_FIX }),
+    )
+    .await?;
+    let landed = wait_status(ctx, &fix, Status::Done).await?;
+    let commit = evidence(&landed)
+        .into_iter()
+        .find(|e| e["kind"] == "commit" && e["verified_by"] == "git")
+        .ok_or_else(|| anyhow!("no commit git verified: {}", evidence_text(&landed)))?;
+    let sha = commit["reference"].as_str().unwrap_or_default().to_string();
+    ensure!(
+        repo.git(&["cat-file", "-t", &sha]).ok().as_deref() == Some("commit"),
+        "the landed commit exists in the repository: {sha}"
+    );
+    let done_trail = event_trail(ctx, &fix).await?;
+    ensure!(
+        done_trail.iter().filter_map(moved_to).next_back() == Some(Status::Done),
+        "the fix item that landed a commit closes done"
+    );
+    keep_evidence("fix-item-landed-commit.events.txt", trail_text(&done_trail))?;
+    keep_evidence(
+        "fix-item-landed-commit.events.json",
+        serde_json::to_string_pretty(&done_trail)?,
+    )?;
+    keep_evidence(
+        "fix-item-landed-commit.evidence.json",
+        serde_json::to_string_pretty(&evidence(&landed))?,
+    )?;
+
+    // ── the failure comes back ───────────────────────────────────────
+    let fourth = file(ctx, failing("Add the fourth helper")).await?;
+    let second_fix = wait_fix_item(ctx, &fourth, Some(&fix)).await?;
+    let again = wait_status(
+        ctx,
+        &second_fix,
+        Status::Blocked(BlockedReason::NeedsDecision),
+    )
+    .await?;
+    ensure!(
+        body(&again)["artifact_refs"]
+            .as_array()
+            .is_some_and(|refs| refs
+                .iter()
+                .any(|r| r["kind"] == "previous_fix" && r["value"] == fix.as_str())),
+        "the second fix item names the first: {}",
+        body(&again)["artifact_refs"]
+    );
+    // The first fix item's second run was capture 2; this is capture 3.
+    let second_brief = std::fs::read_to_string(captures.join("run-3/brief.txt"))
+        .context("the second fix item's brief was captured")?;
+    for wanted in [
+        format!("earlier fix: item #{fix} is done"),
+        INVESTIGATION_LANDED.to_string(),
+        format!("commit {sha}"),
+        "The failure recurred after it: run ".to_string(),
+        format!("of item #{fourth}"),
+        "the fix was NOT in what ran".to_string(),
+    ] {
+        ensure!(
+            second_brief.contains(&wanted),
+            "the second fix item's brief lacks {wanted:?}: {second_brief}"
+        );
+    }
+    let after: Value = get(ctx, &format!("{WORK}/investigate/{fingerprint}")).await?;
+    let recurrences = after["fixes"]
+        .as_array()
+        .and_then(|fixes| fixes.iter().find(|f| f["item"]["id"] == fix.as_str()))
+        .map(|f| f["recurrences"].clone())
+        .unwrap_or_default();
+    ensure!(
+        recurrences.as_array().is_some_and(|all| all
+            .iter()
+            .any(|r| r["item"] == fourth.as_str() && r["includes_fix"] == "not_included")),
+        "the history records the recurrence and that the fix was not in what ran: {recurrences}"
+    );
+
+    keep_evidence("second-fix-item.brief.txt", &second_brief)?;
+    keep_evidence(
+        "work-investigate.after-recurrence.json",
+        serde_json::to_string_pretty(&after)?,
+    )?;
+    // What each investigator run recorded about what it was given: the
+    // first fix item's two runs, then the second fix item's.
+    for run in ["run-1", "run-2", "run-3"] {
+        for file in [
+            "brief.txt",
+            "args.txt",
+            "head.txt",
+            "working-directory.txt",
+            "read-index.txt",
+            "read-session-log.txt",
+        ] {
+            keep_evidence_file(
+                &format!("investigator/{run}/{file}"),
+                &captures.join(run).join(file),
+            )?;
+        }
+        keep_evidence_file(
+            &format!("investigator/{run}/bundle/index.md"),
+            &captures.join(run).join("bundle/index.md"),
+        )?;
+    }
+    // The bundle as the controller wrote it for the first run.
+    keep_evidence_file("bundle/bundle.json", &cap.join("bundle/bundle.json"))?;
+    keep_evidence_file("bundle/index.md", &cap.join("bundle/index.md"))?;
     Ok(())
 }
 

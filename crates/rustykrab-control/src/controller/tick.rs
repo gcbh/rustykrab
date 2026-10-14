@@ -20,6 +20,7 @@ use crate::errors::{
 };
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
+use crate::investigate::{fix_fingerprint, RESOLUTION_WAIT};
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
 use crate::routing::{built_tool, work_class, Judged, Verdict};
 use crate::worker::{run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
@@ -713,9 +714,12 @@ impl Controller {
     /// parks (a cascade reason is not the worker's to claim); questions
     /// park as `needs_decision`; a `done` claim with an empty summary, or
     /// with claims the evidence does not bear out ([`Self::verify_claims`]),
-    /// fails verification; otherwise the item is `done`, its artifacts
-    /// evidence verified by the report and its checked claims evidence
-    /// verified by what checked them.
+    /// fails verification; a fix item that landed nothing checked (no
+    /// commit git verified, no classifier rule that replayed) parks for its
+    /// owner with its conclusion as the question
+    /// ([`Self::park_unlanded_fix`]); otherwise the item is `done`, its
+    /// artifacts evidence verified by the report and its checked claims
+    /// evidence verified by what checked them.
     async fn judge(
         &self,
         b: &mut Batch,
@@ -838,6 +842,21 @@ impl Controller {
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
         };
+        // A fix item (the ladder's item for a recurring or unknown failure)
+        // is done only when it landed something checked: a commit git
+        // verified in its worktree, or a classifier rule that replayed. A
+        // report that changed nothing is a conclusion, not a fix: it goes
+        // to the owner as the item's question.
+        if let Some(fingerprint) = fix_fingerprint(item.kind, &item.artifact_refs) {
+            let committed = proofs
+                .iter()
+                .any(|(kind, _, by)| kind == "commit" && by.as_deref() == Some(BY_GIT));
+            if !committed && rules.is_empty() {
+                return self
+                    .park_unlanded_fix(b, item, worker, fingerprint, result, &proofs)
+                    .await;
+            }
+        }
         for artifact in &result.artifacts {
             // A landed rule is verified by the replay above, not by being
             // in the report; an adapter's command record is what checks
@@ -930,9 +949,12 @@ impl Controller {
                 Ok(rule) => rule,
                 Err(why) => return Ok(Err(format!("classifier_rule {text:?}: {why}"))),
             };
+            // The rule has to do the classifying: a failure the built-in
+            // table already knows "replays" as known whatever the rule says.
             let replays = failures.iter().any(|f| {
-                apply_learned(f.clone(), std::slice::from_ref(&rule), &ctx).class
-                    != ErrorClass::Unknown
+                f.class == ErrorClass::Unknown
+                    && apply_learned(f.clone(), std::slice::from_ref(&rule), &ctx).class
+                        != ErrorClass::Unknown
             });
             if !replays {
                 return Ok(Err(format!(
@@ -1090,7 +1112,7 @@ impl Controller {
 
     /// The workspace the item's latest run was given, from its lease-time
     /// evidence.
-    async fn workspace_of(&self, item: &str) -> Result<Option<Workspace>, Error> {
+    pub(super) async fn workspace_of(&self, item: &str) -> Result<Option<Workspace>, Error> {
         Ok(self
             .store
             .work_evidence_list(item)
@@ -1367,7 +1389,7 @@ impl Controller {
                                 &mut state,
                                 rung,
                                 &error,
-                                format!("waiting on resolution item {filed}"),
+                                format!("{RESOLUTION_WAIT}{filed}"),
                             );
                             return Ok(changed.into_iter().chain([filed]).collect());
                         }
@@ -1816,14 +1838,26 @@ impl Controller {
                 }
             }
             brief.capability = mode;
-            let mut lease_evidence = vec![rustykrab_core::work::Evidence {
-                item: item.id.clone(),
-                kind: RUN.into(),
-                reference: run_id,
-                hash: None,
-                verified_by: None,
-                at: Utc::now(),
-            }];
+            let mut lease_evidence = vec![
+                rustykrab_core::work::Evidence {
+                    item: item.id.clone(),
+                    kind: RUN.into(),
+                    reference: run_id.clone(),
+                    hash: None,
+                    verified_by: None,
+                    at: Utc::now(),
+                },
+                // Which build of the daemon ran it: a fix only takes effect
+                // once it is built and deployed, and a later investigation
+                // has to tell a recurrence on an older build from a failed
+                // fix.
+                self.build_evidence(&item.id, &run_id),
+            ];
+            // A fix item is given what is on record about its failure.
+            if let Some((kit, bundle)) = self.investigation_kit(&item, &run_id).await {
+                brief.investigation = Some(kit);
+                lease_evidence.push(bundle);
+            }
             if !brief.discussion.is_empty() {
                 lease_evidence.push(rustykrab_core::work::Evidence {
                     item: item.id.clone(),
@@ -1886,7 +1920,10 @@ impl Controller {
         Ok(())
     }
 
-    /// Pin project code to the newest verified ancestor chain, otherwise repository HEAD.
+    /// Pin project code to the newest verified ancestor chain, otherwise
+    /// repository HEAD. A fix item is pinned to the commit the failing run
+    /// started from ([`Self::failing_base`]), and to HEAD only when no
+    /// failing run recorded one.
     pub(super) async fn plan_workspace(
         &self,
         item: &WorkItem,
@@ -1899,6 +1936,12 @@ impl Controller {
         let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
             return Ok(None);
         };
+        // A fix item reads the code the failure ran on: its worktree starts
+        // from the commit the failing run started from, not from wherever
+        // the repository has moved to since.
+        if let Some(base) = self.failing_base(item, &repo).await {
+            return Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)));
+        }
         let commits: Vec<(String, String)> = context
             .as_ref()
             .into_iter()

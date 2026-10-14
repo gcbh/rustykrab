@@ -213,6 +213,40 @@ explicit urgency, age and id break ties. Base
 priorities, authorization, worker eligibility and resource locks remain separate
 gates. This adds no queue, persistence table or model-controlled status field.
 
+## The investigation kit (2026-10-13)
+
+A fix item, the prerequisite the ladder files for a recurring or unknown
+failure, used to run blind and close unchecked: on the live instance one ran
+in an empty scratch directory, reported that it could read neither the
+repository nor the verifier's records, and was marked `done`. Four things
+changed, all in code (`rustykrab-control/src/investigate/` and
+`controller/investigation.rs`), none of them a model's decision.
+
+*It can see.* One history query, `investigate::failure_history`, returns every
+occurrence of a fingerprint run by run. An operator reads it with `rustykrab
+work investigate` and `GET /api/work/investigate/{target}`; the controller
+writes the same records as an investigation bundle into
+`<data dir>/investigations/<item>-<run>/` when it leases a fix item, because an
+external worker has no route to the daemon's API. The bundle carries, for each
+failed run, the daemon's own log for that run's window with secrets redacted,
+and every worker type now leaves a session log for it to point at. The fix
+item runs in a worktree of the failing item's repository at the commit the
+failing run started from, and its agent is given read access to the bundle,
+the session logs, any failed run's kept worktree and, when one of the
+repositories a worker was added for is the repository the daemon was built
+from, the daemon's own source at the running commit.
+
+*Its conclusion is checked.* A fix item is `done` only when it landed a commit
+git verified or a classifier rule that replayed. Otherwise its report is kept
+as evidence, it parks with its conclusion as a question to its owner, and what
+waited on it is released to go on with its own ladder.
+
+*A recurrence is connected.* When the fingerprint comes back after a fix item
+closed `done`, the next fix item names it and is given what it concluded, the
+commit it landed, and each failing run since with whether that run's code, or
+the daemon build that ran it, contained the fix. Every run records the build
+that ran it (`daemon_build` evidence) for that purpose.
+
 The `claude-cli` model provider hands Rust model turns to a selected Max
 login with native tools disabled, then returns structured calls to the
 existing Rust harness. Native execution workers select a Max profile each

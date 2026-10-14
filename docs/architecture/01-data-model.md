@@ -622,14 +622,35 @@ compaction writes the item's total into the archive's `cost`.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
-`error`, `run`, `run_log` (the path of the run's session log, `hash` its run
+`error` (`hash` the failure's fingerprint, which is how
+`investigate::failure_history` finds every item that hit one), `run`,
+`run_log` (the path of the run's session log, `hash` its run
 id, `verified_by` the worker that wrote it; what an investigation of a failed
-run opens), and `classifier_rule` (a `<subclass>: <pattern>` row an
+run opens; every worker type writes one now, the local worker included),
+`daemon_build` (written with `run` at lease time: `<version>+<commit>` of the
+daemon that ran the run, `hash` its run id; the work tables carry no
+`rustykrab_version` column of their own, so this row is what later tells a
+failure on an older build from a failed fix), `investigation_bundle` (on a fix
+item: the path of the bundle the controller wrote for that run, `hash` the
+fingerprint), `resolution_outcome` (on an item released from a fix item that
+parked without landing: that item's id and the fact), and `classifier_rule` (a `<subclass>: <pattern>` row an
 `internal` item landed, `verified_by = 'replay'` once the controller replayed
 the failure through it). The last is reloaded across items on start
 (`work_evidence_of_kind`), which is how a landed rule survives restarts and
 aging (section 9). The SSE progress stream pages `work_item_events` by its
 autoincrement `id` (`work_events_after`), not by time.
+
+**A fix item is told apart by an artifact ref, not a column.** The ladder's
+item for a recurring or unknown failure is an `internal` item whose
+`artifact_refs` hold `failure_fingerprint: <fingerprint>`; each failing item it
+was filed or reused for is an `item` ref, and one filed after an earlier fix
+item closed `done` holds `previous_fix: <that item's id>`. The refs go when
+the item is compacted, so a history also finds an aged-out fix item through
+the `improve` rung events of the items that waited on it, which outlive
+compaction. Two things about it live on disk beside the store, both under the
+daemon's data directory and both pointed at by evidence rows rather than
+stored in them: `run-logs/<run id>.jsonl` (every run's session log, 30 days)
+and `investigations/<item>-<run>/` (a fix item's bundle for one run, 30 days).
 
 **Aging is lossy by design.** `work_item_archive` takes one line per
 compacted closed item, written in the transaction that deletes its

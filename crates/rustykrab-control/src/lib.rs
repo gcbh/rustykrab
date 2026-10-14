@@ -16,6 +16,10 @@
 //! - [`handle`]: the controller as the gateway, the CLI and the tools see it.
 //! - [`import`]: the delivery import, a `StackManifest` turned into the
 //!   layered `code` graph of section 14.1, filed through the validator.
+//! - [`investigate`]: what is on record about a failure (every occurrence,
+//!   run by run, and every fix item filed for it), the investigation bundle
+//!   the controller writes for a fix item's run, the daemon log cut to a
+//!   run's window, and the redaction of secrets from what a worker reads.
 //! - [`questions`]: the question router and the standing-judgment compiler
 //!   (section 7), as pure functions.
 //! - [`progress`]: the progress ledger that calls a run stalled (section 6,
@@ -48,6 +52,7 @@ pub mod graph;
 pub mod handle;
 pub mod handoff;
 pub mod import;
+pub mod investigate;
 pub mod ladder;
 pub mod lock;
 pub mod peer;

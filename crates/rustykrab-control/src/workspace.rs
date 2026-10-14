@@ -91,16 +91,16 @@ impl Workspace {
             .map(PathBuf::from)
     }
 
+    /// What a run's branch and worktree names end with: `-<run>`, the run id
+    /// shortened as [`Workspace::plan`] shortens it. Tells which run a
+    /// recorded workspace belonged to.
+    pub fn slug_of_run(run: &str) -> String {
+        format!("-{}", short_id(run))
+    }
+
     /// The workspace a run of `item` gets: names only, nothing is created.
     pub fn plan(root: &Path, repo: &Path, base: &str, item: &str, run: &str) -> Workspace {
-        let short = |s: &str| -> String {
-            s.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(8)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        };
-        let slug = format!("{}-{}", short(item), short(run));
+        let slug = format!("{}{}", short_id(item), Self::slug_of_run(run));
         Workspace {
             repo: repo.to_path_buf(),
             base: base.to_string(),
@@ -169,6 +169,41 @@ impl Workspace {
             .unwrap_or_else(|_| claimed.to_string());
         claimed.trim_start_matches("./").to_string()
     }
+}
+
+/// An id as the first eight of its letters and digits, lower case: the
+/// part of an item or run id a branch and a worktree are named with.
+fn short_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// The full hash of the commit `rev` names in `repo`, or `None` when the
+/// repository has no such commit.
+pub fn resolve_commit(repo: &Path, rev: &str) -> Result<Option<String>, String> {
+    let rev = rev.trim();
+    if rev.is_empty() || rev.starts_with('-') {
+        return Ok(None);
+    }
+    let out = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )?;
+    Ok(out.status.success().then(|| stdout(&out)))
+}
+
+/// Whether `commit` in `repo` has a file or directory at `path`.
+pub fn has_path(repo: &Path, commit: &str, path: &str) -> Result<bool, String> {
+    let out = git(repo, &["cat-file", "-e", &format!("{commit}:{path}")])?;
+    Ok(out.status.success())
 }
 
 /// The commit `repo`'s `HEAD` points at.

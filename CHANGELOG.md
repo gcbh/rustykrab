@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- feat: an investigation kit for fix items. `rustykrab work investigate
+  <fingerprint|id> [--json]` and `GET /api/work/investigate/{target}` return
+  everything on record about a failure, run by run. A fix item is leased in a
+  worktree at the commit the failing run started from, with that history
+  written as its investigation bundle (the daemon log for each failed run's
+  window included, secrets redacted) and read access to it. A fix item is
+  `done` only when it lands a commit git verifies or a classifier rule that
+  replays; otherwise it parks with its conclusion as a question to its owner
+  and releases what waited on it. A failure that comes back after a `done`
+  fix names that fix, what it concluded and landed, and whether the fix was in
+  what ran. Local workers leave session logs like external ones.
+- fix: the Telegram channel no longer writes the bot token to the daemon log
+  when a Bot API request fails.
 - fix: a repository-scoped run that changed nothing verifies as unchanged
   after its adapter has removed its worktree, instead of failing as
   `incomplete`.

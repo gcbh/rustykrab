@@ -38,6 +38,10 @@ pub(super) const W_PEER_PAUSE: &str = "e2e-control worker: work for eight second
 pub(super) const W_TIMEOUT: &str = "e2e-control worker: fail with a timeout";
 /// Match the generated repair objective, not failure text also carried by
 /// human notifications. W_TIMEOUT still wins on the original repair brief.
+/// The fix item this script runs lands nothing the controller can check
+/// (no commit, no classifier rule), so it is not `done`: it parks with its
+/// summary as a question and the item that waited on it goes on with its
+/// own ladder, which is what the scenarios that reach it rely on.
 pub(super) const W_RECURRING_FIX: &str = "the same failure recurred across items";
 pub(super) const W_UNRECOGNISED: &str =
     "e2e-control worker: fail in a way no classifier recognises";

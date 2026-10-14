@@ -208,6 +208,20 @@ pub trait ControlHandle: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// Everything on record about a failure, for `work investigate` and
+    /// `GET /api/work/investigate/{target}`: `target` is a failure
+    /// fingerprint (or an unambiguous prefix of one) or a work item's id.
+    /// `None` when the store knows neither. The same call fills the
+    /// investigation bundle a fix item's run is given
+    /// ([`crate::investigate`]). The default refuses, for a handle with no
+    /// store behind it.
+    async fn investigate(
+        &self,
+        _target: &str,
+    ) -> Result<Option<crate::investigate::FailureHistory>, Error> {
+        Err(unsupported("failure histories"))
+    }
+
     /// The loop's own state, or `None` for a handle that runs no loop.
     fn loop_status(&self) -> Option<LoopStatus> {
         None
