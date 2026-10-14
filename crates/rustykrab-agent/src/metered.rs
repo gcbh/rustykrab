@@ -114,6 +114,13 @@ impl ModelProvider for MeteredProvider {
         self.inner.requires_paired_tool_results()
     }
 
+    // Without this the trait default (`false`) answered for every metered
+    // run, so every worker run re-rendered its tools array on a late load
+    // and paid a cold prefill, whatever its provider accepts.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        self.inner.accepts_undeclared_tool_calls()
+    }
+
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
         self.meter.check()?;
         self.count(self.inner.chat(messages, tools).await)
@@ -162,5 +169,33 @@ impl ModelProvider for MeteredProvider {
                 .chat_stream_with_choice(messages, tools, choice, on_event)
                 .await,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Appends;
+
+    #[async_trait]
+    impl ModelProvider for Appends {
+        fn name(&self) -> &str {
+            "appends"
+        }
+        fn accepts_undeclared_tool_calls(&self) -> bool {
+            true
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            unreachable!("capability data only")
+        }
+    }
+
+    /// The runner reads late binding from the provider it holds, which in a
+    /// worker run is this wrapper.
+    #[test]
+    fn forwards_the_late_binding_capability() {
+        let metered = MeteredProvider::new(Arc::new(Appends), Arc::new(Meter::new(0)));
+        assert!(metered.accepts_undeclared_tool_calls());
     }
 }
