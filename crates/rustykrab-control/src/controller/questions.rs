@@ -144,7 +144,7 @@ fn may_resume(actor: &str) -> bool {
 /// delegates budget, so a delegate's answer, like a default's, neither
 /// replenishes a budget nor resumes it (resuming without a grant would only
 /// stop again at the guard).
-fn is_owner(actor: &str) -> bool {
+pub(super) fn is_owner(actor: &str) -> bool {
     actor == "user" || actor.starts_with("user:")
 }
 

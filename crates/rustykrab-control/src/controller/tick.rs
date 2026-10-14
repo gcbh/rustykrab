@@ -865,7 +865,7 @@ impl Controller {
                     .await;
             }
         }
-        for artifact in &result.artifacts {
+        for artifact in super::breaker::reported_artifacts(b, &item.id, worker, &result.artifacts) {
             // A landed rule is verified by the replay above, not by being
             // in the report; an adapter's command record is what checks
             // were verified against.
@@ -1197,7 +1197,7 @@ impl Controller {
                 worker_kind: Some(self.worker_kind(worker)),
             },
         );
-        for artifact in artifacts {
+        for artifact in super::breaker::reported_artifacts(b, &item.id, worker, artifacts) {
             b.evidence(&item.id, &artifact.kind, &artifact.value, None);
         }
         b.evidence.push(rustykrab_core::work::Evidence {
