@@ -4,7 +4,7 @@
 //! reused across multiple tool implementations.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Default safe base directory for file operations.
 /// If RUSTYKRAB_WORKSPACE environment variable is set, it is used instead.
@@ -79,8 +79,25 @@ fn is_path_blocked(path_str: &str, blocked: &[String]) -> Option<String> {
 /// - Access to sensitive system directories and user credential files
 /// - Access outside the workspace root
 pub fn validate_path(path: &str) -> Result<PathBuf, String> {
-    let path_buf = PathBuf::from(path);
+    validate_within(&workspace_root(), PathBuf::from(path))
+}
 
+/// [`validate_path`] with `root` as the boundary instead of the daemon's
+/// workspace, and a relative `path` taken from `root`. A file tool bound to
+/// a run's own directory (a coding worktree) uses this, so the run can read
+/// and change its checkout and nothing beside it. Every other check is the
+/// same: no `..`, no symlink out, no sensitive location.
+pub fn validate_path_in(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let given = PathBuf::from(path);
+    let path_buf = if given.is_absolute() {
+        given
+    } else {
+        root.join(given)
+    };
+    validate_within(root, path_buf)
+}
+
+fn validate_within(workspace: &Path, path_buf: PathBuf) -> Result<PathBuf, String> {
     // Reject paths with .. components before canonicalization
     for component in path_buf.components() {
         if matches!(component, Component::ParentDir) {
@@ -89,7 +106,6 @@ pub fn validate_path(path: &str) -> Result<PathBuf, String> {
     }
 
     let blocked = blocked_path_prefixes();
-    let workspace = workspace_root();
 
     let path_str = path_buf.to_string_lossy();
     if let Some(prefix) = is_path_blocked(&path_str, &blocked) {
@@ -114,7 +130,7 @@ pub fn validate_path(path: &str) -> Result<PathBuf, String> {
         // Enforce workspace boundary: canonical path must be under workspace root
         let canonical_workspace = workspace
             .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
+            .unwrap_or_else(|_| workspace.to_path_buf());
         if !canonical.starts_with(&canonical_workspace) {
             return Err(format!(
                 "path is outside the workspace boundary ({})",
@@ -142,7 +158,7 @@ pub fn validate_path(path: &str) -> Result<PathBuf, String> {
             // Enforce workspace boundary for new files too
             let canonical_workspace = workspace
                 .canonicalize()
-                .unwrap_or_else(|_| workspace.clone());
+                .unwrap_or_else(|_| workspace.to_path_buf());
             if !canonical_parent.starts_with(&canonical_workspace) {
                 return Err(format!(
                     "path is outside the workspace boundary ({})",

@@ -40,14 +40,25 @@
 //! `budget/wall`, a failed process `process/<code>`, an unreadable final
 //! message `model/format`.
 //!
-//! **Its turn budget.** The brief tells a Claude Code agent how many turns
-//! it has and asks it to commit and return the contract with a few to
-//! spare. One that still stops at the cap (`error_max_turns`) and printed a
-//! session id is resumed once (`--resume <session>`, the same allowlist,
-//! permission mode and directory, at most [`RESUME_TURNS`] turns) and asked
-//! only for the contract for the work it already committed. That report is
-//! read and attested as usual, with a `known_limits` entry saying it was
-//! recovered; if the resume fails too, the run stays `budget/iterations`.
+//! **Its turn budget.** The brief tells a Claude Code agent how many turns a
+//! round has. One that stops at the cap (`error_max_turns`) and printed a
+//! session id is not finished and not failed: the same session is resumed
+//! (`--resume <session>`, the same allowlist, permission mode and
+//! directory) to keep working, up to [`CONTINUATIONS_MAX`] rounds and while
+//! the wall limit leaves more than the wrap-up's reserve. Still at the cap
+//! after that, it is resumed once more for at most [`WRAP_UP_TURNS`] turns
+//! and asked only for the contract for the work it already committed. That
+//! report is read and attested as usual, with a `known_limits` entry saying
+//! how it came about; if the wrap-up fails too, the run stays
+//! `budget/iterations`.
+//!
+//! **Its session log.** Everything each invocation printed (the agent's
+//! own JSON event stream: every message, tool call and tool result) is
+//! appended to `<data dir>/run-logs/<run id>.jsonl`, whether the run
+//! reported or not, and named to the controller through
+//! [`Worker::run_log`]. Codex is run without `--ephemeral`, so its own
+//! session survives as well. A failed run is investigated from this file,
+//! not from a one-line error.
 //!
 //! **Its environment** is cleared: only the variables an agent CLI needs
 //! (`PATH`, `HOME`, the locale, its own config and key variables) and the
@@ -89,8 +100,22 @@ use serde_json::Value;
 const STDERR_TAIL: usize = 600;
 /// Commands recorded per run; the rest are counted, not kept.
 const COMMANDS_MAX: usize = 64;
-/// Turns a resume after the turn cap gets to return the contract.
-pub const RESUME_TURNS: u32 = 2;
+/// Turns the last resume of a run gets: only enough to commit nothing new
+/// and return the contract ([`wrap_up_prompt`]).
+pub const WRAP_UP_TURNS: u32 = 2;
+/// Times a run that stopped at its turn cap is resumed to keep working
+/// before the wrap-up. The wall limit ends a run sooner.
+pub const CONTINUATIONS_MAX: u32 = 8;
+/// Wall time kept back for the wrap-up: a run with less than this left is
+/// asked for its contract instead of being resumed to keep working.
+pub const WRAP_UP_RESERVE: Duration = Duration::from_secs(120);
+/// How long a run's session log is kept ([`Worker::run_log`]).
+const RUN_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+/// The directory under the daemon's data directory that holds every run's
+/// session log, `<run id>.jsonl`.
+pub const RUN_LOGS_DIR: &str = "run-logs";
+/// Characters of an agent's stderr kept in its session log.
+const STDERR_LOG_MAX: usize = 16_000;
 
 /// The section 5 result contract's shape, as the brief shows it.
 const CONTRACT_SHAPE: &str = "{\"summary\": \"...\", \"artifacts\": [{\"kind\": \"path\", \
@@ -99,36 +124,71 @@ const CONTRACT_SHAPE: &str = "{\"summary\": \"...\", \"artifacts\": [{\"kind\": 
      \"questions\": [], \"discovered\": [{\"title\": \"...\", \
      \"objective\": \"...\", \"done_when\": \"...\"}]}";
 
-/// Claude Code's tools a worker gets when the spec names none: reading and
-/// editing files, and the local git and build commands a change needs.
-pub const CLAUDE_DEFAULT_TOOLS: [&str; 14] = [
+/// The toolset a Claude Code worker runs with: Claude Code's own default
+/// working tools, named so that a headless run is not refused them (the
+/// owner's decision of 2026-10-13: a defined toolset modelled on the
+/// agent's defaults, not a narrow one of RustyKrab's choosing). `Glob`,
+/// `Grep` and `MultiEdit` are listed for the builds that still have them;
+/// a name a build does not know is ignored. A spec's `allowed_tools` adds
+/// to this list and never replaces it, so naming one extra tool cannot
+/// take the rest away.
+pub const CLAUDE_DEFAULT_TOOLS: [&str; 18] = [
+    "Bash",
     "Read",
-    "Glob",
-    "Grep",
     "Edit",
     "MultiEdit",
     "Write",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+    "Skill",
     "TodoWrite",
-    "Bash(git status:*)",
-    "Bash(git diff:*)",
-    "Bash(git add:*)",
-    "Bash(git commit:*)",
-    "Bash(git log:*)",
-    "Bash(ls:*)",
-    "Bash(cargo:*)",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "LSP",
 ];
 
-/// Never allowed, whatever the spec says: publishing and the network are
-/// not a worker's to use (delivery plan, section 7.5).
-pub const CLAUDE_DENIED_TOOLS: [&str; 3] = ["Bash(git push:*)", "WebFetch", "WebSearch"];
+/// Never allowed, whatever the spec says: publishing is not a worker's to
+/// do (delivery plan, section 7.5). The daemon's secret files are denied
+/// beside it ([`SECRET_FILES`]).
+pub const CLAUDE_DENIED_TOOLS: [&str; 1] = ["Bash(git push:*)"];
 
-/// Claude Code's `--disallowedTools`: [`CLAUDE_DENIED_TOOLS`], then the
-/// worker's own additions. A spec can deny more, never less.
-fn denied_list(extra: &[String]) -> String {
+/// Claude Code's `--allowedTools`: [`CLAUDE_DEFAULT_TOOLS`], then whatever
+/// the worker's spec adds.
+fn allowed_list(extra: &[String]) -> String {
+    let mut all: Vec<&str> = CLAUDE_DEFAULT_TOOLS.to_vec();
+    for tool in extra.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if !all.contains(&tool) {
+            all.push(tool);
+        }
+    }
+    all.join(",")
+}
+
+/// Files in the daemon's data directory that hold its credentials. A
+/// Claude Code worker is denied reading them by rule; it is a guard against
+/// accident, not isolation, since a worker runs as the daemon's own user.
+pub const SECRET_FILES: [&str; 4] = ["service.json", "auth-token", "auth.token", "master.key"];
+
+/// Claude Code's `--disallowedTools`: [`CLAUDE_DENIED_TOOLS`], the secret
+/// files under `data_dir`, then the worker's own additions. A spec can deny
+/// more, never less.
+fn denied_list(data_dir: &Path, extra: &[String]) -> String {
+    let secrets = SECRET_FILES.iter().map(|name| {
+        // Claude Code reads a leading `//` in a path rule as the
+        // filesystem root.
+        format!("Read(/{})", data_dir.join(name).display())
+    });
     CLAUDE_DENIED_TOOLS
         .iter()
-        .copied()
-        .chain(extra.iter().map(String::as_str))
+        .map(|rule| rule.to_string())
+        .chain(secrets)
+        .chain(extra.iter().cloned())
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -347,7 +407,7 @@ pub struct ExternalConfig {
     pub require_max: bool,
     pub codex_home: Option<PathBuf>,
     pub require_chatgpt: bool,
-    /// Claude Code's `--allowedTools`; empty takes [`CLAUDE_DEFAULT_TOOLS`].
+    /// Added to [`CLAUDE_DEFAULT_TOOLS`] in Claude Code's `--allowedTools`.
     pub allowed_tools: Vec<String>,
     /// Denied on top of [`CLAUDE_DENIED_TOOLS`] in Claude Code's
     /// `--disallowedTools`; empty for codex, which has no such flag.
@@ -355,6 +415,9 @@ pub struct ExternalConfig {
     pub max_turns: u32,
     pub permission_mode: String,
     pub timeout: Duration,
+    /// Wall time kept back for the wrap-up after the turn cap
+    /// ([`WRAP_UP_RESERVE`]).
+    pub wrap_up_reserve: Duration,
     pub concurrency: usize,
     /// Extra environment variables passed through, by name.
     pub env: Vec<String>,
@@ -452,6 +515,7 @@ impl ExternalConfig {
                 .clone()
                 .unwrap_or_else(|| "acceptEdits".to_string()),
             timeout: Duration::from_secs(spec.timeout_seconds.unwrap_or(1_800)),
+            wrap_up_reserve: WRAP_UP_RESERVE,
             concurrency: spec.concurrency.unwrap_or(1).max(1),
             env: spec.env.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -475,6 +539,32 @@ pub struct ExternalWorker {
     commands: Mutex<HashMap<String, Vec<String>>>,
     /// Where its live runs' process groups are recorded.
     groups: Arc<RunGroups>,
+    /// The session log each run left, by the brief's run id
+    /// ([`Worker::run_log`]).
+    logs: Mutex<HashMap<String, PathBuf>>,
+}
+
+/// Which invocation of a run this is: the first, a resume to keep working
+/// after the turn cap, or the last resume, asked only for the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume<'a> {
+    KeepWorking(&'a str),
+    WrapUp(&'a str),
+}
+
+impl Resume<'_> {
+    fn session(&self) -> &str {
+        match self {
+            Resume::KeepWorking(s) | Resume::WrapUp(s) => s,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Resume::KeepWorking(_) => "continue",
+            Resume::WrapUp(_) => "wrap_up",
+        }
+    }
 }
 
 /// What one invocation printed, read.
@@ -512,6 +602,7 @@ impl ExternalWorker {
             usage: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
             groups: RunGroups::global(),
+            logs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -532,6 +623,73 @@ impl ExternalWorker {
             .join("workers")
             .join(&self.name)
             .join("runs")
+    }
+
+    /// Where runs' session logs are kept: one file per run, every worker's
+    /// in the same place so an investigator needs one path convention.
+    fn logs_root(&self) -> PathBuf {
+        self.config.data_dir.join(RUN_LOGS_DIR)
+    }
+
+    /// Append one invocation of `run` to its session log: a marker line,
+    /// then everything the agent printed (its own JSON event stream, one
+    /// event per line: every message, tool call and tool result), then its
+    /// stderr when it wrote any. This is the whole session, kept whether
+    /// the run reported or not, so a later run can investigate a failure
+    /// from what happened instead of from a one-line error. Best effort: a
+    /// log that cannot be written is logged and the run goes on.
+    fn append_log(&self, run: &str, invocation: &str, output: &std::process::Output) {
+        let root = self.logs_root();
+        let path = root.join(format!("{}.jsonl", file_id(run)));
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            std::fs::create_dir_all(&root)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.append(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path)?;
+            let marker = serde_json::json!({
+                "type": "rustykrab.invocation",
+                "invocation": invocation,
+                "run": run,
+                "worker": self.name,
+                "kind": self.config.kind.as_str(),
+                "at": chrono::Utc::now().to_rfc3339(),
+                "exit": output.status.code(),
+            });
+            writeln!(file, "{marker}")?;
+            file.write_all(&output.stdout)?;
+            if output.stdout.last().is_some_and(|b| *b != b'\n') {
+                file.write_all(b"\n")?;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                let line = serde_json::json!({
+                    "type": "rustykrab.stderr",
+                    "text": tail(&stderr, STDERR_LOG_MAX),
+                });
+                writeln!(file, "{line}")?;
+            }
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.logs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(run.to_string(), path);
+            }
+            Err(e) => tracing::warn!(
+                worker = %self.name,
+                run = %run,
+                error = %e,
+                "session log not written"
+            ),
+        }
     }
 
     /// Whether the command resolves to a file, on `PATH` when it is a bare
@@ -666,14 +824,15 @@ impl ExternalWorker {
     }
 
     /// The process for one run, or with `resume`, the Claude Code session
-    /// to continue for [`RESUME_TURNS`] turns.
+    /// to continue: for a full round of turns to keep working, or for
+    /// [`WRAP_UP_TURNS`] to hand in the contract.
     fn command(
         &self,
         prompt: &str,
         dir: &Path,
         brief: &Brief,
         last: &Path,
-        resume: Option<&str>,
+        resume: Option<Resume<'_>>,
     ) -> tokio::process::Command {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
@@ -695,15 +854,15 @@ impl ExternalWorker {
                     .arg("--output-last-message")
                     .arg(last);
                 if c.require_chatgpt {
+                    // Not `--ephemeral`: Codex keeps its session, so a
+                    // failed run can be investigated from it like any
+                    // other worker's.
                     cmd.args([
                         "--ignore-user-config",
-                        "--ephemeral",
                         "-c",
                         "forced_login_method=\"chatgpt\"",
                         "-c",
                         "model_provider=\"openai\"",
-                        "-c",
-                        "web_search=\"disabled\"",
                     ]);
                 }
                 if review {
@@ -723,27 +882,26 @@ impl ExternalWorker {
             }
             _ => {
                 let turns = match resume {
-                    Some(_) => RESUME_TURNS,
-                    None => self.turn_limit(brief),
+                    Some(Resume::WrapUp(_)) => WRAP_UP_TURNS,
+                    Some(Resume::KeepWorking(_)) | None => self.turn_limit(brief),
                 }
                 .to_string();
-                let allowed = if c.allowed_tools.is_empty() {
-                    CLAUDE_DEFAULT_TOOLS.join(",")
-                } else {
-                    c.allowed_tools.join(",")
-                };
+                let allowed = allowed_list(&c.allowed_tools);
                 cmd.arg("-p").arg(prompt);
                 if review {
                     cmd.args(["--tools", ""]);
                 }
-                if let Some(session) = resume {
-                    cmd.args(["--resume", session]);
+                if let Some(resume) = resume {
+                    cmd.args(["--resume", resume.session()]);
                 }
                 cmd.args(["--output-format", "stream-json", "--verbose"])
                     .args(["--max-turns", &turns])
                     .args(["--permission-mode", &c.permission_mode])
                     .args(["--allowedTools", &allowed])
-                    .args(["--disallowedTools", &denied_list(&c.denied_tools)]);
+                    .args([
+                        "--disallowedTools",
+                        &denied_list(&c.data_dir, &c.denied_tools),
+                    ]);
                 if let Some(model) = &c.model {
                     cmd.args(["--model", model]);
                 }
@@ -898,11 +1056,47 @@ impl ExternalWorker {
         }
     }
 
-    /// Resume a Claude Code session that stopped at its turn cap and ask
-    /// only for the result contract. `None` when there is no time left, the
-    /// resume did not return one, or a run in a worktree reported no
-    /// commit; beside it, whether daemon shutdown ended the resume.
-    async fn recover(
+    /// Resume a Claude Code session that stopped at its turn cap, within
+    /// `limit`: to keep working for another round of turns, or (the wrap-up)
+    /// only to hand in the result contract for what it already committed.
+    /// Returns what the resume ended with, the session to resume again when
+    /// it stopped at the cap once more, and whether daemon shutdown ended
+    /// it.
+    async fn resume(
+        &self,
+        brief: &Brief,
+        run: &str,
+        resume: Resume<'_>,
+        dir: &Path,
+        last: &Path,
+        limit: Duration,
+    ) -> (Result<ResultReport>, Option<String>, bool) {
+        let prompt = match resume {
+            Resume::KeepWorking(_) => continue_prompt(self.turn_limit(brief)),
+            Resume::WrapUp(_) => wrap_up_prompt(),
+        };
+        let cmd = self.command(&prompt, dir, brief, last, Some(resume));
+        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
+        match executed {
+            Ok(output) => {
+                self.append_log(run, resume.label(), &output);
+                let (outcome, again) = self.read_output(brief, run, &output, last, true);
+                (outcome, again, interrupted)
+            }
+            Err(e) => {
+                if let Some(partial) = &partial {
+                    self.append_log(run, resume.label(), partial);
+                    let _ = self.read_output(brief, run, partial, last, true);
+                }
+                (Err(e), None, interrupted)
+            }
+        }
+    }
+
+    /// The wrap-up: ask the session only for the contract. `None` when
+    /// there is no time left, it did not return one, or a run in a worktree
+    /// reported no commit; beside it, whether daemon shutdown ended it.
+    async fn wrap_up(
         &self,
         brief: &Brief,
         run: &str,
@@ -914,17 +1108,9 @@ impl ExternalWorker {
         if limit.is_zero() {
             return (None, false);
         }
-        let cmd = self.command(&resume_prompt(), dir, brief, last, Some(session));
-        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
-        let recovered = match executed {
-            Ok(output) => self.read_output(brief, run, &output, last, true).0,
-            Err(e) => {
-                if let Some(partial) = &partial {
-                    let _ = self.read_output(brief, run, partial, last, true);
-                }
-                Err(e)
-            }
-        };
+        let (recovered, _, interrupted) = self
+            .resume(brief, run, Resume::WrapUp(session), dir, last, limit)
+            .await;
         let report = match recovered {
             // A worktree run that committed nothing has nothing to recover:
             // it stays the budget/iterations failure it already was.
@@ -932,14 +1118,14 @@ impl ExternalWorker {
                 tracing::warn!(
                     worker = %self.name,
                     item = %brief.item,
-                    "resume after the turn cap reported no commit"
+                    "wrap-up after the turn cap reported no commit"
                 );
                 None
             }
             Ok(mut report) => {
                 report.known_limits.push(format!(
                     "recovered after the turn cap: the run stopped at its {}-turn limit and this \
-                     report came from resuming its session for at most {RESUME_TURNS} turns",
+                     report came from resuming its session for at most {WRAP_UP_TURNS} turns",
                     self.turn_limit(brief)
                 ));
                 Some(report)
@@ -949,7 +1135,7 @@ impl ExternalWorker {
                     worker = %self.name,
                     item = %brief.item,
                     error = %e,
-                    "resume after the turn cap returned no contract"
+                    "wrap-up after the turn cap returned no contract"
                 );
                 None
             }
@@ -958,14 +1144,26 @@ impl ExternalWorker {
     }
 }
 
-/// What a resume after the turn cap is asked.
-fn resume_prompt() -> String {
+/// What a resume to keep working is told.
+fn continue_prompt(turns: u32) -> String {
+    format!(
+        "You stopped at your turn limit before the work item was finished. Nothing is lost: \
+         this is the same session, in the same directory. Continue from where you stopped, \
+         for up to {turns} more turns. Commit as you go. When the item's done_when is met, or \
+         you are truly blocked, end with one JSON object and nothing after it, the result \
+         contract:\n{CONTRACT_SHAPE}\n"
+    )
+}
+
+/// What the wrap-up after the turn cap is asked.
+fn wrap_up_prompt() -> String {
     format!(
         "You ran out of turns before returning the result contract. Do no more work and run \
          nothing. Return the result contract for the work already committed on this branch: \
          commit is the sha of your last commit, or null if you committed nothing, and \
-         changed_paths are exactly the files your commits change. End with one JSON object and \
-         nothing after it:\n{CONTRACT_SHAPE}\n"
+         changed_paths are exactly the files your commits change. Say in known_limits what \
+         of the done_when is not met. End with one JSON object and nothing after it:\n\
+         {CONTRACT_SHAPE}\n"
     )
 }
 
@@ -1108,6 +1306,16 @@ impl Worker for ExternalWorker {
             .copied()
     }
 
+    /// The session log [`ExternalWorker::append_log`] wrote for the run.
+    fn run_log(&self, run: &str) -> Option<PathBuf> {
+        self.logs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run)
+            .filter(|path| path.is_file())
+            .cloned()
+    }
+
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         if let Some(runtime) = &self.max_runtime {
             runtime.verify_login(true).await?;
@@ -1216,29 +1424,85 @@ impl Worker for ExternalWorker {
             secs => self.config.timeout.min(Duration::from_secs(secs)),
         };
         let started = std::time::Instant::now();
+        prune_files(&self.logs_root(), RUN_LOG_RETENTION);
         let (executed, partial, mut interrupted) = self.execute(cmd, limit).await;
-        let (mut outcome, resume) = match executed {
-            Ok(output) => self.read_output(&brief, &run_id, &output, &last, false),
+        let (mut outcome, mut resume) = match executed {
+            Ok(output) => {
+                self.append_log(&run_id, "start", &output);
+                self.read_output(&brief, &run_id, &output, &last, false)
+            }
             // Ended by its wall limit: record what it had spent, and keep
             // the timeout as the outcome.
             Err(e) => {
                 if let Some(partial) = &partial {
+                    self.append_log(&run_id, "start", partial);
                     let _ = self.read_output(&brief, &run_id, partial, &last, false);
                 }
                 (Err(e), None)
             }
         };
-        // A run that stopped at its turn cap may still have committed its
-        // work: ask the same session for the contract, within what is left
-        // of the wall limit. Not once the daemon is shutting down.
-        if let Some(session) = resume.filter(|_| !interrupted) {
+        // A run that stopped at its turn cap is not finished and not
+        // failed: the same session is resumed to keep working, round after
+        // round, while there is wall time beyond the wrap-up's reserve.
+        // Then, still at the cap, it is asked once for the contract for
+        // what it committed. Not once the daemon is shutting down.
+        let mut continued = 0u32;
+        while let Some(session) = resume.take().filter(|_| !interrupted) {
             let left = limit.saturating_sub(started.elapsed());
-            let (report, stopped) = self
-                .recover(&brief, &run_id, &session, &dir, &last, left)
-                .await;
-            interrupted = stopped;
-            if let Some(report) = report {
-                outcome = Ok(report);
+            let reserve = self.config.wrap_up_reserve;
+            if continued < CONTINUATIONS_MAX && left > reserve {
+                continued += 1;
+                let (next, again, stopped) = self
+                    .resume(
+                        &brief,
+                        &run_id,
+                        Resume::KeepWorking(&session),
+                        &dir,
+                        &last,
+                        left - reserve,
+                    )
+                    .await;
+                interrupted = stopped;
+                match next {
+                    Ok(mut report) => {
+                        report.known_limits.push(format!(
+                            "the run stopped at its {}-turn limit and was resumed {continued} \
+                             time(s) in the same session to finish",
+                            self.turn_limit(&brief)
+                        ));
+                        outcome = Ok(report);
+                    }
+                    // At the cap again: go round, with the session it
+                    // printed (the same one, unless the CLI forked it).
+                    Err(e) if again.is_some() => {
+                        outcome = Err(e);
+                        resume = again;
+                    }
+                    // The round ended some other way (its share of the wall
+                    // limit, a failed process): the reserve is still there
+                    // for the wrap-up of what it had committed.
+                    Err(e) => {
+                        outcome = Err(e);
+                        if !interrupted {
+                            let left = limit.saturating_sub(started.elapsed());
+                            let (report, stopped) = self
+                                .wrap_up(&brief, &run_id, &session, &dir, &last, left)
+                                .await;
+                            interrupted = stopped;
+                            if let Some(report) = report {
+                                outcome = Ok(report);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let (report, stopped) = self
+                    .wrap_up(&brief, &run_id, &session, &dir, &last, left)
+                    .await;
+                interrupted = stopped;
+                if let Some(report) = report {
+                    outcome = Ok(report);
+                }
             }
         }
         // Shutdown ended the group: whatever the process said, the run was
@@ -1347,6 +1611,39 @@ fn prune_dirs(root: &Path, window: Duration) {
         if old && entry.path().is_dir() {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// Remove files under `root` older than `window`.
+fn prune_files(root: &Path, window: Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > window);
+        if old && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A run id as a file name: its letters, digits and dashes.
+fn file_id(id: &str) -> String {
+    let name: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        "run".to_string()
+    } else {
+        name
     }
 }
 
@@ -1808,8 +2105,10 @@ pub fn render_executor_brief(
     if let Some(turns) = turns {
         let _ = writeln!(
             out,
-            "- You have {turns} turns in all. Commit and return the result contract with a few \
-             turns to spare; a run that reaches the limit without it loses its work."
+            "- You work in rounds of {turns} turns. A run that reaches the limit is resumed in \
+             the same session to keep going, a limited number of times and within its time \
+             limit, so commit as you go and return the result contract as soon as the \
+             done_when is met."
         );
     }
     if let Some(ws) = &brief.workspace {
@@ -2121,24 +2420,37 @@ else:
 
     #[test]
     fn a_spec_s_denied_tools_extend_the_built_in_deny_list() {
-        let built_in = CLAUDE_DENIED_TOOLS.join(",");
-        assert_eq!(
-            disallowed(WorkerKind::ClaudeCode, &[]).as_deref(),
-            Some(built_in.as_str()),
-            "a spec without denied_tools is unchanged"
+        // Built in: publishing, and the daemon's secret files by path.
+        let built_in = disallowed(WorkerKind::ClaudeCode, &[]).unwrap();
+        let rules: Vec<&str> = built_in.split(',').collect();
+        assert_eq!(rules[0], "Bash(git push:*)");
+        assert_eq!(rules.len(), 1 + SECRET_FILES.len(), "{built_in}");
+        for name in SECRET_FILES {
+            assert!(
+                rules
+                    .iter()
+                    .any(|r| r.starts_with("Read(//") && r.ends_with(&format!("/{name})"))),
+                "{name} is denied by absolute path: {built_in}"
+            );
+        }
+        assert!(
+            !built_in.contains("WebFetch") && !built_in.contains("WebSearch"),
+            "the web is part of the worker's toolset: {built_in}"
         );
+        let extended = disallowed(
+            WorkerKind::ClaudeCode,
+            &[
+                "Read(~/.config/**)",
+                " Edit(//Users/someone/secrets/**) ",
+                "",
+            ],
+        )
+        .unwrap();
+        let added: Vec<&str> = extended.split(',').skip(rules.len()).collect();
         assert_eq!(
-            disallowed(
-                WorkerKind::ClaudeCode,
-                &[
-                    "Read(~/.config/**)",
-                    " Edit(//Users/someone/secrets/**) ",
-                    ""
-                ]
-            ),
-            Some(format!(
-                "{built_in},Read(~/.config/**),Edit(//Users/someone/secrets/**)"
-            ))
+            added,
+            ["Read(~/.config/**)", "Edit(//Users/someone/secrets/**)"],
+            "a spec adds to the list and takes nothing from it"
         );
         // Codex has no such flag: the list is dropped, not passed on.
         assert_eq!(disallowed(WorkerKind::Codex, &["Read(~/.config/**)"]), None);
@@ -2511,8 +2823,8 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         worker.run(brief(Some(f.workspace()))).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
         assert!(args.contains("--max-turns\n12\n"), "{args}");
-        assert!(args.contains("You have 12 turns in all"), "{args}");
-        assert!(args.contains("with a few turns to spare"), "{args}");
+        assert!(args.contains("You work in rounds of 12 turns"), "{args}");
+        assert!(args.contains("is resumed in the same session"), "{args}");
         // Codex has no turn cap to name.
         let codex = render_executor_brief(
             &brief(None),
@@ -2522,7 +2834,7 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             Path::new("/tmp/skills"),
             None,
         );
-        assert!(!codex.contains("turns in all"), "{codex}");
+        assert!(!codex.contains("rounds of"), "{codex}");
     }
 
     #[tokio::test]
@@ -2583,6 +2895,139 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         );
         assert!(resume.contains("already committed"), "{resume}");
         assert!(!ws.path.exists(), "a recovered run gives its worktree back");
+    }
+
+    /// With wall time beyond the wrap-up's reserve, a capped run is not
+    /// wrapped up: its session is resumed for a full round to keep working.
+    #[tokio::test]
+    async fn a_run_at_its_turn_cap_with_time_left_is_resumed_to_keep_working() {
+        let f = Fixture::new();
+        let mut worker = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent("claude", &capped_claude(RESUME_CONTRACT)),
+        );
+        worker.config.max_turns = 12;
+        worker.config.wrap_up_reserve = Duration::from_secs(1);
+        let report = worker.run(brief(Some(f.workspace()))).await.unwrap();
+
+        assert_eq!(report.summary, "added status");
+        assert!(
+            report
+                .known_limits
+                .iter()
+                .any(|l| l.contains("was resumed 1 time(s) in the same session")),
+            "{:?}",
+            report.known_limits
+        );
+        let resume = std::fs::read_to_string(f.data.path().join("resume.txt")).unwrap();
+        assert!(resume.contains("--resume\nsess-1\n"), "{resume}");
+        assert!(
+            resume.contains("--max-turns\n12\n"),
+            "a full round, not the wrap-up's two turns: {resume}"
+        );
+        assert!(
+            resume.contains("Continue from where you stopped"),
+            "{resume}"
+        );
+    }
+
+    /// Every invocation's event stream is kept in one file per run, and the
+    /// worker names it, whether the run reported or not.
+    #[tokio::test]
+    async fn every_run_leaves_its_session_log() {
+        let f = Fixture::new();
+        // A run that reports.
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
+        assert_eq!(worker.run_log("run-1"), None, "no log before the run");
+        worker.run(brief(Some(f.workspace()))).await.unwrap();
+        let log = worker.run_log("run-1").expect("the run left a log");
+        assert_eq!(log, f.data.path().join(RUN_LOGS_DIR).join("run-1.jsonl"));
+        let text = std::fs::read_to_string(&log).unwrap();
+        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["type"], "rustykrab.invocation");
+        assert_eq!(first["invocation"], "start");
+        assert_eq!(first["worker"], "pinch");
+        assert!(
+            text.contains("\"type\":\"result\""),
+            "the agent's own event stream follows the marker: {text}"
+        );
+
+        // A run that stops at its cap and whose wrap-up fails leaves both
+        // invocations, with what the failed one wrote to stderr.
+        std::fs::remove_file(&log).unwrap();
+        let capped = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent("claude", &capped_claude("echo 'resume failed' >&2\nexit 1")),
+        );
+        capped.run(brief(None)).await.unwrap_err();
+        let text = std::fs::read_to_string(capped.run_log("run-1").unwrap()).unwrap();
+        let invocations: Vec<String> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "rustykrab.invocation")
+            .map(|v| v["invocation"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(invocations, ["start", "wrap_up"]);
+        assert!(text.contains("error_max_turns"), "{text}");
+        assert!(text.contains("resume failed"), "{text}");
+    }
+
+    /// The toolset is Claude Code's default working tools; a spec adds to
+    /// it and cannot shrink it. Codex keeps its session and its web search.
+    #[test]
+    fn the_toolset_is_the_agent_s_defaults_and_a_spec_only_adds_to_it() {
+        let data = tempfile::tempdir().unwrap();
+        let args_of = |spec: &WorkerSpec| -> Vec<String> {
+            let worker = ExternalWorker::new(
+                "pinch",
+                ExternalConfig::from_spec(spec, data.path()).unwrap(),
+            );
+            worker
+                .command(
+                    "go",
+                    data.path(),
+                    &brief(None),
+                    &data.path().join("last"),
+                    None,
+                )
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let allowed = |args: &[String]| -> Vec<String> {
+            let at = args.iter().position(|a| a == "--allowedTools").unwrap();
+            args[at + 1].split(',').map(str::to_string).collect()
+        };
+        let plain = WorkerSpec {
+            kind: WorkerKind::ClaudeCode,
+            repos: vec!["/src/app".into()],
+            ..WorkerSpec::default()
+        };
+        let defaults = allowed(&args_of(&plain));
+        assert_eq!(defaults, CLAUDE_DEFAULT_TOOLS);
+        for tool in ["Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch"] {
+            assert!(defaults.iter().any(|t| t == tool), "{tool}: {defaults:?}");
+        }
+        // The spec that broke the live workers: two extra names used to
+        // replace the whole list.
+        let extra = WorkerSpec {
+            allowed_tools: vec!["cargo".into(), " node ".into(), "Bash".into(), "".into()],
+            ..plain.clone()
+        };
+        let widened = allowed(&args_of(&extra));
+        assert_eq!(&widened[..defaults.len()], &defaults[..]);
+        assert_eq!(&widened[defaults.len()..], ["cargo", "node"]);
+
+        let codex = args_of(&WorkerSpec {
+            kind: WorkerKind::Codex,
+            repos: vec!["/src/app".into()],
+            require_chatgpt: true,
+            ..WorkerSpec::default()
+        });
+        assert!(!codex.iter().any(|a| a == "--ephemeral"), "{codex:?}");
+        assert!(!codex.iter().any(|a| a.contains("web_search")), "{codex:?}");
+        assert!(!codex.iter().any(|a| a == "--allowedTools"), "{codex:?}");
     }
 
     #[tokio::test]
