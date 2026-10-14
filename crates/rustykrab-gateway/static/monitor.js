@@ -154,7 +154,7 @@
     if (!reply.schedules?.length) $('scheduleRows').append(node('p', 'No schedules in this manager.', 'note'));
     for (const job of reply.schedules || []) {
       const card = node('article', undefined, 'agent');
-      card.append(node('h3', job.task.length > 120 ? job.task.slice(0, 120) + '…' : job.task), badge(job.enabled ? 'scheduled' : 'paused'), node('p', job.schedule + ' · ' + job.timezone + ' · Next ' + at(job.next_run_at)), node('p', 'Execution ' + human(job.execution?.worker_kind || 'any') + (job.execution?.required_tools?.length ? ' · Tools ' + job.execution.required_tools.join(', ') : '') + (job.execution?.writable_resources?.length ? ' · Resources ' + job.execution.writable_resources.join(', ') : '')));
+      card.append(node('h3', job.task.length > 120 ? job.task.slice(0, 120) + '…' : job.task), badge(job.enabled ? 'scheduled' : 'paused'), node('p', job.schedule + ' · ' + job.timezone + ' · Next ' + at(job.next_run_at)), node('p', 'Execution requirements' + (job.execution?.required_tools?.length ? ' · Tools ' + job.execution.required_tools.join(', ') : '') + (job.execution?.writable_resources?.length ? ' · Resources ' + job.execution.writable_resources.join(', ') : '')));
       const delivery = reply.scheduled_deliveries?.find(d => d.job_id === job.id);
       if (delivery) card.append(node('p', 'Last delivery: ' + delivery.status + ' · ' + at(delivery.at), 'note'));
       const history = node('button', 'Run history');
@@ -308,8 +308,8 @@
     $('workRows').replaceChildren();
     for (const row of selected) {
       const i = row.item, tr = node('tr'), title = node('td'), state = node('td');
-      title.append(itemButton(i.id, i.title), node('small', i.id.slice(0, 8) + ' · ' + human(i.kind)));
-      state.append(badge(status(i)));
+      title.append(itemButton(i.id, i.title), node('small', i.id.slice(0, 8)));
+      state.append(badge(status(i) === 'ready' ? 'Queued' : status(i), status(i)));
       if (reason(i)) state.append(node('small', human(reason(i))));
       const agent = node('td', row.last_worker || 'Unassigned');
       if (row.lease) agent.append(node('small', 'Heartbeat ' + age(row.lease.heartbeat_at)));
@@ -547,7 +547,7 @@
       const d = await api('/api/work/' + encodeURIComponent(id));
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
       $('detailTitle').textContent = d.item.title;
-      const body = $('detailBody'); delete body.dataset.startOptions; body.replaceChildren(badge(status(d.item)), node('p', id, 'note'));
+      const body = $('detailBody'); delete body.dataset.startOptions; body.replaceChildren(badge(status(d.item) === 'ready' ? 'Queued' : status(d.item), status(d.item)), node('p', id, 'note'));
       if (d.item.parent) body.append(itemButton(d.item.parent, 'View parent work'));
       if (d.item.kind === 'proposal' && !closed.has(status(d.item))) {
         const controls = node('div', undefined, 'controls');

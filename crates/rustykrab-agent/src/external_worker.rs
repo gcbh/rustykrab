@@ -96,7 +96,7 @@ pub const RESUME_TURNS: u32 = 2;
 const CONTRACT_SHAPE: &str = "{\"summary\": \"...\", \"artifacts\": [{\"kind\": \"path\", \
      \"value\": \"...\"}], \"changed_paths\": [\"...\"], \"commit\": \"<sha>\" or null, \
      \"checks_run\": [\"...\"], \"known_limits\": [], \"blocked\": null, \"error\": null, \
-     \"questions\": [], \"discovered\": [{\"kind\": \"code\", \"title\": \"...\", \
+     \"questions\": [], \"discovered\": [{\"title\": \"...\", \
      \"objective\": \"...\", \"done_when\": \"...\"}]}";
 
 /// Claude Code's tools a worker gets when the spec names none: reading and
@@ -678,11 +678,10 @@ impl ExternalWorker {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
         let build = is_tool_build(brief);
-        let review = brief.kind == rustykrab_core::work::WorkKind::Research
-            && brief
-                .artifact_refs
-                .iter()
-                .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
+        let review = brief
+            .artifact_refs
+            .iter()
+            .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
         match c.kind {
             WorkerKind::Codex => {
                 if c.require_chatgpt {
@@ -1271,10 +1270,10 @@ impl Worker for ExternalWorker {
             .remove(&brief.item)
             .unwrap_or_default();
         let outcome = outcome.and_then(|mut report| {
-            let review = brief.kind == rustykrab_core::work::WorkKind::Research
-                && brief.artifact_refs.iter().any(|r| {
-                    r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true"
-                });
+            let review = brief
+                .artifact_refs
+                .iter()
+                .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
             if review
                 && (!report.discovered.is_empty()
                     || report.commit.is_some()
@@ -1709,12 +1708,7 @@ pub fn render_executor_brief(
         kind.as_str()
     );
     out.push('\n');
-    let _ = writeln!(
-        out,
-        "work item: #{}  kind: {}",
-        brief.item,
-        brief.kind.as_str()
-    );
+    let _ = writeln!(out, "work item: #{}", brief.item);
     let _ = writeln!(out, "title: {}", one_line(&brief.title));
     let _ = writeln!(out, "objective: {}", one_line(&brief.objective));
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when));
@@ -3150,7 +3144,7 @@ else:
         let f = Fixture::new();
         let cli = f.agent("read-only-review", "#!/bin/sh\nexit 0\n");
         let mut b = brief(None);
-        b.kind = rustykrab_core::work::WorkKind::Research;
+        b.kind = rustykrab_core::work::WorkKind::Task;
         b.artifact_refs.push(rustykrab_core::work::ArtifactRef {
             kind: rustykrab_core::dream_review::REVIEW_ONLY.into(),
             value: "true".into(),

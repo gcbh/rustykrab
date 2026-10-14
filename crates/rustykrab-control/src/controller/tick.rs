@@ -81,8 +81,6 @@ pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
     // planning items (6, step 2).
     worker.accepts(item)
         && graph::is_planning(item) == super::planning::plans(worker)
-        && (item.worker_kind == WorkerKind::Any || item.worker_kind == worker.kind())
-        && !lacks_checkout(worker.kind(), item)
         && item.required_tools.iter().all(|t| has(&caps.tools, t))
         && item
             .required_mcp_servers
@@ -92,14 +90,6 @@ pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
             .writable_resources
             .iter()
             .all(|r| has(&caps.writable_resources, r))
-}
-
-/// Whether a worker of `kind` would run `item` without a checkout: a
-/// `code` item naming no repository, for a worker that edits one.
-pub(super) fn lacks_checkout(kind: WorkerKind, item: &WorkItem) -> bool {
-    item.kind == WorkKind::Code
-        && kind.needs_checkout()
-        && Workspace::repo_of(&item.writable_resources).is_none()
 }
 
 /// The blocked state a surfaced failure parks in (sections 7 and 8).
@@ -558,9 +548,9 @@ impl Controller {
             changed.extend(self.recover_project_context_holds(&mut b, &waiting).await?);
         }
 
-        // Items waiting for a worker: requeued when one can take them,
-        // climbing their ladder once the wait is past its TTL (section 7).
-        changed.extend(self.worker_waits(&mut b, &waiting).await?);
+        // Availability is queue waiting, never a failed attempt. Recover
+        // historical holds without requiring a resource to be available yet.
+        changed.extend(self.recover_worker_waits(&mut b, &waiting));
 
         // Step 7 for subtrees: a stalled parent re-plans, then surfaces
         // once; a chain open past the digest window gets its digest (6.6).
@@ -600,15 +590,24 @@ impl Controller {
                 .collect();
             (ready, runs)
         };
-        for (id, run) in done_runs {
-            self.record_run(&id, &run, "ended").await;
+        for (id, mut run) in done_runs {
             if run.reported {
+                self.record_run(&id, &run, "ended").await;
                 continue;
             }
-            let outcome: RunResult = match run.handle.await {
+            let outcome: RunResult = match (&mut run.handle).await {
                 Ok(result) => result,
                 Err(e) => Err(Error::Internal(format!("worker run ended abnormally: {e}"))),
             };
+            let how = if outcome
+                .as_ref()
+                .is_err_and(|error| self.availability_error(&run.worker, error))
+            {
+                "resource_wait"
+            } else {
+                "ended"
+            };
+            self.record_run(&id, &run, how).await;
             ready.push((
                 id,
                 Finished {
@@ -672,6 +671,9 @@ impl Controller {
                          ready"
                 ),
             ),
+            Err(e) if self.availability_error(worker, e) => {
+                self.queue_after_unavailable(b, id, worker)
+            }
             Err(e) => {
                 // A typed `RunFailure` (a spent budget, a model that never
                 // reported) comes back typed; anything else as the core
@@ -845,7 +847,7 @@ impl Controller {
             // A landed rule is verified by the replay above, not by being
             // in the report; an adapter's command record is what checks
             // were verified against.
-            let verified = if item.kind == WorkKind::Internal && artifact.kind == CLASSIFIER_RULE {
+            let verified = if artifact.kind == CLASSIFIER_RULE {
                 REPLAYED
             } else {
                 RESULT_REPORT
@@ -908,9 +910,6 @@ impl Controller {
         item: &WorkItem,
         result: &rustykrab_core::work::ResultReport,
     ) -> Result<Result<Vec<LearnedRule>, String>, Error> {
-        if item.kind != WorkKind::Internal {
-            return Ok(Ok(Vec::new()));
-        }
         let raw: Vec<&str> = result
             .artifacts
             .iter()
@@ -954,8 +953,8 @@ impl Controller {
     /// (section 5), as evidence rows to add, or the verdict and why when
     /// the result claims more than the evidence shows:
     ///
-    /// - a `code` item's commit and changed paths, against the run's
-    ///   workspace ([`workspace::verify`]); a `code` result that claims a
+    /// - a repository-scoped item's commit and changed paths, against its
+    ///   workspace ([`workspace::verify`]); any result that claims a
     ///   commit or paths with no workspace to check them against claims
     ///   beyond the evidence;
     /// - every check it names, against the commands its adapter recorded
@@ -967,7 +966,10 @@ impl Controller {
         result: &rustykrab_core::work::ResultReport,
     ) -> Result<Result<Vec<Proof>, (VerifierVerdict, String)>, Error> {
         let mut proofs: Vec<Proof> = Vec::new();
-        if item.kind == WorkKind::Code {
+        if Workspace::repo_of(&item.writable_resources).is_some()
+            || result.commit.is_some()
+            || !result.changed_paths.is_empty()
+        {
             match self.workspace_of(&item.id).await? {
                 Some(ws) => {
                     let claim_commit = result.commit.clone();
@@ -984,6 +986,9 @@ impl Controller {
                     .await
                     .map_err(|e| Error::Internal(format!("verification task failed: {e}")))?;
                     match verdict {
+                        Ok(CodeVerdict::Unchanged { base }) => {
+                            proofs.push(("repository_unchanged".into(), base, Some(BY_GIT.into())));
+                        }
                         Ok(CodeVerdict::Verified {
                             commit,
                             changed_paths,
@@ -1690,15 +1695,14 @@ impl Controller {
     pub(super) fn has_alternative(
         &self,
         item: &WorkItem,
-        class: Option<&str>,
+        _class: Option<&str>,
         excluded: &HashSet<String>,
         floor: Option<u32>,
     ) -> bool {
         self.registry.workers().iter().any(|w| {
             !excluded.contains(w.name())
-                && w.healthy()
+                && self.dispatch_available(w.as_ref())
                 && covers(w.as_ref(), item)
-                && self.routing.qualifies(w.as_ref(), item, class)
                 && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
         })
     }
@@ -1768,16 +1772,8 @@ impl Controller {
                 &load,
                 &models,
             ) else {
-                if lacks_checkout(WorkerKind::ClaudeCode, &item) {
-                    tracing::info!(
-                        item = %item.id,
-                        "left unleased: a code item with no repo: resource goes only to a \
-                         worker that needs no checkout"
-                    );
-                }
-                if !self.has_alternative(&item, class.as_deref(), &hist.excluded, hist.floor) {
-                    report.transitions += self.await_worker(&item.id, &events).await?;
-                }
+                // No eligible/free resource: keep the ready item queued.
+                // No attempt has started, so spend no failure/retry budget.
                 continue;
             };
             let (inputs, more) = self.build_inputs(&snap, &item).await?;
@@ -1904,9 +1900,6 @@ impl Controller {
         run: &str,
         context: Option<&mut crate::handoff::ProjectContext>,
     ) -> Result<Option<Workspace>, String> {
-        if item.kind != WorkKind::Code {
-            return Ok(None);
-        }
         let Some(root) = self.config.worktree_root.clone() else {
             return Ok(None);
         };
@@ -1963,50 +1956,37 @@ impl Controller {
         (load, models)
     }
 
-    /// Step 2: the cheapest tier of healthy workers that cover the item,
-    /// whose routing record qualifies them for its class and, after a
-    /// failed verification escalated the item, above `floor`'s tier; then
-    /// a worker of that tier with room and (for a local worker) whose model
-    /// is not busy. When every worker of the cheapest tier is busy the item
-    /// waits for one: a tier is escalated on failure, never on load (plan
-    /// sections 6 step 2 and 17, "cheapest-qualifying worker, and escalation
-    /// only on failure").
+    /// Pick the cheapest compatible resource with available capacity. A
+    /// verified execution failure may impose a tier floor; task labels and
+    /// historical class records never constrain eligibility.
     fn pick(
         &self,
         item: &WorkItem,
-        class: Option<&str>,
+        _class: Option<&str>,
         excluded: &HashSet<String>,
         floor: Option<u32>,
         load: &HashMap<String, usize>,
         models: &HashSet<String>,
     ) -> Option<Arc<dyn Worker>> {
         let workers = self.registry.workers();
-        let qualified: Vec<(u32, usize, &Arc<dyn Worker>)> = workers
+        workers
             .iter()
             .enumerate()
             .filter(|(_, w)| {
-                w.healthy()
+                self.dispatch_available(w.as_ref())
                     && !excluded.contains(w.name())
                     && covers(w.as_ref(), item)
-                    && self.routing.qualifies(w.as_ref(), item, class)
                     && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
-            })
-            .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))
-            .collect();
-        let cheapest = qualified.iter().map(|(tier, _, _)| *tier).min()?;
-        qualified
-            .into_iter()
-            .filter(|(tier, _, w)| {
-                let local = self.config.serialise_local && w.kind() == WorkerKind::Local;
-                *tier == cheapest
                     && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
-                    && !(local
+                    && !(self.config.serialise_local
+                        && w.kind() == WorkerKind::Local
                         && w.capabilities()
                             .models
                             .iter()
-                            .any(|m| models.contains(m) || self.activity.busy(m)))
+                            .any(|model| models.contains(model) || self.activity.busy(model)))
             })
-            .min_by_key(|(_, i, _)| *i)
+            .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))
+            .min_by_key(|(tier, index, _)| (*tier, *index))
             .map(|(_, _, w)| Arc::clone(w))
     }
 

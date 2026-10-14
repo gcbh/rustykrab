@@ -1079,12 +1079,7 @@ pub fn render_brief(brief: &Brief) -> String {
 
 fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "work item: #{}  kind: {}",
-        brief.item,
-        brief.kind.as_str()
-    );
+    let _ = writeln!(out, "work item: #{}", brief.item);
     let _ = writeln!(out, "title: {}", one_line(&brief.title, LINE_MAX));
     let _ = writeln!(out, "objective: {}", one_line(&brief.objective, LINE_MAX));
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when, LINE_MAX));
@@ -1719,10 +1714,7 @@ mod tests {
             .contains("You are pinch"));
         assert_eq!(messages[1].role, Role::User);
         let rendered = messages[1].content.as_text().unwrap();
-        assert!(
-            rendered.starts_with("work item: #item-7  kind: personal\n"),
-            "{rendered}"
-        );
+        assert!(rendered.starts_with("work item: #item-7\n"), "{rendered}");
         assert!(
             rendered.contains("done_when: The cheapest plan is named"),
             "{rendered}"

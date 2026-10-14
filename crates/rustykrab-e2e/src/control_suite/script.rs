@@ -477,6 +477,8 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
         script(
             W_CODE_BAD,
             vec![
+                load(&["exec"]),
+                call("exec", json!({ "command": "sleep 2", "timeout_secs": 5 })),
                 report(json!({
                     "summary": "Documented the helper.",
                     "changed_paths": ["src/lib.rs"],

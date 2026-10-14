@@ -394,8 +394,7 @@ impl Worker for InfrastructureWorker {
         WorkerKind::Local
     }
     fn accepts(&self, item: &WorkItem) -> bool {
-        item.kind == rustykrab_core::work::WorkKind::Personal
-            && item.writable_resources.is_empty()
+        item.writable_resources.is_empty()
             && item.required_tools == [SERVICE_TOOL]
             && action_of(&item.artifact_refs).is_some_and(|a| self.0.registered(&a.resource))
     }

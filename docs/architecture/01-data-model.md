@@ -1013,3 +1013,12 @@ Once rows are examples only; revoked rows remain in the exported dataset.
 Unsupported older freeform scopes no longer apply globally. The schema is
 unchanged; work_item_events review actors name automatic permissions and supply
 the per-24-hour start counter. No training or fuzzy authorization is performed.
+
+## Generic task compatibility
+
+Ordinary tasks use kind=task in the existing text column. Historical category
+and backend pin values remain readable but do not constrain dispatch. Draft
+transport ignores retired selectors; reviewed-template matching ignores them
+while retaining exact scope, objectives and budgets. Recovery of legacy
+worker-unavailable rows uses existing transitions and question settlements;
+audit rows are retained. No schema migration is needed.

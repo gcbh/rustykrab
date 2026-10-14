@@ -147,7 +147,7 @@ and rate-limit middleware as every other `/api` route:
 | `GET /api/work/{id}/events`, `/evidence` | append-only history, readable after the item is archived |
 | `GET /api/work/{id}/plan` | the plan filed under root `{id}`, preferring one whose approval question still holds items; its tree and held ids |
 | `POST /api/work/plan` | a `WorkPlan` through `file_plan` as `FilingSource::Planner`; 200 accepted, 422 rejected with every failed check |
-| `POST /api/work/import` | the delivery import: a `StackManifest` (`{ "manifest": ... }` or bare) turned into its layered `code` graph by `rustykrab_control::import::plan_of` and filed as `FilingSource::DeliveryImport`, the only path by which a `code` graph enters (a single `code` item may also be filed by `POST /api/work`); 201 accepted, 422 rejected whole (a cyclic manifest with `cycle`) |
+| `POST /api/work/import` | the delivery import: a `StackManifest` (`{ "manifest": ... }` or bare) turned into its layered `code` graph by `rustykrab_control::import::plan_of` and filed as `FilingSource::DeliveryImport`, with the same scope, budget and graph validation as conversational task filing; 201 accepted, 422 rejected whole (a cyclic manifest with `cycle`) |
 | `POST /api/work/{id}/approve`, `/reject`, `/cancel` | the controller's commands; reject and cancel take an optional `{ "reason" }`; each returns the affected ids, and reject and cancel also what in the subtree had already finished |
 | `GET /api/work/archive`, `/archive/{id}` | `work_item_archive`: `kind`, `since`, and `q` (or `search`) to search ids, titles and summaries |
 | `POST /api/work/tick` | one pass of the loop, returning the `TickReport`; 409 `controller_lock_waiting` when the controller's `tick` refuses with `Error::LockWaiting` (its loop reports `controller.lock` `waiting`; the route makes no check of its own), so only the lock holder (or a controller no loop drives) ticks |
@@ -469,3 +469,10 @@ subscription_usage_unknown. Authentication or other worker failures retain their
 existing unavailable warning. Prometheus exposes measured usage percentages and
 reset timestamps per worker/window for both native subscriptions, omitting absent
 measurements. Monitoring reads neither probe accounts nor execute inference.
+
+## Queued availability
+
+Progress and detail views render ready work as Queued and omit task-label badges.
+No eligible/free resource is an ordinary queue wait rather than an attention
+item or failure. Backend identity and subscription capacity remain visible in
+Systems. Retired selectors in draft JSON have no execution authority.
