@@ -66,6 +66,9 @@ struct TracerInner {
     completion_reminders: u32,
     /// Whether the run ended because it reached its iteration cap.
     iteration_limit_reached: bool,
+    /// Whether a run-ending tool (`result_report`, an accepted plan) ended
+    /// the run, rather than the model stopping with text.
+    ended_by_tool: bool,
     /// String arguments the runner coerced to their schema's scalar type
     /// before dispatch (`rustykrab_core::coerce_tool_args`).
     arg_coercions: u32,
@@ -140,6 +143,11 @@ impl ExecutionTracer {
         self.lock_inner().iteration_limit_reached = true;
     }
 
+    /// Record that a run-ending tool ended the run.
+    pub fn record_run_end(&self) {
+        self.lock_inner().ended_by_tool = true;
+    }
+
     /// Count string arguments coerced to their schema's type.
     pub fn record_arg_coercions(&self, n: usize) {
         let mut inner = self.lock_inner();
@@ -171,6 +179,11 @@ impl ExecutionTracer {
     /// Whether the run ended at its iteration cap.
     pub fn iteration_limit_reached(&self) -> bool {
         self.lock_inner().iteration_limit_reached
+    }
+
+    /// Whether a run-ending tool ended the run.
+    pub fn ended_by_tool(&self) -> bool {
+        self.lock_inner().ended_by_tool
     }
 
     /// String arguments coerced to their schema's type this run.

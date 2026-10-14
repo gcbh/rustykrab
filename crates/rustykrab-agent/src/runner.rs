@@ -1073,6 +1073,11 @@ pub struct AgentConfig {
     /// run before the next is answered as final: no tool provides it, and
     /// the need is recorded as a tool gap (`rustykrab-tools`' `tools_list`).
     pub tool_search_miss_limit: usize,
+    /// Whether a worker run that ends with text is reminded to call
+    /// `result_report` (up to `TASK_COMPLETE_RETRY_LIMIT` times) before the
+    /// text is taken as its answer. Off, the text ends the run at once and
+    /// the worker turns it into the report.
+    pub result_report_reminder: bool,
 }
 
 impl Default for AgentConfig {
@@ -1091,6 +1096,7 @@ impl Default for AgentConfig {
             tool_heartbeat_interval_secs: 30,
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
+            result_report_reminder: true,
         }
     }
 }
@@ -2605,6 +2611,7 @@ impl AgentRunner {
                 // discards it.
                 if let Some(summary) = run_end {
                     on_event(AgentEvent::TextDelta(summary.clone()));
+                    tracer.record_run_end();
                     self.finalize_run_end(conv, iteration, summary);
                     on_event(AgentEvent::Done);
                     return Ok(());
@@ -2669,7 +2676,7 @@ impl AgentRunner {
                     // `blocked`. Each reminder is counted on the tracer so
                     // the worker can tell the controller it happened.
                     let hold_for_completion = if worker_run {
-                        true
+                        self.config.result_report_reminder
                     } else {
                         has_called_any_tool && !turn_blocked
                     };
@@ -2691,6 +2698,12 @@ impl AgentRunner {
                         }
                     }
 
+                    // A worker's text is its answer, which the worker turns
+                    // into the report: only an empty reply is worth a retry.
+                    let classification = match classification {
+                        ResponseClass::PlanningOnly if worker_run => ResponseClass::Complete,
+                        other => other,
+                    };
                     match classification {
                         ResponseClass::Complete => {
                             on_event(AgentEvent::Done);

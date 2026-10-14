@@ -55,6 +55,9 @@ pub struct HarnessProfile {
     /// models kept searching until the iteration cap (scenario 10,
     /// 2026-09-28).
     pub tool_search_miss_limit: usize,
+    /// Remind a worker run that ends with text to call `result_report`
+    /// before its text is taken as the answer.
+    pub result_report_reminder: bool,
 }
 
 impl Default for HarnessProfile {
@@ -71,6 +74,7 @@ impl Default for HarnessProfile {
             compaction_strategy: CompactionStrategy::default(),
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
+            result_report_reminder: true,
         }
     }
 }
@@ -117,6 +121,7 @@ impl HarnessProfile {
             compaction_strategy: self.compaction_strategy,
             late_tool_binding: self.late_tool_binding,
             tool_search_miss_limit: self.tool_search_miss_limit,
+            result_report_reminder: self.result_report_reminder,
             ..AgentConfig::default()
         }
     }

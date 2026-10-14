@@ -107,8 +107,6 @@ const LINE_MAX: usize = 400;
 const SUMMARY_MAX: usize = 160;
 /// Pointers listed per list; the rest are counted, not rendered.
 const REFS_MAX: usize = 8;
-/// Characters of the model's last text quoted in a failure's detail.
-const QUOTE_MAX: usize = 200;
 
 /// Where a [`LocalWorker`] keeps its runs' transcripts. A run is a
 /// conversation like any other (plan section 16, Phase 1 exit: a task is
@@ -293,6 +291,8 @@ pub struct LocalWorker {
     stall_steps: u32,
     full_reports: bool,
     repository_shell: bool,
+    /// Overrides the harness profile's `result_report_reminder`.
+    result_report_reminder: Option<bool>,
     readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
@@ -351,6 +351,7 @@ impl LocalWorker {
             stall_steps: DEFAULT_STALL_STEPS,
             full_reports: false,
             repository_shell: false,
+            result_report_reminder: None,
             readable_files: Vec::new(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
@@ -387,6 +388,13 @@ impl LocalWorker {
     /// Only expose shell execution inside a controller-owned repository workspace.
     pub fn with_repository_shell(mut self) -> Self {
         self.repository_shell = true;
+        self
+    }
+
+    /// Whether a run that ends with text is first reminded to call
+    /// `result_report`. Either way its text is then taken as the answer.
+    pub fn with_result_report_reminder(mut self, remind: bool) -> Self {
+        self.result_report_reminder = Some(remind);
         self
     }
 
@@ -1074,6 +1082,9 @@ impl LocalWorker {
             max_iterations,
             // No budget warnings: the controller owns the budget.
             soft_iteration_warning: 0,
+            result_report_reminder: self
+                .result_report_reminder
+                .unwrap_or(profile.result_report_reminder),
             ..profile.to_agent_config()
         };
         let mut runner = AgentRunner::new(provider, tools, self.sandbox.clone())
@@ -1196,6 +1207,28 @@ impl LocalWorker {
             }
             .into_error());
         }
+        // A run that stopped on text gave its answer (feather's rule): the
+        // text is the report, filed through the backend `result_report`
+        // uses, so attestation and the controller see it the same way.
+        if matches!(ended, Some(Ok(())))
+            && !tracer.iteration_limit_reached()
+            && !tracer.ended_by_tool()
+        {
+            if let Some(text) = last_assistant_text(&conv) {
+                let provenance = Provenance {
+                    conversation_id: Some(conv_id.to_string()),
+                    filed_by_item: Some(brief.item.clone()),
+                    actor: format!("worker:{}", self.name),
+                };
+                let report = report_from_text(text, self.full_reports);
+                recorder
+                    .report(brief.item.clone(), report, provenance)
+                    .await?;
+                if let Some(report) = recorder.take().into_iter().next() {
+                    return Ok(report);
+                }
+            }
+        }
         let failure = match ended {
             None => RunFailure::Budget {
                 budget: BudgetKind::Wall,
@@ -1214,26 +1247,43 @@ impl LocalWorker {
                     stats.reminders
                 ),
             },
-            Some(Ok(())) => match last_assistant_text(&conv) {
-                None => RunFailure::Model {
-                    problem: ProviderProblem::Empty,
-                    detail: format!(
-                        "the model stopped with no text and no result_report \
-                         ({} reminders)",
-                        stats.reminders
-                    ),
-                },
-                Some(text) => RunFailure::Model {
-                    problem: ProviderProblem::Format,
-                    detail: format!(
-                        "the run ended with text and no result_report ({} reminders): {}",
-                        stats.reminders,
-                        one_line(text, QUOTE_MAX)
-                    ),
-                },
+            Some(Ok(())) => RunFailure::Model {
+                problem: ProviderProblem::Empty,
+                detail: format!(
+                    "the model stopped with no text and no result_report \
+                     ({} reminders)",
+                    stats.reminders
+                ),
             },
         };
         Err(failure.into_error())
+    }
+}
+
+/// The report a run's final text stands for: the result contract the text
+/// carries, as Claude Code and Codex runs give theirs, else the text itself
+/// as the summary, cut to the report's bound.
+fn report_from_text(text: &str, full_report: bool) -> ResultReport {
+    if let Ok(report) = crate::external_worker::parse_contract(text) {
+        // Any trailing JSON object parses as a contract with every field
+        // defaulted; only one that says something is the answer.
+        if !report.summary.trim().is_empty() {
+            return report;
+        }
+    }
+    let max = if full_report {
+        rustykrab_tools::FULL_REPORT_MAX
+    } else {
+        rustykrab_tools::REPORT_SUMMARY_MAX
+    };
+    let text = text.trim();
+    let summary = match text.char_indices().nth(max) {
+        Some((cut, _)) => text[..cut].to_string(),
+        None => text.to_string(),
+    };
+    ResultReport {
+        summary,
+        ..ResultReport::default()
     }
 }
 
@@ -1399,7 +1449,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     }
     out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
-    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete. Text alone does not end this run.");
+    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete.");
     out
 }
 
@@ -1914,7 +1964,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.ends_with("Text alone does not end this run."),
+            rendered.ends_with("Do not claim an unfinished done_when as complete."),
             "{rendered}"
         );
 
@@ -2057,7 +2107,7 @@ mod tests {
     /// A run that ends without a report is the one an investigation opens.
     #[tokio::test]
     async fn a_failed_run_leaves_its_session_log_too() {
-        let provider = Recording::new(vec![text("I think it is plan B.")]);
+        let provider = Recording::new(vec![text("  ")]);
         let (worker, _) = worker(provider, Vec::new());
         let dir = tempfile::tempdir().unwrap();
         let worker = worker.with_run_logs(dir.path());
@@ -2071,8 +2121,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.to_string().contains("I think it is plan B.")),
-            "what the model said before the run failed is kept"
+                .any(|l| l.to_string().contains("work item: #item-9")),
+            "the brief the run failed on is kept"
         );
     }
 
@@ -2147,21 +2197,23 @@ mod tests {
         assert_eq!(provider.requests().len(), 2);
         assert!(stub.calls().is_empty());
 
-        // Prose to every reminder, until the reminders run out.
+        // Prose to every reminder: once they run out, the prose is the answer.
         let provider = Recording::new(
             (0..4)
                 .map(|i| text(&format!("Plan B, I think ({i}).")))
                 .collect(),
         );
-        let (w, _) = worker(provider.clone(), Vec::new());
-        let err = w.run(brief("item-2")).await.unwrap_err();
-        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Format));
-        assert!(
-            err.to_string()
-                .contains("(3 reminders): Plan B, I think (3)."),
-            "{err}"
-        );
+        let (w, stub) = worker(provider.clone(), Vec::new());
+        let answered = w.run(brief("item-2")).await.unwrap();
+        assert_eq!(answered.summary, "Plan B, I think (3).");
         assert_eq!(w.last_run().unwrap().reminders, 3);
+        assert!(
+            stub.calls()
+                .iter()
+                .any(|c| matches!(c, WorkCall::Report { .. })),
+            "the text answer is filed like a result_report: {:?}",
+            stub.calls()
+        );
 
         // Blank replies to every reminder.
         let provider = Recording::new((0..4).map(|_| text("  ")).collect());
@@ -2885,6 +2937,35 @@ mod tests {
         // The third turn began and was refused at its model call.
         assert_eq!(usage.iterations, 3);
         assert_eq!(w.usage(&run), None, "taken once");
+    }
+
+    #[tokio::test]
+    async fn without_the_reminder_text_ends_the_run() {
+        let provider = Recording::new(vec![text("Plan B is cheapest.")]);
+        let (w, _) = worker(provider.clone(), Vec::new());
+        let w = w.with_result_report_reminder(false);
+        let report = w.run(brief("item-30")).await.unwrap();
+        assert_eq!(report.summary, "Plan B is cheapest.");
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(w.last_run().unwrap().reminders, 0);
+    }
+
+    #[tokio::test]
+    async fn a_contract_in_the_final_text_is_the_report() {
+        let provider = Recording::new(vec![text(
+            "Done.\n```json\n{\"summary\": \"Plan B\", \"checks_run\": [\"pytest\"]}\n```",
+        )]);
+        let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(false);
+        let report = w.run(brief("item-31")).await.unwrap();
+        assert_eq!(report.summary, "Plan B");
+        assert_eq!(report.checks_run, vec!["pytest".to_string()]);
+    }
+
+    #[test]
+    fn a_trailing_json_object_without_a_summary_is_not_a_contract() {
+        let report = report_from_text("Use this config: {\"retries\": 3}", false);
+        assert_eq!(report.summary, "Use this config: {\"retries\": 3}");
     }
 
     #[tokio::test]

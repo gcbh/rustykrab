@@ -82,8 +82,8 @@ pub fn worker_run_end_summary(tool_name: &str, output: &Value) -> Option<String>
         .map(str::to_string)
 }
 
-const SUMMARY_MAX: usize = 1_500;
-const FULL_REPORT_MAX: usize = 32_000;
+pub const SUMMARY_MAX: usize = 1_500;
+pub const FULL_REPORT_MAX: usize = 32_000;
 const DETAIL_MAX: usize = 600;
 const ARTIFACTS_MAX: usize = 20;
 
