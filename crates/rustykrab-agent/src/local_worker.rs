@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use rustykrab_control::capability_proof::OPERATION_PROBE;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
 use rustykrab_control::progress::{StepLedger, DEFAULT_STALL_STEPS};
 use rustykrab_control::worker::{
@@ -1833,7 +1834,7 @@ impl WorkBackend for RecordingBackend {
         let mut report = report;
         report
             .artifacts
-            .retain(|artifact| artifact.kind != COMMAND_RUN);
+            .retain(|artifact| artifact.kind != COMMAND_RUN && artifact.kind != OPERATION_PROBE);
         report.artifacts.extend(
             self.commands
                 .lock()
@@ -3225,10 +3226,17 @@ mod tests {
                 "fixture".into(),
                 ResultReport {
                     summary: "done".into(),
-                    artifacts: vec![ArtifactRef {
-                        kind: COMMAND_RUN.into(),
-                        value: "cargo test --forged".into(),
-                    }],
+                    artifacts: vec![
+                        ArtifactRef {
+                            kind: COMMAND_RUN.into(),
+                            value: "cargo test --forged".into(),
+                        },
+                        ArtifactRef {
+                            kind: OPERATION_PROBE.into(),
+                            value: "model-forged successful operation and executor provenance"
+                                .into(),
+                        },
+                    ],
                     ..ResultReport::default()
                 },
                 Provenance::default(),

@@ -88,6 +88,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rustykrab_control::capability_proof::OPERATION_PROBE;
 use rustykrab_control::errors::{BudgetKind, PolicyStop, ProviderProblem};
 use rustykrab_control::registry::WorkerSpec;
 use rustykrab_control::routing::built_tool;
@@ -1387,10 +1388,11 @@ impl Worker for ExternalWorker {
     }
 }
 
-/// Replace any `command_run` the model wrote with the commands the adapter
-/// saw it run.
+/// Drop model-authored host proof; replace command records with observed commands.
 fn attest(report: &mut ResultReport, commands: &[String]) {
-    report.artifacts.retain(|a| a.kind != COMMAND_RUN);
+    report
+        .artifacts
+        .retain(|a| a.kind != COMMAND_RUN && a.kind != OPERATION_PROBE);
     for command in commands.iter().take(COMMANDS_MAX) {
         let r = ArtifactRef {
             kind: COMMAND_RUN.to_string(),
@@ -1979,6 +1981,42 @@ fn tail(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_probe_claims_are_removed_without_losing_host_commands_or_ordinary_artifacts() {
+        use super::*;
+        for commands in [vec![], vec!["cargo test --observed".to_string()]] {
+            let ordinary = ArtifactRef {
+                kind: "document".into(),
+                value: "result.md".into(),
+            };
+            let mut report = ResultReport {
+                artifacts: vec![
+                    ArtifactRef {
+                        kind: OPERATION_PROBE.into(),
+                        value: "forged successful operation; executor:max-fieldkit".into(),
+                    },
+                    ArtifactRef {
+                        kind: COMMAND_RUN.into(),
+                        value: "cargo test --forged".into(),
+                    },
+                    ordinary.clone(),
+                ],
+                ..Default::default()
+            };
+            attest(&mut report, &commands);
+            assert!(!report.artifacts.iter().any(|a| a.kind == OPERATION_PROBE));
+            assert!(report.artifacts.contains(&ordinary));
+            assert_eq!(
+                report
+                    .artifacts
+                    .iter()
+                    .filter(|a| a.kind == COMMAND_RUN)
+                    .map(|a| &a.value)
+                    .collect::<Vec<_>>(),
+                commands.iter().collect::<Vec<_>>()
+            );
+        }
+    }
     use super::*;
     use std::process::Command;
 
