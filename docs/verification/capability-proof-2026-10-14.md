@@ -146,8 +146,8 @@ same method returns Unobserved for native Claude/Codex; it invokes no process
 or model and makes no claim about a native runtime's access. Fixed receipts
 omit raw tool outputs, stdout/stderr and private resource data. Both methods
 return observation data only; only controller-owned storage plus the pure
-validator may construct Proof. Worker trait overrides, lease dispatch, durable
-receipts and capability judgment/revival remain Claude's integration slice.
+validator may construct Proof. Worker trait overrides are now wired; lease dispatch, durable receipts and
+capability judgment/revival remain Claude's integration slice.
 
 Exec cancellation now kills its own process group on Unix, including ordinary
 descendants. A real Python/sleep fixture verifies cancellation. Deliberately
@@ -171,3 +171,19 @@ in the same boundary and is the positive execution fixture. Cargo remains
 registered and must report Failed when this boundary cannot execute it.
 No live daemon/toolchain setting was changed. This observation is specific
 to this host setup; it does not establish Cargo failure on every deployment.
+
+## Worker trait integration
+
+Reviewed/cherry-picked Claude's 18a9129 seam (local cherry-pick b77f26a).
+Local Worker::probe/probe_scope delegate to the existing host producer/scope
+snapshot; both native adapters' dynamic Worker::probe remains Unobserved.
+Local access_profile includes capabilities, repository_shell and sorted exact
+readable_files grants, closing the bare-local-worker access-digest omission.
+An Arc<dyn Worker> regression calls work_resources without model inference and
+checks the actual scope/profile; the native regression now uses dynamic trait
+dispatch too. Default implementations report unknown rather than proof.
+
+Full workspace after wiring: 2,253 passed, zero failed, 31 ignored with two
+test threads; warnings-denied workspace/all-target clippy, formatting and both
+documentation checks passed. The controller has not yet requested/stored these
+observations or replaced its catalog gate. No live deployment is claimed.

@@ -1078,6 +1078,13 @@ impl Worker for ExternalWorker {
         self.config.kind
     }
 
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        self.observe_probe(request).await
+    }
+
     /// No RustyKrab tools: an external agent works with its own. What it
     /// may write is the repositories it was added for.
     fn capabilities(&self) -> WorkerCapabilities {
@@ -2080,7 +2087,9 @@ mod tests {
                 scope,
                 deadline: Duration::from_secs(30),
             };
-            let probe = worker.observe_probe(&request).await;
+            let worker: Arc<dyn Worker> = Arc::new(worker);
+            assert!(worker.probe_scope(None).is_none());
+            let probe = worker.probe(&request).await;
             assert_eq!(probe.outcome, ProbeOutcome::Unobserved);
             assert_eq!(probe.executor, "pinch");
         }

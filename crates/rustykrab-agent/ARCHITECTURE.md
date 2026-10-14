@@ -900,8 +900,10 @@ are Unobserved. Observed boundary errors or failed postconditions are Failed.
 
 ExternalWorker::observe_probe deliberately returns Unobserved without invoking
 any host command or model: this process cannot reproduce the native CLI's
-permissions/account boundary. Adapter methods are ready for the coordinated
-Worker::probe hook; controller dispatch/evidence persistence and lifecycle
-gates remain separate integration work. Tests exercise a real bound-directory
+permissions/account boundary. Worker::probe and Worker::probe_scope delegate to the adapter methods;
+controller dispatch/evidence persistence and lifecycle gates remain separate
+integration work. LocalWorker::access_profile also includes its exact read-only
+file grants and repository-shell setting, so the breaker can recognize actual
+access changes. Tests exercise a real bound-directory
 node version call, shared-slot contention, sandbox rejection, schema failure,
 unsupported/changed bindings and private-output omission.

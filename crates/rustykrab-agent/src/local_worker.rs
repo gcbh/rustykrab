@@ -848,6 +848,28 @@ impl Worker for LocalWorker {
         WorkerKind::Local
     }
 
+    fn access_profile(&self) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": self.capabilities(),
+            "repository_shell": self.repository_shell,
+            "readable_files": self.readable_files.iter().collect::<std::collections::BTreeSet<_>>(),
+        })
+    }
+
+    fn probe_scope(
+        &self,
+        bound_dir: Option<std::path::PathBuf>,
+    ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
+        Some(LocalWorker::probe_scope(self, bound_dir))
+    }
+
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        self.observe_probe(request).await
+    }
+
     fn planning_only(&self) -> bool {
         self.definition.planning_only
     }
@@ -2233,6 +2255,40 @@ mod tests {
             scope,
             deadline: Duration::from_secs(30),
         }
+    }
+
+    #[tokio::test]
+    async fn worker_trait_dispatch_observes_local_operation_and_exposes_effective_access() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[]}),
+            delay: Duration::ZERO,
+        });
+        let (worker, _) = worker(Recording::new(vec![]), vec![resources]);
+        let before = Worker::access_profile(&worker);
+        let worker = worker
+            .with_repository_shell()
+            .with_readable_files(&["/fixture/authorized-input".into()]);
+        let profile = Worker::access_profile(&worker);
+        assert_ne!(before, profile);
+        assert_eq!(
+            profile["readable_files"],
+            json!(["/fixture/authorized-input"])
+        );
+        assert_eq!(profile["repository_shell"], true);
+        let request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        let worker: Arc<dyn Worker> = Arc::new(worker);
+        assert_eq!(worker.probe_scope(None), Some(request.scope.clone()));
+        assert_eq!(worker.probe(&request).await.outcome, ProbeOutcome::Ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
