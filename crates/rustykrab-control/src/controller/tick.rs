@@ -2072,7 +2072,7 @@ impl Controller {
     }
 
     /// Live runs per worker, and the models local runs occupy.
-    fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
+    pub(super) fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
         let state = self.state();
         let mut load: HashMap<String, usize> = HashMap::new();
         let mut models: HashSet<String> = HashSet::new();
@@ -2090,7 +2090,7 @@ impl Controller {
     /// Pick the cheapest compatible resource with available capacity. A
     /// verified execution failure may impose a tier floor; task labels and
     /// historical class records never constrain eligibility.
-    fn pick(
+    pub(super) fn pick(
         &self,
         item: &WorkItem,
         excluded: &HashSet<String>,

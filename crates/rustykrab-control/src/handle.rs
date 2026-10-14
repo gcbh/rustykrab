@@ -304,4 +304,29 @@ pub trait ControlHandle: Send + Sync {
     async fn judgment(&self) -> Result<JudgmentView, Error> {
         Err(unsupported("standing judgment"))
     }
+
+    /// What foreground work the controller could dispatch right now, from
+    /// its own matcher, for analysis that should run only while useful work
+    /// cannot ([`DispatchDemand`]). `Ok(None)` means unknown, and unknown is
+    /// never taken for idle. Default: unknown.
+    async fn foreground_dispatchability(&self) -> Result<Option<DispatchDemand>, Error> {
+        Ok(None)
+    }
+}
+
+/// One observation of the controller's foreground dispatch: project-review
+/// jobs (read-only `Research` items) excluded, and leaves whose cumulative
+/// budget is spent counted as waiting, not dispatchable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchDemand {
+    pub observed_at: DateTime<Utc>,
+    /// Foreground runs in flight.
+    pub active_foreground_runs: usize,
+    /// Ready foreground leaves a healthy worker with free capacity could
+    /// take now.
+    pub dispatchable_foreground_leaves: usize,
+    /// Queued or ready foreground leaves no worker can take now, by why
+    /// (`"no_worker"`, `"capacity"`, `"single_writer"`, `"budget_spent"`,
+    /// `"precondition"`, ...), each with its count.
+    pub waiting: std::collections::BTreeMap<String, usize>,
 }
