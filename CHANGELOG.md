@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after its adapter has removed its worktree, instead of failing as
   `incomplete`.
 
+## [6.5.5] - 2026-10-14
+
+- fix(deps): rustls 0.23.46 for RUSTSEC-2026-0346 to 0349 (#692)
+
 ## [6.5.4] - 2026-10-14
 
 - Allow general agent execution and prioritize shared blockers (#688)
