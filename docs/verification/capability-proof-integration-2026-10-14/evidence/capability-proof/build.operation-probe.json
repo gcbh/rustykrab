@@ -1,0 +1,18 @@
+[
+  {
+    "at": "2026-10-14T22:41:06.222023Z",
+    "hash": "9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a",
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "operation_probe",
+    "reference": "{\"operation\":\"binary.available/node\",\"executor\":\"snapper\",\"inputs_digest\":\"9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a\",\"generation\":\"a7788ebf-0630-42dc-979c-8aa6a774c03b:1\",\"run\":\"probe-f4cf2df8-cc0a-4c0e-a2a9-402070169063\",\"outcome\":\"failed\",\"observation\":\"registered operation executed; observed postcondition failed\"}",
+    "verified_by": "executor:snapper"
+  },
+  {
+    "at": "2026-10-14T22:41:06.902248Z",
+    "hash": "9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a",
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "operation_probe",
+    "reference": "{\"operation\":\"binary.available/node\",\"executor\":\"snapper\",\"inputs_digest\":\"9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a\",\"generation\":\"a7788ebf-0630-42dc-979c-8aa6a774c03b:2\",\"run\":\"probe-74960b97-cdbf-4cf4-a9b5-8af4f336bee5\",\"outcome\":\"ok\",\"observation\":\"registered operation executed; observed postcondition matched\"}",
+    "verified_by": "executor:snapper"
+  }
+]
