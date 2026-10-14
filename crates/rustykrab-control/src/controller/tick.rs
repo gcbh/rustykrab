@@ -2020,7 +2020,7 @@ impl Controller {
                 continue;
             }
             let events = self.store.work_events(&item.id).await?;
-            let hist = history(&events);
+            let hist = self.activatable(history(&events));
             let mode = match item.kind {
                 WorkKind::Capability => self.capability_mode(&item.id).await?,
                 _ => None,

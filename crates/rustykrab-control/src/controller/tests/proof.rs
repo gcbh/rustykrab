@@ -334,6 +334,12 @@ async fn a_failed_probe_leaves_the_capability_unproven_and_its_waiter_parked_unt
     assert_eq!(h.status(&cap.id).await, Status::Done);
     assert_eq!(h.status(&w).await, Status::Done);
     assert_eq!(h.leases(&w).await, 2);
+    let resumed = h.script.briefs_for(NODE).remove(1);
+    assert!(
+        !resumed.required_tools.contains(&"node".to_string()),
+        "a host binary is not activated as a RustyKrab tool: {:?}",
+        resumed.required_tools
+    );
     let requests = pinch.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].expected.generation, format!("{w}:2"));
