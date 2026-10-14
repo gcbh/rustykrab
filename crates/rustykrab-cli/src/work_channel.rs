@@ -475,6 +475,7 @@ pub fn planner_worker(
     backend: Arc<dyn rustykrab_tools::WorkBackend>,
     transcripts: Arc<dyn rustykrab_agent::RunTranscripts>,
     slot: Arc<tokio::sync::Semaphore>,
+    run_logs: std::path::PathBuf,
 ) -> Arc<dyn rustykrab_control::worker::Worker> {
     Arc::new(
         rustykrab_agent::LocalWorker::new(
@@ -486,6 +487,7 @@ pub fn planner_worker(
             backend,
         )
         .with_transcripts(transcripts)
+        .with_run_logs(run_logs)
         .with_slot(slot),
     )
 }

@@ -175,7 +175,9 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Channel(format!("Telegram sendChatAction error: {e}")))?;
+            .map_err(|e| {
+                Error::Channel(format!("Telegram sendChatAction error: {}", transport(e)))
+            })?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
@@ -266,7 +268,10 @@ impl TelegramChannel {
             "text": text.chars().take(190).collect::<String>(),
         });
         if let Err(e) = self.client.post(&url).json(&body).send().await {
-            tracing::debug!("answerCallbackQuery failed (non-critical): {e}");
+            tracing::debug!(
+                "answerCallbackQuery failed (non-critical): {}",
+                transport(e)
+            );
         }
     }
 
@@ -381,7 +386,7 @@ impl TelegramChannel {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::Channel(format!("Telegram API error: {}", e.without_url())))?;
+            .map_err(|e| Error::Channel(format!("Telegram API error: {}", transport(e))))?;
         let status = response.status();
         let retry_header = response
             .headers()
@@ -389,7 +394,7 @@ impl TelegramChannel {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let text = response.text().await.map_err(|e| {
-            Error::Channel(format!("Telegram response unreadable: {}", e.without_url()))
+            Error::Channel(format!("Telegram response unreadable: {}", transport(e)))
         })?;
         if status.as_u16() == 429 {
             let delay = retry_delay(retry_header.as_deref(), &text);
@@ -446,7 +451,8 @@ impl TelegramChannel {
                     tracing::error!(
                         consecutive_errors,
                         delay_secs = delay.as_secs(),
-                        "Telegram getUpdates network error: {e}"
+                        "Telegram getUpdates network error: {}",
+                        transport(e)
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -474,7 +480,8 @@ impl TelegramChannel {
                     tracing::error!(
                         consecutive_errors,
                         delay_secs = delay.as_secs(),
-                        "failed to read Telegram response body: {e}"
+                        "failed to read Telegram response body: {}",
+                        transport(e)
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -563,7 +570,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Channel(format!("failed to set webhook: {e}")))?;
+            .map_err(|e| Error::Channel(format!("failed to set webhook: {}", transport(e))))?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
@@ -581,7 +588,7 @@ impl TelegramChannel {
             .post(&url)
             .send()
             .await
-            .map_err(|e| Error::Channel(format!("deleteWebhook failed: {e}")))?;
+            .map_err(|e| Error::Channel(format!("deleteWebhook failed: {}", transport(e))))?;
         Ok(())
     }
 
@@ -779,6 +786,14 @@ impl TelegramChannel {
     pub fn bot_token(&self) -> &str {
         &self.bot_token
     }
+}
+
+/// A failed request, described without the URL it was sent to. Every Bot
+/// API URL carries the bot token in its path (`/bot<id>:<token>/<method>`),
+/// and `reqwest::Error`'s own text names that URL, so an error written to a
+/// log or returned to a caller must go through here.
+fn transport(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
 }
 
 /// Exponential backoff delay, capped at 60 seconds.
@@ -1212,5 +1227,77 @@ mod rate_limit_tests {
         let requests = server.await.unwrap();
         assert!(requests[1].0.duration_since(requests[0].0) >= Duration::from_secs(1));
         assert!(requests[2].0.duration_since(requests[0].0) >= Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod token_leak_tests {
+    use super::*;
+
+    /// A fake token in the shape of a real one: `<bot id>:<35 characters>`.
+    const FAKE_TOKEN: &str = "7000000001:AAFakeFakeFakeFakeFakeFakeFakeFake_0";
+
+    /// A channel whose Bot API is a port nothing listens on, so every
+    /// request fails in transport, the way an outage does.
+    async fn unreachable() -> TelegramChannel {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut channel = TelegramChannel::new(FAKE_TOKEN.into(), [1].into_iter().collect());
+        channel.api_base = format!("http://{address}/bot{FAKE_TOKEN}");
+        channel
+    }
+
+    /// The line `start_polling` logs for a failed poll: reqwest's own text
+    /// names the request URL, token included; what is logged does not.
+    #[tokio::test]
+    async fn a_failed_poll_is_described_without_the_bot_token() {
+        let channel = unreachable().await;
+        let url = format!("{}/getUpdates", channel.api_base);
+        let failed = || async {
+            channel
+                .client
+                .get(&url)
+                .query(&[("timeout", "30")])
+                .send()
+                .await
+                .unwrap_err()
+        };
+        let before = format!("Telegram getUpdates network error: {}", failed().await);
+        let after = format!(
+            "Telegram getUpdates network error: {}",
+            transport(failed().await)
+        );
+        println!("before: {before}\nafter:  {after}");
+        assert!(before.contains(FAKE_TOKEN), "{before}");
+        assert!(!after.contains(FAKE_TOKEN), "{after}");
+        assert!(!after.contains("/bot"), "{after}");
+        assert!(after.contains("error sending request"), "{after}");
+    }
+
+    /// The errors the other Bot API calls return reach logs and callers too.
+    #[tokio::test]
+    async fn failed_requests_return_errors_without_the_bot_token() {
+        let channel = unreachable().await;
+        let errors = [
+            channel.delete_webhook().await.unwrap_err().to_string(),
+            channel.send_typing(1, 0).await.unwrap_err().to_string(),
+            channel
+                .set_webhook("https://example.invalid/hook")
+                .await
+                .unwrap_err()
+                .to_string(),
+            channel
+                .try_send(1, "hello", None, 0, 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        for error in errors {
+            assert!(!error.contains(FAKE_TOKEN), "{error}");
+            assert!(!error.contains("/bot"), "{error}");
+        }
     }
 }

@@ -367,6 +367,11 @@ pub enum WorkOp {
     /// edges, section 4.4); its `supersedes` and `discovered_from` edges are
     /// history and stay.
     RemoveOrderingEdgesOf(WorkItemId),
+    /// Drop one edge row, leaving every other edge its downstream holds: an
+    /// item released from a failure prerequisite that will not land (the
+    /// fix item parked for its owner). A row that is not there is left
+    /// alone. The caller writes the event that says why.
+    RemoveEdge(Edge),
     Repoint(RepointSpec),
     Transition(TransitionSpec),
     /// An event that changes no status: a rung, a rejection, a warning, a

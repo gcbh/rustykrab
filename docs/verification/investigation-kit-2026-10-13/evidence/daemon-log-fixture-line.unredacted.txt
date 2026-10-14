@@ -1,0 +1,1 @@
+2026-10-14T16:45:28.173277Z ERROR rustykrab_channels::telegram: Telegram getUpdates network error: error sending request for url (https://api.telegram.org/bot7000000001:AAFakeFakeFakeFakeFakeFakeFakeFake_0/getUpdates?timeout=30) consecutive_errors=1 delay_secs=2

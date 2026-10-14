@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use rustykrab_control::handle::TickReport;
+use rustykrab_control::investigate::FailureHistory;
 use rustykrab_gateway::work_routes::{
     ApproveReply, ArchiveList, CancelReply, GraphReply, ItemDetail, PlanPreview, WorkList,
 };
@@ -35,6 +36,9 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// given rather than resolved as a prefix.
 const FULL_ID: usize = 36;
 
+/// The length of a failure fingerprint.
+const FINGERPRINT_LEN: usize = 16;
+
 const USAGE: &str = "\
 usage: rustykrab work <command>
 
@@ -47,6 +51,10 @@ usage: rustykrab work <command>
   approve <id>                   release the items the plan holds
   reject <id> [reason]           cancel the held items, with cascade
   cancel <id> [reason]           cancel an item and its open subtree
+  investigate <fingerprint|id> [--json]
+                                 everything on record about a failure: each
+                                 item that hit it, run by run, and the fix
+                                 items filed for it
   archive [list] [--kind K] [--since DATE]
   archive show <id>
   archive search <text>          compacted items, one line each
@@ -112,6 +120,10 @@ enum Command {
     ArchiveSearch {
         text: String,
     },
+    Investigate {
+        target: String,
+        json: bool,
+    },
     Tick,
 }
 
@@ -153,6 +165,13 @@ fn parse(args: &[String]) -> Result<Command, String> {
         "cancel" => {
             let (id, reason) = id_and_reason(rest, "cancel <id> [reason]")?;
             Ok(Command::Cancel { id, reason })
+        }
+        "investigate" => {
+            let flags = Flags::parse(rest, &[], &["json"])?;
+            Ok(Command::Investigate {
+                target: flags.one_word("investigate <fingerprint|id> [--json]")?,
+                json: flags.switch("json"),
+            })
         }
         "archive" => parse_archive(rest),
         "tick" => no_more(rest, Command::Tick),
@@ -450,6 +469,26 @@ impl Daemon {
 async fn execute(daemon: &Daemon, command: Command) -> anyhow::Result<String> {
     Ok(match command {
         Command::Help => USAGE.to_string(),
+        Command::Investigate { target, json } => {
+            // A fingerprint is sixteen hex characters and goes as given; an
+            // item is resolved from its id or a prefix of it.
+            let wanted = target.trim().trim_start_matches('#');
+            let fingerprint =
+                wanted.len() == FINGERPRINT_LEN && wanted.chars().all(|c| c.is_ascii_hexdigit());
+            let target = if fingerprint {
+                wanted.to_string()
+            } else {
+                daemon.resolve(wanted).await?
+            };
+            let history: FailureHistory = daemon
+                .get(&["api", "work", "investigate", &target], &[])
+                .await?;
+            if json {
+                format!("{}\n", serde_json::to_string_pretty(&history)?)
+            } else {
+                rustykrab_control::investigate::render(&history)
+            }
+        }
         Command::Ready => {
             let list: WorkList = daemon.get(&["api", "work", "ready"], &[]).await?;
             render::list(&list.items, false, "nothing is ready")
@@ -888,6 +927,126 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("409"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn investigate_parses_a_target_and_the_json_switch() {
+        assert_eq!(
+            parse(&args("investigate 0123456789abcdef")),
+            Ok(Command::Investigate {
+                target: "0123456789abcdef".into(),
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(&args("investigate #3f2a9c1e --json")),
+            Ok(Command::Investigate {
+                target: "#3f2a9c1e".into(),
+                json: true,
+            })
+        );
+        for bad in ["investigate", "investigate a b", "investigate x --yaml"] {
+            assert!(parse(&args(bad)).is_err(), "`{bad}` should not parse");
+        }
+    }
+
+    /// `work investigate` over the real router and a real controller: the
+    /// same history by fingerprint and by item id, as text and as JSON, and
+    /// a 404 for something the store does not know.
+    #[tokio::test]
+    async fn investigate_prints_what_is_on_record_about_a_failure() {
+        use rustykrab_control::controller::{Controller, ControllerConfig};
+        use rustykrab_core::work::Evidence;
+
+        const TOKEN: &str = "work-cmd-test-token";
+        const FP: &str = "0123456789abcdef";
+        const ID: &str = "3f2a9c1e-0000-4000-8000-000000000001";
+        let dir = std::env::temp_dir().join(format!("rk-work-inv-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir, vec![5u8; 32]).expect("store opens");
+        let held = Status::Blocked(BlockedReason::VerificationFailed);
+        store
+            .work_insert_graph(&[stored(0, ID, "Add the helper", held, None)], &[], None)
+            .await
+            .unwrap();
+        let at = Utc::now();
+        for (kind, reference, hash) in [
+            ("run", "run-0001", None),
+            (
+                "error",
+                "verification/claim_mismatch: the changed paths do not match the diff",
+                Some(FP),
+            ),
+        ] {
+            store
+                .work_evidence_add(Evidence {
+                    item: ID.into(),
+                    kind: kind.into(),
+                    reference: reference.into(),
+                    hash: hash.map(str::to_string),
+                    verified_by: None,
+                    at,
+                })
+                .await
+                .unwrap();
+        }
+        let controller = Arc::new(Controller::new(
+            store.clone(),
+            Vec::new(),
+            ControllerConfig::default(),
+        ));
+        let state =
+            rustykrab_gateway::AppState::new(store, vec![], Arc::new(NoModel), TOKEN.into())
+                .with_control(controller);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = rustykrab_gateway::router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let daemon = Daemon::new(Url::parse(&format!("http://{addr}")).unwrap(), TOKEN).unwrap();
+        let investigate = |target: &str, json: bool| Command::Investigate {
+            target: target.into(),
+            json,
+        };
+
+        let text = execute(&daemon, investigate(FP, false)).await.unwrap();
+        assert!(
+            text.contains(&format!(
+                "failure {FP}  verification/claim_mismatch  1 item(s)"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("item #3f2a9c1e"), "{text}");
+        assert!(text.contains("run run-0001"), "{text}");
+
+        let json = execute(&daemon, investigate(FP, true)).await.unwrap();
+        let history: FailureHistory = serde_json::from_str(&json).unwrap();
+        assert_eq!(history.fingerprints[0].fingerprint, FP);
+        assert_eq!(history.occurrences[0].item.id, ID);
+        assert!(history.occurrences[0].runs[0].hit);
+
+        // By a prefix of the item's id: the same item, matched as an item.
+        let by_item = execute(&daemon, investigate("#3f2a9c1e", true))
+            .await
+            .unwrap();
+        let by_item: FailureHistory = serde_json::from_str(&by_item).unwrap();
+        assert_eq!(
+            by_item.matched,
+            rustykrab_control::investigate::Matched::Item
+        );
+        assert_eq!(by_item.occurrences[0].item.id, ID);
+
+        let unknown = execute(&daemon, investigate("ffffffffffffffff", false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("404"), "{unknown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

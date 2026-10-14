@@ -7,8 +7,10 @@
 //! - **claude_code**: `claude -p <brief> --output-format stream-json
 //!   --verbose --max-turns <n> --permission-mode <mode> --allowedTools <list>
 //!   --disallowedTools <list>` (the built-in deny list, then the spec's
-//!   `denied_tools`), plus `--model` and, for a capability build,
-//!   `--add-dir <skills dir>`.
+//!   `denied_tools`), plus `--model`, for a capability build
+//!   `--add-dir <skills dir>`, and for a fix item `--add-dir` for each
+//!   directory of its investigation kit (the bundle, the session logs, the
+//!   failed runs' kept worktrees, the daemon's own source).
 //! - **codex**: `codex exec --json --skip-git-repo-check --sandbox
 //!   workspace-write --cd <dir> --output-last-message <file> <brief>`, plus
 //!   `--model` and `--add-dir <skills dir>`.
@@ -30,6 +32,13 @@
 //! failure, and the section 5 result contract the final message must be. A
 //! capability build of a tool is told to write it as
 //! `<skills dir>/<tool>/SKILL.md`, which the daemon loads at run time.
+//!
+//! A fix item's brief also carries its investigation kit
+//! (`Brief::investigation`): where the controller wrote what is on record
+//! about the failure, how to read it a portion at a time, what else the run
+//! may read, where the daemon's own source is, and what earlier fix items
+//! concluded. Codex is given no flag for those directories: its sandbox
+//! reads the whole disk, and its `--add-dir` grants write access.
 //!
 //! **What it returns.** The contract JSON is taken from the agent's final
 //! message ([`parse_contract`]). The adapter adds what it saw itself: every
@@ -110,7 +119,7 @@ pub const CONTINUATIONS_MAX: u32 = 8;
 /// asked for its contract instead of being resumed to keep working.
 pub const WRAP_UP_RESERVE: Duration = Duration::from_secs(120);
 /// How long a run's session log is kept ([`Worker::run_log`]).
-const RUN_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+pub(crate) const RUN_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 /// The directory under the daemon's data directory that holds every run's
 /// session log, `<run id>.jsonl`.
 pub const RUN_LOGS_DIR: &str = "run-logs";
@@ -891,6 +900,11 @@ impl ExternalWorker {
                 if build {
                     cmd.arg("--add-dir").arg(&c.skills_dir);
                 }
+                // An investigation's inputs (its bundle, the session logs,
+                // the failed runs' kept worktrees, the daemon's source) are
+                // named in the brief and need no flag here: Codex's sandbox
+                // reads the whole disk, and its `--add-dir` makes a
+                // directory writable, which evidence must not be.
                 cmd.arg(prompt);
             }
             _ => {
@@ -920,6 +934,14 @@ impl ExternalWorker {
                 }
                 if build {
                     cmd.arg("--add-dir").arg(&c.skills_dir);
+                }
+                // A fix item reads outside its worktree: its investigation
+                // bundle, the failed runs' session logs and kept worktrees,
+                // and the daemon's own source when that is known.
+                if let Some(kit) = &brief.investigation {
+                    for dir in &kit.read_dirs {
+                        cmd.arg("--add-dir").arg(dir);
+                    }
                 }
             }
         }
@@ -1628,7 +1650,7 @@ fn prune_dirs(root: &Path, window: Duration) {
 }
 
 /// Remove files under `root` older than `window`.
-fn prune_files(root: &Path, window: Duration) {
+pub(crate) fn prune_files(root: &Path, window: Duration) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -1647,7 +1669,7 @@ fn prune_files(root: &Path, window: Duration) {
 }
 
 /// A run id as a file name: its letters, digits and dashes.
-fn file_id(id: &str) -> String {
+pub(crate) fn file_id(id: &str) -> String {
     let name: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -2102,6 +2124,9 @@ pub fn render_executor_brief(
             let _ = writeln!(out, "working directory: {} (scratch)", dir.display());
         }
     }
+    if let Some(kit) = &brief.investigation {
+        out.push_str(&rustykrab_control::investigate::bundle::brief_section(kit));
+    }
     if let Some(tool) = built_tool(brief.capability, &brief.artifact_refs) {
         let _ = writeln!(
             out,
@@ -2398,6 +2423,7 @@ else:
             workspace,
             capability: None,
             project_context: None,
+            investigation: None,
         }
     }
 
@@ -3130,6 +3156,129 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         assert!(args.lines().any(|l| l == "--add-dir"), "{args}");
         let runs = f.data.path().join("workers/pinch/runs");
         assert_eq!(std::fs::read_dir(runs).unwrap().count(), 0);
+    }
+
+    /// A kit as the controller writes one for a fix item's run.
+    fn kit(f: &Fixture) -> rustykrab_control::investigate::bundle::Kit {
+        let dir = f.data.path().join("investigations/item-run");
+        rustykrab_control::investigate::bundle::Kit {
+            fingerprint: "0123456789abcdef".into(),
+            index: dir.join("index.md"),
+            bundle: dir.join("bundle.json"),
+            read_dirs: vec![
+                dir.clone(),
+                f.data.path().join("run-logs"),
+                f.data.path().join("worktrees/kept-run"),
+            ],
+            dir,
+            source: None,
+            own_source: false,
+            items: 3,
+            runs: 5,
+            failed_runs: 4,
+            earlier_fixes: Vec::new(),
+        }
+    }
+
+    /// The directories of `--add-dir` flags among the printed arguments.
+    fn added_dirs(args: &str) -> Vec<String> {
+        let lines: Vec<&str> = args.lines().collect();
+        lines
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .map(|pair| pair[1].to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_fix_item_on_claude_code_can_read_its_kit_and_is_told_where_it_is() {
+        let f = Fixture::new();
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
+        let mut b = brief(Some(f.workspace()));
+        b.kind = WorkKind::Internal;
+        let kit = kit(&f);
+        b.investigation = Some(kit.clone());
+        let prompt = render_executor_brief(
+            &b,
+            "pinch",
+            WorkerKind::ClaudeCode,
+            &f.workspace().path,
+            &f.data.path().join("skills"),
+            Some(30),
+        );
+        assert!(
+            prompt.contains("investigation: this item investigates failure 0123456789abcdef"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&kit.index.display().to_string()),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&kit.bundle.display().to_string()),
+            "{prompt}"
+        );
+        assert!(prompt.contains("a portion at a time"), "{prompt}");
+        // An ordinary item is told nothing about investigations.
+        let plain = render_executor_brief(
+            &brief(Some(f.workspace())),
+            "pinch",
+            WorkerKind::ClaudeCode,
+            &f.workspace().path,
+            &f.data.path().join("skills"),
+            Some(30),
+        );
+        assert!(!plain.contains("investigation:"), "{plain}");
+
+        worker.run(b).await.unwrap();
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        let want: Vec<String> = kit
+            .read_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
+        assert_eq!(added_dirs(&args), want, "{args}");
+        // Its toolset is what every Claude Code worker gets: nothing gated.
+        assert!(args.contains(&allowed_list(&[])), "{args}");
+
+        // Without a kit, nothing outside the worktree is added.
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
+        worker.run(brief(Some(f.workspace()))).await.unwrap();
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        assert!(added_dirs(&args).is_empty(), "{args}");
+    }
+
+    /// Codex reads the whole disk from inside its sandbox, and its
+    /// `--add-dir` makes a directory writable: a kit is named in the brief
+    /// and given no flag.
+    #[tokio::test]
+    async fn a_fix_item_on_codex_is_told_where_its_kit_is_and_given_no_writable_directory() {
+        let f = Fixture::new();
+        let codex = f.agent(
+            "codex",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/args.txt"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --output-last-message) out="$2"; shift ;; esac
+  shift
+done
+printf '{"summary":"looked"}' > "$out"
+"#,
+        );
+        let worker = f.worker(WorkerKind::Codex, codex);
+        let mut b = brief(None);
+        b.kind = WorkKind::Internal;
+        let kit = kit(&f);
+        b.investigation = Some(kit.clone());
+        worker.run(b).await.unwrap();
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        assert!(added_dirs(&args).is_empty(), "{args}");
+        assert!(args.contains(&kit.bundle.display().to_string()), "{args}");
+        assert!(
+            args.contains("readable outside your working directory"),
+            "{args}"
+        );
     }
 
     #[tokio::test]

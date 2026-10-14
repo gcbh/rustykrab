@@ -129,6 +129,11 @@ impl CodingWorker {
             .expect("local resource provider is Ollama"),
         }
     }
+    /// Keep each run's session log in `dir` (`LocalWorker::with_run_logs`).
+    pub(crate) fn with_run_logs(mut self, dir: PathBuf) -> Self {
+        self.worker = self.worker.with_run_logs(dir);
+        self
+    }
 }
 #[async_trait]
 impl Worker for CodingWorker {
@@ -155,6 +160,9 @@ impl Worker for CodingWorker {
     }
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.worker.usage(run)
+    }
+    fn run_log(&self, run: &str) -> Option<PathBuf> {
+        self.worker.run_log(run)
     }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
@@ -257,6 +265,27 @@ mod tests {
         // them; this host has none, and a tool it lacks is not advertised.
         assert!(CODING_TOOLS.contains(&"web_fetch") && CODING_TOOLS.contains(&"web_search"));
         assert!(!tools.iter().any(|t| t == "web_fetch"), "{tools:?}");
+    }
+
+    /// The wrapper names the session log its inner worker keeps.
+    #[test]
+    fn local_coding_names_the_session_log_its_worker_keeps() {
+        let mut c = config("http://127.0.0.1:11434", 32768);
+        c.repositories = vec![PathBuf::from("/fixture")];
+        let dir = tempfile::tempdir().unwrap();
+        let worker = CodingWorker::new(
+            &c,
+            Arc::new(NoModel),
+            vec![],
+            Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
+            Arc::new(Discard),
+            Arc::new(Semaphore::new(1)),
+        )
+        .with_run_logs(dir.path().to_path_buf());
+        assert_eq!(worker.run_log("run-1"), None, "no log before a run");
+        let log = dir.path().join("run-1.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        assert_eq!(worker.run_log("run-1"), Some(log));
     }
 
     #[test]

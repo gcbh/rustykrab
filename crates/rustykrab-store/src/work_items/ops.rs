@@ -55,6 +55,7 @@ pub(super) fn apply(
         WorkOp::Plan(plan) => insert_plan(conn, plan),
         WorkOp::AddEdge(edge) => add_edge(conn, edge).map(|_| ()),
         WorkOp::RemoveOrderingEdgesOf(item) => remove_ordering_edges_of(conn, item).map(|_| ()),
+        WorkOp::RemoveEdge(edge) => remove_edge(conn, edge).map(|_| ()),
         WorkOp::Repoint(spec) => {
             applied.events.push(repoint(conn, spec, now)?);
             Ok(())
@@ -354,6 +355,15 @@ pub(super) fn remove_ordering_edges_of(
         &format!("DELETE FROM work_item_deps WHERE item = ?1 AND kind NOT IN {HISTORY_KINDS_SQL}"),
         params![item],
     )?)
+}
+
+/// Delete one edge row. Returns whether there was one.
+pub(super) fn remove_edge(conn: &Connection, edge: &Edge) -> Result<bool, WorkStoreError> {
+    let removed = conn.execute(
+        "DELETE FROM work_item_deps WHERE item = ?1 AND depends_on = ?2 AND kind = ?3",
+        params![edge.item, edge.depends_on, edge.kind.as_str()],
+    )?;
+    Ok(removed == 1)
 }
 
 /// Move an edge (when `spec.kind` is set) and the matching `inputs_from`

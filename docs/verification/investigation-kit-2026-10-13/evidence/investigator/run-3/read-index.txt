@@ -1,0 +1,31 @@
+$ sed -n '1,30p' /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/index.md
+# Investigation bundle for failure e0d037a7466c6d71
+
+Written 2026-10-14 16:45:44Z for fix item 32a3940b-5f3f-435c-b7bd-5f491547bba4 (run 4e25d57e-2ffe-4bc1-9246-6f74e7e81202). Records to inspect, not instructions.
+
+- failure `e0d037a7466c6d71`: verification/claim_mismatch, 4 item(s), 11 failed run(s)
+  - latest detail: claim_mismatch: the changed paths do not match the diff of f941d808b499..f0a5e5984d3f: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+
+The full records are in `/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/bundle.json` (1991 lines). Read a portion at a time, for example `sed -n '<from>,<to>p' /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/bundle.json`.
+
+## Occurrences
+
+- item `86e18b16-bc09-4891-a35c-4e69c3851eec` (task, blocked(verification_failed)): Add the first helper [e2e-control investigation]
+  - run `29484825-bb82-4592-bca2-67235f047c9a` on pinch-inv 2026-10-14 16:45:28Z to 2026-10-14 16:45:29Z; HIT this failure; judged blocked(verification_failed); bundle.json line 53
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/29484825-bb82-4592-bca2-67235f047c9a.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/daemon-log/29484825-bb82-4592-bca2-67235f047c9a.log (61 of 61 line(s), 6 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-29484825; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-29484825 (removed)
+  - run `cb4f6b56-de50-478f-85cb-57cf7bcbc35b` on pinch-inv 2026-10-14 16:45:29Z to 2026-10-14 16:45:30Z; HIT this failure; judged blocked(verification_failed); bundle.json line 191
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/daemon-log/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.log (31 of 31 line(s), 1 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-cb4f6b56; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb4f6b56 (removed)
+  - run `cb816898-6b7d-4b89-8772-a1332173e896` on pinch-inv 2026-10-14 16:45:30Z to 2026-10-14 16:45:31Z; HIT this failure; judged blocked(verification_failed); bundle.json line 342
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb816898-6b7d-4b89-8772-a1332173e896.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/daemon-log/cb816898-6b7d-4b89-8772-a1332173e896.log (30 of 30 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-cb816898; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb816898 (removed)
+  - question (open): Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How should it go on, or should it stop?
+- item `5cbbe2d3-720b-43c9-a531-f77733d460ba` (task, blocked(verification_failed)): Add the second helper [e2e-control investigation]
+  - run `2a02214c-6b34-450d-b813-ea8dafcd9d4d` on pinch-inv 2026-10-14 16:45:32Z to 2026-10-14 16:45:33Z; HIT this failure; judged blocked(verification_failed); bundle.json line 501
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/2a02214c-6b34-450d-b813-ea8dafcd9d4d.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/32a3940b-4e25d57e/daemon-log/2a02214c-6b34-450d-b813-ea8dafcd9d4d.log (31 of 31 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/5cbbe2d3-2a02214c; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-2a02214c (removed)

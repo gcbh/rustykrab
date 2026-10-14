@@ -1,0 +1,100 @@
+failure e0d037a7466c6d71  verification/claim_mismatch  3 item(s), 7 run(s)
+  first seen 2026-10-14 16:45:29Z, last seen 2026-10-14 16:45:37Z
+  claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+
+item #86e18b16  task  blocked(verification_failed)  "Add the first helper [e2e-control investigation]"
+  id 86e18b16-bc09-4891-a35c-4e69c3851eec
+  run 29484825-bb82-4592-bca2-67235f047c9a  pinch-inv  2026-10-14 16:45:28Z -> 2026-10-14 16:45:29Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 199 ms
+    daemon build 6.5.4+b6605c6
+    rung repair verification/claim_mismatch [e0d037a7466c6d71]: repair with the failure evidence
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..e3690dd71a89: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/86e18b16-29484825 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-29484825 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/29484825-bb82-4592-bca2-67235f047c9a.jsonl
+  run cb4f6b56-de50-478f-85cb-57cf7bcbc35b  pinch-inv  2026-10-14 16:45:29Z -> 2026-10-14 16:45:30Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 42 ms
+    daemon build 6.5.4+b6605c6
+    rung switch_worker verification/claim_mismatch [e0d037a7466c6d71]: skipped: no other worker qualifies
+    rung repair verification/claim_mismatch [e0d037a7466c6d71]: repair with the failure evidence and a diagnosis step
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..6a81a67c93de: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/86e18b16-cb4f6b56 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb4f6b56 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.jsonl
+  run cb816898-6b7d-4b89-8772-a1332173e896  pinch-inv  2026-10-14 16:45:30Z -> 2026-10-14 16:45:31Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms
+    daemon build 6.5.4+b6605c6
+    rung surface verification/claim_mismatch [e0d037a7466c6d71]: Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How sh...
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/86e18b16-cb816898 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb816898 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb816898-6b7d-4b89-8772-a1332173e896.jsonl
+  question (open): Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How sh...
+
+item #5cbbe2d3  task  blocked(verification_failed)  "Add the second helper [e2e-control investigation]"
+  id 5cbbe2d3-720b-43c9-a531-f77733d460ba
+  run 2a02214c-6b34-450d-b813-ea8dafcd9d4d  pinch-inv  2026-10-14 16:45:32Z -> 2026-10-14 16:45:33Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms
+    daemon build 6.5.4+b6605c6
+    rung repair verification/claim_mismatch [e0d037a7466c6d71]: repair with the failure evidence
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..8f6e05ee5c9c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/5cbbe2d3-2a02214c base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-2a02214c (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/2a02214c-6b34-450d-b813-ea8dafcd9d4d.jsonl
+  run 964aefb9-8cf9-4bce-9df3-a96ea8e5867d  pinch-inv  2026-10-14 16:45:33Z -> 2026-10-14 16:45:34Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms
+    daemon build 6.5.4+b6605c6
+    rung switch_worker verification/claim_mismatch [e0d037a7466c6d71]: skipped: no other worker qualifies
+    rung repair verification/claim_mismatch [e0d037a7466c6d71]: repair with the failure evidence and a diagnosis step
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..b8d4037dac76: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/5cbbe2d3-964aefb9 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-964aefb9 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/964aefb9-8cf9-4bce-9df3-a96ea8e5867d.jsonl
+  run 33b09393-452b-4663-b6a6-d3893ec56bb4  pinch-inv  2026-10-14 16:45:34Z -> 2026-10-14 16:45:35Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms
+    daemon build 6.5.4+b6605c6
+    rung surface verification/claim_mismatch [e0d037a7466c6d71]: Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How sh...
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/5cbbe2d3-33b09393 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-33b09393 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/33b09393-452b-4663-b6a6-d3893ec56bb4.jsonl
+  question (open): Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How sh...
+
+item #b422dbf8  task  running  "Add the third helper [e2e-control investigation]"
+  id b422dbf8-6052-48e4-8953-e5ff1baf1a23
+  run 43be53f6-851f-4f00-ab7a-c73817cd0950  pinch-inv  2026-10-14 16:45:36Z -> 2026-10-14 16:45:37Z  HIT
+    judged blocked(verification_failed)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms
+    daemon build 6.5.4+b6605c6
+    rung improve verification/claim_mismatch [e0d037a7466c6d71]: waiting on resolution item c038ccc0-fa6c-49fd-8190-927c01a0674c
+    error: verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+    resolution_outcome: c038ccc0-fa6c-49fd-8190-927c01a0674c: no fix landed; its conclusion is with the owner
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/b422dbf8-43be53f6 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/b422dbf8-43be53f6 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/43be53f6-851f-4f00-ab7a-c73817cd0950.jsonl
+  run d0312d9f-086a-4cbb-8a7e-4723400fcef6  pinch-inv  2026-10-14 16:45:38Z -> still running
+    daemon build 6.5.4+b6605c6
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/b422dbf8-d0312d9f base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/b422dbf8-d0312d9f (removed)
+
+fix item #c038ccc0  blocked(needs_decision)  "Stop recurring verification/claim_mismatch failure e0d037a7466c6d71"
+  id c038ccc0-fa6c-49fd-8190-927c01a0674c
+  landed nothing the controller checked
+  concluded: Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.
+  run d9ac79e6-83c9-405e-911a-a6550d2ffc13  pinch-inv  2026-10-14 16:45:37Z -> 2026-10-14 16:45:38Z
+    judged blocked(needs_decision)
+    run ended: 0 iterations, 0 completion reminders, 0 tokens, 74 ms
+    daemon build 6.5.4+b6605c6
+    rung surface: parked needs_decision: no fix landed on pinch-inv
+    summary: Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.
+    repository_unchanged: f941d808b499e3509d15181d2d1663870d6d0d31
+    known_limit: read the records only; changed nothing
+    workspace /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG branch rustykrab/work/c038ccc0-d9ac79e6 base f941d808b499e3509d15181d2d1663870d6d0d31
+    worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/c038ccc0-d9ac79e6 (removed)
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/d9ac79e6-83c9-405e-911a-a6550d2ffc13.jsonl

@@ -278,6 +278,10 @@ pub struct LocalWorker {
     ceiling: Vec<String>,
     recall: Option<Arc<RecallStore>>,
     transcripts: Option<Arc<dyn RunTranscripts>>,
+    /// Where each run's session log is written, `<run id>.jsonl`: the
+    /// daemon's `<data dir>/run-logs`, shared with the external workers.
+    /// `None`: no file is kept ([`Worker::run_log`] answers `None`).
+    run_logs: Option<std::path::PathBuf>,
     late: Option<Arc<dyn LateTools>>,
     /// The KV slot runs wait for. Local work is serialised per model
     /// (plan section 12.1), so workers on one model share one.
@@ -339,6 +343,7 @@ impl LocalWorker {
             ceiling,
             recall: None,
             transcripts: None,
+            run_logs: None,
             late: None,
             slot: Arc::new(Semaphore::new(1)),
             runs: LocalRuns::global(),
@@ -405,6 +410,75 @@ impl LocalWorker {
     pub fn with_transcripts(mut self, transcripts: Arc<dyn RunTranscripts>) -> Self {
         self.transcripts = Some(transcripts);
         self
+    }
+
+    /// Leave each run's whole session as a file in `dir`, `<run id>.jsonl`
+    /// (the daemon's `<data dir>/run-logs`): a marker line, then one JSON
+    /// message per line, readable by its owner only. Written with the brief
+    /// before the first model call and again when the run ends, so a run
+    /// that fails, stalls or is cancelled still leaves what it had. The
+    /// controller records the file as the item's `run_log` evidence
+    /// ([`Worker::run_log`]), which is what an investigation of a failed
+    /// run opens: the conversation store keeps the same messages, but an
+    /// external worker cannot read the store.
+    pub fn with_run_logs(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.run_logs = Some(dir.into());
+        self
+    }
+
+    /// The session log file of `run`, when this worker keeps logs.
+    fn log_path(&self, run: &str) -> Option<std::path::PathBuf> {
+        self.run_logs
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.jsonl", crate::external_worker::file_id(run))))
+    }
+
+    /// Write `conv` as the session log of `run`, replacing an earlier save.
+    /// Best effort: a log that cannot be written is logged and the run goes
+    /// on.
+    fn write_log(&self, run: &str, conv: &Conversation) {
+        let Some(path) = self.log_path(run) else {
+            return;
+        };
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = std::io::BufWriter::new(options.open(&path)?);
+            let marker = serde_json::json!({
+                "type": "rustykrab.invocation",
+                "invocation": "local",
+                "run": run,
+                "worker": self.name,
+                "kind": WorkerKind::Local.as_str(),
+                "model": self.provider.name(),
+                "conversation": conv.id,
+                "at": chrono::Utc::now().to_rfc3339(),
+                "messages": conv.messages.len(),
+            });
+            writeln!(file, "{marker}")?;
+            for message in &conv.messages {
+                let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
+                writeln!(file, "{line}")?;
+            }
+            file.flush()
+        })();
+        if let Err(e) = written {
+            tracing::warn!(
+                worker = %self.name,
+                run = %run,
+                error = %e,
+                "session log not written"
+            );
+        }
     }
 
     /// Add the tools `late` hands back to the catalog of every run.
@@ -778,6 +852,11 @@ impl Worker for LocalWorker {
         })
     }
 
+    /// The session log [`LocalWorker::with_run_logs`] keeps for the run.
+    fn run_log(&self, run: &str) -> Option<std::path::PathBuf> {
+        self.log_path(run).filter(|path| path.is_file())
+    }
+
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         let (mut host_tools, mut ceiling) = self.catalog();
         if self.repository_shell && brief.workspace.is_none() {
@@ -939,6 +1018,12 @@ impl LocalWorker {
             None => self.conversation(conv_id, &brief),
         };
         self.keep(&conv).await;
+        // The session log goes by the id the controller asks for.
+        let log_id = brief.run.clone().unwrap_or_else(|| conv_id.to_string());
+        if let Some(dir) = &self.run_logs {
+            crate::external_worker::prune_files(dir, crate::external_worker::RUN_LOG_RETENTION);
+        }
+        self.write_log(&log_id, &conv);
         let tracer = spending.tracer.clone();
         let binding = WorkRunContext {
             item: brief.item.clone(),
@@ -965,6 +1050,7 @@ impl LocalWorker {
 
         *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
+        self.write_log(&log_id, &conv);
         let reports = recorder.take();
         let stats = LocalRun {
             item: brief.item.clone(),
@@ -1201,6 +1287,9 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
                 .map(|e| one_line(&format!("{}:{}", e.kind, e.reference), LINE_MAX));
             let _ = writeln!(out, "  prior_evidence: {}", list(refs));
         }
+    }
+    if let Some(kit) = &brief.investigation {
+        out.push_str(&rustykrab_control::investigate::bundle::brief_section(kit));
     }
     if let Some(ws) = &brief.workspace {
         let _ = writeln!(
@@ -1668,6 +1757,7 @@ mod tests {
             workspace: None,
             capability: None,
             project_context: None,
+            investigation: None,
         }
     }
 
@@ -1805,6 +1895,120 @@ mod tests {
             &m.content,
             MessageContent::ToolCall(call) if call.name == "result_report"
         )));
+    }
+
+    #[test]
+    fn a_fix_items_brief_says_where_its_investigation_kit_is() {
+        let mut b = brief("item-11");
+        assert!(!render_brief(&b).contains("investigation:"));
+        let dir = std::path::PathBuf::from("/data/investigations/item-run");
+        b.investigation = Some(rustykrab_control::investigate::bundle::Kit {
+            fingerprint: "0123456789abcdef".into(),
+            index: dir.join("index.md"),
+            bundle: dir.join("bundle.json"),
+            read_dirs: vec![dir.clone()],
+            dir,
+            source: None,
+            own_source: false,
+            items: 2,
+            runs: 3,
+            failed_runs: 3,
+            earlier_fixes: Vec::new(),
+        });
+        let rendered = render_brief(&b);
+        assert!(
+            rendered.contains("investigation: this item investigates failure 0123456789abcdef"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/data/investigations/item-run/index.md"));
+        assert!(rendered.contains("/data/investigations/item-run/bundle.json"));
+        assert!(rendered.contains("a portion at a time"));
+    }
+
+    /// The lines of a session log, each parsed as JSON.
+    fn log_lines(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is one JSON value"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_run_leaves_its_session_log_as_a_file_named_through_run_log() {
+        let provider = Recording::new(vec![report("B is cheapest.")]);
+        let (worker, _) = worker(provider, vec![Arc::new(Named("noop"))]);
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("run-logs");
+        let worker = worker.with_run_logs(&logs);
+        let run = Uuid::new_v4().to_string();
+        assert_eq!(worker.run_log(&run), None, "no file before the run");
+        let mut b = brief("item-8");
+        b.run = Some(run.clone());
+
+        worker.run(b).await.unwrap();
+
+        let path = worker.run_log(&run).expect("the run left a session log");
+        assert_eq!(path, logs.join(format!("{run}.jsonl")));
+        let lines = log_lines(&path);
+        assert_eq!(lines[0]["type"], "rustykrab.invocation");
+        assert_eq!(lines[0]["run"], run.as_str());
+        assert_eq!(lines[0]["worker"], "pinch");
+        assert_eq!(lines[0]["kind"], "local");
+        let messages = &lines[1..];
+        assert_eq!(lines[0]["messages"], messages.len());
+        assert!(messages.len() > 2, "the whole run, not only the brief");
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[1].to_string().contains("work item: #item-8"),
+            "the brief is the first user turn: {}",
+            messages[1]
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.to_string().contains("result_report")),
+            "the report call is in the log"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "readable by its owner only");
+        }
+    }
+
+    /// A run that ends without a report is the one an investigation opens.
+    #[tokio::test]
+    async fn a_failed_run_leaves_its_session_log_too() {
+        let provider = Recording::new(vec![text("I think it is plan B.")]);
+        let (worker, _) = worker(provider, Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let worker = worker.with_run_logs(dir.path());
+        let run = Uuid::new_v4().to_string();
+        let mut b = brief("item-9");
+        b.run = Some(run.clone());
+
+        worker.run(b).await.unwrap_err();
+
+        let lines = log_lines(&worker.run_log(&run).expect("a failed run has a log"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("I think it is plan B.")),
+            "what the model said before the run failed is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_without_a_log_directory_names_no_log() {
+        let provider = Recording::new(vec![report("B is cheapest.")]);
+        let (worker, _) = worker(provider, Vec::new());
+        let run = Uuid::new_v4().to_string();
+        let mut b = brief("item-10");
+        b.run = Some(run.clone());
+        worker.run(b).await.unwrap();
+        assert_eq!(worker.run_log(&run), None);
     }
 
     #[tokio::test]

@@ -1,0 +1,3 @@
+$ tail -n 2 /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/29484825-bb82-4592-bca2-67235f047c9a.jsonl
+{"at":"2026-10-14T16:45:28.397609+00:00","exit":0,"invocation":"start","kind":"claude_code","run":"29484825-bb82-4592-bca2-67235f047c9a","type":"rustykrab.invocation","worker":"pinch-inv"}
+{"type":"result","subtype":"success","is_error":false,"result":"{\"summary\":\"Touched src/lib.rs\",\"artifacts\":[],\"changed_paths\":[\"src/elsewhere.rs\"],\"commit\":\"e3690dd71a89526df4cc6a06459efdb5e1414364\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"}

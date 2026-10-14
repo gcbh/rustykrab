@@ -1,0 +1,131 @@
+[
+  {
+    "actor": "controller",
+    "at": "2026-10-14T16:45:37.223263Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:pinch-inv",
+    "at": "2026-10-14T16:45:37.256670Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:pinch-inv",
+    "at": "2026-10-14T16:45:37.257007Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:pinch-inv",
+    "at": "2026-10-14T16:45:38.160013Z",
+    "evidence_ref": "d9ac79e6-83c9-405e-911a-a6550d2ffc13",
+    "from": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 74 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:pinch-inv",
+    "at": "2026-10-14T16:45:38.160359Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T16:45:38.160359Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"surface\",\"at\":\"2026-10-14T16:45:38.158895Z\",\"error\":null,\"outcome\":\"parked needs_decision: no fix landed on pinch-inv\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T16:45:38.160359Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "question",
+    "origin": null,
+    "reason": "question cc23e105 blocking_now by rule fix_not_landed: open",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T16:45:38.172139Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "transition",
+    "origin": null,
+    "reason": "checking the result report",
+    "to": {
+      "status": "verifying"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T16:45:38.172139Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "verifying"
+    },
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "transition",
+    "origin": null,
+    "reason": "no fix landed on pinch-inv: a fix item is done only with a commit git verified or a classifier rule that replays; its conclusion goes to the owner",
+    "to": {
+      "reason": "needs_decision",
+      "status": "blocked"
+    },
+    "upstream": null
+  }
+]

@@ -1485,6 +1485,9 @@ async fn main() -> anyhow::Result<()> {
     // RUSTYKRAB_LOCAL_WORKER=off: a daemon with no local model registers no
     // local worker, so routing never leases an item to one (fleet.rs).
     let local_worker_on = fleet::local_worker_enabled();
+    // Every worker's session logs go in one place (`<data dir>/run-logs`),
+    // so an investigation opens any failed run as a file.
+    let run_logs_dir = data_dir.join(rustykrab_agent::external_worker::RUN_LOGS_DIR);
     let local_worker: Option<Arc<dyn rustykrab_control::worker::Worker>> = if local_worker_on {
         Some(Arc::new(
             rustykrab_agent::LocalWorker::new(
@@ -1496,6 +1499,7 @@ async fn main() -> anyhow::Result<()> {
                 deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
             )
             .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
+            .with_run_logs(run_logs_dir.clone())
             .with_late_tools(fleet.skills.clone())
             .with_slot(model_slot.clone()),
         ))
@@ -1524,6 +1528,13 @@ async fn main() -> anyhow::Result<()> {
         // Phase 4: standing judgment's baseline, and notices coalesced.
         approval: rustykrab_control::questions::baseline(),
         coalesce_window: chrono::TimeDelta::seconds(2),
+        // The commit this binary was built from: recorded with every run,
+        // and what tells the daemon's own source checkout from any other
+        // repository a worker was added for.
+        build: (GIT_HASH != "unknown").then(|| rustykrab_control::investigate::BuildId {
+            commit: GIT_HASH.to_string(),
+            dirty: !GIT_DIRTY.is_empty(),
+        }),
         ..Default::default()
     });
     // How long aging may wait for an idle tick before it runs anyway
@@ -1561,17 +1572,20 @@ async fn main() -> anyhow::Result<()> {
             .registry
             .register(
                 if matches!(provider.name(), "claude-cli" | "ollama") {
-                    Arc::new(integrations::IntegrationWorker::general(
-                        "planner",
-                        None,
-                        provider.clone(),
-                        tools.clone(),
-                        deferred_work_backend.clone(),
-                        scheduled_work::transcripts(&store, skill_registry.clone()),
-                        model_slot.clone(),
-                        &local_repositories,
-                        integrations::enabled(),
-                    )?) as Arc<dyn rustykrab_control::worker::Worker>
+                    Arc::new(
+                        integrations::IntegrationWorker::general(
+                            "planner",
+                            None,
+                            provider.clone(),
+                            tools.clone(),
+                            deferred_work_backend.clone(),
+                            scheduled_work::transcripts(&store, skill_registry.clone()),
+                            model_slot.clone(),
+                            &local_repositories,
+                            integrations::enabled(),
+                        )?
+                        .with_run_logs(run_logs_dir.clone()),
+                    ) as Arc<dyn rustykrab_control::worker::Worker>
                 } else {
                     work_channel::planner_worker(
                         agent_defs::planner_definition(&agent_definitions),
@@ -1580,6 +1594,7 @@ async fn main() -> anyhow::Result<()> {
                         deferred_work_backend.clone(),
                         scheduled_work::transcripts(&store, skill_registry.clone()),
                         model_slot.clone(),
+                        run_logs_dir.clone(),
                     )
                 },
                 serde_json::json!({ "role": "general-agent", "resource_slot": true }),
@@ -1591,17 +1606,20 @@ async fn main() -> anyhow::Result<()> {
         fleet
             .registry
             .register(
-                Arc::new(integrations::IntegrationWorker::general(
-                    "integrations",
-                    None,
-                    provider.clone(),
-                    tools.clone(),
-                    deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
-                    scheduled_work::transcripts(&store, skill_registry.clone()),
-                    model_slot.clone(),
-                    &local_repositories,
-                    true,
-                )?),
+                Arc::new(
+                    integrations::IntegrationWorker::general(
+                        "integrations",
+                        None,
+                        provider.clone(),
+                        tools.clone(),
+                        deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
+                        scheduled_work::transcripts(&store, skill_registry.clone()),
+                        model_slot.clone(),
+                        &local_repositories,
+                        true,
+                    )?
+                    .with_run_logs(run_logs_dir.clone()),
+                ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 local_resources.as_ref().map(|_| 1),
             )
@@ -1613,14 +1631,17 @@ async fn main() -> anyhow::Result<()> {
         fleet
             .registry
             .register(
-                Arc::new(local_resources::CodingWorker::new(
-                    config,
-                    local_provider.clone(),
-                    tools.clone(),
-                    deferred_work_backend.clone(),
-                    scheduled_work::transcripts(&store, skill_registry.clone()),
-                    local_slot.clone(),
-                )),
+                Arc::new(
+                    local_resources::CodingWorker::new(
+                        config,
+                        local_provider.clone(),
+                        tools.clone(),
+                        deferred_work_backend.clone(),
+                        scheduled_work::transcripts(&store, skill_registry.clone()),
+                        local_slot.clone(),
+                    )
+                    .with_run_logs(run_logs_dir.clone()),
+                ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 Some(0),
             )
@@ -1629,17 +1650,20 @@ async fn main() -> anyhow::Result<()> {
             fleet
                 .registry
                 .register(
-                    Arc::new(integrations::IntegrationWorker::general(
-                        local_resources::INTEGRATION_NAME,
-                        Some(config.model.clone()),
-                        local_provider,
-                        tools.clone(),
-                        deferred_work_backend.clone(),
-                        scheduled_work::transcripts(&store, skill_registry.clone()),
-                        local_slot,
-                        &local_repositories,
-                        true,
-                    )?),
+                    Arc::new(
+                        integrations::IntegrationWorker::general(
+                            local_resources::INTEGRATION_NAME,
+                            Some(config.model.clone()),
+                            local_provider,
+                            tools.clone(),
+                            deferred_work_backend.clone(),
+                            scheduled_work::transcripts(&store, skill_registry.clone()),
+                            local_slot,
+                            &local_repositories,
+                            true,
+                        )?
+                        .with_run_logs(run_logs_dir.clone()),
+                    ),
                     serde_json::json!({"role":"general-agent", "resource_slot":true}),
                     Some(0),
                 )

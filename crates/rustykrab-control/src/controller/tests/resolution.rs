@@ -49,11 +49,17 @@ async fn a_failure_creates_a_prerequisite_and_schedules_it_before_routine_work()
     let repairs = h.of_kind(WorkKind::Internal).await;
     assert_eq!(repairs.len(), 1);
     let repair = &repairs[0];
+    // The prerequisite lands something the controller checks: a classifier
+    // rule that classifies the unknown failure on replay. One that landed
+    // nothing would park for its owner instead (`tests/investigation.rs`).
+    let mut landed = done("repair");
+    landed.artifacts.push(ArtifactRef {
+        kind: crate::errors::CLASSIFIER_RULE.into(),
+        value: "process: flux capacitor".into(),
+    });
     let gate = Arc::new(Notify::new());
-    h.script.push(
-        &repair.title,
-        Step::Wait(gate.clone(), Box::new(done("repair"))),
-    );
+    h.script
+        .push(&repair.title, Step::Wait(gate.clone(), Box::new(landed)));
     h.ctl.set_draining(false);
     assert_eq!(h.tick().await.leased, vec![repair.id.clone()]);
     assert_eq!(h.script.briefs_for("urgent task").len(), 1);
@@ -127,7 +133,10 @@ async fn a_resolution_cannot_become_its_own_prerequisite() {
         .await;
     let mut batch = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
     let item = batch.snap.item(&resolution).unwrap().clone();
-    let why = h.ctl.file_internal(&mut batch, &item, &error).unwrap_err();
+    let why = h
+        .ctl
+        .file_internal(&mut batch, &item, &error, None)
+        .unwrap_err();
     assert!(why.contains("cycle"), "{why}");
     assert!(batch.ops.is_empty());
 }
@@ -151,7 +160,9 @@ async fn an_existing_resolution_is_reused_by_identity_across_work_kinds_and_titl
     let mut batch = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
     let item = batch.snap.item(&waiter).unwrap().clone();
     assert_eq!(
-        h.ctl.file_internal(&mut batch, &item, &error).unwrap(),
+        h.ctl
+            .file_internal(&mut batch, &item, &error, None)
+            .unwrap(),
         known
     );
     assert_eq!(batch.snap.items().len(), 2);

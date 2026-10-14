@@ -8,6 +8,7 @@
 mod checks;
 mod closeout;
 mod drain;
+mod investigation;
 mod loop_status;
 mod model_check;
 mod paths;
@@ -386,6 +387,30 @@ impl Harness {
             .with_catalog(catalog.clone());
         let routing = Arc::new(crate::routing::RecordRouting::new(ctl.registry().clone()));
         let ctl = ctl.with_routing(routing);
+        Harness {
+            ctl,
+            clock,
+            script,
+            store,
+            config,
+            catalog,
+            dir,
+        }
+    }
+
+    /// A harness over the given workers whose controller runs on the wall
+    /// clock, as the daemon's does: the store stamps leases with the wall
+    /// clock whatever the controller's is, and a failure's history
+    /// attributes a run's records by time. Its manual clock is not wired.
+    pub fn on_wall_clock(config: ControllerConfig, fleet: Vec<Arc<dyn Worker>>) -> Harness {
+        let path = std::env::temp_dir().join(format!("rk-controller-{}", Uuid::new_v4()));
+        let store = Store::open(&path, vec![9u8; 32]).expect("store opens");
+        let dir = Arc::new(TempDir(path));
+        let clock = Arc::new(ManualClock::new(Utc::now()));
+        let script = Arc::new(Script::default());
+        let catalog: Arc<dyn ToolCatalog> = Arc::new(StaticCatalog::default());
+        let ctl =
+            Controller::new(store.clone(), fleet, config.clone()).with_catalog(catalog.clone());
         Harness {
             ctl,
             clock,

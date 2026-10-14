@@ -363,6 +363,15 @@ pub fn unnamed_gap(err: &WorkError) -> Option<GapKind> {
         .map(|g| g.kind)
 }
 
+/// The constraint every fix item carries: what the controller will count as
+/// done (see `controller/tick.rs`, `judge`), and what to do when nothing
+/// can be landed.
+pub const LANDING_RULE: &str = "This item is done only when it lands something the controller \
+     can check: a commit on its branch in its worktree, or a `classifier_rule` artifact that \
+     replays. If you cannot land one, say plainly in the summary what you found, what you \
+     could not determine and what you need; that conclusion goes to the owner as a question, \
+     and nothing is marked done.";
+
 /// The `internal` item the ladder's order 3 files.
 ///
 /// For an `unknown` error it asks for the probe, log line, check or parser
@@ -376,7 +385,7 @@ pub fn unnamed_gap(err: &WorkError) -> Option<GapKind> {
 pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkItemDraft {
     let mut artifact_refs = err.artifact_refs.clone();
     let identity = ArtifactRef {
-        kind: "failure_fingerprint".into(),
+        kind: crate::investigate::FAILURE_FINGERPRINT.into(),
         value: err.fingerprint.clone(),
     };
     if !artifact_refs.contains(&identity) {
@@ -388,7 +397,7 @@ pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkI
         }
     }
     let fp = &err.fingerprint;
-    let (title, objective, done_when, constraints) = if is_defect(err) {
+    let (title, objective, done_when, mut constraints) = if is_defect(err) {
         (
             format!("Classify unknown failure {fp}"),
             format!(
@@ -446,6 +455,7 @@ pub fn internal_item_draft(err: &WorkError, evidence: Vec<ArtifactRef>) -> WorkI
             Vec::new(),
         )
     };
+    constraints.push(LANDING_RULE.to_string());
     WorkItemDraft {
         kind: Some(WorkKind::Internal),
         title,
@@ -518,8 +528,9 @@ mod tests {
             .artifact_refs
             .iter()
             .any(|r| r.kind == "failure_fingerprint" && r.value == e.fingerprint));
-        assert_eq!(d.constraints.len(), 2);
+        assert_eq!(d.constraints.len(), 3);
         assert!(d.constraints[1].contains("`classifier_rule` artifact"));
+        assert_eq!(d.constraints[2], LANDING_RULE);
         // The model proposes, code transitions: nothing here is a status,
         // and the host fills parent and provenance.
         assert!(d.parent.is_none());
@@ -533,7 +544,8 @@ mod tests {
         assert_eq!(d.kind, Some(WorkKind::Internal));
         assert!(d.title.contains("verification/check_failed"), "{}", d.title);
         assert!(d.objective.contains("recurred"));
-        assert!(d.constraints.is_empty());
+        // Every fix item is told what will count as done.
+        assert_eq!(d.constraints, vec![LANDING_RULE.to_string()]);
     }
 
     #[test]

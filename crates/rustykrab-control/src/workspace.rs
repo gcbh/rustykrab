@@ -91,16 +91,16 @@ impl Workspace {
             .map(PathBuf::from)
     }
 
+    /// What a run's branch and worktree names end with: `-<run>`, the run id
+    /// shortened as [`Workspace::plan`] shortens it. Tells which run a
+    /// recorded workspace belonged to.
+    pub fn slug_of_run(run: &str) -> String {
+        format!("-{}", short_id(run))
+    }
+
     /// The workspace a run of `item` gets: names only, nothing is created.
     pub fn plan(root: &Path, repo: &Path, base: &str, item: &str, run: &str) -> Workspace {
-        let short = |s: &str| -> String {
-            s.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(8)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        };
-        let slug = format!("{}-{}", short(item), short(run));
+        let slug = format!("{}{}", short_id(item), Self::slug_of_run(run));
         Workspace {
             repo: repo.to_path_buf(),
             base: base.to_string(),
@@ -171,6 +171,41 @@ impl Workspace {
     }
 }
 
+/// An id as the first eight of its letters and digits, lower case: the
+/// part of an item or run id a branch and a worktree are named with.
+fn short_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// The full hash of the commit `rev` names in `repo`, or `None` when the
+/// repository has no such commit.
+pub fn resolve_commit(repo: &Path, rev: &str) -> Result<Option<String>, String> {
+    let rev = rev.trim();
+    if rev.is_empty() || rev.starts_with('-') {
+        return Ok(None);
+    }
+    let out = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )?;
+    Ok(out.status.success().then(|| stdout(&out)))
+}
+
+/// Whether `commit` in `repo` has a file or directory at `path`.
+pub fn has_path(repo: &Path, commit: &str, path: &str) -> Result<bool, String> {
+    let out = git(repo, &["cat-file", "-e", &format!("{commit}:{path}")])?;
+    Ok(out.status.success())
+}
+
 /// The commit `repo`'s `HEAD` points at.
 pub fn head(repo: &Path) -> Result<String, String> {
     let out = git(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
@@ -206,6 +241,16 @@ pub fn verify(ws: &Workspace, claim: CodeClaim<'_>) -> Result<CodeVerdict, Strin
                         "the run's branch {} is unavailable",
                         ws.branch
                     )));
+                }
+                // The adapters remove the worktree once a run has a result,
+                // before the controller gets here. The branch is still at
+                // its parent and whatever was uncommitted went with the
+                // directory, so the repository is unchanged; only a
+                // worktree that is still there can hold unreported edits.
+                if !ws.path.exists() {
+                    return Ok(CodeVerdict::Unchanged {
+                        base: ws.base.clone(),
+                    });
                 }
                 let status = git(
                     &ws.path,
@@ -591,6 +636,33 @@ pub(crate) mod tests {
     fn workspace(repo: &Repo, root: &Path) -> Workspace {
         let base = head(repo.path()).unwrap();
         Workspace::plan(root, repo.path(), &base, "item-0001-abcd", "run-9f8e7d6c")
+    }
+
+    /// The adapters remove a run's worktree once it has a result, before
+    /// the controller verifies it. A run that committed nothing and claims
+    /// nothing is then still an unchanged repository, not an unverifiable
+    /// claim.
+    #[test]
+    fn a_run_that_changed_nothing_verifies_after_its_worktree_is_removed() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        ws.remove().unwrap();
+        assert!(!ws.path.exists());
+        let verdict = verify(
+            &ws,
+            CodeClaim {
+                commit: None,
+                changed_paths: &[],
+            },
+        );
+        assert_eq!(
+            verdict,
+            Ok(CodeVerdict::Unchanged {
+                base: ws.base.clone()
+            })
+        );
     }
 
     #[test]

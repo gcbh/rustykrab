@@ -91,7 +91,14 @@ impl NativeWorker {
             &config.repos,
             tools.integrations,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        // The host half's runs leave session logs where the native half's
+        // do, so either is opened from the same evidence.
+        .with_run_logs(
+            config
+                .data_dir
+                .join(rustykrab_agent::external_worker::RUN_LOGS_DIR),
+        );
         Ok(Self {
             native: ExternalWorker::new(name, config).with_subscription_runtimes(claude, codex),
             host,
@@ -156,7 +163,7 @@ impl Worker for NativeWorker {
         self.host.usage(run).or_else(|| self.native.usage(run))
     }
     fn run_log(&self, run: &str) -> Option<std::path::PathBuf> {
-        self.native.run_log(run)
+        self.host.run_log(run).or_else(|| self.native.run_log(run))
     }
     fn stop(&self, run: &str) {
         self.host.stop(run);

@@ -332,7 +332,148 @@ impl ClaudeCodeStandIn {
     pub fn path(&self) -> std::path::PathBuf {
         self.dir.path().join("claude")
     }
+
+    /// A stand-in for the investigation scenario: it fails an item whose
+    /// prompt carries [`INVESTIGATION_CLAIM_WRONGLY`] the way a worker that
+    /// claims a path it did not change fails, and acts as the investigator
+    /// when its prompt is a fix item's brief (see
+    /// [`INVESTIGATOR_STAND_IN`]).
+    pub fn investigator() -> Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("rustykrab-investigator-stand-in-")
+            .tempdir()?;
+        let script = INVESTIGATOR_STAND_IN
+            .replace("{CLAIM_WRONGLY}", INVESTIGATION_CLAIM_WRONGLY)
+            .replace("{LAND_THE_FIX}", INVESTIGATION_LAND_THE_FIX)
+            .replace("{NOT_DONE}", INVESTIGATION_NOT_DONE)
+            .replace("{LANDED}", INVESTIGATION_LANDED)
+            .replace("{FAIL_IN_DAEMON}", INVESTIGATION_FAIL_IN_DAEMON)
+            .replace("{DAEMON_FAILURE}", INVESTIGATION_DAEMON_FAILURE);
+        let path = dir.path().join("claude");
+        std::fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(Self { dir })
+    }
 }
+
+/// In an item's objective: the investigation stand-in commits a change and
+/// claims a path the commit did not touch, every time it runs the item.
+pub const INVESTIGATION_CLAIM_WRONGLY: &str = "e2e-investigation: claim a path wrongly";
+/// In an answer to a fix item's question: the investigator lands a commit
+/// on its next run instead of reporting that nothing changed.
+pub const INVESTIGATION_LAND_THE_FIX: &str = "e2e-investigation: land the fix";
+/// In an item's objective: the investigation stand-in fails the item with
+/// an error no classifier recognises, [`INVESTIGATION_DAEMON_FAILURE`].
+pub const INVESTIGATION_FAIL_IN_DAEMON: &str = "e2e-investigation: fail in the daemon";
+/// The unclassified failure [`INVESTIGATION_FAIL_IN_DAEMON`] reports. It
+/// carries [`INVESTIGATION_LAND_THE_FIX`], so the fix item filed for it
+/// (whose objective quotes the failure) lands a commit.
+pub const INVESTIGATION_DAEMON_FAILURE: &str =
+    "E2E-OWN-SOURCE the verifier refused a step it should have taken; e2e-investigation: land the fix";
+/// How the investigator's report starts when it changed nothing.
+pub const INVESTIGATION_NOT_DONE: &str = "Not done: no fix is committed";
+/// How the investigator's report starts when it landed a commit.
+pub const INVESTIGATION_LANDED: &str = "Root cause: the worker claimed a path it did not change";
+/// The directory under the daemon's data directory where the investigator
+/// stand-in leaves what it was given, one `run-<n>` directory per run.
+pub const INVESTIGATOR_CAPTURES: &str = "e2e-investigator";
+
+/// A stand-in for `claude -p <prompt> ...` that plays both parts of the
+/// investigation scenario. No model, no network.
+///
+/// As the investigator (its prompt is a fix item's brief) it first records
+/// what it was actually given, under `$RUSTYKRAB_DATA_DIR/e2e-investigator/
+/// run-<n>/`: the brief as rendered, its arguments after the prompt, its
+/// working directory with the commit it is checked out at, a copy of the
+/// investigation bundle directory, and what it could read from the index
+/// and from one failed run's session log. Then it reports that nothing
+/// changed, or, when its brief carries the owner's answer
+/// [`INVESTIGATION_LAND_THE_FIX`], commits a change and reports it.
+const INVESTIGATOR_STAND_IN: &str = r##"#!/bin/sh
+# Stand-in for `claude -p <prompt> ...`, written by the RustyKrab e2e
+# harness for the investigation scenario. No model, no network.
+prompt=""
+if [ "$1" = "-p" ]; then prompt="$2"; shift 2; fi
+emit() {
+  escaped=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$escaped"
+}
+# The file a change goes in: the fixture repository's src/lib.rs, or a new
+# file at the root of a checkout that has none (RustyKrab's own source).
+target() {
+  if [ -f src/lib.rs ]; then echo src/lib.rs; else echo e2e-investigator-fix.md; fi
+}
+commit_change() {
+  echo "// $1" >> "$2"
+  git add "$2"
+  git -c user.name=e2e -c user.email=e2e@rustykrab.invalid commit -q --no-gpg-sign -m "e2e: $1"
+  git rev-parse HEAD
+}
+case "$prompt" in
+  *"investigation: this item investigates failure"*)
+    captures="$RUSTYKRAB_DATA_DIR/e2e-investigator"
+    mkdir -p "$captures"
+    n=$(ls "$captures" | wc -l | tr -d ' ')
+    cap="$captures/run-$((n + 1))"
+    mkdir -p "$cap"
+    printf '%s\n' "$prompt" > "$cap/brief.txt"
+    printf '%s\n' "$@" > "$cap/args.txt"
+    git rev-parse HEAD > "$cap/head.txt" 2>&1
+    {
+      echo '$ pwd'; pwd
+      echo '$ git rev-parse HEAD'; git rev-parse HEAD
+      echo '$ git status --short --branch'; git status --short --branch
+      echo '$ git log --oneline -3'; git log --oneline -3
+      echo '$ ls -la'; ls -la
+      echo '$ ls -la src'; ls -la src
+    } > "$cap/working-directory.txt" 2>&1
+    dir=$(printf '%s\n' "$prompt" | sed -n 's/^investigation: .* to \(\/[^ ]*\)\. These are records.*/\1/p' | head -n 1)
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      cp -R "$dir" "$cap/bundle"
+      {
+        echo "\$ sed -n '1,30p' $dir/index.md"
+        sed -n '1,30p' "$dir/index.md"
+      } > "$cap/read-index.txt" 2>&1
+      log=$(sed -n 's/^ *"path": "\(.*run-logs[^"]*\)",*$/\1/p' "$dir/bundle.json" | head -n 1)
+      if [ -n "$log" ]; then
+        {
+          echo "\$ tail -n 2 $log"
+          tail -n 2 "$log"
+        } > "$cap/read-session-log.txt" 2>&1
+      fi
+    fi
+    case "$prompt" in
+      *"{LAND_THE_FIX}"*)
+        file=$(target)
+        sha=$(commit_change "bookkeeping fixed by the e2e investigator" "$file")
+        landed="{LANDED}; fixed the bookkeeping and committed it."
+        if [ "$file" != src/lib.rs ]; then
+          landed="Root cause in RustyKrab's own code; fixed it in the daemon's source and committed it."
+        fi
+        emit "{\"summary\":\"$landed\",\"artifacts\":[],\"changed_paths\":[\"$file\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
+        ;;
+      *)
+        emit "{\"summary\":\"{NOT_DONE}. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.\",\"artifacts\":[],\"changed_paths\":[],\"commit\":null,\"checks_run\":[],\"known_limits\":[\"read the records only; changed nothing\"],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
+        ;;
+    esac
+    ;;
+  *"{FAIL_IN_DAEMON}"*)
+    emit "{\"summary\":\"Stopped: the daemon refused the step.\",\"artifacts\":[],\"changed_paths\":[],\"commit\":null,\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":{\"class\":\"unknown\",\"subclass\":\"unclassified\",\"detail\":\"{DAEMON_FAILURE}\"},\"questions\":[],\"discovered\":[]}"
+    ;;
+  *"{CLAIM_WRONGLY}"*)
+    sha=$(commit_change "touched by the e2e investigation stand-in" src/lib.rs)
+    emit "{\"summary\":\"Touched src/lib.rs\",\"artifacts\":[],\"changed_paths\":[\"src/elsewhere.rs\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
+    ;;
+  *)
+    sha=$(commit_change "touched by the e2e investigation stand-in" src/lib.rs)
+    emit "{\"summary\":\"Touched src/lib.rs\",\"artifacts\":[],\"changed_paths\":[\"src/lib.rs\"],\"commit\":\"$sha\",\"checks_run\":[],\"known_limits\":[],\"blocked\":null,\"error\":null,\"questions\":[],\"discovered\":[]}"
+    ;;
+esac
+"##;
 
 const CLAUDE_CODE_STAND_IN: &str = r##"#!/bin/sh
 # Stand-in for `claude -p <prompt> --output-format json`, written by the

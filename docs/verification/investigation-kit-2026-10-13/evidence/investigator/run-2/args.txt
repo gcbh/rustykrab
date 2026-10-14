@@ -1,0 +1,15 @@
+--output-format
+stream-json
+--verbose
+--max-turns
+25
+--permission-mode
+acceptEdits
+--allowedTools
+Bash,Read,Edit,MultiEdit,Write,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Agent,Skill,TodoWrite,TaskCreate,TaskGet,TaskList,TaskUpdate,LSP
+--disallowedTools
+Bash(git push:*),Read(//var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/service.json),Read(//var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/auth-token),Read(//var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/auth.token),Read(//var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/master.key)
+--add-dir
+/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-68592600
+--add-dir
+/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs

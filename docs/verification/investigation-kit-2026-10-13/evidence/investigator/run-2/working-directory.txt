@@ -1,0 +1,22 @@
+$ pwd
+/private/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/c038ccc0-68592600
+$ git rev-parse HEAD
+f941d808b499e3509d15181d2d1663870d6d0d31
+$ git status --short --branch
+## rustykrab/work/c038ccc0-68592600
+$ git log --oneline -3
+f941d80 fixture: initial project
+$ ls -la
+total 32
+drwxr-xr-x  7 geoffrey  staff  224 Oct 14 09:45 .
+drwxr-xr-x  3 geoffrey  staff   96 Oct 14 09:45 ..
+-rw-r--r--  1 geoffrey  staff  132 Oct 14 09:45 .git
+-rw-r--r--  1 geoffrey  staff    8 Oct 14 09:45 .gitignore
+-rw-r--r--  1 geoffrey  staff   70 Oct 14 09:45 Cargo.toml
+-rw-r--r--  1 geoffrey  staff   75 Oct 14 09:45 README.md
+drwxr-xr-x  3 geoffrey  staff   96 Oct 14 09:45 src
+$ ls -la src
+total 8
+drwxr-xr-x  3 geoffrey  staff   96 Oct 14 09:45 .
+drwxr-xr-x  7 geoffrey  staff  224 Oct 14 09:45 ..
+-rw-r--r--  1 geoffrey  staff  204 Oct 14 09:45 lib.rs

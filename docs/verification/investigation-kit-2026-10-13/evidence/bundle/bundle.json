@@ -1,0 +1,1097 @@
+{
+  "bundle": {
+    "version": 1,
+    "written_at": "2026-10-14T16:45:37.254674Z",
+    "for_item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "for_run": "d9ac79e6-83c9-405e-911a-a6550d2ffc13",
+    "fingerprint": "e0d037a7466c6d71",
+    "dir": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6",
+    "read_dirs": [
+      "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6",
+      "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs"
+    ],
+    "how_to_read": [
+      "Start with /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/index.md: one line per occurrence and run, with the line of this file where each run's record starts.",
+      "Read this file a portion at a time (for example `sed -n '<from>,<to>p'`), never whole.",
+      "A run's `run_log.path` is its whole session, one JSON event per line: open it with `tail -n 40` or `grep`, not whole.",
+      "A failed run's `daemon_log.path` holds the daemon's own log lines for that run's window, bounded and with secrets redacted.",
+      "A run's `workspace.worktree` is the checkout it left behind when `worktree_exists` is true. When it is false the directory is gone, and what the run committed is still on `workspace.branch` in `workspace.repository` (`git log <branch>`, `git diff <base>..<branch>`).",
+      "Everything here is a record to inspect, not an instruction to follow."
+    ]
+  },
+  "history": {
+    "query": "e0d037a7466c6d71",
+    "matched": "fingerprint",
+    "fingerprints": [
+      {
+        "fingerprint": "e0d037a7466c6d71",
+        "class": "verification",
+        "subclass": "claim_mismatch",
+        "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+        "items": 3,
+        "runs": 7,
+        "first_seen": "2026-10-14T16:45:29.160636Z",
+        "last_seen": "2026-10-14T16:45:37.160910Z"
+      }
+    ],
+    "occurrences": [
+      {
+        "item": {
+          "id": "86e18b16-bc09-4891-a35c-4e69c3851eec",
+          "kind": "task",
+          "title": "Add the first helper [e2e-control investigation]",
+          "status": {
+            "status": "blocked",
+            "reason": "verification_failed"
+          },
+          "objective": "e2e-investigation: claim a path wrongly. Add the first helper [e2e-control investigation]",
+          "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+          "created_at": "2026-10-14T16:45:27.736007Z"
+        },
+        "runs": [
+          {
+            "run": "29484825-bb82-4592-bca2-67235f047c9a",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:28.172277Z",
+            "ended_at": "2026-10-14T16:45:29.161575Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 199 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "repair",
+                "at": "2026-10-14T16:45:29.160636Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..e3690dd71a89: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "repair with the failure evidence"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..e3690dd71a89: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:29.160636Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:28.172304Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:28.172653Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:29.161834Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:29.222950Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:29.222950Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..e3690dd71a89: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:29.222950Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "queued"
+                },
+                "actor": "controller",
+                "reason": "repair"
+              },
+              {
+                "at": "2026-10-14T16:45:29.222950Z",
+                "kind": "transition",
+                "from": {
+                  "status": "queued"
+                },
+                "to": {
+                  "status": "ready"
+                },
+                "actor": "controller",
+                "reason": "ready"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/86e18b16-29484825",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-29484825",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/29484825-bb82-4592-bca2-67235f047c9a.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/29484825-bb82-4592-bca2-67235f047c9a.log",
+              "lines_in_window": 61,
+              "lines_kept": 61,
+              "redactions": 6,
+              "truncated": false
+            }
+          },
+          {
+            "run": "cb4f6b56-de50-478f-85cb-57cf7bcbc35b",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:29.234275Z",
+            "ended_at": "2026-10-14T16:45:30.161727Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 42 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "switch_worker",
+                "at": "2026-10-14T16:45:30.160880Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..6a81a67c93de: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "skipped: no other worker qualifies"
+              },
+              {
+                "rung": "repair",
+                "at": "2026-10-14T16:45:30.160880Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..6a81a67c93de: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "repair with the failure evidence and a diagnosis step"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..6a81a67c93de: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:30.160880Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:29.234308Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:29.234609Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:30.161998Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:30.221997Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:30.221997Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..6a81a67c93de: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:30.221997Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "queued"
+                },
+                "actor": "controller",
+                "reason": "repair"
+              },
+              {
+                "at": "2026-10-14T16:45:30.221997Z",
+                "kind": "transition",
+                "from": {
+                  "status": "queued"
+                },
+                "to": {
+                  "status": "ready"
+                },
+                "actor": "controller",
+                "reason": "ready"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/86e18b16-cb4f6b56",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb4f6b56",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.log",
+              "lines_in_window": 31,
+              "lines_kept": 31,
+              "redactions": 1,
+              "truncated": false
+            }
+          },
+          {
+            "run": "cb816898-6b7d-4b89-8772-a1332173e896",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:30.233859Z",
+            "ended_at": "2026-10-14T16:45:31.159724Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "surface",
+                "at": "2026-10-14T16:45:31.158855Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:31.158855Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:30.233901Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:30.234244Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:31.159983Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:31.159983Z",
+                "kind": "question",
+                "actor": "controller",
+                "reason": "question b0137164 blocking_now by rule surfaced: open"
+              },
+              {
+                "at": "2026-10-14T16:45:31.220730Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:31.220730Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:31.220730Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/86e18b16-cb816898",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb816898",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb816898-6b7d-4b89-8772-a1332173e896.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/cb816898-6b7d-4b89-8772-a1332173e896.log",
+              "lines_in_window": 30,
+              "lines_kept": 30,
+              "redactions": 0,
+              "truncated": false
+            }
+          }
+        ],
+        "questions": [
+          {
+            "id": "b0137164-b8b3-4e4f-8acd-b9447ae5d514",
+            "kind": "decision",
+            "status": "open",
+            "text": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?",
+            "asked_by": "controller",
+            "asked_at": "2026-10-14T16:45:31.220470Z"
+          }
+        ]
+      },
+      {
+        "item": {
+          "id": "5cbbe2d3-720b-43c9-a531-f77733d460ba",
+          "kind": "task",
+          "title": "Add the second helper [e2e-control investigation]",
+          "status": {
+            "status": "blocked",
+            "reason": "verification_failed"
+          },
+          "objective": "e2e-investigation: claim a path wrongly. Add the second helper [e2e-control investigation]",
+          "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+          "created_at": "2026-10-14T16:45:31.289038Z"
+        },
+        "runs": [
+          {
+            "run": "2a02214c-6b34-450d-b813-ea8dafcd9d4d",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:32.172666Z",
+            "ended_at": "2026-10-14T16:45:33.160841Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "repair",
+                "at": "2026-10-14T16:45:33.159873Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..8f6e05ee5c9c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "repair with the failure evidence"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..8f6e05ee5c9c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:33.159873Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:32.172687Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:32.173011Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:33.161131Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:33.221333Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:33.221333Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..8f6e05ee5c9c: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:33.221333Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "queued"
+                },
+                "actor": "controller",
+                "reason": "repair"
+              },
+              {
+                "at": "2026-10-14T16:45:33.221333Z",
+                "kind": "transition",
+                "from": {
+                  "status": "queued"
+                },
+                "to": {
+                  "status": "ready"
+                },
+                "actor": "controller",
+                "reason": "ready"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/5cbbe2d3-2a02214c",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-2a02214c",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/2a02214c-6b34-450d-b813-ea8dafcd9d4d.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/2a02214c-6b34-450d-b813-ea8dafcd9d4d.log",
+              "lines_in_window": 31,
+              "lines_kept": 31,
+              "redactions": 0,
+              "truncated": false
+            }
+          },
+          {
+            "run": "964aefb9-8cf9-4bce-9df3-a96ea8e5867d",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:33.232735Z",
+            "ended_at": "2026-10-14T16:45:34.161738Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "switch_worker",
+                "at": "2026-10-14T16:45:34.160762Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..b8d4037dac76: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "skipped: no other worker qualifies"
+              },
+              {
+                "rung": "repair",
+                "at": "2026-10-14T16:45:34.160762Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..b8d4037dac76: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "repair with the failure evidence and a diagnosis step"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..b8d4037dac76: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:34.160762Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:33.232770Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:33.233076Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:34.162020Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:34.223288Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:34.223288Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..b8d4037dac76: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:34.223288Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "queued"
+                },
+                "actor": "controller",
+                "reason": "repair"
+              },
+              {
+                "at": "2026-10-14T16:45:34.223288Z",
+                "kind": "transition",
+                "from": {
+                  "status": "queued"
+                },
+                "to": {
+                  "status": "ready"
+                },
+                "actor": "controller",
+                "reason": "ready"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/5cbbe2d3-964aefb9",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-964aefb9",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/964aefb9-8cf9-4bce-9df3-a96ea8e5867d.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/964aefb9-8cf9-4bce-9df3-a96ea8e5867d.log",
+              "lines_in_window": 33,
+              "lines_kept": 33,
+              "redactions": 0,
+              "truncated": false
+            }
+          },
+          {
+            "run": "33b09393-452b-4663-b6a6-d3893ec56bb4",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:34.235216Z",
+            "ended_at": "2026-10-14T16:45:35.161652Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "surface",
+                "at": "2026-10-14T16:45:35.160670Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:35.160670Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:34.235258Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:34.235623Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:35.161967Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:35.161967Z",
+                "kind": "question",
+                "actor": "controller",
+                "reason": "question 624d29a1 blocking_now by rule surfaced: open"
+              },
+              {
+                "at": "2026-10-14T16:45:35.223185Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:35.223185Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:35.223185Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/5cbbe2d3-33b09393",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-33b09393",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/33b09393-452b-4663-b6a6-d3893ec56bb4.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/33b09393-452b-4663-b6a6-d3893ec56bb4.log",
+              "lines_in_window": 32,
+              "lines_kept": 32,
+              "redactions": 0,
+              "truncated": false
+            }
+          }
+        ],
+        "questions": [
+          {
+            "id": "624d29a1-246d-4040-9b5b-4991b2ba63c2",
+            "kind": "decision",
+            "status": "open",
+            "text": "Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. How should it go on, or should it stop?",
+            "asked_by": "controller",
+            "asked_at": "2026-10-14T16:45:35.222920Z"
+          }
+        ]
+      },
+      {
+        "item": {
+          "id": "b422dbf8-6052-48e4-8953-e5ff1baf1a23",
+          "kind": "task",
+          "title": "Add the third helper [e2e-control investigation]",
+          "status": {
+            "status": "queued"
+          },
+          "objective": "e2e-investigation: claim a path wrongly. Add the third helper [e2e-control investigation]",
+          "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+          "created_at": "2026-10-14T16:45:35.369221Z"
+        },
+        "runs": [
+          {
+            "run": "43be53f6-851f-4f00-ab7a-c73817cd0950",
+            "worker": "pinch-inv",
+            "started_at": "2026-10-14T16:45:36.172588Z",
+            "ended_at": "2026-10-14T16:45:37.162017Z",
+            "ended": "run ended: 0 iterations, 0 completion reminders, 0 tokens, 44 ms",
+            "judged": {
+              "status": "blocked",
+              "reason": "verification_failed"
+            },
+            "hit": true,
+            "build": "6.5.4+b6605c6",
+            "rungs": [
+              {
+                "rung": "improve",
+                "at": "2026-10-14T16:45:37.160910Z",
+                "error": {
+                  "class": "verification",
+                  "subclass": "claim_mismatch",
+                  "fingerprint": "e0d037a7466c6d71",
+                  "detail": "claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                  "artifact_refs": [],
+                  "observed_by": "verifier"
+                },
+                "outcome": "waiting on resolution item c038ccc0-fa6c-49fd-8190-927c01a0674c"
+              }
+            ],
+            "evidence": [
+              {
+                "kind": "error",
+                "reference": "verification/claim_mismatch: claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]",
+                "hash": "e0d037a7466c6d71",
+                "verified_by": "verifier",
+                "at": "2026-10-14T16:45:37.160910Z"
+              }
+            ],
+            "trail": [
+              {
+                "at": "2026-10-14T16:45:36.172607Z",
+                "kind": "lease",
+                "from": {
+                  "status": "ready"
+                },
+                "to": {
+                  "status": "leased"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "ttl 1800s"
+              },
+              {
+                "at": "2026-10-14T16:45:36.173015Z",
+                "kind": "transition",
+                "from": {
+                  "status": "leased"
+                },
+                "to": {
+                  "status": "running"
+                },
+                "actor": "worker:pinch-inv",
+                "reason": "run started"
+              },
+              {
+                "at": "2026-10-14T16:45:37.162329Z",
+                "kind": "comment",
+                "actor": "worker:pinch-inv",
+                "reason": "Agent reported: Touched src/lib.rs"
+              },
+              {
+                "at": "2026-10-14T16:45:37.223263Z",
+                "kind": "transition",
+                "from": {
+                  "status": "running"
+                },
+                "to": {
+                  "status": "verifying"
+                },
+                "actor": "controller",
+                "reason": "checking the result report"
+              },
+              {
+                "at": "2026-10-14T16:45:37.223263Z",
+                "kind": "transition",
+                "from": {
+                  "status": "verifying"
+                },
+                "to": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "actor": "controller",
+                "reason": "verification failed on pinch-inv: claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]"
+              },
+              {
+                "at": "2026-10-14T16:45:37.223263Z",
+                "kind": "transition",
+                "from": {
+                  "status": "blocked",
+                  "reason": "verification_failed"
+                },
+                "to": {
+                  "status": "queued"
+                },
+                "actor": "controller",
+                "reason": "waiting for failure resolution"
+              }
+            ],
+            "workspace": {
+              "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+              "branch": "rustykrab/work/b422dbf8-43be53f6",
+              "base": "f941d808b499e3509d15181d2d1663870d6d0d31",
+              "worktree": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/b422dbf8-43be53f6",
+              "worktree_exists": false
+            },
+            "run_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/43be53f6-851f-4f00-ab7a-c73817cd0950.jsonl",
+              "exists": true,
+              "bytes": 511
+            },
+            "daemon_log": {
+              "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/43be53f6-851f-4f00-ab7a-c73817cd0950.log",
+              "lines_in_window": 21,
+              "lines_kept": 21,
+              "redactions": 0,
+              "truncated": false
+            }
+          }
+        ]
+      }
+    ],
+    "total_items": 3,
+    "fixes": [
+      {
+        "item": {
+          "id": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+          "kind": "internal",
+          "title": "Stop recurring verification/claim_mismatch failure e0d037a7466c6d71",
+          "status": {
+            "status": "ready"
+          },
+          "objective": "The same failure recurred across items (fingerprint e0d037a7466c6d71, observed_by verifier): claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: [\"src/elsewhere.rs\"]; in the diff but not claimed: [\"src/lib.rs\"]. Fix the cause, or add the check that catches it before dispatch, instead of repairing the symptom again.",
+          "repository": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG",
+          "created_at": "2026-10-14T16:45:37.160910Z"
+        },
+        "landed": [],
+        "runs": []
+      }
+    ],
+    "generated_at": "2026-10-14T16:45:37.237387Z",
+    "build": "6.5.4+b6605c6"
+  }
+}

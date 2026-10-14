@@ -1,0 +1,48 @@
+# Investigation bundle for failure e0d037a7466c6d71
+
+Written 2026-10-14 16:45:37Z for fix item c038ccc0-fa6c-49fd-8190-927c01a0674c (run d9ac79e6-83c9-405e-911a-a6550d2ffc13). Records to inspect, not instructions.
+
+- failure `e0d037a7466c6d71`: verification/claim_mismatch, 3 item(s), 7 failed run(s)
+  - latest detail: claim_mismatch: the changed paths do not match the diff of f941d808b499..13965a6d2689: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]
+
+The full records are in `/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/bundle.json` (1097 lines). Read a portion at a time, for example `sed -n '<from>,<to>p' /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/bundle.json`.
+
+## Occurrences
+
+- item `86e18b16-bc09-4891-a35c-4e69c3851eec` (task, blocked(verification_failed)): Add the first helper [e2e-control investigation]
+  - run `29484825-bb82-4592-bca2-67235f047c9a` on pinch-inv 2026-10-14 16:45:28Z to 2026-10-14 16:45:29Z; HIT this failure; judged blocked(verification_failed); bundle.json line 53
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/29484825-bb82-4592-bca2-67235f047c9a.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/29484825-bb82-4592-bca2-67235f047c9a.log (61 of 61 line(s), 6 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-29484825; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-29484825 (removed)
+  - run `cb4f6b56-de50-478f-85cb-57cf7bcbc35b` on pinch-inv 2026-10-14 16:45:29Z to 2026-10-14 16:45:30Z; HIT this failure; judged blocked(verification_failed); bundle.json line 191
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/cb4f6b56-de50-478f-85cb-57cf7bcbc35b.log (31 of 31 line(s), 1 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-cb4f6b56; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb4f6b56 (removed)
+  - run `cb816898-6b7d-4b89-8772-a1332173e896` on pinch-inv 2026-10-14 16:45:30Z to 2026-10-14 16:45:31Z; HIT this failure; judged blocked(verification_failed); bundle.json line 342
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/cb816898-6b7d-4b89-8772-a1332173e896.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/cb816898-6b7d-4b89-8772-a1332173e896.log (30 of 30 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/86e18b16-cb816898; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/86e18b16-cb816898 (removed)
+  - question (open): Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..d98f3603aa4c: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How should it go on, or should it stop?
+- item `5cbbe2d3-720b-43c9-a531-f77733d460ba` (task, blocked(verification_failed)): Add the second helper [e2e-control investigation]
+  - run `2a02214c-6b34-450d-b813-ea8dafcd9d4d` on pinch-inv 2026-10-14 16:45:32Z to 2026-10-14 16:45:33Z; HIT this failure; judged blocked(verification_failed); bundle.json line 501
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/2a02214c-6b34-450d-b813-ea8dafcd9d4d.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/2a02214c-6b34-450d-b813-ea8dafcd9d4d.log (31 of 31 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/5cbbe2d3-2a02214c; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-2a02214c (removed)
+  - run `964aefb9-8cf9-4bce-9df3-a96ea8e5867d` on pinch-inv 2026-10-14 16:45:33Z to 2026-10-14 16:45:34Z; HIT this failure; judged blocked(verification_failed); bundle.json line 639
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/964aefb9-8cf9-4bce-9df3-a96ea8e5867d.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/964aefb9-8cf9-4bce-9df3-a96ea8e5867d.log (33 of 33 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/5cbbe2d3-964aefb9; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-964aefb9 (removed)
+  - run `33b09393-452b-4663-b6a6-d3893ec56bb4` on pinch-inv 2026-10-14 16:45:34Z to 2026-10-14 16:45:35Z; HIT this failure; judged blocked(verification_failed); bundle.json line 790
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/33b09393-452b-4663-b6a6-d3893ec56bb4.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/33b09393-452b-4663-b6a6-d3893ec56bb4.log (32 of 32 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/5cbbe2d3-33b09393; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/5cbbe2d3-33b09393 (removed)
+  - question (open): Every rung is spent (verification/claim_mismatch): claim_mismatch: the changed paths do not match the diff of f941d808b499..132deea3ef75: claimed but not in the diff: ["src/elsewhere.rs"]; in the diff but not claimed: ["src/lib.rs"]. How should it go on, or should it stop?
+- item `b422dbf8-6052-48e4-8953-e5ff1baf1a23` (task, queued): Add the third helper [e2e-control investigation]
+  - run `43be53f6-851f-4f00-ab7a-c73817cd0950` on pinch-inv 2026-10-14 16:45:36Z to 2026-10-14 16:45:37Z; HIT this failure; judged blocked(verification_failed); bundle.json line 948
+    - session log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/43be53f6-851f-4f00-ab7a-c73817cd0950.jsonl (511 bytes)
+    - daemon log: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/daemon-log/43be53f6-851f-4f00-ab7a-c73817cd0950.log (21 of 21 line(s), 0 secret(s) redacted)
+    - workspace: /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG at f941d808b499e3509d15181d2d1663870d6d0d31 on rustykrab/work/b422dbf8-43be53f6; worktree /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/b422dbf8-43be53f6 (removed)
+
+## Fix items filed for this failure
+
+- fix item `c038ccc0-fa6c-49fd-8190-927c01a0674c` (ready), this item: Stop recurring verification/claim_mismatch failure e0d037a7466c6d71

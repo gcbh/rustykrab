@@ -23,6 +23,11 @@
 //! controller reports to that conversation's channel as it does for a
 //! conversation that called `work_file`.
 //!
+//! `GET /api/work/investigate/{target}` returns everything on record about
+//! a failure fingerprint or a work item (every occurrence run by run, and
+//! the fix items filed for it), from the controller's one implementation
+//! (`rustykrab_control::investigate`).
+//!
 //! `GET /api/work/events` is the SSE progress stream (section 14): every
 //! `work_item_events` row written after the stream opened, one frame each,
 //! polled from the store by row id so no row is sent twice or skipped.
@@ -49,6 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use rustykrab_control::graph::FilingSource;
 use rustykrab_control::handle::{ControlHandle, GraphView, TickReport};
 use rustykrab_control::import::{self, StackManifest};
+use rustykrab_control::investigate::FailureHistory;
 use rustykrab_control::ladder::{self, RUNGS};
 use rustykrab_control::Provenance;
 use rustykrab_core::work::{
@@ -72,6 +78,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/work/tick", post(tick))
         .route("/api/work/archive", get(archive_list))
         .route("/api/work/archive/{id}", get(archive_get))
+        .route("/api/work/investigate/{target}", get(investigate))
         .route("/api/work/{id}", get(item_detail))
         .route(
             "/api/work/{id}/discussion",
@@ -794,6 +801,26 @@ async fn item_detail(
         evidence,
         events,
     }))
+}
+
+/// `GET /api/work/investigate/{target}`: everything on record about a
+/// failure. `target` is a failure fingerprint (or an unambiguous prefix of
+/// one) or a work item's id; the reply is the controller's
+/// [`FailureHistory`], the same records it writes into a fix item's
+/// investigation bundle. 404 when the store knows neither.
+async fn investigate(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> Result<Json<FailureHistory>, WorkApiError> {
+    let control = control(&state)?;
+    match control.investigate(&target).await? {
+        Some(history) => Ok(Json(history)),
+        None => Err(WorkApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no failure fingerprint or work item {target}"),
+        )),
+    }
 }
 
 /// `GET /api/work/{id}/graph`.

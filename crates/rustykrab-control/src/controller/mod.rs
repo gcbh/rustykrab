@@ -57,6 +57,7 @@ mod commit;
 mod credentials;
 mod discussion;
 mod filing;
+mod investigation;
 mod load;
 mod notice;
 mod planning;
@@ -337,6 +338,18 @@ pub struct ControllerConfig {
     /// Re-plan at the parent when a chain fails or stalls (6.4), when a
     /// `planner` worker is registered.
     pub replan: bool,
+    /// Where a fix item's investigation bundle is written when it is
+    /// leased: the daemon's `<data dir>/investigations`. `None`: no bundle
+    /// is written and the brief carries no investigation kit.
+    pub investigation_root: Option<PathBuf>,
+    /// The daemon's rolling log directory (`<data dir>/logs`), which a
+    /// bundle's per-run log slices are cut from. `None`: bundles carry no
+    /// daemon log.
+    pub daemon_log_dir: Option<PathBuf>,
+    /// The commit this daemon was built from, when the build recorded one.
+    /// Recorded with every run (`daemon_build` evidence), and what tells
+    /// the daemon's own source checkout from any other repository.
+    pub build: Option<crate::investigate::BuildId>,
 }
 
 impl Default for ControllerConfig {
@@ -368,6 +381,9 @@ impl Default for ControllerConfig {
                 rungs: RungBudgets::default(),
             },
             replan: true,
+            investigation_root: None,
+            daemon_log_dir: None,
+            build: None,
         }
     }
 }
@@ -443,6 +459,10 @@ struct State {
     /// The standing judgment in force (section 7), reloaded after a grant
     /// changes.
     judgment: Option<Arc<Judgment>>,
+    /// The daemon's own source checkout as last looked for, with the
+    /// candidate repositories it was looked for among: asked again only
+    /// when the candidates change.
+    source: Option<(Vec<PathBuf>, Option<crate::investigate::SourceCheckout>)>,
 }
 
 /// The loop of plan section 6 over one store and the workers of a
@@ -506,6 +526,7 @@ impl Controller {
                 fail_next_tick: None,
                 lock: None,
                 judgment: None,
+                source: None,
             }),
             draining: AtomicBool::new(false),
         }
@@ -745,6 +766,13 @@ impl ControlHandle for Controller {
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {
         self.graph_view(root).await
+    }
+
+    async fn investigate(
+        &self,
+        target: &str,
+    ) -> Result<Option<crate::investigate::FailureHistory>, Error> {
+        self.failure_history(target).await
     }
 
     fn loop_status(&self) -> Option<LoopStatus> {

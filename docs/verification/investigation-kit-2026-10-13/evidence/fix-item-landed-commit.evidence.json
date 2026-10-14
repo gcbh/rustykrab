@@ -1,0 +1,138 @@
+[
+  {
+    "at": "2026-10-14T16:45:37.235025Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "run",
+    "reference": "d9ac79e6-83c9-405e-911a-a6550d2ffc13",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:37.235028Z",
+    "hash": "d9ac79e6-83c9-405e-911a-a6550d2ffc13",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "daemon_build",
+    "reference": "6.5.4+b6605c6",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:37.256654Z",
+    "hash": "e0d037a7466c6d71",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "investigation_bundle",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-d9ac79e6/bundle.json",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:37.256669Z",
+    "hash": "f941d808b499e3509d15181d2d1663870d6d0d31",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "workspace",
+    "reference": "{\"repo\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG\",\"base\":\"f941d808b499e3509d15181d2d1663870d6d0d31\",\"branch\":\"rustykrab/work/c038ccc0-d9ac79e6\",\"path\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/c038ccc0-d9ac79e6\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:38.158895Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "summary",
+    "reference": "Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:38.158895Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "repository_unchanged",
+    "reference": "f941d808b499e3509d15181d2d1663870d6d0d31",
+    "verified_by": "git"
+  },
+  {
+    "at": "2026-10-14T16:45:38.158895Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "known_limit",
+    "reference": "read the records only; changed nothing",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:38.159815Z",
+    "hash": "d9ac79e6-83c9-405e-911a-a6550d2ffc13",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "run_log",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/d9ac79e6-83c9-405e-911a-a6550d2ffc13.jsonl",
+    "verified_by": "worker:pinch-inv"
+  },
+  {
+    "at": "2026-10-14T16:45:41.239828Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "run",
+    "reference": "68592600-88f4-4ec6-941f-b41264005080",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:41.239830Z",
+    "hash": "68592600-88f4-4ec6-941f-b41264005080",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "daemon_build",
+    "reference": "6.5.4+b6605c6",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:41.271876Z",
+    "hash": "e0d037a7466c6d71",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "investigation_bundle",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/investigations/c038ccc0-68592600/bundle.json",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:41.271899Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "work_discussion",
+    "reference": "[{\"item\":\"c038ccc0-fa6c-49fd-8190-927c01a0674c\",\"at\":\"2026-10-14T16:45:38.160359Z\",\"kind\":\"comment\",\"from\":null,\"to\":null,\"actor\":\"worker:pinch-inv\",\"reason\":\"Agent reported: Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker.\",\"upstream\":null,\"origin\":null,\"evidence_ref\":null}]",
+    "verified_by": "controller"
+  },
+  {
+    "at": "2026-10-14T16:45:41.271908Z",
+    "hash": "f941d808b499e3509d15181d2d1663870d6d0d31",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "workspace",
+    "reference": "{\"repo\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-planning-fixture-HGUYxG\",\"base\":\"f941d808b499e3509d15181d2d1663870d6d0d31\",\"branch\":\"rustykrab/work/c038ccc0-68592600\",\"path\":\"/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/worktrees/c038ccc0-68592600\"}",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:42.160094Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "summary",
+    "reference": "Root cause: the worker claimed a path it did not change; fixed the bookkeeping and committed it.",
+    "verified_by": null
+  },
+  {
+    "at": "2026-10-14T16:45:42.160094Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "commit",
+    "reference": "eaf924e7e91c4a2145605d44916fa347698cf32d",
+    "verified_by": "git"
+  },
+  {
+    "at": "2026-10-14T16:45:42.160094Z",
+    "hash": null,
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "changed_path",
+    "reference": "src/lib.rs",
+    "verified_by": "git"
+  },
+  {
+    "at": "2026-10-14T16:45:42.162055Z",
+    "hash": "68592600-88f4-4ec6-941f-b41264005080",
+    "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+    "kind": "run_log",
+    "reference": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/run-logs/68592600-88f4-4ec6-941f-b41264005080.jsonl",
+    "verified_by": "worker:pinch-inv"
+  }
+]

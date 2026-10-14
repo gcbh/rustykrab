@@ -1,0 +1,22 @@
+{
+  "answer": null,
+  "answered_at": null,
+  "answered_by": null,
+  "asked_by": "controller",
+  "asked_class": null,
+  "class": "blocking_now",
+  "created_at": "2026-10-14T16:45:38.171661Z",
+  "decision": null,
+  "default_answer": null,
+  "delivered_via": "webchat",
+  "id": "cc23e105-f022-40c0-afe5-6defd4af3e49",
+  "item": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+  "kind": "decision",
+  "options": [],
+  "research_item": null,
+  "root": "c038ccc0-fa6c-49fd-8190-927c01a0674c",
+  "rule": "fix_not_landed",
+  "status": "open",
+  "superseded_by": null,
+  "text": "\"Stop recurring verification/claim_mismatch failure e0d037a7466c6d71\" (#c038ccc0) landed nothing the controller can check for failure e0d037a7466c6d71 (no commit in its worktree, no classifier rule that replays), so it is not done. It reported: Not done: no fix is committed. I read the bundle index and one failed run's session log; the worker claims src/elsewhere.rs while its commit changes src/lib.rs, and this run was not told to change the worker. Known limits: read the records only; changed nothing. What should it do next? Your answer goes into its next run (for example where the code is, what to change, or that no fix is wanted)."
+}

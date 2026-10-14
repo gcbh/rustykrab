@@ -731,6 +731,7 @@ mod tests {
             workspace: None,
             capability: None,
             project_context: None,
+            investigation: None,
         }
     }
 

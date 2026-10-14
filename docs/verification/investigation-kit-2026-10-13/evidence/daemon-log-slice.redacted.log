@@ -1,0 +1,63 @@
+# daemon log for run 29484825-bb82-4592-bca2-67235f047c9a of item 86e18b16-bc09-4891-a35c-4e69c3851eec
+# window 2026-10-14T16:45:26.172277+00:00 to 2026-10-14T16:45:31.161575+00:00 (with padding); 61 of 61 line(s) kept; 6 secret(s) redacted
+2026-10-14T16:45:27.137300Z  INFO rustykrab_cli: rustykrab 6.5.4 (b6605c6, 2026-10-14)
+2026-10-14T16:45:27.137361Z  INFO rustykrab_cli: harness profile loaded profile=default
+2026-10-14T16:45:27.137390Z  INFO rustykrab_store::keychain: using master key from RUSTYKRAB_MASTER_KEY env var
+2026-10-14T16:45:27.150256Z  WARN rustykrab_cli: RUSTYKRAB_CREDENTIAL_BACKEND=memory — credentials are held in memory only, are lost on restart, and are protected by nothing. This is the evaluation harness switch and must never be set on a real deployment.
+2026-10-14T16:45:27.150478Z  WARN rustykrab_cli: optional secret 'Anthropic Claude API key' not found — some features may be unavailable secret="<redacted>"
+2026-10-14T16:45:27.150494Z  WARN rustykrab_cli: optional secret 'Gmail email address (for IMAP/SMTP)' not found — some features may be unavailable secret="<redacted>"
+2026-10-14T16:45:27.150506Z  WARN rustykrab_cli: optional secret 'Gmail app password (for IMAP/SMTP)' not found — some features may be unavailable secret="<redacted>"
+2026-10-14T16:45:27.150517Z  WARN rustykrab_cli: optional secret 'APNs signing key (.p8 contents) for push notifications' not found — some features may be unavailable secret="<redacted>"
+2026-10-14T16:45:27.150530Z  WARN rustykrab_cli: optional secret 'GitHub token for the review surface (issues on RUSTYKRAB_GITHUB_REPO)' not found — some features may be unavailable secret="<redacted>"
+2026-10-14T16:45:27.150562Z  INFO rustykrab_cli: auth token resolved via registry
+2026-10-14T16:45:27.150621Z  WARN rustykrab_cli: RUSTYKRAB_PROVIDER=scripted — replaying a fixed script instead of calling a model. This is the E2E harness provider and must never be set on a real deployment. path=/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/e2e-script.json
+2026-10-14T16:45:27.151323Z  INFO rustykrab_cli: compaction context budget configured max_context_tokens=128000 provider=scripted
+2026-10-14T16:45:27.151340Z  INFO rustykrab_cli: memory distillation off: only the Ollama provider can be asked not to think provider="scripted"
+2026-10-14T16:45:27.151415Z  INFO rustykrab_cli: soul path defaulted (set RUSTYKRAB_SOUL_PATH to override) path=/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/soul.md
+2026-10-14T16:45:27.151530Z  INFO rustykrab_cli: seeded soul.md with default template — edit to customize path=/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/soul.md
+2026-10-14T16:45:27.153319Z  INFO rustykrab_cli: generated new persistent agent_id id=5af73d0b-2586-4c0c-905b-919d7a80ccad
+2026-10-14T16:45:27.153361Z  INFO rustykrab_cli: memory system initialized agent_id=5af73d0b-2586-4c0c-905b-919d7a80ccad
+2026-10-14T16:45:27.153384Z  INFO rustykrab_cli: video channel disabled (set RUSTYKRAB_VIDEO=true to enable)
+2026-10-14T16:45:27.153866Z  INFO rustykrab_cli: wiki tool registered
+2026-10-14T16:45:27.153879Z  INFO rustykrab_cli: message tool registered
+2026-10-14T16:45:27.153891Z  INFO rustykrab_cli: cron tool registered
+2026-10-14T16:45:27.153923Z  INFO rustykrab_cli: model provider configured provider="scripted"
+2026-10-14T16:45:27.154210Z  INFO rustykrab_cli: subagent tools disabled — set RUSTYKRAB_ENABLE_SUBAGENTS=true to enable
+2026-10-14T16:45:27.154224Z  INFO rustykrab_cli: recall tools registered
+2026-10-14T16:45:27.154234Z  INFO rustykrab_cli: todo tools registered
+2026-10-14T16:45:27.154284Z  INFO rustykrab_cli: skill-tools registered added=0 registered_skills=0
+2026-10-14T16:45:27.154856Z  INFO rustykrab_cli: local worker off (RUSTYKRAB_LOCAL_WORKER=off): none registered or leased to worker=snapper
+2026-10-14T16:45:27.156486Z  INFO rustykrab_cli::fleet: worker registry ready local=snapper local_on=false restored=[]
+2026-10-14T16:45:27.156549Z  INFO rustykrab_cli: control layer registered worker=snapper local_worker="off" notices="webchat"
+2026-10-14T16:45:27.157301Z  WARN rustykrab_gateway::rate_limit: rate limiter running with non-default limits from the environment max_requests=100000 window_secs=60 lockout_secs=1
+2026-10-14T16:45:27.157373Z  INFO rustykrab_gateway::origin: additional origins allowed origins=["https://harness.example.ts.net"]
+2026-10-14T16:45:27.157443Z  INFO rustykrab_cli: task queue started max_concurrent=4
+2026-10-14T16:45:27.157465Z  INFO rustykrab_cli: delegated-task worker started
+2026-10-14T16:45:27.157487Z  INFO rustykrab_cli::scheduled_work: scheduled jobs fire as work items (RUSTYKRAB_CRON_WORK_ITEMS) every_secs=1
+2026-10-14T16:45:27.157516Z  INFO rustykrab_cli: control layer started tick_secs=1
+2026-10-14T16:45:27.158752Z  INFO rustykrab_cli: controller lock held; the control loop runs here lock=/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-local-off-Bu5nn3/controller.lock
+2026-10-14T16:45:27.164771Z  INFO rustykrab_cli: RustyKrab gateway listening addr=127.0.0.1:52880
+2026-10-14T16:45:27.735346Z  INFO rustykrab_gateway::worker_routes: worker added worker=pinch-inv kind=claude_code
+2026-10-14T16:45:27.735480Z  INFO rustykrab_gateway::logging: request completed trace_id=919ed01f-4568-4f2c-8140-bd8cad4689fa method=POST path=/api/workers query=None client_ip=127.0.0.1 user_agent=- req_content_length=Some(243) status=201 resp_content_length=None latency_ms=0
+2026-10-14T16:45:27.736806Z  INFO rustykrab_gateway::logging: request completed trace_id=169f9563-651e-40d4-a5de-a1b987773742 method=POST path=/api/work query=None client_ip=127.0.0.1 user_agent=- req_content_length=Some(496) status=201 resp_content_length=None latency_ms=0
+2026-10-14T16:45:27.737319Z  INFO rustykrab_gateway::logging: request completed trace_id=0dec7112-a80a-4a65-8cc8-8e64fd0ce49c method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:27.991146Z  INFO rustykrab_gateway::logging: request completed trace_id=c77d1ac7-9589-4d5a-b662-3dcbca155fdd method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:28.172889Z  INFO rustykrab_cli: control tick leased=1 reconciled=0 transitions=2 notices=0
+2026-10-14T16:45:28.243128Z  INFO rustykrab_gateway::logging: request completed trace_id=3ba51d9e-1a11-4a66-9487-a70dd14fba72 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:28.417984Z  INFO rustykrab_agent::external_worker: external worker run ended worker=pinch-inv item=86e18b16-bc09-4891-a35c-4e69c3851eec ok=true commands=0
+2026-10-14T16:45:28.497499Z  INFO rustykrab_gateway::logging: request completed trace_id=3a40549f-5cec-4e52-ac54-8761cd7ed217 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:28.751485Z  INFO rustykrab_gateway::logging: request completed trace_id=5a5e492d-a0ea-46fb-a702-29aa0ee8582b method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:29.005453Z  INFO rustykrab_gateway::logging: request completed trace_id=e48203d2-5ab1-4bdc-a7ad-f39c2a0e3da7 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:29.235039Z  INFO rustykrab_cli: control tick leased=1 reconciled=1 transitions=6 notices=0
+2026-10-14T16:45:29.259321Z  INFO rustykrab_gateway::logging: request completed trace_id=fbcdf869-c486-424b-b38c-0fcfe8bfc036 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:29.320234Z  INFO rustykrab_agent::external_worker: external worker run ended worker=pinch-inv item=86e18b16-bc09-4891-a35c-4e69c3851eec ok=true commands=0
+2026-10-14T16:45:29.513261Z  INFO rustykrab_gateway::logging: request completed trace_id=4be97153-1f55-4621-b36c-9de8abafcb97 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:29.766965Z  INFO rustykrab_gateway::logging: request completed trace_id=70e77d7c-a025-4f1b-b9bc-54697592d41e method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:30.020690Z  INFO rustykrab_gateway::logging: request completed trace_id=03864466-37ff-4f98-a465-325e9a4fed25 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:30.234480Z  INFO rustykrab_cli: control tick leased=1 reconciled=1 transitions=6 notices=0
+2026-10-14T16:45:30.273093Z  INFO rustykrab_gateway::logging: request completed trace_id=0ad495c2-7f09-4296-8703-5872b0b9f1a2 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:30.323159Z  INFO rustykrab_agent::external_worker: external worker run ended worker=pinch-inv item=86e18b16-bc09-4891-a35c-4e69c3851eec ok=true commands=0
+2026-10-14T16:45:30.526021Z  INFO rustykrab_gateway::logging: request completed trace_id=751f246e-479a-47a0-a905-a190b6082af4 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:30.779997Z  INFO rustykrab_gateway::logging: request completed trace_id=eea3030d-a788-483d-a3bc-2de2199f9158 method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:31.033971Z  INFO rustykrab_gateway::logging: request completed trace_id=a9d15e67-4ad1-49a5-bb49-2d03761fc34f method=GET path=/api/questions query=None client_ip=127.0.0.1 user_agent=- req_content_length=None status=200 resp_content_length=None latency_ms=0
+2026-10-14T16:45:28.173277Z ERROR rustykrab_channels::telegram: Telegram getUpdates network error: error sending request for url (https://api.telegram.org/bot<redacted>/getUpdates?timeout=30) consecutive_errors=1 delay_secs=2
