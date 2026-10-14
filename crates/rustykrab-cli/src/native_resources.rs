@@ -36,12 +36,7 @@ impl NativeWorker {
         // Fine-grained native patterns cannot be enforced by host exec, so
         // custom Claude deny policies retain native-only shell execution.
         if config.kind == WorkerKind::ClaudeCode {
-            let shell = config.denied_tools.is_empty()
-                && (config.allowed_tools.is_empty()
-                    || config
-                        .allowed_tools
-                        .iter()
-                        .any(|t| t == "Bash" || t == "Bash(*)"));
+            let shell = config.denied_tools.is_empty();
             let fetch = !config
                 .denied_tools
                 .iter()
@@ -160,6 +155,9 @@ impl Worker for NativeWorker {
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.host.usage(run).or_else(|| self.native.usage(run))
     }
+    fn run_log(&self, run: &str) -> Option<std::path::PathBuf> {
+        self.native.run_log(run)
+    }
     fn stop(&self, run: &str) {
         self.host.stop(run);
         self.native.stop(run);
@@ -224,7 +222,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for (allowed, denied, shell) in [
             (serde_json::json!([]), serde_json::json!([]), true),
-            (serde_json::json!(["Read"]), serde_json::json!([]), false),
+            (serde_json::json!(["Read"]), serde_json::json!([]), true),
             (
                 serde_json::json!(["Bash"]),
                 serde_json::json!(["Bash(git push*)"]),

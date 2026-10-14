@@ -95,7 +95,9 @@ roles share one inference slot. Model identity, health, assignment, finalized
 usage and verified outcomes appear in the ordinary monitoring view.
 
 Use `worker_kind: any` with the exact registered repository for basic coding.
-The local coding worker exposes exec in its isolated worktree; required host
+The local coding worker exposes a shell, file read/edit/write, web fetch and
+search and a task list, the shell and file tools bound to its isolated
+worktree; required host
 tool names should be omitted when native CLI fallback is desired. Integration
 work explicitly requires its host tools and retains read-only Gmail/calendar,
 HTTPS research and dated-note restrictions. The controller chooses the cheapest

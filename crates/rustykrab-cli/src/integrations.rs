@@ -357,7 +357,8 @@ impl IntegrationWorker {
             .into_iter()
             .filter(|tool| {
                 CONTEXT_TOOLS.contains(&tool.name())
-                    || tool.name() == "exec" && !repositories.is_empty()
+                    || crate::local_resources::CODING_TOOLS.contains(&tool.name())
+                        && !repositories.is_empty()
                     || integrations && TOOLS.contains(&tool.name())
             })
             .map(|inner| {

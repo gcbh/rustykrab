@@ -9,11 +9,12 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use rustykrab_core::work::{Budget, EventKind, WorkEvent, WorkItemId};
+use rustykrab_core::work::{Budget, EventKind, Evidence, WorkEvent, WorkItemId};
 use rustykrab_core::Error;
 use rustykrab_store::{RunSpend, Spend};
 
 use crate::graph::Snapshot;
+use crate::worker::RUN_LOG;
 
 use super::{Controller, Run};
 
@@ -79,6 +80,24 @@ impl Controller {
     /// time; and a `run` event on the item with the worker's counts. Best
     /// effort: a failed write is logged, never fails the tick.
     pub(super) async fn record_run(&self, item: &str, run: &Run, how: &str) {
+        // Where the run's whole session is, for whoever looks into it
+        // later: the next attempt, or an investigation of its failure.
+        if let Some(path) = self
+            .worker(&run.worker)
+            .and_then(|w| w.run_log(&run.run_id))
+        {
+            let log = Evidence {
+                item: item.to_string(),
+                kind: RUN_LOG.to_string(),
+                reference: path.display().to_string(),
+                hash: Some(run.run_id.clone()),
+                verified_by: Some(format!("worker:{}", run.worker)),
+                at: Utc::now(),
+            };
+            if let Err(e) = self.store.work_evidence_add(log).await {
+                tracing::warn!(item = %item, error = %e, "run log not recorded");
+            }
+        }
         let usage = self.worker(&run.worker).and_then(|w| w.usage(&run.run_id));
         let wall_ms = match usage {
             Some(u) if u.wall_ms > 0 => u.wall_ms,

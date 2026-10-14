@@ -781,8 +781,8 @@ impl Worker for LocalWorker {
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
         let (mut host_tools, mut ceiling) = self.catalog();
         if self.repository_shell && brief.workspace.is_none() {
-            host_tools.retain(|t| t.name() != "exec");
-            ceiling.retain(|t| t != "exec");
+            host_tools.retain(|t| !["exec", "read", "edit", "write"].contains(&t.name()));
+            ceiling.retain(|t| !["exec", "read", "edit", "write"].contains(&t.as_str()));
         }
         let activate = self
             .activation(&brief, &ceiling)
@@ -850,11 +850,20 @@ impl LocalWorker {
         tools.extend(rustykrab_tools::question_tools(recorder.clone()));
         tools.extend(rustykrab_tools::plan_tools(recorder.clone()));
         let workdir = brief.workspace.as_ref().map(|ws| ws.path.clone());
+        // A run in a worktree works there and nowhere else: its shell and
+        // its file tools are bound to that directory, where the host's own
+        // are bound to the daemon's workspace.
         tools.extend(host_tools.into_iter().map(|t| match &workdir {
-            Some(dir) if t.name() == "exec" => {
-                Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>
-            }
-            _ => t,
+            Some(dir) => match t.name() {
+                "exec" => Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>,
+                "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone())) as Arc<dyn Tool>,
+                "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone())) as Arc<dyn Tool>,
+                "write" => {
+                    Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone())) as Arc<dyn Tool>
+                }
+                _ => t,
+            },
+            None => t,
         }));
         // Every call is a step in the progress ledger (section 6, step 7).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
@@ -1196,7 +1205,8 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     if let Some(ws) = &brief.workspace {
         let _ = writeln!(
             out,
-            "workspace: {} (exec runs here; branch {}, parent commit {})",
+            "workspace: {} (exec, read, edit and write work here, with paths relative to it; \
+             branch {}, parent commit {})",
             ws.path.display(),
             ws.branch,
             ws.base
