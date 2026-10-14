@@ -1029,6 +1029,108 @@ async fn status_and_graph_views_show_the_tree_with_roll_ups() {
 }
 
 #[tokio::test]
+async fn status_tool_pages_bulk_ids_and_subtrees_over_the_real_store() {
+    use serde_json::json;
+
+    let h = Harness::new(&[]);
+    let mut ids = Vec::new();
+    for i in 0..40 {
+        ids.push(
+            h.file_one(draft("item", &format!("Inspect blocked item {i}")))
+                .await,
+        );
+    }
+    ids.reverse();
+    // A missing position at a page boundary must not move or hide later rows.
+    ids.insert(14, "missing-id".to_string());
+    let tree = h
+        .file(plan(vec![
+            draft("P", "Status tree"),
+            draft("a", "First"),
+            draft("b", "Second"),
+            draft("c", "Third"),
+            draft("d", "Fourth"),
+        ]))
+        .await;
+    let expected_tree: Vec<String> = WorkBackend::status(
+        &h.ctl,
+        StatusQuery {
+            select: StatusSelector::Root(tree.root.clone()),
+            include_closed: false,
+        },
+        &Principal::default(),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|view| view.item.id)
+    .collect();
+    let tool = rustykrab_tools::work_tools(Arc::new(h.ctl))
+        .into_iter()
+        .find(|tool| tool.name() == "work_status")
+        .unwrap();
+    let mut offset = json!(0);
+    let mut seen = Vec::new();
+    let mut missing = Vec::new();
+    loop {
+        let page = tool
+            .execute(json!({"ids": ids, "offset": offset}))
+            .await
+            .unwrap();
+        assert_eq!(page["total"], 41);
+        let items = page["items"].as_array().unwrap();
+        assert!(items.len() <= 15);
+        seen.extend(items.iter().map(|line| {
+            line.as_str()
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        }));
+        if let Some(unreadable) = page["missing"].as_array() {
+            missing.extend(unreadable.iter().map(|id| id.as_str().unwrap().to_string()));
+        }
+        offset = page["next_offset"].clone();
+        if offset.is_null() {
+            break;
+        }
+    }
+    assert_eq!(missing, ["missing-id"]);
+    assert_eq!(
+        seen,
+        ids.into_iter()
+            .filter(|id| id != "missing-id")
+            .collect::<Vec<_>>()
+    );
+
+    offset = json!(0);
+    seen.clear();
+    loop {
+        let page = tool
+            .execute(json!({"root": tree.root, "offset": offset, "limit": 2}))
+            .await
+            .unwrap();
+        assert_eq!(page["total"], expected_tree.len());
+        let items = page["items"].as_array().unwrap();
+        assert!(items.len() <= 2);
+        seen.extend(items.iter().map(|line| {
+            line.as_str()
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        }));
+        offset = page["next_offset"].clone();
+        if offset.is_null() {
+            break;
+        }
+    }
+    assert_eq!(seen, expected_tree);
+}
+
+#[tokio::test]
 async fn closed_trees_age_into_the_archive_at_idle() {
     let h = Harness::new(&["pinch"]);
     let ids = h

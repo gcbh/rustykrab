@@ -1388,7 +1388,14 @@ Model-facing tools, all with strict schemas and host validation:
 - `work_plan` files a whole graph of items, edges and parent links in one
   atomic call (section 14.1);
 - `work_status` reads the items an agent may see, with their parent, edges and
-  roll-up status;
+  roll-up status. Send the complete `ids` list or a `root`; the host pages
+  results using `offset` (default 0) and `limit` (default and maximum 15,
+  larger values clamped). Repeat the same selector and `include_closed` with
+  the returned `next_offset` until it is null. Explicit IDs are normalized
+  and deduplicated before paging; `total` and `more` count requested positions,
+  including missing IDs, and `missing` names only those checked on this page.
+  Root pagination counts visible subtree entries. Each page reads current
+  status rather than freezing a snapshot;
 - `result_report` returns the typed result contract at the end of a worker run
   (replacing free-text completion for workers);
 - `ask_user` files a typed question with a class and options;
