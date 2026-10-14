@@ -53,6 +53,28 @@ pub(super) const W_PROBE_FIX: &str = "e2e-zqx-17";
 /// The classifier rule the internal item of 14 lands: `<subclass>:
 /// <pattern>` (section 9's extension point, as data).
 pub(super) const PROBE_RULE: &str = "process: e2e-zqx-17";
+/// Bounded recovery: a worker that fails the same way every time, with an
+/// error no classifier recognises, whatever revives it.
+pub(super) const W_GAUGE: &str = "e2e-control worker: read the corrupted tide gauge";
+/// The raw failure [`W_GAUGE`] reports.
+pub(super) const RAW_GAUGE: &str = "E2E-GAUGE-41 tide gauge frame checksum mismatch";
+/// The trigger of the investigation the breaker files for [`RAW_GAUGE`]
+/// (its objective quotes the failure), shorter than [`W_GAUGE`] so a repair
+/// brief that carries both still fails.
+pub(super) const W_GAUGE_FIX: &str = "e2e-gauge-41";
+/// The classifier rule that investigation lands.
+pub(super) const GAUGE_RULE: &str = "process: e2e-gauge-41";
+/// The investigation's summary, which the resumed item's brief carries as
+/// its input, and longer than [`W_GAUGE`]: once the fix is in, it reads.
+pub(super) const GAUGE_REPAIRED: &str =
+    "e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again";
+/// Bounded recovery: a worker whose station is rejected until its owner
+/// says which one to use.
+pub(super) const W_STATION: &str = "e2e-control worker: query the rejected gauge station";
+/// The owner's answer to the spent budget's question: one more allotment,
+/// and the station that works. Longer than [`W_STATION`].
+pub(super) const ANSWER_STATION: &str =
+    "e2e-control answer: one more round of budget, and use gauge station 8 instead";
 pub(super) const W_DOC_ALPHA: &str = "e2e-control worker: attach document alpha";
 pub(super) const W_DOC_BETA_SLOW: &str = "e2e-control worker: attach document beta after a pause";
 pub(super) const W_DOC_GAMMA: &str = "e2e-control worker: attach document gamma";
@@ -357,6 +379,67 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                 done("Added the probe."),
             ],
         ),
+        // Bounded recovery: the same unrecognised failure every run, until
+        // the investigation's probe lands and the resumed brief carries it.
+        script(
+            W_GAUGE,
+            vec![
+                report(json!({
+                    "summary": "The tide gauge frame failed its checksum again.",
+                    "error": {
+                        "class": "unknown", "subclass": "unclassified",
+                        "detail": RAW_GAUGE,
+                    },
+                })),
+                done("Stopped."),
+            ],
+        ),
+        script(
+            W_GAUGE_FIX,
+            vec![
+                report(json!({
+                    "summary": GAUGE_REPAIRED,
+                    "artifacts": [
+                        { "kind": "path", "value": "e2e-control/gauge_probe.rs" },
+                        { "kind": "classifier_rule", "value": GAUGE_RULE },
+                    ],
+                })),
+                done("Added the gauge probe."),
+            ],
+        ),
+        script(
+            GAUGE_REPAIRED,
+            vec![
+                succeeded(
+                    "Read the tide gauge once its probe had landed.",
+                    ("message", "e2e-control-gauge-reading"),
+                ),
+                done("Read the gauge."),
+            ],
+        ),
+        script(
+            W_STATION,
+            vec![
+                report(json!({
+                    "summary": "The gauge rejected the station.",
+                    "error": {
+                        "class": "tool", "subclass": "invalid_args",
+                        "detail": "the gauge rejected station 7",
+                    },
+                })),
+                done("Rejected."),
+            ],
+        ),
+        script(
+            ANSWER_STATION,
+            vec![
+                succeeded(
+                    "Read gauge station 8.",
+                    ("message", "e2e-control-station-8"),
+                ),
+                done("Read station 8."),
+            ],
+        ),
         script(
             W_DOC_ALPHA,
             vec![
@@ -535,6 +618,11 @@ mod tests {
             W_RECURRING_FIX,
             W_UNRECOGNISED,
             W_PROBE_FIX,
+            W_GAUGE,
+            W_GAUGE_FIX,
+            GAUGE_REPAIRED,
+            W_STATION,
+            ANSWER_STATION,
             W_DOC_ALPHA,
             W_DOC_BETA_SLOW,
             W_DOC_GAMMA,
@@ -576,6 +664,13 @@ mod tests {
             W_TIMEOUT.len() > W_RECURRING_FIX.len(),
             "the original must still fail after its prerequisite reports completion"
         );
+        // Bounded recovery: a repair brief quoting the failure still fails,
+        // the investigation matches the failure it quotes, and the resumed
+        // brief that carries the landed fix (or the owner's answer) reads.
+        assert!(W_GAUGE.len() > W_GAUGE_FIX.len());
+        assert!(RAW_GAUGE.to_lowercase().contains(W_GAUGE_FIX));
+        assert!(GAUGE_REPAIRED.len() > W_GAUGE.len());
+        assert!(ANSWER_STATION.len() > W_STATION.len());
     }
 
     /// The scripted calls must parse as the shared vocabulary, or a
