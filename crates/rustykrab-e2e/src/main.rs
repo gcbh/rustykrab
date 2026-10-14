@@ -186,6 +186,21 @@ fn agent_script() -> Result<String> {
     Ok(serde_json::to_string_pretty(&script)?)
 }
 
+fn agent_script_in(data_dir: &Path) -> Result<String> {
+    fn bind(value: &mut Value, path: &str) {
+        match value {
+            Value::String(text) => *text = text.replace("__E2E_DATA_DIR__", path),
+            Value::Array(values) => values.iter_mut().for_each(|v| bind(v, path)),
+            Value::Object(values) => values.values_mut().for_each(|v| bind(v, path)),
+            _ => {}
+        }
+    }
+    let mut script: Value = serde_json::from_str(&agent_script()?)?;
+    let path = format!("'{}'", data_dir.to_string_lossy().replace('\'', "'\\''"));
+    bind(&mut script, &path);
+    Ok(serde_json::to_string_pretty(&script)?)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Expected {
@@ -1334,7 +1349,7 @@ fn spawn_daemon_env(
     match backend {
         Backend::Scripted(stand_ins) => {
             let script_path = data_dir.join("e2e-script.json");
-            std::fs::write(&script_path, agent_script()?)?;
+            std::fs::write(&script_path, agent_script_in(data_dir)?)?;
             command
                 .env("RUSTYKRAB_PROVIDER", "scripted")
                 .env("RUSTYKRAB_SCRIPT_PATH", &script_path)
