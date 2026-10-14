@@ -77,7 +77,7 @@ use rustykrab_tools::work_backend::{
     AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, ToolState,
     WorkBackend, WorkRunContext, WorkStatusView, WORK_RUN_CONTEXT,
 };
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::metered::{Meter, MeteredProvider};
@@ -1030,14 +1030,12 @@ impl LocalWorker {
         }));
         // Every call is a step in the progress ledger (section 6, step 7).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
-        let stall = Arc::new(Notify::new());
         let tools: Vec<Arc<dyn Tool>> = tools
             .into_iter()
             .map(|inner| {
                 Arc::new(LedgerTool {
                     inner,
                     ledger: ledger.clone(),
-                    stall: stall.clone(),
                     commands: recorder.commands.clone(),
                 }) as Arc<dyn Tool>
             })
@@ -1118,18 +1116,10 @@ impl LocalWorker {
         };
         let wall = brief.budget.wall_seconds;
         let run = WORK_RUN_CONTEXT.scope(binding, runner.run_traced(&mut conv, &session, &tracer));
-        // A run the ledger calls stalled stops at once rather than taking
-        // more turns; it reads as ended, and the stall decides the failure.
-        let guarded = async {
-            tokio::select! {
-                ended = run => ended,
-                _ = stall.notified() => Ok(()),
-            }
-        };
         // `None`: the wall budget ran out and the run was dropped mid-step.
         let ended = match wall {
-            0 => Some(guarded.await),
-            secs => tokio::time::timeout(Duration::from_secs(secs), guarded)
+            0 => Some(run.await),
+            secs => tokio::time::timeout(Duration::from_secs(secs), run)
                 .await
                 .ok(),
         };
@@ -1194,19 +1184,6 @@ impl LocalWorker {
             .into_error());
         }
 
-        if let Some(stall) = stalled {
-            tracing::info!(
-                worker = %self.name,
-                item = %brief.item,
-                steps = stall.steps,
-                "local worker run stalled"
-            );
-            return Err(RunFailure::Model {
-                problem: ProviderProblem::Loop,
-                detail: stall.detail(),
-            }
-            .into_error());
-        }
         // A run that stopped on text gave its answer (feather's rule): the
         // text is the report, filed through the backend `result_report`
         // uses, so attestation and the controller see it the same way.
@@ -1241,11 +1218,19 @@ impl LocalWorker {
             Some(Err(e)) => return Err(e),
             Some(Ok(())) if tracer.iteration_limit_reached() => RunFailure::Budget {
                 budget: BudgetKind::Iterations,
-                detail: format!(
-                    "{max_iterations} iterations used without result_report \
-                     ({} reminders)",
-                    stats.reminders
-                ),
+                detail: match stalled {
+                    // Told it was repeating itself, the run went on to its
+                    // cap: the ledger's verdict is why, for the repair run.
+                    Some(stall) => format!(
+                        "{max_iterations} iterations used without result_report; {}",
+                        stall.detail()
+                    ),
+                    None => format!(
+                        "{max_iterations} iterations used without result_report \
+                         ({} reminders)",
+                        stats.reminders
+                    ),
+                },
             },
             Some(Ok(())) => RunFailure::Model {
                 problem: ProviderProblem::Empty,
@@ -1507,8 +1492,17 @@ fn one_line(text: &str, max: usize) -> String {
 struct LedgerTool {
     inner: Arc<dyn Tool>,
     ledger: Arc<Mutex<StepLedger>>,
-    stall: Arc<Notify>,
     commands: Arc<Mutex<Vec<String>>>,
+}
+
+/// What a call that repeats an earlier call and its result carries back,
+/// once the ledger calls the run stalled: the run goes on, told so.
+fn repeat_notice(stall: &rustykrab_control::progress::Stall) -> String {
+    format!(
+        "Note: this is call {} in a row that repeats an earlier call with the same result, so \
+         it tells you nothing new. Change the approach, or finish with what you have.",
+        stall.without_progress
+    )
 }
 
 #[async_trait]
@@ -1563,12 +1557,28 @@ impl Tool for LedgerTool {
         let stalled = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.record(self.inner.name(), &args, &outcome);
-            ledger.stalled().is_some()
+            ledger.stalled()
         };
-        if stalled {
-            self.stall.notify_one();
+        // A repeat is answered as text the model can act on, never by ending
+        // the run: the iteration cap is the only stop (feather's rule).
+        let Some(stall) = stalled else {
+            return result;
+        };
+        let notice = repeat_notice(&stall);
+        match result {
+            Ok(serde_json::Value::Object(mut object)) => {
+                object.insert("notice".into(), serde_json::Value::String(notice));
+                Ok(serde_json::Value::Object(object))
+            }
+            Ok(other) => Ok(serde_json::json!({ "result": other, "notice": notice })),
+            Err(Error::ToolExecution(error)) => {
+                Err(Error::ToolExecution(rustykrab_core::ToolError {
+                    kind: error.kind,
+                    message: format!("{}\n\n{notice}", error.message),
+                }))
+            }
+            Err(other) => Err(other),
         }
-        result
     }
 }
 
@@ -2662,24 +2672,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_that_repeats_itself_stalls_into_a_loop_failure() {
-        let provider = Recording::new((0..12).map(|_| call("noop", json!({}))).collect());
-        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+    async fn a_run_that_repeats_itself_is_told_and_goes_on() {
+        let mut script: Vec<ModelResponse> = (0..5).map(|_| call("noop", json!({}))).collect();
+        script.push(report("Tried noop five times; it never changes."));
+        let provider = Recording::new(script);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
         let w = w.with_stall_steps(3);
         let mut b = brief("item-stall");
         b.required_tools = vec!["noop".into()];
+        let report = w.run(b).await.unwrap();
+        assert_eq!(report.summary, "Tried noop five times; it never changes.");
+        assert_eq!(
+            provider.requests().len(),
+            6,
+            "the stall did not stop the run"
+        );
+        let (last, _) = provider.requests()[5].clone();
+        let told = last
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::ToolResult(r) => Some(r.output.to_string()),
+                _ => None,
+            })
+            .any(|output| output.contains("repeats an earlier call"));
+        assert!(told, "the repeat notice reached the model");
+    }
+
+    #[tokio::test]
+    async fn a_run_still_repeating_at_its_cap_names_the_stall() {
+        let provider = Recording::new((0..6).map(|_| call("noop", json!({}))).collect());
+        let (w, _) = worker(provider, vec![Arc::new(Named("noop"))]);
+        let w = w.with_stall_steps(2);
+        let mut b = brief("item-stall-cap");
+        b.required_tools = vec!["noop".into()];
+        b.budget.iterations = 5;
         let err = w.run(b).await.unwrap_err();
-        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
-        assert!(
-            err.to_string().contains("stalled") && err.to_string().contains("progress ledger"),
-            "{err}"
+        assert_eq!(
+            classified(&err),
+            (ErrorClass::Budget, ErrorSubclass::Iterations)
         );
-        assert!(
-            provider.requests().len() <= 5,
-            "the stall stopped the run, not the budget: {} calls",
-            provider.requests().len()
-        );
-        assert!(stub.calls().is_empty());
+        assert!(err.to_string().contains("progress ledger"), "{err}");
     }
 
     /// Scenario 31's shape: the worker keeps its own scratch list, and the
@@ -2848,7 +2880,6 @@ mod tests {
         let tool = LedgerTool {
             inner: Arc::new(rustykrab_tools::ExecTool::new()),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
-            stall: Arc::new(Notify::new()),
             commands: recorder.commands.clone(),
         };
         tool.execute(json!({"command":"echo observed"}))

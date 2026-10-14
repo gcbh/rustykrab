@@ -5,10 +5,11 @@
 //! from the tool, its arguments and what came back; a step whose
 //! fingerprint the run has not seen is progress, and one it has seen is
 //! not. Once `threshold` steps in a row bring nothing new, the run has
-//! stalled: the worker adapter stops it, and the failure reaches the
-//! ladder as `model/loop` with [`Stall::detail`], so the repair run's brief
-//! carries this attempt's evidence. Deterministic and pure: the same steps
-//! always give the same verdict.
+//! stalled: the worker adapter says so in each repeating step's result and
+//! the run goes on, so the model can change course. A run that reaches its
+//! iteration cap still stalled carries [`Stall::detail`] in its failure, so
+//! the repair run's brief has this attempt's evidence. Deterministic and
+//! pure: the same steps always give the same verdict.
 //!
 //! The subtree half of step 7 (a parent with nothing moving beneath it) is
 //! the controller's, over the graph: `controller::stalled_parents`.
