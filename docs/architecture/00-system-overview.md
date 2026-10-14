@@ -262,6 +262,16 @@ commit it landed, and each failing run since with whether that run's code, or
 the daemon build that ran it, contained the fix. Every run records the build
 that ran it (`daemon_build` evidence) for that purpose.
 
+*Recovery is bounded.* A leaf's budget is cumulative over every attempt,
+restart and revival: a run is briefed with what is left, and a leaf with too
+little left is not leased but surfaces `blocked(budget_exhausted)` for its
+owner, whose answer grants one more allotment. Each lease records the
+attempt's state (what could change its outcome); when the same failure comes
+back three times running in the same state, the circuit breaker gives the
+item no further identical attempt and queues it behind one investigation of
+the failure. A new repair generation, an answer, a changed input, an access
+repair or a new build is a new state.
+
 The `claude-cli` model provider hands Rust model turns to a selected Max
 login with native tools disabled, then returns structured calls to the
 existing Rust harness. Native execution workers select a Max profile each

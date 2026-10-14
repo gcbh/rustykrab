@@ -1,7 +1,7 @@
 //! The text a surfaced message carries: what was tried at each order
 //! (section 8, "Surfacing carries the ladder") and what is being asked.
 
-use rustykrab_core::work::{Rung, RungEvent, WorkError};
+use rustykrab_core::work::{ErrorClass, Rung, RungEvent, WorkError};
 
 use super::{LadderState, SurfaceReason, RUNGS};
 use crate::errors::gap_of;
@@ -112,6 +112,14 @@ pub(super) fn ask(reason: SurfaceReason, err: &WorkError) -> String {
     match reason {
         SurfaceReason::PolicyStop => format!(
             "Stopped by policy ({what}): {}. Allow it, change it, or cancel it?",
+            err.detail
+        ),
+        // A spent budget parks in `budget_exhausted`, where an owner's
+        // answer grants one more allotment and resumes it, and a no
+        // cancels it (`controller/questions.rs`).
+        SurfaceReason::LadderSpent if err.class == ErrorClass::Budget => format!(
+            "Its budget is spent ({what}): {}. Answer to grant one more allotment of its budget \
+             and resume it, or no to cancel it.",
             err.detail
         ),
         SurfaceReason::LadderSpent => format!(

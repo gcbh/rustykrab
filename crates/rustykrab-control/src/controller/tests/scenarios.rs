@@ -438,16 +438,24 @@ async fn scenario_14_the_internal_items_rule_lands_after_replay_and_classifies_t
 // ── 20 ─────────────────────────────────────────────────────────────────
 
 fn chain() -> WorkPlan {
+    // b's budget is cumulative over its attempts, and every scripted run
+    // spends three iterations: room for its whole ladder (six runs).
     let mut b = draft("b", "Compare the fares");
     b.edges = vec![on(EdgeKind::Blocks, "a")];
+    b.budget = Some(Budget {
+        iterations: 30,
+        tokens: 60_000,
+        wall_seconds: 1_800,
+        ..Budget::default()
+    });
     let mut c = draft("c", "Book the cheapest");
     c.edges = vec![on(EdgeKind::Blocks, "b")];
-    plan(vec![
-        draft("P", "Plan the Lisbon trip"),
-        draft("a", "Collect the dates"),
-        b,
-        c,
-    ])
+    let mut p = draft("P", "Plan the Lisbon trip");
+    p.budget = Some(Budget {
+        iterations: 60,
+        ..Budget::default()
+    });
+    plan(vec![p, draft("a", "Collect the dates"), b, c])
 }
 
 #[tokio::test]
