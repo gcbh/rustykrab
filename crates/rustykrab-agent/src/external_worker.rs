@@ -625,6 +625,18 @@ impl ExternalWorker {
         &self.config
     }
 
+    /// A daemon-host process cannot attest the native CLI's sandbox or account.
+    /// No subprocess/model is invoked until an equivalent boundary exists.
+    pub async fn observe_probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        request.expected.observation(
+            rustykrab_control::capability_proof::ProbeOutcome::Unobserved,
+            "native CLI operation was not observed through its runtime boundary",
+        )
+    }
+
     fn runs_root(&self) -> PathBuf {
         self.config
             .data_dir
@@ -2040,6 +2052,38 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn native_host_probe_never_spawns_a_process_or_fakes_cli_access() {
+        use rustykrab_control::capability_proof::*;
+        let fixture = Fixture::new();
+        for kind in [WorkerKind::ClaudeCode, WorkerKind::Codex] {
+            let worker = fixture.worker(kind, PathBuf::from("/must-not-execute-probe"));
+            let scope = ProbeScope {
+                worker: "pinch".into(),
+                bound_dir: None,
+                ceiling_digest: tool_ceiling_digest(&[]),
+            };
+            let action = RegisteredAction::BinaryAvailable {
+                binary: "cargo".into(),
+            };
+            let request = ProbeRequest {
+                expected: ExpectedOperation {
+                    operation: action.operation(),
+                    executor: "pinch".into(),
+                    inputs_digest: probe_inputs_digest(&action, &scope),
+                    generation: "fixture:2".into(),
+                    run: "probe-1".into(),
+                },
+                action,
+                scope,
+                deadline: Duration::from_secs(30),
+            };
+            let probe = worker.observe_probe(&request).await;
+            assert_eq!(probe.outcome, ProbeOutcome::Unobserved);
+            assert_eq!(probe.executor, "pinch");
+        }
     }
 
     struct Fixture {

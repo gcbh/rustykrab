@@ -11,6 +11,8 @@
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::{Evidence, WorkItem};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{path::PathBuf, time::Duration};
 use thiserror::Error;
 
 pub const OPERATION_PROBE: &str = "operation_probe";
@@ -29,6 +31,105 @@ pub struct ExpectedOperation {
     pub inputs_digest: String,
     pub generation: String,
     pub run: String,
+}
+
+impl ExpectedOperation {
+    /// Observation data alone does not construct a Proof.
+    pub fn observation(
+        &self,
+        outcome: ProbeOutcome,
+        observation: impl Into<String>,
+    ) -> OperationProbe {
+        OperationProbe {
+            operation: self.operation.clone(),
+            executor: self.executor.clone(),
+            inputs_digest: self.inputs_digest.clone(),
+            generation: self.generation.clone(),
+            run: self.run.clone(),
+            outcome,
+            observation: observation.into(),
+        }
+    }
+}
+
+/// Host-selected, effect-free availability checks. These do not attest a build,
+/// test, repository read or the completion of the original owner's goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RegisteredAction {
+    BinaryAvailable {
+        binary: String,
+    },
+    ToolCallable {
+        tool: String,
+        args: serde_json::Value,
+    },
+}
+
+impl RegisteredAction {
+    pub fn operation(&self) -> String {
+        match self {
+            Self::BinaryAvailable { binary } => format!("binary.available/{binary}"),
+            Self::ToolCallable { tool, .. } => format!("tool.callable/{tool}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeScope {
+    pub worker: String,
+    /// Controller-owned execution directory, never inferred from model text.
+    pub bound_dir: Option<PathBuf>,
+    /// Digest of the effective tool ceiling, using tool_ceiling_digest.
+    pub ceiling_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeRequest {
+    pub expected: ExpectedOperation,
+    pub action: RegisteredAction,
+    pub scope: ProbeScope,
+    pub deadline: Duration,
+}
+
+/// Stable across registry order and duplicate names; contains no secret values.
+pub fn tool_ceiling_digest(names: &[String]) -> String {
+    let mut names = names.to_vec();
+    names.sort();
+    names.dedup();
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&names).unwrap()))
+}
+
+/// The first two actions establish availability independent of repository
+/// content. Incidental worktree paths and deadlines do not change that claim.
+/// Effective permission/configuration changes also require a fresh generation.
+pub fn probe_inputs_digest(action: &RegisteredAction, scope: &ProbeScope) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(action, &scope.worker, &scope.ceiling_digest)).unwrap()
+        )
+    )
+}
+
+impl ProbeRequest {
+    /// Refuse inconsistent host requests before performing any operation.
+    pub fn valid(&self) -> bool {
+        valid_expected(&self.expected).is_ok()
+            && self.expected.executor == self.scope.worker
+            && self.expected.operation == self.action.operation()
+            && digest(&self.scope.ceiling_digest)
+            && self.expected.inputs_digest == probe_inputs_digest(&self.action, &self.scope)
+            && self
+                .scope
+                .bound_dir
+                .as_ref()
+                .is_none_or(|p| p.is_absolute())
+            && !self.deadline.is_zero()
+            && self.deadline <= Duration::from_secs(30)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +229,11 @@ pub fn capability_proven(
     evidence: &[Evidence],
     need: &ExpectedOperation,
 ) -> Result<Proof, Missing> {
+    valid_expected(need)?;
+    validate_latest(item, evidence, need)
+}
+
+fn valid_expected(need: &ExpectedOperation) -> Result<(), Missing> {
     for (field, valid) in [
         ("operation", identity(&need.operation, 1_024)),
         ("executor", identity(&need.executor, 128)),
@@ -139,6 +245,14 @@ pub fn capability_proven(
             return Err(Missing::InvalidNeed(field));
         }
     }
+    Ok(())
+}
+
+fn validate_latest(
+    item: &WorkItem,
+    evidence: &[Evidence],
+    need: &ExpectedOperation,
+) -> Result<Proof, Missing> {
     let latest = evidence
         .iter()
         .filter(|e| e.kind == OPERATION_PROBE && e.item == item.id)
@@ -199,6 +313,60 @@ pub fn capability_proven(
 mod tests {
     use super::*;
     use rustykrab_core::work::{BlockedReason, Budget, Status, Trigger, WorkKind};
+
+    #[test]
+    fn probe_request_binds_action_args_executor_and_effective_ceiling() {
+        let names = vec!["exec".into(), "work_resources".into()];
+        assert_eq!(
+            tool_ceiling_digest(&names),
+            tool_ceiling_digest(&["work_resources".into(), "exec".into(), "exec".into()])
+        );
+        let scope = ProbeScope {
+            worker: "pinch".into(),
+            bound_dir: None,
+            ceiling_digest: tool_ceiling_digest(&names),
+        };
+        let action = RegisteredAction::ToolCallable {
+            tool: "work_resources".into(),
+            args: serde_json::json!({}),
+        };
+        let request = ProbeRequest {
+            expected: ExpectedOperation {
+                operation: action.operation(),
+                executor: scope.worker.clone(),
+                inputs_digest: probe_inputs_digest(&action, &scope),
+                generation: "original:2".into(),
+                run: "probe-1".into(),
+            },
+            action,
+            scope,
+            deadline: Duration::from_secs(30),
+        };
+        assert!(request.valid());
+        for change in 0..6 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.scope.worker = "other".into(),
+                1 => changed.expected.operation = "repository.read".into(),
+                2 => changed.scope.ceiling_digest = tool_ceiling_digest(&[]),
+                3 => {
+                    changed.action = RegisteredAction::ToolCallable {
+                        tool: "work_resources".into(),
+                        args: serde_json::json!({"project_id":"other"}),
+                    }
+                }
+                4 => changed.deadline = Duration::from_secs(31),
+                _ => changed.scope.bound_dir = Some("relative".into()),
+            }
+            assert!(!changed.valid(), "change {change}");
+        }
+        let mut moved = request.clone();
+        moved.scope.bound_dir = Some("/tmp/new-probe-worktree".into());
+        assert!(
+            moved.valid(),
+            "the registered availability claims do not attest repository content"
+        );
+    }
 
     fn fixture() -> (WorkItem, ExpectedOperation, Evidence) {
         let at = DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")

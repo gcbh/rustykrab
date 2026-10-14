@@ -14,6 +14,25 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// sits just above it, so the command's limit is the one that applies.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 
+// Dropping wait_with_output kills only the direct child. A timed-out shell can
+// otherwise leave its actual command running after the observation is gone.
+#[cfg(unix)]
+struct ProcessGroupGuard(u32);
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Ok(pid) = libc::pid_t::try_from(self.0) {
+            if pid > 0 {
+                // SAFETY: this is the positive child pid used to create a fresh
+                // process group below; its negative identifies only that group.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 /// Commands that are explicitly allowed for execution.
 /// All other commands are rejected to prevent arbitrary command injection.
 const ALLOWED_COMMANDS: &[&str] = &[
@@ -612,6 +631,10 @@ impl Tool for ExecTool {
 
         let mut process = self.shell();
         process
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .arg("-c")
             .arg(command)
             .env_clear()
@@ -621,7 +644,14 @@ impl Tool for ExecTool {
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
         }
-        let future = process.output();
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process.spawn().map_err(|e| {
+            rustykrab_core::Error::ToolExecution(ToolError::transient(e.to_string()))
+        })?;
+        #[cfg(unix)]
+        let _group = child.id().map(ProcessGroupGuard);
+        let future = child.wait_with_output();
 
         let output = timeout(Duration::from_secs(timeout_secs), future)
             .await
@@ -762,6 +792,7 @@ mod error_typing_tests {
     use super::ExecTool;
     use rustykrab_core::{Tool, ToolErrorKind};
     use serde_json::json;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn invalid_commands_are_typed_as_invalid_input() {
@@ -784,6 +815,52 @@ mod error_typing_tests {
         assert_eq!(
             pwd.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_exec_stops_the_command_and_its_descendant_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ExecTool::in_dir(dir.path());
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"command":"python3 -c \"import os,subprocess,time; p=subprocess.Popen(['sleep','30']); open('pids','w').write(str(os.getpid())+' '+str(p.pid)); time.sleep(30)\""})).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("pids").exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pids = std::fs::read_to_string(dir.path().join("pids"));
+        task.abort();
+        let _ = task.await;
+        let pids = pids.expect("fixture shell command should run");
+        let mut survivors = Vec::new();
+        for pid in pids.split_whitespace() {
+            let mut stopped = false;
+            for _ in 0..100 {
+                let state = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", pid])
+                    .output()
+                    .unwrap();
+                let state = String::from_utf8_lossy(&state.stdout);
+                if state.trim().is_empty() || state.trim().starts_with('Z') {
+                    stopped = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !stopped {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .status();
+            }
+            if !stopped {
+                survivors.push(pid.to_string());
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "cancelled exec left processes running: {survivors:?}"
         );
     }
 

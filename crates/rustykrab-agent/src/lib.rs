@@ -1,3 +1,4 @@
+mod capability_probe;
 pub mod compaction;
 pub mod delegated;
 pub mod external_worker;

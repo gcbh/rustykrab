@@ -2,7 +2,8 @@
 
 Base: `619d476` (v6.5.7). This slice implements a pure evidence validator and
 removes model-authored operation probes at both worker report boundaries.
-It does not yet execute probes or replace the controller's catalog gate;
+A follow-up implements registered local host producers; controller dispatch
+and replacement of the catalog gate remain integration work;
 controller integration belongs to Claude's coordinated recovery slice.
 
 ## Contract
@@ -108,3 +109,65 @@ The native sanitization regression and the local real-command/early-forwarding
 regression each failed their assertion (exit 101, one failed test). The original
 source was restored and the full regression run above passed. Logs remain in
 the operator's task workspace; these fixtures contain no live account data.
+
+## Registered producer follow-up
+
+The shared contract now exports `ProbeRequest { expected, action, scope,
+deadline }`, `RegisteredAction`, `ProbeScope { worker, bound_dir, ceiling_digest }`,
+`tool_ceiling_digest` and `probe_inputs_digest`. Deadline uses std::time::Duration
+and is strictly positive, at most 30 seconds (including local-slot wait).
+Scope worker equals ExpectedOperation.executor; registered action determines
+ExpectedOperation.operation; inputs_digest must match the canonical request.
+The controller selects the directory and persists the relevant generation before
+dispatch. `LocalWorker::probe_scope` supplies its current effective ceiling.
+
+Registered actions and their only claims:
+
+- `BinaryAvailable { binary: "cargo" | "node" }`: exact fixed --version via
+  the worker's existing exec tool. Identifiers `binary.available/cargo` and
+  `binary.available/node`. Exit 0 plus `cargo <major>.<minor>...` or
+  `v<major>.<minor>...` is required. An unrelated exit-0 response is failure.
+- `ToolCallable { tool: "work_resources", args: {} }`: identifier
+  `tool.callable/work_resources`; success requires an object with workers array.
+  Other args, tool names and commands are not executed.
+
+These claims establish availability/callability only. They do not prove a
+repository read, compilation, test pass, permission for an unrelated command
+or owner-goal completion. The digest binds action/args, worker and the sorted,
+deduplicated effective tool ceiling. Worktree path and deadline are excluded
+for these repository-independent claims; future content operations need a
+separately registered content/access binding. Permission/configuration change
+still requires the controller's fresh generation. No fallback to version/describe
+may satisfy a different original functional claim.
+
+LocalWorker::observe_probe reuses runner::execute_single_tool, its schema and
+sandbox checks and the existing shared model/resource slot. ExternalWorker's
+same method returns Unobserved for native Claude/Codex; it invokes no process
+or model and makes no claim about a native runtime's access. Fixed receipts
+omit raw tool outputs, stdout/stderr and private resource data. Both methods
+return observation data only; only controller-owned storage plus the pure
+validator may construct Proof. Worker trait overrides, lease dispatch, durable
+receipts and capability judgment/revival remain Claude's integration slice.
+
+Exec cancellation now kills its own process group on Unix, including ordinary
+descendants. A real Python/sleep fixture verifies cancellation. Deliberately
+detached processes are outside that group; this adds no OS access isolation.
+
+Final restored-source verification: 2,251 workspace tests passed, zero failed,
+31 ignored (two test threads). Workspace/all-target clippy with -D warnings,
+format and both documentation checkers passed. Nine additional regressions
+cover request/digest bindings, both registered postconditions, local execution,
+no model/report/private-output leakage, invalid/unsupported requests, shared
+slot and execution deadlines, sandbox/schema failures, native Unobserved and
+real Unix subprocess-group cancellation. Disabling the postcondition check
+and the process-group guard separately makes their regression fail (exit 101);
+exact sources were restored before this complete final run.
+
+Observed local environment gap during the follow-up: cargo --version through
+the real exec boundary exited 1. Its cleared environment sets
+HOME=/tmp/rustykrab-home; the rustup shim attempted a toolchain update rather
+than using the owner's configured toolchain. A real Node version call passed
+in the same boundary and is the positive execution fixture. Cargo remains
+registered and must report Failed when this boundary cannot execute it.
+No live daemon/toolchain setting was changed. This observation is specific
+to this host setup; it does not establish Cargo failure on every deployment.
