@@ -1609,6 +1609,10 @@ async fn s32(ctx: &Ctx) -> Result<()> {
 /// controller verifies the commit and changed paths; a result whose claimed
 /// paths differ from the diff is marked `verification_failed`.
 async fn s02(ctx: &Ctx) -> Result<()> {
+    // Verify this adapter's Git claims independently of model routing.
+    // Generic-pool coding and escalation are covered by scenario 17.
+    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let ctx = &daemon.ctx;
     let tag = tag(2);
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::create()?;
