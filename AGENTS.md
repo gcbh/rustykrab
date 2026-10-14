@@ -4,6 +4,16 @@ Read `CLAUDE.md` completely before changing this repository. Its build,
 validation, architecture, and security instructions apply to every coding
 agent, regardless of which product launched it.
 
+## Useful agency and self-correction
+
+For work on execution, context, scheduling, permissions, UI, dreaming or
+evaluation, read [the owner's design direction](docs/architecture/08-agent-agency-and-self-correction.md).
+Give agents coherent authority and relevant evidence to complete the original
+goal. Remove artificial barriers within delegated scope, verify recovery on the
+affected operation, and measure useful results rather than repair activity.
+Record remaining gaps and failed hypotheses; a design target is not proof of
+implemented behavior or a grant of additional authority.
+
 ## Architecture maintenance is required
 
 Architecture write-ups are part of the implementation, not a later cleanup.

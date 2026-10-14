@@ -400,6 +400,7 @@ impl Dreaming {
                     "crates/rustykrab-gateway/src/work_routes.rs",
                     "docs/architecture/OPINION.md",
                     "crates/rustykrab-cli/ARCHITECTURE.md",
+                    "docs/architecture/08-agent-agency-and-self-correction.md",
                 ]
                 .iter()
                 .enumerate()
@@ -408,7 +409,7 @@ impl Dreaming {
                         Ok(content) => {
                             let max = if n == 2 || n == 3 {
                                 10000
-                            } else if n == 6 {
+                            } else if n == 6 || n == 7 {
                                 8000
                             } else {
                                 5000
@@ -858,10 +859,22 @@ mod tests {
         Dreaming,
         LoopLock,
     ) {
+        setup_in_repo(bad, None).await
+    }
+    async fn setup_in_repo(
+        bad: bool,
+        repository: Option<&std::path::Path>,
+    ) -> (
+        tempfile::TempDir,
+        Store,
+        Arc<Controller>,
+        Dreaming,
+        LoopLock,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), vec![4; 32]).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let command=serde_json::from_value(json!({"request_id":uuid::Uuid::new_v4().to_string(),"project_id":id,"repository_id":null,"title":"Dreaming fixture","status":"active","judgment_policy":{"statement":"Complete fixture intake","delegated_scopes":[],"reserved_decisions":[]},"canonical_conversation_id":null,"summary":"Create fixture","author":"user","source_message":null,"project_provenance":[],"created_at":Utc::now(),"initial_changes":[]})).unwrap();
+        let command=serde_json::from_value(json!({"request_id":uuid::Uuid::new_v4().to_string(),"project_id":id,"repository_id":repository.map(|p|p.display().to_string()),"title":"Dreaming fixture","status":"active","judgment_policy":{"statement":"Complete fixture intake","delegated_scopes":[],"reserved_decisions":[]},"canonical_conversation_id":null,"summary":"Create fixture","author":"user","source_message":null,"project_provenance":[],"created_at":Utc::now(),"initial_changes":[]})).unwrap();
         store.projects().create(command).await.unwrap();
         let control = Arc::new(Controller::new(
             store.clone(),
@@ -880,6 +893,151 @@ mod tests {
             },
         );
         (dir, store, control, dream, lock)
+    }
+
+    const AGENCY_PATH: &str = "docs/architecture/08-agent-agency-and-self-correction.md";
+
+    fn commit_fixture(repo: &std::path::Path) {
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_agency_direction_uses_committed_source_and_survives_later_edits() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg(repo.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::create_dir_all(repo.path().join("docs/architecture")).unwrap();
+        let direction =
+            include_str!("../../../docs/architecture/08-agent-agency-and-self-correction.md");
+        assert!(
+            direction.len() <= 8000,
+            "the full owner direction must fit the review excerpt"
+        );
+        std::fs::write(repo.path().join(AGENCY_PATH), direction).unwrap();
+        commit_fixture(repo.path());
+        let (_dir, _store, _control, dream, _lock) = setup_in_repo(false, Some(repo.path())).await;
+        let frozen = dream.freeze(&dream.config.projects[0]).await.unwrap();
+        let observation = frozen
+            .observations
+            .iter()
+            .find(|o| o.source.ends_with(AGENCY_PATH))
+            .unwrap();
+        assert_eq!(observation.content, direction);
+        let head = frozen
+            .observations
+            .iter()
+            .find(|o| o.id == "repository-head")
+            .unwrap();
+        assert_eq!(
+            observation.source,
+            format!("{}:{AGENCY_PATH}", head.content)
+        );
+
+        std::fs::write(
+            repo.path().join(AGENCY_PATH),
+            "uncommitted contradictory instruction",
+        )
+        .unwrap();
+        let again = dream.freeze(&dream.config.projects[0]).await.unwrap();
+        assert_eq!(
+            again
+                .observations
+                .iter()
+                .find(|o| o.source.ends_with(AGENCY_PATH))
+                .unwrap()
+                .content,
+            direction
+        );
+        commit_fixture(repo.path());
+        let changed = dream.freeze(&dream.config.projects[0]).await.unwrap();
+        assert_eq!(
+            changed
+                .observations
+                .iter()
+                .find(|o| o.source.ends_with(AGENCY_PATH))
+                .unwrap()
+                .content,
+            "uncommitted contradictory instruction"
+        );
+        assert_eq!(
+            observation.content, direction,
+            "later repository changes cannot rewrite a frozen review"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_and_oversized_agency_direction_are_explicit_omissions() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg(repo.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(repo.path().join("README.md"), "fixture repository").unwrap();
+        commit_fixture(repo.path());
+        let (_dir, _store, _control, dream, _lock) = setup_in_repo(false, Some(repo.path())).await;
+        let absent = dream.freeze(&dream.config.projects[0]).await.unwrap();
+        assert!(absent
+            .omissions
+            .iter()
+            .any(|o| o == &format!("No readable committed observation at {AGENCY_PATH}")));
+        assert!(!absent
+            .observations
+            .iter()
+            .any(|o| o.source.ends_with(AGENCY_PATH)));
+
+        std::fs::create_dir_all(repo.path().join("docs/architecture")).unwrap();
+        std::fs::write(repo.path().join(AGENCY_PATH), "€".repeat(3000)).unwrap();
+        commit_fixture(repo.path());
+        let bounded = dream.freeze(&dream.config.projects[0]).await.unwrap();
+        let observation = bounded
+            .observations
+            .iter()
+            .find(|o| o.source.ends_with(AGENCY_PATH))
+            .unwrap();
+        assert!(observation.content.len() <= 8000);
+        assert_eq!(observation.content, "€".repeat(2666));
+        assert!(bounded
+            .omissions
+            .iter()
+            .any(|o| o == &format!("{AGENCY_PATH} truncated at 8000 bytes")));
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= 100_000);
     }
     #[tokio::test]
     async fn held_legacy_work_does_not_silence_dreaming_but_ready_work_does() {
