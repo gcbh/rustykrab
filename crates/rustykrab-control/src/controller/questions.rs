@@ -130,12 +130,22 @@ fn is_no(answer: &str) -> bool {
     .any(|w| a == *w || a.starts_with(&format!("{w} ")))
 }
 
-/// Whether `actor`'s answer may resume a stopped item and grant it budget:
-/// its owner (`user`, `user:<who>`) or a delegate deciding under standing
-/// judgment (`policy:<grant>`). Not a recorded default, research, the
-/// controller, or a worker.
-fn may_grant(actor: &str) -> bool {
-    actor == "user" || actor.starts_with("user:") || actor.starts_with("policy:")
+/// Whether `actor`'s answer may resume an item stopped on a failed
+/// verification: its owner (`user`, `user:<who>`), or a delegate deciding
+/// under standing judgment (`policy:<grant>`; only the router writes that
+/// actor, after a grant covered the question). Not a recorded default,
+/// research, the controller, or a worker.
+fn may_resume(actor: &str) -> bool {
+    is_owner(actor) || actor.starts_with("policy:")
+}
+
+/// Whether `actor`'s answer may grant a spent budget one more allotment, or
+/// cancel a stopped item: its owner only. No standing-judgment check
+/// delegates budget, so a delegate's answer, like a default's, neither
+/// replenishes a budget nor resumes it (resuming without a grant would only
+/// stop again at the guard).
+fn is_owner(actor: &str) -> bool {
+    actor == "user" || actor.starts_with("user:")
 }
 
 /// Who answered, as the brief says it.
@@ -1357,10 +1367,10 @@ impl Controller {
                     | BlockedReason::WorkerUnavailable
             ))
         );
-        // A leaf the ladder stopped on a spent budget or a failed
-        // verification resumes on its owner's (or a delegate's) answer,
-        // and a no cancels it, as a declined consent does. Releasing it
-        // from a spent budget grants one more allotment ([`BUDGET_GRANT`]).
+        // A leaf the ladder stopped on a failed verification resumes on its
+        // owner's or a delegate's answer; one stopped on a spent budget only
+        // on its owner's, which grants one more allotment ([`BUDGET_GRANT`]).
+        // The owner's no cancels either, as a declined consent does.
         let recovering = !b.snap.has_children(&q.item)
             && matches!(
                 status,
@@ -1368,8 +1378,11 @@ impl Controller {
                     BlockedReason::BudgetExhausted | BlockedReason::VerificationFailed
                 ))
             );
-        let authority = may_grant(actor);
-        let refused = recovering && authority && is_no(&answer);
+        let authority = match status {
+            Some(Status::Blocked(BlockedReason::BudgetExhausted)) => is_owner(actor),
+            _ => may_resume(actor),
+        };
+        let refused = recovering && is_owner(actor) && is_no(&answer);
         if declined || refused {
             let (touched, cancelled) =
                 b.cancel_tree(&q.item, actor, Some(format!("declined: {answer}")));

@@ -259,7 +259,15 @@ async fn no_to_a_spent_budget_cancels_and_grants_nothing() {
 
 #[tokio::test]
 async fn an_answer_that_is_not_the_owners_never_grants_budget() {
-    for actor in ["default", "research:r1", "controller", "worker:pinch"] {
+    // A delegate under standing judgment is no owner here: no grant
+    // delegates budget, so its answer neither grants nor resumes.
+    for actor in [
+        "default",
+        "research:r1",
+        "controller",
+        "worker:pinch",
+        "policy:standing",
+    ] {
         let h = Harness::new(&["pinch"]);
         let x = spent(&h).await;
         let q = open_question(&h, &x).await;
@@ -338,6 +346,40 @@ async fn an_owners_answer_resumes_a_failed_verification() {
         evidence(&h, &x, "budget_grant").await.is_empty(),
         "only a spent budget is granted more"
     );
+}
+
+/// A delegate deciding under standing judgment may resume a failed
+/// verification (it is bounded by the item's cumulative budget and the
+/// breaker), but grants nothing.
+#[tokio::test]
+async fn a_delegates_answer_resumes_a_failed_verification_without_a_grant() {
+    let h = Harness::new(&["pinch"]);
+    let empty = || {
+        report(ResultReport {
+            summary: String::new(),
+            ..ResultReport::default()
+        })
+    };
+    for _ in 0..3 {
+        h.script.push(GAUGE, empty());
+    }
+    let x = h.file_one(draft("x", GAUGE)).await;
+    h.drain().await;
+    assert_eq!(
+        h.status(&x).await,
+        Status::Blocked(BlockedReason::VerificationFailed)
+    );
+    let q = open_question(&h, &x).await;
+    let reply = ControlHandle::answer(
+        &h.ctl,
+        &q.id,
+        "report what the gauge read",
+        "policy:standing",
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.resumed, vec![x.clone()]);
+    assert!(evidence(&h, &x, "budget_grant").await.is_empty());
 }
 
 #[tokio::test]
