@@ -1,0 +1,694 @@
+{
+  "query": "e69d1e56500ffb87",
+  "matched": "fingerprint",
+  "fingerprints": [
+    {
+      "fingerprint": "e69d1e56500ffb87",
+      "class": "unknown",
+      "subclass": "unclassified",
+      "detail": "E2E-GAUGE-41 tide gauge frame checksum mismatch",
+      "items": 1,
+      "runs": 4,
+      "first_seen": "2026-10-14T21:23:08.817571Z",
+      "last_seen": "2026-10-14T21:23:11.817434Z"
+    }
+  ],
+  "occurrences": [
+    {
+      "item": {
+        "id": "62c403bb-8fbb-4705-af91-db77c5ed28c9",
+        "kind": "task",
+        "title": "Read the corrupted tide gauge [e2e-control bounded-recovery breaker]",
+        "status": {
+          "status": "done"
+        },
+        "objective": "e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]",
+        "created_at": "2026-10-14T21:23:07.292488Z",
+        "closed_at": "2026-10-14T21:23:13.819280Z"
+      },
+      "runs": [
+        {
+          "run": "587f7034-8134-4ee2-9353-cf0b9ba6d876",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:07.819206Z",
+          "ended_at": "2026-10-14T21:23:08.818558Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms",
+          "judged": {
+            "status": "queued"
+          },
+          "hit": true,
+          "build": "6.5.7+e621ee2",
+          "rungs": [
+            {
+              "rung": "repair",
+              "at": "2026-10-14T21:23:08.817571Z",
+              "error": {
+                "class": "unknown",
+                "subclass": "unclassified",
+                "fingerprint": "e69d1e56500ffb87",
+                "detail": "E2E-GAUGE-41 tide gauge frame checksum mismatch",
+                "artifact_refs": [],
+                "observed_by": "unclassified"
+              },
+              "outcome": "repair with the failure evidence and a diagnosis step"
+            }
+          ],
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"other\"}",
+              "hash": "ccd82966f4ce3642",
+              "at": "2026-10-14T21:23:07.819206Z"
+            },
+            {
+              "kind": "error",
+              "reference": "unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch",
+              "hash": "e69d1e56500ffb87",
+              "verified_by": "unclassified",
+              "at": "2026-10-14T21:23:08.817571Z"
+            },
+            {
+              "kind": "attempt_failure",
+              "reference": "{\"run\":\"587f7034-8134-4ee2-9353-cf0b9ba6d876\",\"fingerprint\":\"e69d1e56500ffb87\",\"error\":\"unknown/unclassified\",\"counted\":true}",
+              "hash": "ccd82966f4ce3642",
+              "at": "2026-10-14T21:23:08.817571Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:07.819208Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:07.819474Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:08.818799Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: The tide gauge frame failed its checksum again."
+            },
+            {
+              "at": "2026-10-14T21:23:08.819242Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "queued"
+              },
+              "actor": "controller",
+              "reason": "repair"
+            },
+            {
+              "at": "2026-10-14T21:23:08.819242Z",
+              "kind": "transition",
+              "from": {
+                "status": "queued"
+              },
+              "to": {
+                "status": "ready"
+              },
+              "actor": "controller",
+              "reason": "ready"
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/587f7034-8134-4ee2-9353-cf0b9ba6d876.jsonl",
+            "exists": true,
+            "bytes": 3763
+          }
+        },
+        {
+          "run": "d6f7850d-675a-4d02-8659-e79432db20cc",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:08.820962Z",
+          "ended_at": "2026-10-14T21:23:09.817564Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms",
+          "judged": {
+            "status": "queued"
+          },
+          "hit": true,
+          "build": "6.5.7+e621ee2",
+          "rungs": [
+            {
+              "rung": "repair",
+              "at": "2026-10-14T21:23:09.815429Z",
+              "error": {
+                "class": "unknown",
+                "subclass": "unclassified",
+                "fingerprint": "e69d1e56500ffb87",
+                "detail": "E2E-GAUGE-41 tide gauge frame checksum mismatch",
+                "artifact_refs": [],
+                "observed_by": "unclassified"
+              },
+              "outcome": "repair with the failure evidence and a diagnosis step"
+            }
+          ],
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:08.820962Z"
+            },
+            {
+              "kind": "error",
+              "reference": "unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch",
+              "hash": "e69d1e56500ffb87",
+              "verified_by": "unclassified",
+              "at": "2026-10-14T21:23:09.815429Z"
+            },
+            {
+              "kind": "attempt_failure",
+              "reference": "{\"run\":\"d6f7850d-675a-4d02-8659-e79432db20cc\",\"fingerprint\":\"e69d1e56500ffb87\",\"error\":\"unknown/unclassified\",\"counted\":true}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:09.815429Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:08.820983Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:08.821211Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:09.818700Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: The tide gauge frame failed its checksum again."
+            },
+            {
+              "at": "2026-10-14T21:23:09.820141Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "queued"
+              },
+              "actor": "controller",
+              "reason": "repair"
+            },
+            {
+              "at": "2026-10-14T21:23:09.820141Z",
+              "kind": "transition",
+              "from": {
+                "status": "queued"
+              },
+              "to": {
+                "status": "ready"
+              },
+              "actor": "controller",
+              "reason": "ready"
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/d6f7850d-675a-4d02-8659-e79432db20cc.jsonl",
+            "exists": true,
+            "bytes": 5169
+          }
+        },
+        {
+          "run": "8f85490c-80e7-4ced-9b03-2ed7d828cda3",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:09.823487Z",
+          "ended_at": "2026-10-14T21:23:10.816563Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 5 ms",
+          "judged": {
+            "status": "queued"
+          },
+          "hit": true,
+          "build": "6.5.7+e621ee2",
+          "rungs": [
+            {
+              "rung": "repair",
+              "at": "2026-10-14T21:23:10.815181Z",
+              "error": {
+                "class": "unknown",
+                "subclass": "unclassified",
+                "fingerprint": "e69d1e56500ffb87",
+                "detail": "E2E-GAUGE-41 tide gauge frame checksum mismatch",
+                "artifact_refs": [],
+                "observed_by": "unclassified"
+              },
+              "outcome": "repair with the failure evidence and a diagnosis step"
+            }
+          ],
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:09.823487Z"
+            },
+            {
+              "kind": "error",
+              "reference": "unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch",
+              "hash": "e69d1e56500ffb87",
+              "verified_by": "unclassified",
+              "at": "2026-10-14T21:23:10.815181Z"
+            },
+            {
+              "kind": "attempt_failure",
+              "reference": "{\"run\":\"8f85490c-80e7-4ced-9b03-2ed7d828cda3\",\"fingerprint\":\"e69d1e56500ffb87\",\"error\":\"unknown/unclassified\",\"counted\":true}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:10.815181Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:09.823515Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:09.823978Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:10.816895Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: The tide gauge frame failed its checksum again."
+            },
+            {
+              "at": "2026-10-14T21:23:10.817657Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "queued"
+              },
+              "actor": "controller",
+              "reason": "repair"
+            },
+            {
+              "at": "2026-10-14T21:23:10.817657Z",
+              "kind": "transition",
+              "from": {
+                "status": "queued"
+              },
+              "to": {
+                "status": "ready"
+              },
+              "actor": "controller",
+              "reason": "ready"
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/8f85490c-80e7-4ced-9b03-2ed7d828cda3.jsonl",
+            "exists": true,
+            "bytes": 5814
+          }
+        },
+        {
+          "run": "722a9ae5-7584-4950-8d2c-c2b0b268857d",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:10.820185Z",
+          "ended_at": "2026-10-14T21:23:11.818655Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+          "judged": {
+            "status": "queued"
+          },
+          "hit": true,
+          "build": "6.5.7+e621ee2",
+          "rungs": [
+            {
+              "rung": "improve",
+              "at": "2026-10-14T21:23:11.817434Z",
+              "error": {
+                "class": "unknown",
+                "subclass": "unclassified",
+                "fingerprint": "e69d1e56500ffb87",
+                "detail": "E2E-GAUGE-41 tide gauge frame checksum mismatch",
+                "artifact_refs": [],
+                "observed_by": "unclassified"
+              },
+              "outcome": "waiting on resolution item fa4158f2-ff31-42d2-bb60-5a277c617b23; circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d)"
+            }
+          ],
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"repair\"}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:10.820185Z"
+            },
+            {
+              "kind": "error",
+              "reference": "unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch",
+              "hash": "e69d1e56500ffb87",
+              "verified_by": "unclassified",
+              "at": "2026-10-14T21:23:11.817434Z"
+            },
+            {
+              "kind": "attempt_failure",
+              "reference": "{\"run\":\"722a9ae5-7584-4950-8d2c-c2b0b268857d\",\"fingerprint\":\"e69d1e56500ffb87\",\"error\":\"unknown/unclassified\",\"counted\":true}",
+              "hash": "509082d610d3cded",
+              "at": "2026-10-14T21:23:11.817434Z"
+            },
+            {
+              "kind": "circuit_open",
+              "reference": "{\"attempt_state\":\"509082d610d3cded\",\"error\":\"unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"fingerprint\":\"e69d1e56500ffb87\",\"repeats\":3,\"runs\":[\"d6f7850d-675a-4d02-8659-e79432db20cc\",\"8f85490c-80e7-4ced-9b03-2ed7d828cda3\",\"722a9ae5-7584-4950-8d2c-c2b0b268857d\"]}",
+              "hash": "e69d1e56500ffb87",
+              "at": "2026-10-14T21:23:11.817434Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:10.820222Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:10.820570Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:11.818893Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: The tide gauge frame failed its checksum again."
+            },
+            {
+              "at": "2026-10-14T21:23:11.819960Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "queued"
+              },
+              "actor": "controller",
+              "reason": "circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-8659-e79432db20cc, 8f85490c-80e7-4ced-9b03-2ed7d828cda3, 722a9ae5-7584-4950-8d2c-c2b0b268857d); waiting for an investigation"
+            },
+            {
+              "at": "2026-10-14T21:23:12.818353Z",
+              "kind": "transition",
+              "from": {
+                "status": "queued"
+              },
+              "to": {
+                "status": "ready"
+              },
+              "actor": "controller",
+              "reason": "ready"
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/722a9ae5-7584-4950-8d2c-c2b0b268857d.jsonl",
+            "exists": true,
+            "bytes": 5975
+          }
+        },
+        {
+          "run": "bf520b04-6fd2-476a-bf92-0789d4856e64",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:12.820605Z",
+          "ended_at": "2026-10-14T21:23:13.818542Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+          "judged": {
+            "status": "done"
+          },
+          "hit": false,
+          "build": "6.5.7+e621ee2",
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]\",\"done_when\":\"the worker reports Read the corrupted tide gauge finished, with evidence\",\"constraints\":[],\"decisions\":[],\"inputs\":[{\"item\":\"fa4158f2-ff31-42d2-bb60-5a277c617b23\",\"status\":\"done\",\"commits\":[]}],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[{\"item\":\"fa4158f2-ff31-42d2-bb60-5a277c617b23\",\"kind\":\"internal\",\"edge\":\"blocks\",\"closed_at\":\"2026-10-14T21:23:12.818353+00:00\"}],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"other\"}",
+              "hash": "e1a8d4d7ae0bd505",
+              "at": "2026-10-14T21:23:12.820605Z"
+            },
+            {
+              "kind": "message",
+              "reference": "e2e-control-gauge-reading",
+              "verified_by": "result_report",
+              "at": "2026-10-14T21:23:13.817540Z"
+            },
+            {
+              "kind": "summary",
+              "reference": "Read the tide gauge once its probe had landed.",
+              "at": "2026-10-14T21:23:13.817540Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:12.820645Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:12.820941Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:13.818803Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: Read the tide gauge once its probe had landed."
+            },
+            {
+              "at": "2026-10-14T21:23:13.819280Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "verifying"
+              },
+              "actor": "controller",
+              "reason": "checking the result report"
+            },
+            {
+              "at": "2026-10-14T21:23:13.819280Z",
+              "kind": "transition",
+              "from": {
+                "status": "verifying"
+              },
+              "to": {
+                "status": "done"
+              },
+              "actor": "controller",
+              "reason": "verified on snapper: 1 artifact(s); Read the tide gauge once its probe had landed."
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/bf520b04-6fd2-476a-bf92-0789d4856e64.jsonl",
+            "exists": true,
+            "bytes": 6659
+          }
+        }
+      ]
+    }
+  ],
+  "total_items": 1,
+  "fixes": [
+    {
+      "item": {
+        "id": "fa4158f2-ff31-42d2-bb60-5a277c617b23",
+        "kind": "internal",
+        "title": "Classify unknown failure e69d1e56500ffb87",
+        "status": {
+          "status": "done"
+        },
+        "objective": "Add the probe, log line, check or parser that would have classified this failure. It was recorded as unknown (observed_by unclassified): E2E-GAUGE-41 tide gauge frame checksum mismatch",
+        "created_at": "2026-10-14T21:23:11.817434Z",
+        "closed_at": "2026-10-14T21:23:12.818353Z"
+      },
+      "landed": [
+        {
+          "kind": "classifier_rule",
+          "reference": "process: e2e-gauge-41",
+          "verified_by": "replay",
+          "at": "2026-10-14T21:23:12.816461Z"
+        }
+      ],
+      "conclusion": "e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again",
+      "runs": [
+        {
+          "run": "c0b4575f-3856-49bf-b795-73be18961cd1",
+          "worker": "snapper",
+          "started_at": "2026-10-14T21:23:11.821663Z",
+          "ended_at": "2026-10-14T21:23:12.817593Z",
+          "ended": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms",
+          "judged": {
+            "status": "done"
+          },
+          "hit": false,
+          "build": "6.5.7+e621ee2",
+          "evidence": [
+            {
+              "kind": "attempt_state",
+              "reference": "{\"objective\":\"Add the probe, log line, check or parser that would have classified this failure. It was recorded as unknown (observed_by unclassified): E2E-GAUGE-41 tide gauge frame checksum mismatch\",\"done_when\":\"Replaying the attached evidence through the classifier yields a class other than unknown, and a test pins that classification for fingerprint e69d1e56500ffb87.\",\"constraints\":[\"Add measurement only; change no behaviour beyond classification.\",\"A message rule may land as a `classifier_rule` artifact, `<subclass>: <pattern>`; it counts once the failure replays through it as classified.\",\"This item is done only when it lands something the controller can check: a commit on its branch in its worktree, or a `classifier_rule` artifact that replays. If you cannot land one, say plainly in the summary what you found, what you could not determine and what you need; that conclusion goes to the owner as a question, and nothing is marked done.\"],\"decisions\":[],\"inputs\":[],\"more_inputs\":[],\"base\":null,\"worker\":\"snapper\",\"worker_kind\":\"local\",\"access\":\"64c5f754814d586b\",\"required_tools\":[],\"required_mcp_servers\":[],\"writable_resources\":[],\"generation\":[],\"build\":\"6.5.7+e621ee2\",\"granted_by\":\"other\"}",
+              "hash": "cb0dd8ba3522c67b",
+              "at": "2026-10-14T21:23:11.821663Z"
+            },
+            {
+              "kind": "path",
+              "reference": "e2e-control/gauge_probe.rs",
+              "verified_by": "result_report",
+              "at": "2026-10-14T21:23:12.816461Z"
+            },
+            {
+              "kind": "classifier_rule",
+              "reference": "process: e2e-gauge-41",
+              "verified_by": "replay",
+              "at": "2026-10-14T21:23:12.816461Z"
+            },
+            {
+              "kind": "summary",
+              "reference": "e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again",
+              "at": "2026-10-14T21:23:12.816461Z"
+            }
+          ],
+          "trail": [
+            {
+              "at": "2026-10-14T21:23:11.839390Z",
+              "kind": "lease",
+              "from": {
+                "status": "ready"
+              },
+              "to": {
+                "status": "leased"
+              },
+              "actor": "worker:snapper",
+              "reason": "ttl 1800s"
+            },
+            {
+              "at": "2026-10-14T21:23:11.839708Z",
+              "kind": "transition",
+              "from": {
+                "status": "leased"
+              },
+              "to": {
+                "status": "running"
+              },
+              "actor": "worker:snapper",
+              "reason": "run started"
+            },
+            {
+              "at": "2026-10-14T21:23:12.817854Z",
+              "kind": "comment",
+              "actor": "worker:snapper",
+              "reason": "Agent reported: e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again"
+            },
+            {
+              "at": "2026-10-14T21:23:12.818353Z",
+              "kind": "transition",
+              "from": {
+                "status": "running"
+              },
+              "to": {
+                "status": "verifying"
+              },
+              "actor": "controller",
+              "reason": "checking the result report"
+            },
+            {
+              "at": "2026-10-14T21:23:12.818353Z",
+              "kind": "transition",
+              "from": {
+                "status": "verifying"
+              },
+              "to": {
+                "status": "done"
+              },
+              "actor": "controller",
+              "reason": "verified on snapper: 2 artifact(s); e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again"
+            }
+          ],
+          "run_log": {
+            "path": "/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/c0b4575f-3856-49bf-b795-73be18961cd1.jsonl",
+            "exists": true,
+            "bytes": 6456
+          }
+        }
+      ]
+    }
+  ],
+  "generated_at": "2026-10-14T21:23:13.967808Z",
+  "build": "6.5.7+e621ee2"
+}

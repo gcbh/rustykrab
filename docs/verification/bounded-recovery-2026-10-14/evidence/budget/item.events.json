@@ -1,0 +1,392 @@
+[
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:14.491532Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:15.017935Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:15.018236Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:16.017221Z",
+    "evidence_ref": "6f734e47-86d0-4768-b7a2-1135578ef3bf",
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:16.017478Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The gauge rejected the station.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:16.017478Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T21:23:16.016225Z\",\"error\":{\"class\":\"tool\",\"subclass\":\"invalid_args\",\"fingerprint\":\"cdde88625b37c8fc\",\"detail\":\"the gauge rejected station 7\",\"artifact_refs\":[],\"observed_by\":\"result_report\"},\"outcome\":\"repair with the failure evidence\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:16.017989Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:16.017989Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:16.019923Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:16.020292Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:17.017062Z",
+    "evidence_ref": "e981dd4a-f788-4231-8312-176207f85185",
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:17.017290Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: The gauge rejected the station.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.017290Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T21:23:17.016031Z\",\"error\":{\"class\":\"tool\",\"subclass\":\"invalid_args\",\"fingerprint\":\"cdde88625b37c8fc\",\"detail\":\"the gauge rejected station 7\",\"artifact_refs\":[],\"observed_by\":\"result_report\"},\"outcome\":\"repair with the failure evidence and a diagnosis step\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.017746Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.017746Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.018525Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"surface\",\"at\":\"2026-10-14T21:23:17.018525Z\",\"error\":{\"class\":\"budget\",\"subclass\":\"iterations\",\"fingerprint\":\"40024d321e814c1e\",\"detail\":\"iterations budget spent: 2 of 2 iterations used over 2 run(s) (1 allotment(s) of 2, counted across every attempt); 0 left, under the 1 a run needs\",\"artifact_refs\":[],\"observed_by\":\"cumulative_budget_guard\"},\"outcome\":\"Its budget is spent (budget/iterations): iterations budget spent: 2 of 2 iterations used over 2 run(s) (1 allotment(s) of 2, counted across every attempt); 0 left, under the 1 a run needs. Answer to grant one more allotment of its budget and resume it, or no to cancel it.\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.018525Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "question",
+    "origin": null,
+    "reason": "question 28516066 blocking_now by rule surfaced: open",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:17.019101Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "Its budget is spent (budget/iterations): iterations budget spent: 2 of 2 iterations used over 2 run(s) (1 allotment(s) of 2, counted across every attempt); 0 left, under the 1 a run needs. Answer to grant one more allotment of its budget and resume it, or no to cancel it.",
+    "to": {
+      "reason": "budget_exhausted",
+      "status": "blocked"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "user:master",
+    "at": "2026-10-14T21:23:22.053814Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "question",
+    "origin": null,
+    "reason": "question 28516066 answered",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "user:master",
+    "at": "2026-10-14T21:23:22.054171Z",
+    "evidence_ref": null,
+    "from": {
+      "reason": "budget_exhausted",
+      "status": "blocked"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "answered question 28516066; one more allotment of its budget granted",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:22.054171Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:23.018869Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:23.019183Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:24.017507Z",
+    "evidence_ref": "6ea08579-efb2-41e3-8e4b-d6e2a3b33f51",
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T21:23:24.017757Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: Read gauge station 8.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:24.018204Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "checking the result report",
+    "to": {
+      "status": "verifying"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T21:23:24.018204Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "verifying"
+    },
+    "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+    "kind": "transition",
+    "origin": null,
+    "reason": "verified on snapper: 1 artifact(s); Read gauge station 8.",
+    "to": {
+      "status": "done"
+    },
+    "upstream": null
+  }
+]

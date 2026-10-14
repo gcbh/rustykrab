@@ -1,0 +1,65 @@
+failure e69d1e56500ffb87  unknown/unclassified  1 item(s), 4 run(s)
+  first seen 2026-10-14 21:23:08Z, last seen 2026-10-14 21:23:11Z
+  E2E-GAUGE-41 tide gauge frame checksum mismatch
+
+item #62c403bb  task  done  "Read the corrupted tide gauge [e2e-control bounded-recovery breaker]"
+  id 62c403bb-8fbb-4705-af91-db77c5ed28c9
+  run 587f7034-8134-4ee2-9353-cf0b9ba6d876  snapper  2026-10-14 21:23:07Z -> 2026-10-14 21:23:08Z  HIT
+    judged queued
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+    daemon build 6.5.7+e621ee2
+    rung repair unknown/unclassified [e69d1e56500ffb87]: repair with the failure evidence and a diagnosis step
+    attempt_state: {"objective":"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]","done_when":"the worker reports Read the corrupted tide gauge finished, with evidence","constraints":[],"...
+    error: unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch
+    attempt_failure: {"run":"587f7034-8134-4ee2-9353-cf0b9ba6d876","fingerprint":"e69d1e56500ffb87","error":"unknown/unclassified","counted":true}
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/587f7034-8134-4ee2-9353-cf0b9ba6d876.jsonl
+  run d6f7850d-675a-4d02-8659-e79432db20cc  snapper  2026-10-14 21:23:08Z -> 2026-10-14 21:23:09Z  HIT
+    judged queued
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+    daemon build 6.5.7+e621ee2
+    rung repair unknown/unclassified [e69d1e56500ffb87]: repair with the failure evidence and a diagnosis step
+    attempt_state: {"objective":"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]","done_when":"the worker reports Read the corrupted tide gauge finished, with evidence","constraints":[],"...
+    error: unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch
+    attempt_failure: {"run":"d6f7850d-675a-4d02-8659-e79432db20cc","fingerprint":"e69d1e56500ffb87","error":"unknown/unclassified","counted":true}
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/d6f7850d-675a-4d02-8659-e79432db20cc.jsonl
+  run 8f85490c-80e7-4ced-9b03-2ed7d828cda3  snapper  2026-10-14 21:23:09Z -> 2026-10-14 21:23:10Z  HIT
+    judged queued
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 5 ms
+    daemon build 6.5.7+e621ee2
+    rung repair unknown/unclassified [e69d1e56500ffb87]: repair with the failure evidence and a diagnosis step
+    attempt_state: {"objective":"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]","done_when":"the worker reports Read the corrupted tide gauge finished, with evidence","constraints":[],"...
+    error: unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch
+    attempt_failure: {"run":"8f85490c-80e7-4ced-9b03-2ed7d828cda3","fingerprint":"e69d1e56500ffb87","error":"unknown/unclassified","counted":true}
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/8f85490c-80e7-4ced-9b03-2ed7d828cda3.jsonl
+  run 722a9ae5-7584-4950-8d2c-c2b0b268857d  snapper  2026-10-14 21:23:10Z -> 2026-10-14 21:23:11Z  HIT
+    judged queued
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+    daemon build 6.5.7+e621ee2
+    rung improve unknown/unclassified [e69d1e56500ffb87]: waiting on resolution item fa4158f2-ff31-42d2-bb60-5a277c617b23; circuit breaker tripped: 3 failed attempts in a row with failure e69d1e56500ffb87 (unknown/unclassified) and unchanged attempt state 509082d610d3cded (runs d6f7850d-675a-4d02-...
+    attempt_state: {"objective":"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]","done_when":"the worker reports Read the corrupted tide gauge finished, with evidence","constraints":[],"...
+    error: unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch
+    attempt_failure: {"run":"722a9ae5-7584-4950-8d2c-c2b0b268857d","fingerprint":"e69d1e56500ffb87","error":"unknown/unclassified","counted":true}
+    circuit_open: {"attempt_state":"509082d610d3cded","error":"unknown/unclassified: E2E-GAUGE-41 tide gauge frame checksum mismatch","fingerprint":"e69d1e56500ffb87","repeats":3,"runs":["d6f7850d-675a-4d02-8659-e79432db20cc","8f85490c-80e7-4ced-9b03-2ed7d82...
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/722a9ae5-7584-4950-8d2c-c2b0b268857d.jsonl
+  run bf520b04-6fd2-476a-bf92-0789d4856e64  snapper  2026-10-14 21:23:12Z -> 2026-10-14 21:23:13Z
+    judged done
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+    daemon build 6.5.7+e621ee2
+    attempt_state: {"objective":"e2e-control worker: read the corrupted tide gauge. Read the corrupted tide gauge [e2e-control bounded-recovery breaker]","done_when":"the worker reports Read the corrupted tide gauge finished, with evidence","constraints":[],"...
+    message: e2e-control-gauge-reading
+    summary: Read the tide gauge once its probe had landed.
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/bf520b04-6fd2-476a-bf92-0789d4856e64.jsonl
+
+fix item #fa4158f2  done  "Classify unknown failure e69d1e56500ffb87"
+  id fa4158f2-ff31-42d2-bb60-5a277c617b23
+  landed classifier_rule process: e2e-gauge-41 (verified by replay)
+  concluded: e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again
+  run c0b4575f-3856-49bf-b795-73be18961cd1  snapper  2026-10-14 21:23:11Z -> 2026-10-14 21:23:12Z
+    judged done
+    run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+    daemon build 6.5.7+e621ee2
+    attempt_state: {"objective":"Add the probe, log line, check or parser that would have classified this failure. It was recorded as unknown (observed_by unclassified): E2E-GAUGE-41 tide gauge frame checksum mismatch","done_when":"Replaying the attached evid...
+    path: e2e-control/gauge_probe.rs
+    classifier_rule: process: e2e-gauge-41
+    summary: e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-1iguPv/run-logs/c0b4575f-3856-49bf-b795-73be18961cd1.jsonl

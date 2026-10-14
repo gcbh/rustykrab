@@ -1,0 +1,5 @@
+attempt 1: budget: 30 steps
+attempt 2: budget: 29 steps
+attempt 3: budget: 28 steps
+attempt 4: budget: 27 steps
+attempt 5: budget: 26 steps

@@ -1,0 +1,7 @@
+2026-10-14T21:23:11.819960Z  transition -> ready  [controller]  ready
+2026-10-14T21:23:11.839390Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T21:23:11.839708Z  transition -> running  [worker:snapper]  run started
+2026-10-14T21:23:12.817593Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 3 ms
+2026-10-14T21:23:12.817854Z  comment  [worker:snapper]  Agent reported: e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again
+2026-10-14T21:23:12.818353Z  transition -> verifying  [controller]  checking the result report
+2026-10-14T21:23:12.818353Z  transition -> done  [controller]  verified on snapper: 2 artifact(s); e2e-control gauge probe landed: the corrupted frame is classified and the gauge reads again
