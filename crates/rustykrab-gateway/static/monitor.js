@@ -304,11 +304,20 @@
       return progressStates.has(s) && (filter === 'progress' || s === filter) &&
         (!needle || [row.item.id, row.item.title, row.last_worker].join(' ').toLowerCase().includes(needle));
     });
+    const ranks = snapshot.queue_priorities || {};
+    selected.sort((a,b) => {
+      const active = s => ['leased','running','verifying'].includes(status(s.item));
+      const ar = ranks[a.item.id] || {waiters:0,priority:a.item.priority || 0};
+      const br = ranks[b.item.id] || {waiters:0,priority:b.item.priority || 0};
+      return Number(active(b)) - Number(active(a)) || br.waiters-ar.waiters || br.priority-ar.priority || Date.parse(a.item.created_at)-Date.parse(b.item.created_at) || a.item.id.localeCompare(b.item.id);
+    });
     $('workCount').textContent = num(selected.length) + ' displayed';
     $('workRows').replaceChildren();
     for (const row of selected) {
       const i = row.item, tr = node('tr'), title = node('td'), state = node('td');
       title.append(itemButton(i.id, i.title), node('small', i.id.slice(0, 8)));
+      const rank = ranks[i.id];
+      if (rank) title.append(node('small', rank.waiters ? 'Needed by ' + num(rank.waiters) + ' open tasks' : 'No dependent work'));
       state.append(badge(status(i) === 'ready' ? 'Queued' : status(i), status(i)));
       if (reason(i)) state.append(node('small', human(reason(i))));
       const agent = node('td', row.last_worker || 'Unassigned');
@@ -323,7 +332,7 @@
       const tr = node('tr'), td = node('td', 'No work matches this view.', 'empty'); td.colSpan = 5;
       tr.append(td); $('workRows').append(tr);
     }
-    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Open an item to discuss direction, answer decisions, and inspect progress.';
+    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Queue order: blocking impact, then urgency and age. Open an item to discuss direction and inspect progress.';
   }
   const progressStates = new Set(['queued', 'ready', 'leased', 'running', 'verifying']);
   const views = new Set(['attention', 'progress', 'results', 'automatic', 'systems']);

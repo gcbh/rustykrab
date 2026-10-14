@@ -398,6 +398,19 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                 done("Blocked on a missing tool."),
             ],
         ),
+        // A general local agent can build the same capability as the native
+        // stand-in. The harness binds this path to its disposable data dir.
+        script(
+            "Build the tool `tide_table`",
+            vec![
+                load(&["exec"]),
+                call(
+                    "exec",
+                    json!({"command":r#"python3 -c "from pathlib import Path; import sys; p=Path(sys.argv[1])/'skills/tide_table'; p.mkdir(parents=True, exist_ok=True); (p/'SKILL.md').write_text('---\nname: tide_table\ndescription: Tide times for a port (e2e stand-in)\n---\nReturn high and low water for the named port.\n')" __E2E_DATA_DIR__ && sleep 2"#}),
+                ),
+                report(json!({"summary":TIDE_TABLE_BUILT})),
+            ],
+        ),
         script(
             TIDE_TABLE_BUILT,
             vec![

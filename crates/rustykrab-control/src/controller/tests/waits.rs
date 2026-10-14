@@ -527,8 +527,8 @@ async fn legacy_availability_holds_are_requeued_even_before_capacity_returns() {
 async fn peer_advertising_plan_tool_still_runs_ordinary_work() {
     let h = toggle_harness(WorkerKind::Peer, Arc::new(AtomicBool::new(true)));
     assert!(
-        !h.ctl.has_planner(),
-        "a node advertisement is not a planning role"
+        h.ctl.has_planner(),
+        "a peer with the plan tool can plan without a reserved role"
     );
     let mut d = draft("peer", "Peer ordinary task");
     d.worker_kind = WorkerKind::Peer;

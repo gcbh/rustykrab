@@ -27,8 +27,8 @@
 //!    rung climbed and no repair counted.
 //! 3. **Select, match, lease and run** (steps 1 to 4), skipped while the
 //!    controller is draining ([`ControlHandle::set_draining`]): ready leaves by
-//!    effective priority inherited from open dependents, then the number of
-//!    distinct waiters, the single-writer rule over every active item, the
+//!    distinct transitive waiter count, then inherited explicit urgency and
+//!    age, the single-writer rule over every active item, the
 //!    local-model rule of 12.1 (one run per local model, and none while
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
 //!    available compatible resource by cost, without category gates; the
@@ -660,6 +660,15 @@ pub(crate) fn merge(total: &mut TickReport, add: TickReport) {
 
 #[async_trait]
 impl ControlHandle for Controller {
+    async fn queue_priorities(
+        &self,
+    ) -> Result<std::collections::HashMap<WorkItemId, crate::graph::SchedulingPriority>, Error>
+    {
+        Ok(crate::graph::scheduling_priorities(
+            &self.load().await?,
+            self.clock.now(),
+        ))
+    }
     async fn comment(
         &self,
         item: &str,

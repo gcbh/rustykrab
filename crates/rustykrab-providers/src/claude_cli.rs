@@ -353,7 +353,7 @@ fn is_quota_result(event: &Value) -> bool {
 /// Native tools/MCP/settings are disabled here: the existing Rust harness
 /// executes the returned declared tool calls under its own permissions.
 pub struct ClaudeCliProvider {
-    pub runtime: ClaudeMaxRuntime,
+    pub runtime: std::sync::Arc<ClaudeMaxRuntime>,
     model: String,
     work_dir: PathBuf,
     timeout: Duration,
@@ -370,7 +370,9 @@ impl ClaudeCliProvider {
         input_budget: usize,
     ) -> Self {
         Self {
-            runtime: ClaudeMaxRuntime::new(command, config_dir).with_model(Some(&model)),
+            runtime: std::sync::Arc::new(
+                ClaudeMaxRuntime::new(command, config_dir).with_model(Some(&model)),
+            ),
             model,
             work_dir,
             timeout,
@@ -464,7 +466,7 @@ fn response_schema(tools: &[ToolSchema], choice: ToolChoice) -> Value {
     json!({"type":"object","properties":{"text":{"type":"string"},"host_requests":calls},"required":["text","host_requests"],"additionalProperties":false})
 }
 
-fn parse_turn(
+pub(crate) fn parse_turn(
     value: &Value,
     tools: &[ToolSchema],
     choice: ToolChoice,

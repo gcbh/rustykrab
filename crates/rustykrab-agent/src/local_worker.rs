@@ -87,8 +87,7 @@ use crate::subagent::profile_for;
 use crate::trace::ExecutionTracer;
 
 /// The control-layer tools every worker run holds, built per run over the
-/// injected backend. `work_plan` is not among them: only the planner files
-/// a graph, and a worker's follow-up work travels as drafts in its report.
+/// injected backend. Every agent can file a graph as well as execute a slice.
 const WORK_TOOL_NAMES: [&str; 4] = ["work_file", "work_status", "work_discuss", "result_report"];
 
 /// A worker's typed questions (plan section 7): in every worker's ceiling,
@@ -96,7 +95,7 @@ const WORK_TOOL_NAMES: [&str; 4] = ["work_file", "work_status", "work_discuss", 
 /// can carry `blocked` and `questions` too.
 const QUESTION_TOOL_NAMES: [&str; 2] = ["ask_user", "capability_request"];
 
-/// Held only by a definition that names it: the `planner` (section 6.1).
+/// Graph filing is part of every agent's work protocol.
 const PLAN_TOOL: &str = "work_plan";
 
 /// The ordinary conversation's completion signal. A worker never holds it.
@@ -289,6 +288,7 @@ pub struct LocalWorker {
     /// (section 6, step 7).
     stall_steps: u32,
     full_reports: bool,
+    repository_shell: bool,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
     spending: Mutex<HashMap<String, Arc<Spending>>>,
@@ -344,6 +344,7 @@ impl LocalWorker {
             runs: LocalRuns::global(),
             stall_steps: DEFAULT_STALL_STEPS,
             full_reports: false,
+            repository_shell: false,
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
             model: Mutex::new(None),
@@ -354,6 +355,12 @@ impl LocalWorker {
     /// Default workers continue to use compact result summaries.
     pub fn with_full_reports(mut self) -> Self {
         self.full_reports = true;
+        self
+    }
+
+    /// Only expose shell execution inside a controller-owned repository workspace.
+    pub fn with_repository_shell(mut self) -> Self {
+        self.repository_shell = true;
         self
     }
 
@@ -474,22 +481,12 @@ impl LocalWorker {
     /// sub-agent family and computer use need opt-ins a worker never gets).
     fn ceiling_of(definition: &AgentDefinition, tools: &[Arc<dyn Tool>]) -> Vec<String> {
         let allowed = definition.allowed_tools.as_deref();
-        // A planner may file one graph and read context. Do not silently
-        // grant it the ordinary worker's filing/report/question protocol.
-        let mut names: Vec<String> = if definition.planning_only {
-            vec![PLAN_TOOL.into(), "work_status".into()]
-        } else {
-            WORK_TOOL_NAMES
-                .iter()
-                .chain(QUESTION_TOOL_NAMES.iter())
-                .map(|n| n.to_string())
-                .collect()
-        };
-        if allowed.is_some_and(|a| a.iter().any(|n| n == PLAN_TOOL))
-            && !names.iter().any(|n| n == PLAN_TOOL)
-        {
-            names.push(PLAN_TOOL.into());
-        }
+        let mut names: Vec<String> = WORK_TOOL_NAMES
+            .iter()
+            .chain(QUESTION_TOOL_NAMES.iter())
+            .map(|n| n.to_string())
+            .collect();
+        names.push(PLAN_TOOL.into());
         for tool in tools {
             let name = tool.name();
             let permitted = allowed.is_none_or(|a| a.iter().any(|n| n == name));
@@ -658,7 +655,11 @@ impl Worker for LocalWorker {
     }
 
     fn capabilities(&self) -> WorkerCapabilities {
-        let (_, ceiling) = self.catalog();
+        let (tools, ceiling) = self.catalog();
+        let can_act = tools.iter().any(|tool| {
+            ceiling.iter().any(|name| name == tool.name())
+                && tool.sandbox_requirements().has_side_effects()
+        });
         let mut mcp_servers: Vec<String> = ceiling
             .iter()
             .filter_map(|n| mcp_server_of(n))
@@ -675,7 +676,11 @@ impl Worker for LocalWorker {
             // ones it may. Who may write a resource at once is the
             // controller's single-writer rule, not a capability.
             writable_resources: if self.definition.writable_resources.is_empty() {
-                vec!["*".to_string()]
+                if can_act {
+                    vec!["*".to_string()]
+                } else {
+                    Vec::new()
+                }
             } else {
                 self.definition.writable_resources.clone()
             },
@@ -774,7 +779,11 @@ impl Worker for LocalWorker {
     }
 
     async fn run(&self, brief: Brief) -> Result<ResultReport> {
-        let (host_tools, ceiling) = self.catalog();
+        let (mut host_tools, mut ceiling) = self.catalog();
+        if self.repository_shell && brief.workspace.is_none() {
+            host_tools.retain(|t| !["exec", "read", "edit", "write"].contains(&t.name()));
+            ceiling.retain(|t| !["exec", "read", "edit", "write"].contains(&t.as_str()));
+        }
         let activate = self
             .activation(&brief, &ceiling)
             .map_err(RunFailure::into_error)?;
@@ -1092,6 +1101,11 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     let _ = writeln!(out, "title: {}", one_line(&brief.title, LINE_MAX));
     let _ = writeln!(out, "objective: {}", one_line(&brief.objective, LINE_MAX));
     let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when, LINE_MAX));
+    if brief.required_tools.iter().any(|t| t == PLAN_TOOL) {
+        out.push_str("This run files a plan: call work_plan with the bounded graph requested below. An accepted graph completes this run; do not execute its tasks or call result_report afterwards.\n");
+    } else {
+        out.push_str("Execute this objective using the available tools, then call result_report with the actual outcome. Your agent name or previous specialty does not restrict the work.\n");
+    }
     bullets(&mut out, "constraints", &brief.constraints);
     bullets(&mut out, "decisions_made", &brief.decisions_made);
     if !brief.discussion.is_empty() {
@@ -1199,8 +1213,8 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
         );
         let _ = writeln!(
             out,
-            "  commit your change on this branch; report changed_paths relative to the \
-             repository root, exactly the files the commit changes"
+            "  if you change files, commit them on this branch and report changed_paths relative to the \
+             repository root, exactly the files the commit changes. Inspection without edits reports a null commit and no changed paths."
         );
     }
     let _ = writeln!(out, "budget: {} steps", brief.budget.iterations);
@@ -1208,6 +1222,10 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
         let _ = writeln!(out, "origin_conversation: {origin}");
     }
     out.push('\n');
+    if brief.required_tools.iter().any(|t| t == PLAN_TOOL) {
+        out.push_str("Finish by filing one accepted work_plan graph. Fix rejected validation checks and try again. Do not execute the graph's work in this run or report again after acceptance. If planning cannot be completed, report the actual blocked/error outcome.\n");
+        return out;
+    }
     out.push_str("End this run with one result_report call, as your last call. ");
     if full_report {
         out.push_str("Put the complete deliverable in summary, including source links and coverage limits, within the report tool's stated bound. ");
@@ -2010,6 +2028,10 @@ mod tests {
         );
 
         let caps = w.capabilities();
+        assert!(
+            caps.writable_resources.is_empty(),
+            "context-only tools grant no external write scope"
+        );
         assert_eq!(w.name(), "pinch");
         assert_eq!(w.kind(), WorkerKind::Local);
         assert_eq!(w.concurrency(), 1);
@@ -2019,9 +2041,8 @@ mod tests {
         assert!(caps.tools.iter().any(|t| t == "browser"));
         assert!(caps.tools.iter().any(|t| t == "result_report"));
         assert!(!caps.tools.iter().any(|t| t == "task_complete"));
-        // Any resource: the controller's single-writer rule serialises
-        // writers; a capability that listed none would lease no writer.
-        assert_eq!(caps.writable_resources, ["*"]);
+        // These stand-ins declare no side effects, so they grant no writes.
+        assert!(caps.writable_resources.is_empty());
     }
 
     #[tokio::test]
@@ -2095,6 +2116,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_repository_shell_is_unavailable_without_a_controller_workspace() {
+        let provider = Recording::new(vec![report("analysis")]);
+        let (worker, _) = worker(provider.clone(), vec![Arc::new(Named("exec"))]);
+        let worker = worker.with_repository_shell();
+        let mut needs_shell = brief("shell");
+        needs_shell.required_tools = vec!["exec".into()];
+        assert!(worker.run(needs_shell).await.is_err());
+        assert!(
+            provider.requests().is_empty(),
+            "reject unscoped shell before inference"
+        );
+        worker.run(brief("analysis")).await.unwrap();
+        assert!(provider.requests()[0].1.iter().all(|t| t != "exec"));
+    }
+
+    #[test]
+    fn a_real_execution_tool_grants_default_write_scope_without_a_specialty() {
+        let w = LocalWorker::new(
+            "general",
+            LocalWorker::default_definition("general"),
+            Recording::new(Vec::new()),
+            vec![Arc::new(rustykrab_tools::ExecTool::new())],
+            Arc::new(NoSandbox),
+            Arc::new(StubWorkBackend::new()),
+        );
+        assert_eq!(w.capabilities().writable_resources, ["*"]);
+        assert!(w.capabilities().tools.iter().any(|t| t == "work_plan"));
+    }
+
+    #[tokio::test]
     async fn a_brief_beyond_the_ceiling_is_a_gap_before_any_model_call() {
         let provider = Recording::new(vec![report("never")]);
         let mut definition = LocalWorker::default_definition("krabby");
@@ -2116,6 +2167,7 @@ mod tests {
                 "result_report",
                 "work_discuss",
                 "work_file",
+                "work_plan",
                 "work_status"
             ]
         );
@@ -2194,10 +2246,7 @@ mod tests {
             stub.clone(),
         );
         let caps = w.capabilities();
-        assert_eq!(
-            caps.tools,
-            ["memory_search", "recall_search", "work_plan", "work_status"]
-        );
+        assert!(caps.tools.iter().any(|t| t == "result_report"));
         for tool in ["work_plan", "work_status", "recall_search", "memory_search"] {
             assert!(
                 caps.tools.iter().any(|t| t == tool),
@@ -2230,9 +2279,9 @@ mod tests {
         }
         assert!(matches!(stub.calls()[0], WorkCall::Plan { .. }));
 
-        // An ordinary worker never holds work_plan.
+        // An ordinary worker can also plan; there is no reserved role.
         let (pinch, _) = worker(Recording::new(vec![]), Vec::new());
-        assert!(!pinch.capabilities().tools.iter().any(|t| t == "work_plan"));
+        assert!(pinch.capabilities().tools.iter().any(|t| t == "work_plan"));
     }
 
     #[tokio::test]

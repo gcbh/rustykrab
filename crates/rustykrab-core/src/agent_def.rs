@@ -34,7 +34,7 @@ pub struct AgentDefinition {
     pub system_prompt: String,
     /// Harness profile name: `coding`, `research`, `creative`, or `default`.
     pub profile: String,
-    /// Reserved for planning work. Tool availability alone never assigns a role.
+    /// Legacy metadata; the controller ignores it when assigning work.
     pub planning_only: bool,
     /// Tools the sub-agent may call. `None` means inherit the parent's
     /// active capability set unchanged.

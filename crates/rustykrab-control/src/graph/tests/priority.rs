@@ -2,6 +2,44 @@ use super::*;
 use crate::graph::scheduling_priorities;
 
 #[test]
+fn blocker_impact_precedes_explicit_urgency_and_inactive_plan_b_donates_nothing() {
+    let g = G::new()
+        .add("repair")
+        .add("first")
+        .add("second")
+        .add("urgent")
+        .add("alternative")
+        .add("attempt")
+        .set("urgent", |i| i.priority = 999)
+        .set("alternative", |i| i.priority = 2000)
+        .edge("first", EdgeKind::Blocks, "repair")
+        .edge("second", EdgeKind::Blocks, "repair")
+        .edge("alternative", EdgeKind::Blocks, "repair")
+        .edge("alternative", EdgeKind::ConditionalOnFailure, "attempt");
+    let ranks = scheduling_priorities(&g.snap(), now());
+    assert_eq!(ranks["repair"].waiters, 2);
+    assert_eq!(ranks["repair"].priority, 0);
+    assert!(ranks["repair"].compare(&ranks["urgent"]).is_lt());
+    let failed = g.status("attempt", Status::Failed);
+    assert_eq!(
+        scheduling_priorities(&failed.snap(), now())["repair"].waiters,
+        3
+    );
+    let parent = G::new()
+        .add("project")
+        .child("fallback", "project")
+        .add("attempt")
+        .add("repair")
+        .edge("fallback", EdgeKind::ConditionalOnFailure, "attempt")
+        .edge("fallback", EdgeKind::Blocks, "repair");
+    assert_eq!(
+        scheduling_priorities(&parent.snap(), now())["repair"].waiters,
+        0,
+        "a parent does not donate through an unreleased fallback"
+    );
+}
+
+#[test]
 fn urgency_reaches_transitive_prerequisites_and_disappears_with_the_waiter() {
     let g = G::new()
         .add("urgent")

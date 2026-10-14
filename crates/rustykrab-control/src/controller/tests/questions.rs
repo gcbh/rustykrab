@@ -455,6 +455,10 @@ impl Worker for Planner {
     fn planning_only(&self) -> bool {
         true
     }
+    fn accepts(&self, item: &WorkItem) -> bool {
+        // This stand-in implements graph filing, not general execution.
+        crate::graph::is_planning(item)
+    }
     fn capabilities(&self) -> WorkerCapabilities {
         WorkerCapabilities {
             models: vec!["planner-model".to_string()],

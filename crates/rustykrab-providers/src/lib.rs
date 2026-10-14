@@ -3,6 +3,7 @@ mod backoff;
 mod claude_cli;
 mod claude_usage;
 mod codex_cli;
+mod codex_turn;
 mod line_buffer;
 mod ollama;
 mod openai;
@@ -19,3 +20,4 @@ pub use claude_cli::{ClaudeCliProvider, ClaudeMaxRuntime, ClaudeMaxStatus};
 pub use claude_usage::ClaudeQuotaWindow;
 
 pub use codex_cli::{CodexChatGptRuntime, CodexChatGptStatus, CodexQuotaBucket, CodexQuotaWindow};
+pub use codex_turn::CodexCliProvider;

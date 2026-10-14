@@ -152,11 +152,10 @@ correct instinct, and it is applied inconsistently elsewhere — see
   would be churn. A pure pass-through adapter is the tell that a trait is in
   the wrong crate — that was true of exactly one of the six.
 
-AgentDefinition.planning_only explicitly reserves a definition for planner
-work. It defaults to false for older files/JSON. The controller planner is
-assigned this role by the host; a delegated execution worker can inherit
-work_plan in its tool ceiling while retaining work/report/question tools.
-Tool availability cannot assign the planning role.
+AgentDefinition.planning_only remains compatible metadata for older files and
+JSON; it no longer reserves execution roles. The controller routes by actual
+tools and resource scope, and every LocalWorker carries graph filing, reporting
+and questions in its protocol ceiling.
 
 ## Project dreaming receipts
 

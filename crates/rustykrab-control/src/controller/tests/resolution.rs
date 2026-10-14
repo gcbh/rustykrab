@@ -3,6 +3,34 @@ use crate::controller::batch::Batch;
 use rustykrab_core::work::{ErrorClass, WorkKind};
 
 #[tokio::test]
+async fn shared_blockers_run_before_independent_work_even_with_lower_explicit_priority() {
+    let h = Harness::new(&["agent"]);
+    let repair = h.file_one(draft("repair", "shared prerequisite")).await;
+    for title in ["blocked first", "blocked second"] {
+        let mut d = draft(title, title);
+        d.edges.push(DraftEdge {
+            kind: EdgeKind::Blocks,
+            depends_on: ItemRef::Id(repair.clone()),
+        });
+        h.file_one(d).await;
+    }
+    let mut urgent = draft("urgent", "independent urgent work");
+    urgent.priority = 999;
+    h.file_one(urgent).await;
+    let gate = Arc::new(Notify::new());
+    h.script.push(
+        "shared prerequisite",
+        Step::Wait(gate.clone(), Box::new(done("prerequisite"))),
+    );
+    assert_eq!(h.tick().await.leased, vec![repair.clone()]);
+    let ranks = h.ctl.queue_priorities().await.unwrap();
+    assert_eq!(ranks[&repair].waiters, 2);
+    assert!(h.script.briefs_for("independent urgent work").is_empty());
+    gate.notify_one();
+    h.drain().await;
+}
+
+#[tokio::test]
 async fn a_failure_creates_a_prerequisite_and_schedules_it_before_routine_work() {
     let h = Harness::new(&["worker"]);
     h.script.push(

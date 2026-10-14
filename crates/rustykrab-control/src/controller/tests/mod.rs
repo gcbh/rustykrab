@@ -166,7 +166,19 @@ impl Worker for Scripted {
     fn capabilities(&self) -> WorkerCapabilities {
         WorkerCapabilities {
             models: vec![format!("model-of-{}", self.name)],
-            tools: vec!["*".to_string()],
+            // Execution-only stand-in: no graph-filing implementation.
+            tools: [
+                "calendar_read",
+                "exec",
+                "web_fetch",
+                "tools_load",
+                "tools_list",
+                "memory_search",
+                "recall_search",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             mcp_servers: vec!["*".to_string()],
             writable_resources: vec!["*".to_string()],
             ..WorkerCapabilities::default()

@@ -566,8 +566,8 @@ time order and a round trip is exact.
 
 `priority` is the item's base priority. The scheduler derives effective urgency
 from unmet `blocks`/`waits_for` edges and parent gates on each pass: prerequisites
-inherit the highest priority of interested open work, with the number of distinct
-waiters breaking ties before creation time. It does not rewrite the base column;
+inherit the highest priority of interested open work. The number of distinct
+waiters is the primary rank; inherited urgency, creation time and id break ties. It does not rewrite the base column;
 closed, expired, future-triggered and approval-held donors contribute nothing.
 Closing the last interested waiter removes its boost without a cleanup write.
 Failure-resolution `internal` items carry a `failure_fingerprint` artifact for

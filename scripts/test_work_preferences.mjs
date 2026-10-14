@@ -76,6 +76,6 @@ test('In progress displays execution states while excluding blocks, failures and
   t.c.$('search').value='';t.c.$('status').value='progress';
   const renderer=source.slice(source.indexOf('  function renderWork() {'),source.indexOf('  const progressStates ='));
   vm.runInContext(renderer,t.c);t.c.renderWork();
-  assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['queued','ready','leased','running','verifying']);
+  assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['leased','running','verifying','queued','ready']);
   t.c.$('status').value='running';t.c.renderWork();assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['running']);
 });

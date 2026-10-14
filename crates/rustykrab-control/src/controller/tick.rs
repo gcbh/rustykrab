@@ -70,17 +70,12 @@ fn absorb(report: &mut TickReport, written: Written) {
     }
 }
 
-/// Whether `worker` can take `item`: kind, tools, MCP servers and
-/// writable resources all covered (`*` covers everything). A `code` item
-/// with no `repo:` resource never goes to a worker that edits a checkout
-/// ([`WorkerKind::needs_checkout`]): it would get an empty directory.
+/// Whether the executor covers the actual tools, servers and writable scope.
+/// Agent names, specialties, old categories and planner roles do not gate work.
 pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
     let caps = worker.capabilities();
     let has = |list: &[String], want: &String| list.iter().any(|x| x == want || x == "*");
-    // A planning item matches only a planner, and a planner takes only
-    // planning items (6, step 2).
     worker.accepts(item)
-        && graph::is_planning(item) == super::planning::plans(worker)
         && item.required_tools.iter().all(|t| has(&caps.tools, t))
         && item
             .required_mcp_servers
@@ -1731,10 +1726,8 @@ impl Controller {
         ready.sort_by(|a, b| {
             let a_rank = &priorities[&a.id];
             let b_rank = &priorities[&b.id];
-            b_rank
-                .priority
-                .cmp(&a_rank.priority)
-                .then_with(|| b_rank.waiters.cmp(&a_rank.waiters))
+            a_rank
+                .compare(b_rank)
                 .then_with(|| a.created_at.cmp(&b.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });

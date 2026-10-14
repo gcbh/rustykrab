@@ -1,7 +1,7 @@
 //! The planner (plan sections 6.1, 6.4 and 6.5), carried out.
 //!
 //! - **A planned request** (`work_file` with `plan: true`) becomes a parent
-//!   with one planning child, which only the `planner` worker covers, and a
+//!   with one planning child, which any agent with work_plan covers, and a
 //!   fallback child that is the request as one item, `conditional_on_failure`
 //!   on the planning child: when the planning item's ladder is spent without
 //!   an accepted graph, the request runs as one item on one worker, as it
@@ -59,15 +59,17 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
-/// Whether a worker is reserved for planning and holds the plan tool.
-/// A peer's broad tool advertisement does not reserve it for planning.
+/// Any agent with the graph-filing tool can plan work.
 pub(super) fn plans(worker: &dyn Worker) -> bool {
-    worker.planning_only() && worker.capabilities().tools.iter().any(|t| t == PLAN_TOOL)
+    worker
+        .capabilities()
+        .tools
+        .iter()
+        .any(|t| t == PLAN_TOOL || t == "*")
 }
 
 impl Controller {
-    /// Whether a `planner` worker is registered, which is what makes a
-    /// planning item runnable.
+    /// Whether any registered agent advertises the graph-filing tool.
     pub(super) fn has_planner(&self) -> bool {
         self.registry.workers().iter().any(|w| plans(w.as_ref()))
     }
@@ -853,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_role_requires_explicit_reservation_and_the_plan_tool() {
+    fn planning_requires_the_tool_and_no_reserved_role() {
         use crate::worker::{Brief, WorkerCapabilities};
         struct W(Vec<&'static str>, bool);
         #[async_trait::async_trait]
@@ -878,8 +880,23 @@ mod tests {
             }
         }
         assert!(plans(&W(vec!["work_plan", "work_status"], true)));
-        assert!(!plans(&W(vec!["work_plan", "work_status"], false)));
-        assert!(!plans(&W(vec!["*"], true)));
+        assert!(plans(&W(vec!["work_plan", "work_status"], false)));
+        assert!(plans(&W(vec!["*"], true)));
         assert!(!plans(&W(vec!["work_status"], true)));
+        let item = item("execute", None, Status::Ready);
+        assert!(
+            super::super::tick::covers(&W(vec!["work_plan"], true), &item),
+            "old planning-only metadata does not reserve the agent"
+        );
+        let mut planning = item;
+        planning.required_tools = vec!["work_plan".into()];
+        assert!(
+            super::super::tick::covers(&W(vec!["work_plan"], false), &planning),
+            "any covered agent can plan"
+        );
+        assert!(
+            !super::super::tick::covers(&W(vec!["work_status"], false), &planning),
+            "actual tool access still matters"
+        );
     }
 }

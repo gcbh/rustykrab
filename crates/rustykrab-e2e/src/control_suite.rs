@@ -1609,6 +1609,10 @@ async fn s32(ctx: &Ctx) -> Result<()> {
 /// controller verifies the commit and changed paths; a result whose claimed
 /// paths differ from the diff is marked `verification_failed`.
 async fn s02(ctx: &Ctx) -> Result<()> {
+    // Verify this adapter's Git claims independently of model routing.
+    // Generic-pool coding and escalation are covered by scenario 17.
+    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let ctx = &daemon.ctx;
     let tag = tag(2);
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::create()?;
@@ -1755,17 +1759,20 @@ async fn s17(ctx: &Ctx) -> Result<()> {
 /// is filed, with `discovered_from` set, and nothing from the worker's own
 /// tracker reaches the store.
 async fn s31(ctx: &Ctx) -> Result<()> {
+    // Isolate the native adapter's private tracker contract. General routing
+    // is exercised separately; the scripted model has no private Beads ledger.
+    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let ctx = &daemon.ctx;
     let tag = tag(31);
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::create()?;
     register_claude_code(ctx, "pinch-s31", &repo, &stand_in).await?;
-    let mut change = code_draft(
+    let change = code_draft(
         "Add a status helper and track it",
         &tag,
         KEEPS_ITS_OWN_TRACKER,
         &repo,
     );
-    change["worker_kind"] = json!("claude_code");
     let task = file(ctx, change).await?;
     wait_status(ctx, &task, Status::Done).await?;
     let discovered_title = "Add a changelog entry [e2e-control s31]";

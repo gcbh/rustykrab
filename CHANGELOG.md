@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.4] - 2026-10-14
+
+- Allow general agent execution and prioritize shared blockers (#688)
+
 ## [6.5.3] - 2026-10-14
 
 - fix: accept bulk work status reads with bounded pagination (#689)

@@ -208,10 +208,8 @@ implement it — that is what caught the errors last time.
 
 ## Context and monitor integration review (2026-10-02)
 
-The integrated planner requires an explicit planning-only worker role;
-advertising work_plan on a peer does not reserve the peer for planning.
-The real peer-restart scenario exposed that distinction. Phase 4 question
-answers now feed the store-backed evaluator. Registry observation does not
+The former planner reservation is retired; its history is recorded in the
+outcome document. Phase 4 question answers feed the store-backed evaluator. Registry observation does not
 refresh last_seen: reads cannot conceal worker health-check staleness.
 Monitoring projects existing durable rows; it adds no parallel state ledger.
 Authentication/origin, bounded counts, lease faults, normal waits, verification
