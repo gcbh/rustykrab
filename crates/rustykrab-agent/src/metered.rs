@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rustykrab_core::model::{
-    ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
+    CallOptions, ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
 };
 use rustykrab_core::types::{Message, ToolSchema};
 use rustykrab_core::Result;
@@ -102,6 +102,15 @@ impl ModelProvider for MeteredProvider {
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
         self.count(self.inner.chat(messages, tools).await)
+    }
+
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        options: CallOptions,
+    ) -> Result<ModelResponse> {
+        self.count(self.inner.chat_with_options(messages, tools, options).await)
     }
 
     async fn chat_with_ctx(

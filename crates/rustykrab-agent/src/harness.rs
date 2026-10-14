@@ -38,6 +38,11 @@ pub struct HarnessProfile {
     pub compaction_threshold_pct: f64,
     /// Explicit compaction policy; routing must preserve the operator's choice.
     pub compaction_strategy: CompactionStrategy,
+    /// Upper bound on the window compaction budgets derive from.
+    pub compaction_context_ceiling: usize,
+    /// Serve compaction's summary calls at this window, where the provider
+    /// can resize per request. Unset keeps the everyday window.
+    pub compaction_expand_ctx: Option<u32>,
 
     // --- Tool delivery ---
     /// How a tool found mid-run reaches the model: `"append"` (its schema
@@ -72,6 +77,8 @@ impl Default for HarnessProfile {
             max_context_tokens: 128_000,
             compaction_threshold_pct: 0.85,
             compaction_strategy: CompactionStrategy::default(),
+            compaction_context_ceiling: crate::compaction::DEFAULT_CONTEXT_CEILING,
+            compaction_expand_ctx: None,
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
             result_report_reminder: true,
@@ -119,6 +126,8 @@ impl HarnessProfile {
             max_context_tokens: self.max_context_tokens,
             compaction_threshold_pct: self.compaction_threshold_pct,
             compaction_strategy: self.compaction_strategy,
+            compaction_context_ceiling: self.compaction_context_ceiling,
+            compaction_expand_ctx: self.compaction_expand_ctx,
             late_tool_binding: self.late_tool_binding,
             tool_search_miss_limit: self.tool_search_miss_limit,
             result_report_reminder: self.result_report_reminder,
