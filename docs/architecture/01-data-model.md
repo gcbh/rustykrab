@@ -1050,3 +1050,19 @@ transport ignores retired selectors; reviewed-template matching ignores them
 while retaining exact scope, objectives and budgets. Recovery of legacy
 worker-unavailable rows uses existing transitions and question settlements;
 audit rows are retained. No schema migration is needed.
+
+## Exact file grants in worker configuration
+
+The scheduling repair against 5bc3309 adds the default-empty `writable_files`
+array to WorkerSpec, serialized inside `workers.config`. Empty grants omit the
+field, so historical configurations remain valid. Each grant names one exact
+output file; derived capabilities advertise `file:<absolute path>`. No table,
+index, foreign key or second lease ledger is introduced. Worktree-isolation
+state is transient on live runs and recovered conservatively after restart.
+
+The separate default-empty `readable_files` worker option grants exact read-only
+inputs (`worker add --readable-files PATH[,PATH...]`). Reads may use those inputs;
+write/edit calls still require a requested exact output grant or the run's own
+repository worktree. Input grants do not advertise writable resources and remain
+out of native shell arguments. The native host path preserves both grant arrays
+from its stored spec.

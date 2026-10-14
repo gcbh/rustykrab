@@ -149,6 +149,10 @@ impl Worker for CodingWorker {
     fn accepts(&self, item: &WorkItem) -> bool {
         self.worker.accepts(item)
     }
+    fn isolates_worktree(&self) -> bool {
+        self.worker.isolates_worktree()
+    }
+
     fn healthy(&self) -> bool {
         self.worker.healthy()
     }

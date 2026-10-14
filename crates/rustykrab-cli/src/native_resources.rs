@@ -92,6 +92,8 @@ impl NativeWorker {
             tools.integrations,
         )
         .map_err(|e| e.to_string())?
+        .with_writable_files(&config.writable_files)
+        .with_readable_files(&config.readable_files)
         // The host half's runs leave session logs where the native half's
         // do, so either is opened from the same evidence.
         .with_run_logs(
@@ -144,6 +146,10 @@ impl Worker for NativeWorker {
             self.native.accepts(item)
         }
     }
+    fn isolates_worktree(&self) -> bool {
+        self.native.isolates_worktree() && self.host.isolates_worktree()
+    }
+
     fn concurrency(&self) -> usize {
         self.native.concurrency()
     }

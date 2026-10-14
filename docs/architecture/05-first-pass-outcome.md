@@ -240,3 +240,33 @@ real controller/SQLite store for a 40-item list plus a missing boundary ID,
 and for a multi-page subtree. This establishes interface continuity; it does
 not repair the independent empty/truncated-summary model failures or claim
 that a model will always choose to read the next page.
+
+## Scheduling barriers in the live queue (base 5bc3309)
+
+A read-only October 14 audit found one repeatedly dispatched planner item,
+17 dependency-waiting leaves, one queued parent and a ready audit-file item
+matching no worker's declared scope, while Codex and Fieldkit Claude were
+healthy. Every repository writer also contended on one repository-wide lock,
+even though the execution adapters supplied isolated worktrees.
+
+The repair permits opted-in execution in independent first-repository worktrees,
+preserves shared external locks and explicit ordering, and adds exact operator
+file grants through the existing native host-tool path. It also rechecks durable
+controller improve-rung waits on stopped or budget-exhausted prerequisites; the
+same audit identified four such legacy waits. It does not remove ordinary
+blocked dependencies or widen approval authority.
+
+Regression evidence includes three overlapping Local/Codex/Claude stand-in runs
+creating real distinct worktrees and verified independent commits, subsequent
+clean integration without moving repository HEAD, shared-resource exclusion,
+non-isolating executor serialization, exact-file creation/read/edit with sibling
+and symlink refusal, and restart/idempotent recovery preserving an ordinary
+ordering edge on the same prerequisite. These tests establish scheduler and
+scope behavior, not model reasoning quality or live deployment.
+
+A completed capability can wake a parked item only when at least one prerequisite
+landed after its latest hold. If execution subsequently reports the same missing
+capability, the old completion is not new evidence and cannot restart it forever.
+A live audit observed the same planner item repeatedly surfacing a missing
+controller-dispatch tool and being awakened by an already completed capability.
+The regression checks old, newly landed and subsequently stale completions.

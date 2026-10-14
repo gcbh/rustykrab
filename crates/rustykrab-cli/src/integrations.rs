@@ -333,6 +333,18 @@ impl IntegrationWorker {
             true,
         )
     }
+    pub(crate) fn with_readable_files(mut self, files: &[String]) -> Self {
+        self.worker = self.worker.with_readable_files(files);
+        self
+    }
+
+    pub(crate) fn with_writable_files(mut self, files: &[String]) -> Self {
+        self.worker = self.worker.with_writable_files(files);
+        self.resources
+            .extend(files.iter().map(|p| format!("file:{p}")));
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn general(
         name: &str,
@@ -492,6 +504,10 @@ impl Worker for IntegrationWorker {
                 .iter()
                 .all(|r| self.resources.contains(r))
     }
+    fn isolates_worktree(&self) -> bool {
+        self.worker.isolates_worktree()
+    }
+
     fn healthy(&self) -> bool {
         self.worker.healthy()
     }

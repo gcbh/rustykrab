@@ -14,6 +14,7 @@ use rustykrab_core::Error;
 
 use super::{draft, Harness};
 use crate::controller::ControllerConfig;
+use crate::handle::ControlHandle;
 use crate::routing::CODE;
 use crate::worker::{Brief, RunUsage, Worker, WorkerCapabilities};
 use crate::workspace::tests::{commit_all, run_git, Repo};
@@ -684,4 +685,165 @@ async fn an_accepted_routing_proposal_moves_the_default_tier() {
         claude.briefs.lock().unwrap().is_empty(),
         "legacy category tiers cannot force a backend"
     );
+}
+
+struct ParallelCoder {
+    name: &'static str,
+    kind: WorkerKind,
+    repo: String,
+    release: Arc<tokio::sync::Notify>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    isolated: bool,
+    extra: Vec<String>,
+}
+#[async_trait]
+impl Worker for ParallelCoder {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn kind(&self) -> WorkerKind {
+        self.kind
+    }
+    fn isolates_worktree(&self) -> bool {
+        self.isolated
+    }
+    fn capabilities(&self) -> WorkerCapabilities {
+        let mut resources = vec![format!("{REPO_PREFIX}{}", self.repo)];
+        resources.extend(self.extra.clone());
+        WorkerCapabilities {
+            models: vec![self.name.into()],
+            repos: vec![self.repo.clone()],
+            writable_resources: resources,
+            ..Default::default()
+        }
+    }
+    async fn run(&self, brief: Brief) -> Result<ResultReport, Error> {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        let ws = brief.workspace.unwrap();
+        let filename = format!("{}.txt", self.name);
+        tokio::task::spawn_blocking(move || {
+            ws.create().map_err(Error::Internal)?;
+            std::fs::write(ws.path.join(&filename), "verified independent change").unwrap();
+            let commit = commit_all(&ws.path, "parallel change");
+            ws.remove().map_err(Error::Internal)?;
+            Ok(ResultReport {
+                summary: "Completed isolated change".into(),
+                commit: Some(commit),
+                changed_paths: vec![filename],
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn three_models_execute_the_same_repository_in_distinct_worktrees_and_preserve_head() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let head = run_git(repo.path(), &["rev-parse", "HEAD"]);
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let releases: Vec<_> = (0..3)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect();
+    let kinds = [WorkerKind::Local, WorkerKind::Codex, WorkerKind::ClaudeCode];
+    let fleet: Vec<Arc<dyn Worker>> = ["qwen", "codex", "claude"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            Arc::new(ParallelCoder {
+                name,
+                kind: kinds[i],
+                repo: repo.path().display().to_string(),
+                release: releases[i].clone(),
+                entered: entered.clone(),
+                isolated: true,
+                extra: vec![],
+            }) as Arc<dyn Worker>
+        })
+        .collect();
+    let h = Harness::with_fleet(config(&root), fleet);
+    let mut ids = vec![];
+    for name in ["first", "second", "third"] {
+        ids.push(h.file_one(code_draft(name, &repo, WorkerKind::Any)).await);
+    }
+    assert_eq!(h.tick().await.leased.len(), 3);
+    for _ in 0..100 {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let mut branches = std::collections::HashSet::new();
+    for id in &ids {
+        let ws = h.ctl.workspace_of(id).await.unwrap().unwrap();
+        assert!(branches.insert(ws.branch));
+    }
+    for release in releases {
+        release.notify_one();
+    }
+    h.drain().await;
+    let mut commits = vec![];
+    for id in &ids {
+        assert_eq!(h.status(id).await, Status::Done);
+        commits.extend(
+            h.store()
+                .work_evidence_list(id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "commit" && e.verified_by.as_deref() == Some("git"))
+                .map(|e| e.reference.clone()),
+        );
+    }
+    assert_eq!(commits.len(), 3);
+    assert_eq!(run_git(repo.path(), &["rev-parse", "HEAD"]), head);
+    let integrated = crate::workspace::continuation_base(repo.path(), &head, &commits).unwrap();
+    for name in ["qwen", "codex", "claude"] {
+        assert_eq!(
+            run_git(repo.path(), &["show", &format!("{integrated}:{name}.txt")]),
+            "verified independent change"
+        );
+    }
+}
+
+#[tokio::test]
+async fn isolation_does_not_relax_a_shared_non_repository_resource_or_an_unisolated_executor() {
+    for isolated in [true, false] {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let workers: Vec<Arc<dyn Worker>> = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(ParallelCoder {
+                    name,
+                    kind: WorkerKind::Codex,
+                    repo: repo.path().display().to_string(),
+                    release: release.clone(),
+                    entered: entered.clone(),
+                    isolated,
+                    extra: vec!["mailbox:shared".into()],
+                }) as Arc<dyn Worker>
+            })
+            .collect();
+        let h = Harness::with_fleet(config(&root), workers);
+        for name in ["first", "second"] {
+            let mut d = code_draft(name, &repo, WorkerKind::Any);
+            if isolated {
+                d.writable_resources.push("mailbox:shared".into());
+            }
+            h.file_one(d).await;
+        }
+        assert_eq!(h.tick().await.leased.len(), 1);
+        assert_eq!(h.tick().await.leased.len(), 0);
+        h.ctl.set_draining(true);
+        release.notify_one();
+        h.drain().await;
+    }
 }

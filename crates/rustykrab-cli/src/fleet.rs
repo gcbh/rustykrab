@@ -43,6 +43,9 @@ pub(crate) struct AgentFactory {
 impl WorkerFactory for AgentFactory {
     fn build(&self, name: &str, spec: &WorkerSpec) -> Result<Arc<dyn Worker>, String> {
         if spec.kind == rustykrab_core::work::WorkerKind::Peer {
+            if !spec.writable_files.is_empty() || !spec.readable_files.is_empty() {
+                return Err("host file grants apply only to local subscription resources".into());
+            }
             return crate::peers::build(name, spec);
         }
         let config = ExternalConfig::from_spec(spec, &self.data_dir)?;
@@ -52,6 +55,9 @@ impl WorkerFactory for AgentFactory {
                     name, config, host,
                 )?));
             }
+        }
+        if !config.writable_files.is_empty() || !config.readable_files.is_empty() {
+            return Err("writable_files needs the daemon's scoped host-tool resource".into());
         }
         Ok(Arc::new(ExternalWorker::new(name, config)))
     }

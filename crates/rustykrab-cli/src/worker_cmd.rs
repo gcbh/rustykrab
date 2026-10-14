@@ -28,6 +28,7 @@ usage: rustykrab workers
              [--permission-mode M] [--timeout SECONDS]
              [--allowed-tools T[,T...]] [--denied-tools T[,T...]]
              [--cost-tier N] [--env VAR[,VAR...]]
+             [--writable-files PATH[,PATH...]] [--readable-files PATH[,PATH...]]
                                  add an external coding worker; the registry
                                  names it when --name is left out;
                                  --denied-tools adds to claude_code's deny
@@ -156,6 +157,12 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
                 }
                 i = j;
                 continue;
+            }
+            "--readable-files" => {
+                spec.readable_files = split_list(value(i)?).iter().map(|p| absolute(p)).collect()
+            }
+            "--writable-files" => {
+                spec.writable_files = split_list(value(i)?).iter().map(|p| absolute(p)).collect()
             }
             "--name" => spec.name = Some(value(i)?.to_string()),
             "--command" => spec.command = Some(absolute_if_path(value(i)?)),

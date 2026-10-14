@@ -386,3 +386,14 @@ Repository scope permits inspection without edits. When no Git changes are
 claimed, a clean worktree at its starting commit records `repository_unchanged`
 evidence rather than requiring an invented commit. Unreported edits and false
 commit/path claims still fail verification.
+
+## Concurrent bounded work (base 5bc3309)
+
+Independent first-repository tasks can execute together in controller-owned
+worktrees on opted-in workers. Shared external resources and extra repositories
+remain serialized; verified git histories integrate through the existing
+continuation-base path without moving the user's checkout. Exact operator file
+grants give native subscription resources bounded host-file output tools while
+retaining per-account capacity and authentication. Sweep recovery releases only
+receipt-proven controller failure waits on stopped prerequisites, leaving
+ordinary dependencies and consent intact.

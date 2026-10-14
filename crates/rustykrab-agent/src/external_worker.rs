@@ -411,6 +411,9 @@ pub struct ExternalConfig {
     pub command: PathBuf,
     /// Repositories it may work in, as given (`repo:<path>` resources).
     pub repos: Vec<String>,
+    /// Exact host-tool file grants; never exposed as native shell directories.
+    pub writable_files: Vec<String>,
+    pub readable_files: Vec<String>,
     pub model: Option<String>,
     pub claude_config_dir: Option<PathBuf>,
     pub require_max: bool,
@@ -492,6 +495,32 @@ impl ExternalConfig {
         {
             return Err("ChatGPT runtimes refuse OpenAI/Codex/Azure environment overrides; select codex_home instead".into());
         }
+        if !spec.writable_files.is_empty() || !spec.readable_files.is_empty() {
+            if !spec.require_max && !spec.require_chatgpt {
+                return Err(
+                    "writable_files requires a subscription resource with scoped host tools".into(),
+                );
+            }
+            for file in spec.writable_files.iter().chain(&spec.readable_files) {
+                let path = Path::new(file);
+                if !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir)
+                    || path.parent().is_none_or(|p| !p.is_dir())
+                    || path.is_dir()
+                    || std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err("writable_files must name absolute non-symlink files with existing parent directories".into());
+                }
+                rustykrab_tools::security::validate_path_in(path.parent().unwrap(), file)?;
+            }
+            if spec.kind == WorkerKind::ClaudeCode && !spec.denied_tools.is_empty() {
+                return Err(
+                    "writable_files cannot bypass an explicit Claude native deny policy".into(),
+                );
+            }
+        }
         let denied_tools: Vec<String> = spec
             .denied_tools
             .iter()
@@ -511,6 +540,8 @@ impl ExternalConfig {
             kind: spec.kind,
             command: PathBuf::from(spec.command.as_deref().unwrap_or(default_command)),
             repos: spec.repos.iter().map(|r| r.trim().to_string()).collect(),
+            writable_files: spec.writable_files.clone(),
+            readable_files: spec.readable_files.clone(),
             model: spec.model.clone(),
             claude_config_dir: spec.claude_config_dir.as_ref().map(PathBuf::from),
             require_max: spec.require_max,
@@ -1258,6 +1289,10 @@ impl Worker for ExternalWorker {
                 .map(|r| format!("{REPO_PREFIX}{r}"))
                 .collect(),
         }
+    }
+
+    fn isolates_worktree(&self) -> bool {
+        true
     }
 
     fn concurrency(&self) -> usize {

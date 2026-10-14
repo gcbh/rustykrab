@@ -160,7 +160,8 @@ pub(super) fn waiting_on_mcp(
         .collect()
 }
 
-/// Items parked on capability items that have all landed.
+/// All capability prerequisites are done and at least one landed after the
+/// current hold. Old successes cannot reawaken a freshly failed attempt.
 pub(super) fn parked_on_landed_capability(snap: &Snapshot) -> Vec<WorkItemId> {
     snap.items()
         .iter()
@@ -178,7 +179,13 @@ pub(super) fn parked_on_landed_capability(snap: &Snapshot) -> Vec<WorkItemId> {
                 })
                 .map(|e| e.depends_on.as_str())
                 .collect();
-            !caps.is_empty() && caps.iter().all(|c| snap.status(c) == Some(Status::Done))
+            !caps.is_empty()
+                && caps.iter().all(|c| snap.status(c) == Some(Status::Done))
+                && caps.iter().any(|c| {
+                    snap.item(c)
+                        .and_then(|u| u.closed_at)
+                        .is_some_and(|closed| closed > i.updated_at)
+                })
         })
         .map(|i| i.id.clone())
         .collect()
@@ -251,6 +258,7 @@ impl Controller {
     ) -> FilingContext {
         let mut ctx = FilingContext::new(source, now);
         ctx.caps = self.config.caps;
+        ctx.isolated_repo_writes = self.config.worktree_root.is_some();
         ctx.sequential_split = self.config.split_mode;
         ctx.default_budget = self.config.default_budget;
         ctx.supersede_limit = self.config.supersede_limit;
@@ -507,9 +515,9 @@ impl Controller {
     /// from a standalone item form one post-task graph so sibling references
     /// remain valid. One standalone draft stays its own root. Each draft inherits the
     /// item's `repo:` resources and worker constraint unless it sets its own
-    /// ([`inherit_from`]), drafts sharing a repository are ordered among
+    /// ([`inherit_from`]), drafts sharing non-isolated resources are ordered among
     /// themselves ([`order_repo_writers`]), and every draft runs after the
-    /// open writers of its repositories under the parent
+    /// open writers of its shared resources under the parent
     /// ([`order_after_open_writers`]), whether it inherited the repository or
     /// named it. A rejection is recorded on the item. Returns the ids to
     /// settle.
@@ -535,8 +543,13 @@ impl Controller {
         }
         let plans: Vec<WorkPlan> = match &item.parent {
             Some(parent) => {
-                order_repo_writers(&mut drafts);
-                order_after_open_writers(&b.snap, parent, &mut drafts);
+                order_repo_writers(&mut drafts, self.config.worktree_root.is_some());
+                order_after_open_writers(
+                    &b.snap,
+                    parent,
+                    &mut drafts,
+                    self.config.worktree_root.is_some(),
+                );
                 vec![WorkPlan {
                     root: ItemRef::Id(parent.clone()),
                     items: drafts,
@@ -554,7 +567,7 @@ impl Controller {
                 }]
             }
             None => {
-                order_repo_writers(&mut drafts);
+                order_repo_writers(&mut drafts, self.config.worktree_root.is_some());
                 let mut tmp = "post_tasks".to_string();
                 while drafts.iter().any(|d| d.tmp.as_deref() == Some(&tmp)) {
                     tmp.push('_');
@@ -775,7 +788,7 @@ impl Controller {
         // failing item is added to its evidence and goes on with its own
         // ladder.
         if let Some(parked) = existing.as_ref().filter(|i| {
-            i.held_by.is_none() && matches!(i.status, Status::Blocked(r) if r.needs_user())
+            i.held_by.is_none() && matches!(i.status, Status::Blocked(r) if r.needs_user() || r == BlockedReason::BudgetExhausted)
         }) {
             let artifact = ArtifactRef {
                 kind: "item".to_string(),
@@ -1345,22 +1358,21 @@ fn repos_of(resources: &[String]) -> Vec<&str> {
     repos
 }
 
-/// Drafts filed as one graph that write the same repository, inherited or
-/// named themselves, run in the order the worker listed them: each gets a
-/// `blocks` edge on the last earlier draft writing that repository, unless
-/// one already depends on the other through the drafts' own edges (an edge
-/// then would be redundant or close a cycle). Two unordered writers of one
-/// resource are a `single_writer_conflict`, and a worker's list is the only
-/// order it gives, so without this a second follow-up in the same
-/// repository would reject the whole filing. Every draft carries a `tmp`.
-fn order_repo_writers(drafts: &mut [WorkItemDraft]) {
+/// Order discovered writers of shared resources. The first repository may
+/// remain independent when controller worktrees are enabled; other writes keep
+/// their listing order unless the drafts already supply an ordering path.
+fn order_repo_writers(drafts: &mut [WorkItemDraft], isolated: bool) {
     for i in 1..drafts.len() {
         let mut upstreams: Vec<usize> = Vec::new();
-        for r in drafts[i].writable_resources.iter().filter(|r| is_repo(r)) {
-            let Some(j) = (0..i)
-                .rev()
-                .find(|&j| drafts[j].writable_resources.contains(r))
-            else {
+        for r in &drafts[i].writable_resources {
+            let Some(j) = (0..i).rev().find(|&j| {
+                crate::workspace::shared_resources(
+                    &drafts[i].writable_resources,
+                    &drafts[j].writable_resources,
+                    isolated,
+                )
+                .contains(&r)
+            }) else {
                 continue;
             };
             if !upstreams.contains(&j) {
@@ -1409,10 +1421,14 @@ fn depends(drafts: &[WorkItemDraft], from: usize, to: usize) -> bool {
 /// Discovered drafts filed under `root` run after the open items already
 /// there that write one of their repositories: each gets a `blocks` edge
 /// on every such open leaf, unless it already names one or files under it.
-/// A discovered draft is follow-up work, so it queues behind the writers in
-/// flight rather than rejecting the filing as a `single_writer_conflict`;
-/// this holds for a repository the draft named as for one it inherited.
-fn order_after_open_writers(snap: &Snapshot, root: &str, drafts: &mut [WorkItemDraft]) {
+/// Follow-ups queue behind open writers only for actual shared resources;
+/// isolated first-repository execution needs no synthetic dependency.
+fn order_after_open_writers(
+    snap: &Snapshot,
+    root: &str,
+    drafts: &mut [WorkItemDraft],
+    isolated: bool,
+) {
     let writers: Vec<&WorkItem> = snap
         .descendants(root)
         .iter()
@@ -1421,10 +1437,12 @@ fn order_after_open_writers(snap: &Snapshot, root: &str, drafts: &mut [WorkItemD
         .collect();
     for d in drafts.iter_mut() {
         for w in &writers {
-            let writes = d
-                .writable_resources
-                .iter()
-                .any(|r| is_repo(r) && w.writable_resources.contains(r));
+            let writes = !crate::workspace::shared_resources(
+                &d.writable_resources,
+                &w.writable_resources,
+                isolated,
+            )
+            .is_empty();
             let upstream = ItemRef::Id(w.id.clone());
             let linked = d.parent.as_ref() == Some(&upstream)
                 || d.edges.iter().any(|e| e.depends_on == upstream);
