@@ -286,7 +286,8 @@ mod tests {
     #[tokio::test]
     async fn local_coding_forwards_probes_to_its_local_worker() {
         use rustykrab_control::capability_proof::{
-            probe_inputs_digest, ExpectedOperation, ProbeRequest, RegisteredAction,
+            probe_inputs_digest, ExpectedOperation, ProbeOutcome, ProbeRequest, ProbeScope,
+            RegisteredAction,
         };
         let mut c = config("http://127.0.0.1:11434");
         c.repositories = vec![PathBuf::from("/fixture")];
@@ -299,38 +300,65 @@ mod tests {
             Arc::new(Discard),
             Arc::new(Semaphore::new(1)),
         );
-        let scope = worker
-            .probe_scope(None)
-            .expect("the wrapper has its local worker's probe scope");
-        assert_eq!(scope.worker, worker.name());
         assert_ne!(
             worker.access_profile(),
             serde_json::to_value(worker.capabilities()).unwrap(),
             "the wrapper's access profile is its local worker's, not the advertised default"
         );
-        let action = RegisteredAction::BinaryAvailable {
+        let node = RegisteredAction::BinaryAvailable {
             binary: "node".into(),
         };
-        let expected = ExpectedOperation {
-            operation: action.operation(),
-            executor: worker.name().to_string(),
-            inputs_digest: probe_inputs_digest(&action, &scope),
-            generation: "fixture:1".into(),
-            run: "probe-fixture".into(),
+        let request = |scope: ProbeScope| ProbeRequest {
+            expected: ExpectedOperation {
+                operation: node.operation(),
+                executor: worker.name().to_string(),
+                inputs_digest: probe_inputs_digest(&node, &scope),
+                generation: "fixture:1".into(),
+                run: "probe-fixture".into(),
+            },
+            action: node.clone(),
+            scope,
+            deadline: std::time::Duration::from_secs(10),
         };
-        let probe = worker
-            .probe(&ProbeRequest {
-                expected,
-                action,
-                scope,
-                deadline: std::time::Duration::from_secs(10),
-            })
-            .await;
-        assert!(
-            !probe.observation.contains("cannot observe"),
-            "the local worker observed it, whatever the host has: {}",
+
+        // Without a bound directory the repository shell has no exec, so the
+        // probe cannot run and says so.
+        let unbound = worker
+            .probe_scope(None)
+            .expect("the wrapper has its local worker's probe scope");
+        assert_eq!(unbound.worker, worker.name());
+        let probe = worker.probe(&request(unbound)).await;
+        assert_eq!(
+            probe.outcome,
+            ProbeOutcome::Unobserved,
+            "{}",
             probe.observation
         );
+        assert_eq!(
+            probe.observation,
+            "registered tool is absent from this worker"
+        );
+
+        // Bound to a real directory, the local worker runs `node --version`
+        // there through its own exec: Ok where the host has node, Failed
+        // where it does not, never unobserved.
+        let dir = tempfile::tempdir().unwrap();
+        let bound = worker
+            .probe_scope(Some(dir.path().to_path_buf()))
+            .expect("the wrapper has its local worker's probe scope");
+        assert_eq!(bound.bound_dir.as_deref(), Some(dir.path()));
+        let probe = worker.probe(&request(bound)).await;
+        let host_has_node = std::process::Command::new("node")
+            .arg("--version")
+            .current_dir(dir.path())
+            .output()
+            .is_ok_and(|out| out.status.success());
+        let expected = if host_has_node {
+            ProbeOutcome::Ok
+        } else {
+            ProbeOutcome::Failed
+        };
+        assert_eq!(probe.outcome, expected, "{}", probe.observation);
     }
 
     #[test]

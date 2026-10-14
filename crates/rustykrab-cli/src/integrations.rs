@@ -600,13 +600,34 @@ impl Worker for IntegrationWorker {
         Worker::probe_scope(&self.worker, bound_dir)
     }
     /// Probes take the same serial slot as runs, then go to the local
-    /// worker, which performs the registered action itself.
+    /// worker, which performs the registered action itself. The wait for
+    /// the slot counts against the request's deadline: the local worker
+    /// gets only what is left, and a probe still waiting when it runs out
+    /// is unobserved.
     async fn probe(
         &self,
         request: &rustykrab_control::capability_proof::ProbeRequest,
     ) -> rustykrab_control::capability_proof::OperationProbe {
-        let _serial = self.serial.lock().await;
-        Worker::probe(&self.worker, request).await
+        use rustykrab_control::capability_proof::{ProbeOutcome, ProbeRequest};
+        let started = std::time::Instant::now();
+        let Ok(_serial) = tokio::time::timeout(request.deadline, self.serial.lock()).await else {
+            return request.expected.observation(
+                ProbeOutcome::Unobserved,
+                "probe deadline elapsed waiting for this worker's serial slot",
+            );
+        };
+        let remaining = request.deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return request.expected.observation(
+                ProbeOutcome::Unobserved,
+                "probe deadline elapsed waiting for this worker's serial slot",
+            );
+        }
+        let request = ProbeRequest {
+            deadline: remaining,
+            ..request.clone()
+        };
+        Worker::probe(&self.worker, &request).await
     }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
@@ -1045,6 +1066,56 @@ mod tests {
         );
         assert!(
             matches!(inner.calls().as_slice(),[WorkCall::Report { report,.. }] if report==&accepted)
+        );
+    }
+
+    /// A probe waiting behind a run for the serial slot gives up at its own
+    /// deadline, not only at the controller's outer timeout.
+    #[tokio::test]
+    async fn a_probe_waits_for_the_serial_slot_only_until_its_deadline() {
+        use rustykrab_control::capability_proof::{
+            probe_inputs_digest, ExpectedOperation, ProbeOutcome, ProbeRequest, RegisteredAction,
+        };
+        use rustykrab_tools::work_backend::StubWorkBackend;
+        let worker = IntegrationWorker::new_named(
+            "fixture-integrations",
+            Some("fixture-model".into()),
+            Arc::new(Scripted(Mutex::new(Default::default()), "ollama")),
+            vec![],
+            Arc::new(StubWorkBackend::new()),
+            Arc::new(DiscardTranscripts),
+            Arc::new(Semaphore::new(1)),
+        )
+        .unwrap();
+        let action = RegisteredAction::ToolCallable {
+            tool: "work_resources".into(),
+            args: serde_json::json!({}),
+        };
+        let scope = Worker::probe_scope(&worker, None)
+            .expect("the wrapper has its local worker's probe scope");
+        let request = ProbeRequest {
+            expected: ExpectedOperation {
+                operation: action.operation(),
+                executor: worker.name().to_string(),
+                inputs_digest: probe_inputs_digest(&action, &scope),
+                generation: "fixture:1".into(),
+                run: "probe-fixture".into(),
+            },
+            action,
+            scope,
+            deadline: std::time::Duration::from_millis(200),
+        };
+        let _run = worker.serial.lock().await;
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Worker::probe(&worker, &request),
+        )
+        .await
+        .expect("the probe returns at its own deadline, not when the run ends");
+        assert_eq!(probe.outcome, ProbeOutcome::Unobserved);
+        assert_eq!(
+            probe.observation,
+            "probe deadline elapsed waiting for this worker's serial slot"
         );
     }
 }
