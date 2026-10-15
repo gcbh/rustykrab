@@ -144,13 +144,17 @@ impl Worker for Agent {
         self.log_of.lock().unwrap().insert(run, log);
         let act = self.next(&brief.title);
         let ws = brief.workspace.clone();
+        let run_id = brief.run.clone().unwrap_or_default();
         tokio::task::spawn_blocking(move || {
             if let Some(ws) = &ws {
                 ws.create().map_err(Error::Internal)?;
             }
+            // Content unique to the run: a constant body commits nothing
+            // when the worktree's base already has that file, and git
+            // refuses an empty commit.
             let commit = |file: &str| -> Option<String> {
                 let ws = ws.as_ref()?;
-                std::fs::write(ws.path.join(file), format!("// {file}\n")).unwrap();
+                std::fs::write(ws.path.join(file), format!("// {file} {run_id}\n")).unwrap();
                 Some(commit_all(&ws.path, "change"))
             };
             match act {
