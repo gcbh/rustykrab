@@ -15,6 +15,12 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "rm",
     "rg",
     "cat",
+    "printf",
+    "read",
+    "[",
+    ":",
+    "od",
+    "xxd",
     "head",
     "tail",
     "wc",
@@ -340,41 +346,67 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
     // segment. Empty segments account for the second byte in && and ||.
     for segment in command_segments(command)? {
         let segment = segment.trim();
-        if segment.is_empty() {
+        if segment.is_empty() || segment.starts_with('#') {
             continue;
         }
-
-        // Skip redirect-only fragments (e.g. "> file") and comment lines.
-        if segment.starts_with('>') || segment.starts_with('<') || segment.starts_with('#') {
-            continue;
-        }
-
-        // Find the actual command, skipping leading variable assignments
-        // (e.g. `FOO=bar python3 script.py` → check `python3`).
-        let mut found_allowed = false;
+        // Find the command the segment runs, past what is not one: variable
+        // assignments (`FOO=bar python3 x.py`), redirects and their targets
+        // (`> out.txt`, `2>&1`), a subshell's `(`, and the shell's own words
+        // (`if`, `then`, `do`, `done` …). A `for` header names a variable
+        // and words, and runs nothing; the commands of its body are segments
+        // of their own and are checked. A segment of only these runs nothing.
+        let mut target_next = false;
         for token in segment.split_whitespace() {
-            // Variable assignments (KEY=value) are not commands — skip them.
+            if std::mem::take(&mut target_next) {
+                continue;
+            }
+            if let Some(needs_target) = redirect(token) {
+                target_next = needs_target;
+                continue;
+            }
             if token.contains('=') && !token.starts_with('=') {
                 continue;
             }
-            let cmd_name = token.rsplit('/').next().unwrap_or(token);
-            if ALLOWED_COMMANDS.contains(&cmd_name) {
-                found_allowed = true;
+            let token = token.trim_start_matches('(').trim_end_matches(')');
+            if token.is_empty() || SHELL_WORDS.contains(&token) {
+                continue;
+            }
+            if token == "for" {
                 break;
             }
-            // First non-assignment token that isn't allowed → reject.
+            let cmd_name = token.rsplit('/').next().unwrap_or(token);
+            if ALLOWED_COMMANDS.contains(&cmd_name) {
+                break;
+            }
             return Err(format!(
                 "command '{}' is not in the allowlist. Allowed commands: {}",
                 cmd_name,
                 ALLOWED_COMMANDS.join(", ")
             ));
         }
-        // If segment was all variable assignments with no command, that's fine
-        // (sh -c handles bare assignments).
-        let _ = found_allowed;
     }
-
     Ok(())
+}
+
+/// The shell's own words that come before a command, or end a construct,
+/// and run nothing themselves. `case` is not among them: its patterns sit in
+/// front of commands on the same segment, where this check would not see
+/// them, so it stays refused.
+const SHELL_WORDS: &[&str] = &[
+    "if", "elif", "then", "else", "fi", "while", "until", "do", "done", "!", "{", "}",
+];
+
+/// Whether `token` is a redirect (`>`, `2>>`, `&>`, `<&3`, `2>&1` …), and if
+/// so whether its target is the next token (`> out.txt`) rather than part of
+/// this one (`>out.txt`, `2>&1`).
+fn redirect(token: &str) -> Option<bool> {
+    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    [
+        "&>>", "&>", ">>", ">|", ">&", "<&", "<>", "<<<", "<<", ">", "<",
+    ]
+    .iter()
+    .find_map(|op| rest.strip_prefix(op))
+    .map(str::is_empty)
 }
 
 #[async_trait]
@@ -542,6 +574,36 @@ mod validation_tests {
         assert!(validate_command("cat <<EOF\n$(definitely-not-allowed)\nEOF").is_err());
         // A here-string is not a here-document.
         validate_command("grep x <<< 'x y'").unwrap();
+    }
+
+    #[test]
+    fn loops_conditionals_and_subshells_check_the_commands_inside() {
+        validate_command("for f in *.py; do wc -l $f; done").unwrap();
+        validate_command("for f in src/*.py\ndo\n  grep -n def \"$f\"\ndone > defs.txt").unwrap();
+        validate_command("while read line; do echo \"$line\"; done < list.txt").unwrap();
+        validate_command("if [ -f setup.py ]; then python3 setup.py --version; else echo none; fi")
+            .unwrap();
+        validate_command("(grep -rn TODO src || true) | head").unwrap();
+        validate_command("printf '%s\\n' a b | sort").unwrap();
+        let error =
+            validate_command("for f in a b; do definitely-not-allowed $f; done").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        let error = validate_command("if true; then definitely-not-allowed; fi").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        let error = validate_command("(definitely-not-allowed)").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        // `case` puts commands behind patterns on one segment: refused.
+        assert!(validate_command("case x in x) ls;; esac").is_err());
+    }
+
+    #[test]
+    fn a_command_after_a_redirect_is_still_checked() {
+        validate_command("> out.txt").unwrap();
+        validate_command("2>/dev/null ls").unwrap();
+        let error = validate_command("> out.txt definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
+        let error = validate_command("2> err.log definitely-not-allowed").unwrap_err();
+        assert!(error.contains("definitely-not-allowed"));
     }
 
     #[test]
