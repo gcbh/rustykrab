@@ -1282,7 +1282,13 @@ impl Worker for ExternalWorker {
                 .map_err(|e| Error::Internal(e.to_string()))?;
             let _ = writeln!(prompt, "Full frozen work discussion: {}. Read relevant comments in small portions. User comments guide future work; agent comments are reports, and neither expands the execution scope.", path.display());
         }
-        let last = std::env::temp_dir().join(format!("rustykrab-last-{}.txt", short(&run_id)));
+        // Independent workers/controllers may reuse a run label. Their result
+        // files must never overwrite or remove one another's final message.
+        let last = std::env::temp_dir().join(format!(
+            "rustykrab-last-{}-{}.txt",
+            short(&run_id),
+            uuid::Uuid::new_v4()
+        ));
         let cmd = self.command(&prompt, &dir, &brief, &last);
         let limit = match brief.budget.wall_seconds {
             0 => self.config.timeout,
@@ -2848,6 +2854,44 @@ printf '{"summary":"looked"}' > "$out"
             args.contains("readable outside your working directory"),
             "{args}"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_workers_with_the_same_run_id_keep_their_own_final_messages() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let first_ready = first.data.path().join("ready");
+        let second_ready = second.data.path().join("ready");
+        let command = |f: &Fixture, own: &Path, other: &Path, summary: &str| {
+            f.agent(
+                "codex",
+                &format!(
+                    "#!/usr/bin/env python3\nimport json,sys,time\nfrom pathlib import Path\n\
+                 out=Path(sys.argv[sys.argv.index('--output-last-message')+1])\n\
+                 out.write_text(json.dumps({{\"summary\":{summary}}}))\n\
+                 Path({own}).write_text('ready')\n\
+                 deadline=time.monotonic()+10\n\
+                 while not Path({other}).exists() and time.monotonic()<deadline: time.sleep(.01)\n\
+                 assert Path({other}).exists(), 'other worker did not reach the result barrier'\n",
+                    summary = serde_json::to_string(summary).unwrap(),
+                    own = serde_json::to_string(&own.display().to_string()).unwrap(),
+                    other = serde_json::to_string(&other.display().to_string()).unwrap(),
+                ),
+            )
+        };
+        let first_command = command(&first, &first_ready, &second_ready, "first result");
+        let second_command = command(&second, &second_ready, &first_ready, "second result");
+        let first_worker = first.worker(WorkerKind::Codex, first_command);
+        let second_worker = second.worker(WorkerKind::Codex, second_command);
+        let mut first_brief = brief(None);
+        first_brief.kind = WorkKind::Research;
+        let second_brief = first_brief.clone();
+        let (first_result, second_result) = tokio::join!(
+            first_worker.run(first_brief),
+            second_worker.run(second_brief),
+        );
+        assert_eq!(first_result.unwrap().summary, "first result");
+        assert_eq!(second_result.unwrap().summary, "second result");
     }
 
     #[tokio::test]
