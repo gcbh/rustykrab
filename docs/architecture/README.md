@@ -83,7 +83,8 @@ is taste it is marked as taste.
 
 The general-agent follow-up against 65e335b retires planning reservations and
 shares existing host-tool grants with local and native subscription resources.
-Blocker impact leads queue ordering; the monitor reads that same derived rank.
+Explicit inherited priority leads queue ordering, with blocker impact breaking
+ties; the monitor reads the controller's authoritative priority list.
 The affected control, agent, CLI, provider and gateway write-ups describe the
 execution paths and permissions; the data-model and outcome documents retain
 priority and role history.

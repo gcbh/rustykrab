@@ -216,6 +216,12 @@ skips ineligible entries while they remain visible in place. Authorization,
 worker eligibility and resource locks remain separate gates. This adds no queue,
 persistence table or model-controlled status field.
 
+The work manager presents each task's existing goal, completion criteria and
+current state together. The complete priority list carries bounded text previews;
+task details retain the full execution source and diagnostics. Presentation and
+task-writing guidance improve readability without creating another decision model
+or changing permissions, completion checks or dispatch order.
+
 ## The investigation kit (2026-10-13)
 
 A fix item, the prerequisite the ladder files for a recurring or unknown

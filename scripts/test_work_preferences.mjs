@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 const source=readFileSync(new URL('../crates/rustykrab-gateway/static/monitor.js',import.meta.url),'utf8');
+const taskFragment=source.slice(source.indexOf('  function taskOverview('),source.indexOf('  const badge ='));
 new vm.Script(source);
 const fragment=source.slice(source.indexOf('  const progressStates ='),source.indexOf('  const discussionDrafts ='));
 class Element {
@@ -28,7 +29,7 @@ function client(data={preferences:[]}) {
     refresh:async()=>{},showDetail:async id=>opened.push(id),
     api:async(path,payload)=>{calls.push({path,payload});if(fail)throw Error('Connection interrupted');return data;}
   };
-  vm.createContext(c);vm.runInContext(fragment,c);
+  vm.createContext(c);vm.runInContext(taskFragment+fragment,c);
   return {c,ids,panes,buttons,calls,opened,setFail:v=>{fail=v;}};
 }
 test('separate views default to the priority list and preserve the work link on navigation',()=>{

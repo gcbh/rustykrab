@@ -28,6 +28,50 @@
     if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
     return Math.floor(seconds / 86400) + 'd ago';
   };
+  function taskOverview(item) {
+    const title = String(item.title || 'Untitled task');
+    const goal = String(item.objective || '').trim() || 'No task goal has been recorded yet.';
+    const outcome = String(item.done_when || '').trim() || 'No completion criteria have been recorded yet.';
+    const recurring = /^Stop recurring ([^ ]+) failure [a-f0-9]{16}$/.exec(title);
+    const unknown = /^Classify unknown failure [a-f0-9]{16}$/.test(title);
+    const missing = /^Name the missing (tool|credential|consent|compute|knowledge) in failure [a-f0-9]{16}$/.exec(title);
+    const failures = {'budget/tokens':'token-budget stops','budget/wall':'execution time limits','budget/iterations':'stalled runs','tool/upstream_error':'service request failures','tool/timeout':'tool timeouts','verification/incomplete':'incomplete results','verification/check_failed':'failed result checks','environment/permission':'file-access failures','environment/dependency':'missing-dependency failures'};
+    if (recurring) return {
+      title: 'Repair repeated ' + (failures[recurring[1]] || 'task failures'),
+      goal: goal.replace(/^The same failure recurred across items \(fingerprint [a-f0-9]{16}, observed_by [^)]*\): /, 'Fix the cause of a failure affecting several tasks, or catch it before work starts. Recorded problem: ').replace(/\. Fix the cause, or add the check that catches it before dispatch, instead of repairing the symptom again\.$/, '.'),
+      outcome: outcome.replace(/^The attached evidence no longer reproduces the failure, or a check rejects it before dispatch, and fingerprint [a-f0-9]{16} stops recurring\.$/, 'The recorded failure no longer occurs, or a check prevents it before work starts.')
+    };
+    if (unknown) return {
+      title: 'Identify an unexplained task failure',
+      goal: goal.replace(/^Add the probe, log line, check or parser that would have classified this failure\. It was recorded as unknown \(observed_by [^)]*\): /, 'Add the logs or checks needed to explain this recorded failure: '),
+      outcome: outcome.replace(/^Replaying the attached evidence through the classifier yields a class other than unknown, and a test pins that classification for fingerprint [a-f0-9]{16}\.$/, 'Replaying the recorded failure produces a known error category, with a test confirming it.')
+    };
+    if (missing) return {
+      title: 'Identify the missing ' + ({consent:'permission',compute:'computing resource',knowledge:'information'}[missing[1]] || missing[1]),
+      goal: goal.replace(/^A capability gap was recorded without naming the ([^ ]+) it lacks \(fingerprint [a-f0-9]{16}, observed_by [^)]*\), so no capability item could be filed for it: /, 'Identify the missing requirement so the system can arrange it. Recorded problem: '),
+      outcome: outcome.replace(/^Replaying the attached evidence through the classifier names the missing [^,]+, and a test pins that for fingerprint [a-f0-9]{16}\.$/, 'Replaying the recorded failure names the missing requirement, with a test confirming it.')
+    };
+    return {
+      title: title.replace(/^Build tool: (.+)$/, 'Build the $1 tool'),
+      goal,
+      outcome
+    };
+  }
+  function taskTitle(item) { return taskOverview(item).title; }
+  function appendTaskOverview(target, item, compact = false) {
+    const overview = taskOverview(item);
+    for (const [label, text] of [['Goal',overview.goal],['Completion requires',overview.outcome]]) {
+      const p = node('p', undefined, 'task-description' + (compact ? ' compact' : ''));
+      p.append(node('strong', label + ': '), node('span', text)); target.append(p);
+    }
+    if (item.description_truncated) target.append(node('p', 'Open the task for its full description and completion criteria.', 'note'));
+  }
+  function taskState(item) {
+    if (item.wait_reason) return item.wait_reason;
+    const waits = {needs_consent:'Needs your permission',needs_decision:'Needs your decision',needs_credential:'Needs a credential',budget_exhausted:'Stopped at its execution budget',needs_tool:'Waiting for a required tool',worker_unavailable:'Waiting for an eligible agent',precondition_failed:'A required check has not passed',upstream_failed:'Waiting for a failed prerequisite to be resolved',upstream_expired:'A prerequisite expired',verification_failed:'The result did not pass verification'};
+    if (item.held_by) return 'Waiting for your approval';
+    return waits[reason(item)] || ({queued:'Waiting to be scheduled',ready:'Queued for an eligible agent',leased:'Assigned to an agent',running:'Work is running',verifying:'Checking the result',done:'Completed',failed:'Work failed',cancelled:'Cancelled',expired:'The task expired',blocked:'Waiting for recovery'}[status(item)] || 'State unavailable');
+  }
   const badge = (text, kind) => node('span', human(text), 'badge ' + (kind || text));
   const itemButton = (id, text) => {
     const b = node('button', text);
@@ -241,7 +285,7 @@
     for (const row of handoffs) {
       const ctx = row.project_context, project = ctx.snapshot.project;
       const card = node('article', undefined, 'agent');
-      card.append(node('h3', project.title), itemButton(row.item.id, row.item.title));
+      card.append(node('h3', project.title), itemButton(row.item.id, taskTitle(row.item)));
       card.append(node('p', 'Agent: ' + (row.last_worker || 'Unassigned') + ' · Context revision ' + ctx.snapshot.revision.id.slice(0, 12)));
       if (row.workspace) card.append(node('p', 'Code base: ' + row.workspace.base + ' · Branch ' + row.workspace.branch));
       const sources = (ctx.work || []).filter(work => (ctx.base_sources || []).includes(work.item));
@@ -266,7 +310,7 @@
       if (a.runtime) renderSubscription(card, a.kind, a.runtime);
       for (const row of live) {
         const assignment = node('div', undefined, 'assignment');
-        assignment.append(itemButton(row.item.id, row.item.title), node('p', human(status(row.item)) + ' · Heartbeat ' + age(row.lease.heartbeat_at)));
+        assignment.append(itemButton(row.item.id, taskTitle(row.item)), node('p', human(status(row.item)) + ' · Heartbeat ' + age(row.lease.heartbeat_at)));
         card.append(assignment);
       }
       const records = Object.values(a.routing_record || {});
@@ -297,12 +341,6 @@
     }
     if (!reply.expectation_metrics.length) $('quality').append(node('p', 'No evaluation recorded yet.', 'empty'));
     $('build').textContent = 'RustyKrab ' + reply.version + (reply.commit ? ' · ' + reply.commit.slice(0, 12) : '') + ' · Usage covers completed run records. Active run totals may still be pending.';
-  }
-  function priorityTitle(entry) {
-    const match = /^Stop recurring ([^ ]+) failure [a-f0-9]{16}$/.exec(entry.title);
-    if (!match) return entry.title;
-    const labels = {'budget/tokens':'token-budget stops','tool/upstream_error':'model-provider failures','verification/incomplete':'incomplete results'};
-    return 'Repair repeated ' + (labels[match[1]] || human(match[1]) + ' failures');
   }
   async function movePriority(index, offset) {
     if (priorityMoving || !snapshot?.priority_list) return;
@@ -337,18 +375,20 @@
     for (const [index, entry] of list.entries.entries()) {
       const row = node('li', undefined, 'priority-item'), position = node('span', num(entry.position), 'priority-position');
       const content = node('div', undefined, 'priority-content');
-      content.append(itemButton(entry.item, priorityTitle(entry)), node('p', entry.wait_reason, 'priority-wait'));
-      if (entry.goal) content.append(node('p', 'Goal: ' + entry.goal.title, 'note'));
+      content.append(itemButton(entry.item, taskTitle(entry)));
+      appendTaskOverview(content, entry, true);
+      content.append(node('p', 'Current state: ' + taskState(entry), 'priority-wait'));
+      if (entry.goal) content.append(node('p', 'Part of: ' + taskTitle(entry.goal), 'note'));
       if (entry.waiters) content.append(node('p', 'Needed by ' + num(entry.waiters) + ' open items', 'note'));
       if (entry.waiting_on.length) {
         const waiting = node('div', undefined, 'priority-dependencies'); waiting.append(node('span', 'Waiting on: '));
-        for (const dependency of entry.waiting_on) waiting.append(itemButton(dependency.item, dependency.title));
+        for (const dependency of entry.waiting_on) waiting.append(itemButton(dependency.item, taskTitle(dependency)));
         content.append(waiting);
       }
       const controls = node('div', undefined, 'priority-controls');
       for (const [label, offset] of [['Move up',-1],['Move down',1]]) {
         const b = node('button', label); b.type = 'button';
-        b.setAttribute('aria-label', label + ': ' + priorityTitle(entry));
+        b.setAttribute('aria-label', label + ': ' + taskTitle(entry));
         b.disabled = priorityMoving || index + offset < 0 || index + offset >= list.entries.length;
         b.addEventListener('click', () => movePriority(index, offset)); controls.append(b);
       }
@@ -362,7 +402,7 @@
     const selected = w.items.filter(row => {
       const s = status(row.item);
       return progressStates.has(s) && (filter === 'progress' || s === filter) &&
-        (!needle || [row.item.id, row.item.title, row.last_worker].join(' ').toLowerCase().includes(needle));
+        (!needle || [row.item.id, row.item.title, taskTitle(row.item), row.item.objective, row.item.done_when, row.last_worker].join(' ').toLowerCase().includes(needle));
     });
     const ranks = snapshot.queue_priorities || {};
     const positions = new Map((snapshot.priority_list?.entries || []).map(e => [e.item,e.position]));
@@ -373,7 +413,8 @@
     $('workRows').replaceChildren();
     for (const row of selected) {
       const i = row.item, tr = node('tr'), title = node('td'), state = node('td');
-      title.append(itemButton(i.id, i.title), node('small', i.id.slice(0, 8)));
+      title.append(itemButton(i.id, taskTitle(i)));
+      appendTaskOverview(title, i, true);
       const rank = ranks[i.id];
       if (rank) title.append(node('small', rank.waiters ? 'Needed by ' + num(rank.waiters) + ' open tasks' : 'No dependent work'));
       state.append(badge(status(i) === 'ready' ? 'Queued' : status(i), status(i)));
@@ -414,7 +455,9 @@
       if (!list.length) $(target).append(node('p', empty, 'empty'));
       for (const r of list) {
         const card = node('article', undefined, 'work-summary');
-        card.append(itemButton(r.item.id, r.item.title), badge(reason(r.item) || status(r.item)), node('p', r.item.objective.length > 420 ? r.item.objective.slice(0,420) + '…' : r.item.objective), node('small', (r.last_worker || 'Unassigned') + ' · ' + age(r.item.updated_at)));
+        card.append(itemButton(r.item.id, taskTitle(r.item)), badge(reason(r.item) || status(r.item)));
+        appendTaskOverview(card, r.item, true);
+        card.append(node('p', 'Current state: ' + taskState(r.item), 'note'), node('small', (r.last_worker || 'Unassigned') + ' · ' + age(r.item.updated_at)));
         if (target === 'resultRows') card.append(node('small', 'Open receipt for verification and execution evidence.'));
         $(target).append(card);
       }
@@ -435,7 +478,7 @@
       for (const p of [...data.preferences].reverse()) {
         const check = p.checks.find(c => c.check === 'work_template'); if (!check) continue;
         const t = check.template, card = node('article', undefined, 'work-summary');
-        card.append(itemButton(t.example_item,t.title), badge(p.revoked_at ? 'revoked' : check.mode === 'automatic' ? 'automatic' : 'once', p.revoked_at ? 'cancelled' : 'idle'));
+        card.append(itemButton(t.example_item,taskTitle(t)), badge(p.revoked_at ? 'revoked' : check.mode === 'automatic' ? 'automatic' : 'once', p.revoked_at ? 'cancelled' : 'idle'));
         card.append(node('p', check.mode === 'automatic' ? 'Exact template · Up to ' + check.daily_limit + ' automatic starts per 24 hours' : 'One-time approval example · Grants no future permission'));
         if (p.text) card.append(node('p', p.text));
         const scope = node('details'); scope.append(node('summary', 'Reviewed scope'), node('pre', JSON.stringify(t,null,2))); card.append(scope, node('small', p.granted_by + ' · ' + at(p.granted_at)));
@@ -505,15 +548,17 @@
       const groups = questionsByWork(data.questions);
       const card = $('stats').lastElementChild;
       const proposals = snapshot?.work.items.filter(r => r.item.kind === 'proposal' && !closed.has(status(r.item))).map(r => r.item.id) || [];
-      if (card) { card.querySelector('.number').textContent = num(new Set([...groups.keys(),...proposals]).size); card.querySelector('.caption').textContent = num(data.questions.length) + ' pending decisions · ' + num(proposals.length) + ' displayed proposals'; }
+      if (card) { card.querySelector('.number').textContent = num(new Set([...groups.keys(),...proposals]).size); card.querySelector('.caption').textContent = num(data.questions.length) + (data.questions.length === 1 ? ' pending decision · ' : ' pending decisions · ') + num(proposals.length) + ' displayed proposals'; }
       const signature = JSON.stringify(data.questions);
       if (signature === lastQuestions) return;
       lastQuestions = signature;
       $('questions').hidden = !groups.size; $('questionRows').replaceChildren();
       for (const [id, questions] of groups) {
-        const item = snapshot?.work.items.find(r => r.item.id === id)?.item;
+        const item = snapshot?.work.items.find(r => r.item.id === id)?.item || snapshot?.priority_list?.entries.find(e => e.item === id);
         const row = node('article', undefined, 'question');
-        row.append(itemButton(id, item?.title || 'Work ' + id.slice(0, 8)), node('p', questions.length + (questions.length === 1 ? ' pending decision' : ' pending decisions') + ' · ' + human(item ? status(item) : 'blocked'), 'note'));
+        row.append(itemButton(id, item ? taskTitle(item) : 'Work ' + id.slice(0, 8)));
+        if (item) appendTaskOverview(row, item, true);
+        row.append(node('p', questions.length + (questions.length === 1 ? ' pending decision' : ' pending decisions') + ' · ' + (item ? taskState(item) : 'Waiting for your direction'), 'note'));
         row.append(node('p', questions[0].text), node('small', 'Questions and replies stay in this work item’s discussion.'));
         $('questionRows').append(row);
       }
@@ -615,8 +660,15 @@
     try {
       const d = await api('/api/work/' + encodeURIComponent(id));
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
-      $('detailTitle').textContent = d.item.title;
-      const body = $('detailBody'); delete body.dataset.startOptions; body.replaceChildren(badge(status(d.item) === 'ready' ? 'Queued' : status(d.item), status(d.item)), node('p', id, 'note'));
+      $('detailTitle').textContent = taskTitle(d.item);
+      const body = $('detailBody'); delete body.dataset.startOptions; body.replaceChildren(node('p', 'Current state: ' + taskState(d.item), 'task-state'));
+      appendTaskOverview(body, d.item);
+      const priority = snapshot?.priority_list?.entries.find(entry => entry.item === id);
+      if (priority?.waiting_on?.length) {
+        const waiting = node('p', 'Waiting on: ', 'task-dependencies');
+        for (const dependency of priority.waiting_on) waiting.append(itemButton(dependency.item, taskTitle(dependency)));
+        body.append(waiting);
+      }
       if (d.item.parent) body.append(itemButton(d.item.parent, 'View parent work'));
       if (d.item.kind === 'proposal' && !closed.has(status(d.item))) {
         const controls = node('div', undefined, 'controls');
@@ -627,17 +679,33 @@
         } body.append(controls);
       }
       const section = (title, value) => { body.append(node('h3', title), node('pre', value)); };
-      section('Objective', d.item.objective);
-      section('Done when', d.item.done_when);
-      section('Resources and tools', [...d.item.writable_resources, ...d.item.required_tools, ...d.item.required_mcp_servers].join('\n') || 'No write resources or required tools declared.');
+      const scope = node('section'); scope.append(node('h3', 'Requested scope'));
+      const resources = d.item.writable_resources.map(resource => resource.replace(/^repo:/, 'Repository: ').replace(/^file:/, 'File: '));
+      scope.append(node('p', resources.length ? 'May change: ' + resources.join(' · ') : 'No writable resources requested.', 'task-description'));
+      if (d.item.required_tools.length) scope.append(node('p', 'Required tools: ' + d.item.required_tools.join(', '), 'task-description'));
+      if (d.item.required_mcp_servers.length) scope.append(node('p', 'Required integrations: ' + d.item.required_mcp_servers.join(', '), 'task-description'));
+      body.append(scope);
       renderStartOptions(d, body, g, request);
-      if (d.item.constraints.length) section('Constraints', d.item.constraints.join('\n'));
+      if (d.item.constraints.length) {
+        const limits = node('section'); limits.append(node('h3', 'Limits on this task'));
+        for (const constraint of d.item.constraints) limits.append(node('p', constraint, 'task-description'));
+        body.append(limits);
+      }
       await renderDiscussion(id, body, g, request);
       if (g !== generation || request !== detailRequest || !$('detail').open) return;
       if (d.item.summary) section('Summary', d.item.summary);
       if (d.lease) section('Current assignment', d.lease.worker + '\nHeartbeat: ' + at(d.lease.heartbeat_at));
-      if (d.last_error) section('Last error', JSON.stringify(d.last_error, null, 2));
-      if (d.ladder.length) section('Recovery attempts', JSON.stringify(d.ladder, null, 2));
+      const technical = node('details'), technicalBody = node('div');
+      technical.append(node('summary', 'Technical details'), technicalBody);
+      const raw = (title,value) => technicalBody.append(node('h3',title),node('pre',value));
+      raw('Task ID', id);
+      raw('Original title', d.item.title);
+      raw('Full execution goal', d.item.objective);
+      raw('Full completion criteria', d.item.done_when);
+      raw('Resources and tools', [...d.item.writable_resources, ...d.item.required_tools, ...d.item.required_mcp_servers].join('\n') || 'No write resources or required tools declared.');
+      if (d.last_error) raw('Last error', JSON.stringify(d.last_error, null, 2));
+      if (d.ladder.length) raw('Recovery attempts', JSON.stringify(d.ladder, null, 2));
+      body.append(technical);
       const evidenceDetails = node('details'), evidenceBody = node('div');
       evidenceDetails.append(node('summary', 'Execution evidence (' + d.evidence.length + ' records)'), evidenceBody); body.append(evidenceDetails);
       if (!d.evidence.length) evidenceBody.append(node('p', 'No evidence recorded.', 'note'));

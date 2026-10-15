@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 const source = readFileSync(new URL('../crates/rustykrab-gateway/static/monitor.js', import.meta.url), 'utf8');
+const taskFragment = source.slice(source.indexOf('  function taskOverview('), source.indexOf('  const badge ='));
 const fragment = source.slice(source.indexOf('  function renderWork()'), source.indexOf('  const views ='));
 class Element {
   constructor(text = '') { this.textContent = text; this.children = []; this.value = ''; }
@@ -15,7 +16,7 @@ function render(withRanks) {
   $('status').value = 'progress';
   const row = (id, state, priority) => ({item:{id,title:id,status:{status:state},priority,created_at:'2026-10-12T00:00:00Z'},spend:{runs:0},evidence_count:0,verified_evidence_count:0});
   const context = {snapshot:{work:{items:[row('independent','ready',999),row('shared repair','ready',0),row('active','running',0),row('finished','done',0)]},priority_list:withRanks ? {entries:[{item:'shared repair',position:1},{item:'independent',position:2},{item:'active',position:3}]} : undefined,queue_priorities:withRanks ? {'shared repair':{waiters:3,priority:0},independent:{waiters:0,priority:999}} : undefined},$,num:String,status:i=>i.status.status,reason:()=>null,human:String,node:(_tag,text)=>new Element(text),badge:label=>new Element(label),itemButton:(_id,title)=>new Element(title)};
-  vm.createContext(context); vm.runInContext(fragment, context); context.renderWork();
+  vm.createContext(context); vm.runInContext(taskFragment + fragment, context); context.renderWork();
   return nodes;
 }
 test('monitor uses the exact server order rather than recomputing priority or pinning active work', () => {
@@ -29,7 +30,7 @@ test('monitor tolerates an older daemon without derived queue ranks', () => {
   assert.deepEqual(rows.map(r=>r.children[0].children[0].textContent), ['active','independent','shared repair']);
 });
 
-const priorityFragment = source.slice(source.indexOf('  function priorityTitle('),source.indexOf('  function renderWork()'));
+const priorityFragment = source.slice(source.indexOf('  async function movePriority('),source.indexOf('  function renderWork()'));
 class PriorityElement extends Element {
   setAttribute(name,value){this[name]=value;}
   addEventListener(name,callback){this[name]=callback;}
@@ -39,7 +40,7 @@ function priorityContext(api){
   const entry=(item,position)=>({item,title:item,position,status:{status:'blocked',reason:'needs_consent'},wait_reason:'Needs your permission',waiting_on:[],waiters:0});
   const list={revision:'a'.repeat(64),entries:[entry('held first',1),entry('ready second',2)]};
   const context={snapshot:{priority_list:list},priorityMoving:false,priorityError:'',priorityVersion:0,generation:0,api,$,renderWork(){},num:String,human:String,node:(_tag,text)=>new PriorityElement(text),itemButton:(_id,title)=>new PriorityElement(title)};
-  vm.createContext(context);vm.runInContext(priorityFragment,context);return{context,nodes};
+  vm.createContext(context);vm.runInContext(taskFragment + priorityFragment,context);return{context,nodes};
 }
 test('priority list retains a blocked first entry and sends a reviewed revision when moving it',async()=>{
   const {context,nodes}=priorityContext(async(path,body)=>{
@@ -75,4 +76,46 @@ test('a monitor read started before a move cannot restore an older order',async(
   complete({priority_list:{revision:'old',entries:[]}});
   await reading;
   assert.equal(context.snapshot.priority_list,moved);
+});
+
+test('each priority task carries its goal and observable completion criteria as literal text',()=>{
+  const {context,nodes}=priorityContext(async()=>{});
+  const item=context.snapshot.priority_list.entries[0];
+  item.objective='Restore <img src=x> reliable self-improvement';
+  item.done_when='A scheduled task completes with verified output';
+  item.description_truncated=true;
+  context.renderPriorityList();
+  const flatten=e=>[e,...e.children.flatMap(flatten)];
+  const text=flatten(nodes.get('priorityRows')).map(e=>e.textContent).join(' ');
+  assert.match(text,/Goal:.*Restore <img src=x> reliable self-improvement/);
+  assert.match(text,/Completion requires:.*A scheduled task completes with verified output/);
+  assert.match(text,/Current state: Needs your permission/);
+  assert.match(text,/Open the task for its full description/);
+});
+
+test('generated failure wording is understandable while custom task requirements are preserved',()=>{
+  const {context}=priorityContext(async()=>{});
+  const fp='0123456789abcdef';
+  const legacy={title:'Stop recurring budget/tokens failure '+fp,
+    objective:'The same failure recurred across items (fingerprint '+fp+', observed_by controller): exceeded 200000 tokens. Fix the cause, or add the check that catches it before dispatch, instead of repairing the symptom again.',
+    done_when:'The attached evidence no longer reproduces the failure, or a check rejects it before dispatch, and fingerprint '+fp+' stops recurring.'};
+  const overview=context.taskOverview(legacy);
+  assert.equal(overview.title,'Repair repeated token-budget stops');
+  assert.match(overview.goal,/exceeded 200000 tokens/);
+  assert(!overview.goal.includes(fp));
+  assert.match(overview.outcome,/prevents it before work starts/);
+  assert(legacy.objective.includes(fp),'the execution source must remain intact');
+  const custom=context.taskOverview({...legacy,objective:'Investigate the audit task only',done_when:'A regression test proves the exact authorized audit completes'});
+  assert.equal(custom.goal,'Investigate the audit task only');
+  assert.equal(custom.outcome,'A regression test proves the exact authorized audit completes');
+  assert.match(context.taskOverview({title:'Classify unknown failure '+fp}).title,/unexplained task failure/);
+});
+
+test('missing task descriptions stay explicitly unknown and blocker states use plain language',()=>{
+  const {context}=priorityContext(async()=>{});
+  context.status=item=>item.status.status;
+  context.reason=item=>item.status.reason;
+  assert.match(context.taskOverview({title:'Existing task'}).goal,/No task goal/);
+  assert.match(context.taskOverview({title:'Existing task'}).outcome,/No completion criteria/);
+  assert.equal(context.taskState({status:{status:'blocked',reason:'verification_failed'}}),'The result did not pass verification');
 });

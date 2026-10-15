@@ -46,6 +46,13 @@ pub struct PriorityEntry {
     pub position: usize,
     pub item: WorkItemId,
     pub title: String,
+    /// Bounded description for every entry, including those outside telemetry.
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub done_when: String,
+    #[serde(default)]
+    pub description_truncated: bool,
     pub status: Status,
     pub base_priority: i32,
     pub effective_priority: i32,
@@ -124,6 +131,10 @@ pub fn priority_list(snap: &Snapshot, now: DateTime<Utc>) -> PriorityList {
                 position: index + 1,
                 item: item.id.clone(),
                 title: item.title.clone(),
+                objective: item.objective.chars().take(800).collect(),
+                done_when: item.done_when.chars().take(400).collect(),
+                description_truncated: item.objective.chars().count() > 800
+                    || item.done_when.chars().count() > 400,
                 status: item.status,
                 base_priority: item.priority,
                 effective_priority: ranks[&item.id].priority,

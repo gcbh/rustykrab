@@ -846,15 +846,15 @@ pub(crate) fn draft_properties(nested: bool) -> Map<String, Value> {
     let mut p = Map::new();
     p.insert(
         "title".into(),
-        json!({ "type": "string", "description": format!("Short name, one line (max {TITLE_MAX} chars).") }),
+        json!({ "type": "string", "description": format!("A plain-language action and its subject that the owner can understand without chat history. Keep error codes, fingerprints and execution IDs in artifact_refs, not the title. One line, max {TITLE_MAX} chars.") }),
     );
     p.insert(
         "objective".into(),
-        json!({ "type": "string", "description": format!("What the work must achieve (max {OBJECTIVE_MAX} chars).") }),
+        json!({ "type": "string", "description": format!("Explain what will change and why it matters to the owner. Name the affected feature, project or deliverable; avoid unexplained shorthand and transcript dumps. Max {OBJECTIVE_MAX} chars.") }),
     );
     p.insert(
         "done_when".into(),
-        json!({ "type": "string", "description": format!("The check that proves it done (max {DONE_WHEN_MAX} chars).") }),
+        json!({ "type": "string", "description": format!("Describe the observable result the owner should expect and how it will be checked. Use plain language and distinguish success from merely attempting the work. Max {DONE_WHEN_MAX} chars.") }),
     );
     p.insert(
         "constraints".into(),

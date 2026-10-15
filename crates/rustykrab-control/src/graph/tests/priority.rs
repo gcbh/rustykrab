@@ -49,6 +49,10 @@ fn one_priority_list_retains_blocked_leaves_and_excludes_goals_and_history() {
         .add("held")
         .add("closed")
         .set("work", |i| i.priority = 20)
+        .set("work", |i| {
+            i.objective = "Restore reliable self-improvement".into();
+            i.done_when = "A scheduled task completes with verified output".into();
+        })
         .set("held", |i| {
             i.priority = 30;
             i.held_by = Some("consent".into());
@@ -69,6 +73,15 @@ fn one_priority_list_retains_blocked_leaves_and_excludes_goals_and_history() {
     assert_eq!(list.entries[2].waiting_on[0].item, "repair");
     assert_eq!(list.entries[2].goal.as_ref().unwrap().item, "goal");
     assert_eq!(
+        list.entries[2].objective,
+        "Restore reliable self-improvement"
+    );
+    assert_eq!(
+        list.entries[2].done_when,
+        "A scheduled task completes with verified output"
+    );
+    assert!(!list.entries[2].description_truncated);
+    assert_eq!(
         list.entries.iter().map(|e| e.position).collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
@@ -78,6 +91,21 @@ fn one_priority_list_retains_blocked_leaves_and_excludes_goals_and_history() {
         list.revision,
         crate::graph::priority_list(&changed.snap(), now()).revision
     );
+}
+
+#[test]
+fn priority_descriptions_are_bounded_unicode_previews_without_changing_the_task() {
+    let g = G::new().add("work").set("work", |item| {
+        item.objective = "修".repeat(801);
+        item.done_when = "✅".repeat(401);
+    });
+    let snap = g.snap();
+    let list = crate::graph::priority_list(&snap, now());
+    assert_eq!(list.entries[0].objective.chars().count(), 800);
+    assert_eq!(list.entries[0].done_when.chars().count(), 400);
+    assert!(list.entries[0].description_truncated);
+    assert_eq!(snap.item("work").unwrap().objective.chars().count(), 801);
+    assert_eq!(snap.item("work").unwrap().done_when.chars().count(), 401);
 }
 
 #[test]

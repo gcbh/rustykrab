@@ -272,6 +272,12 @@ async fn bounded_monitor_ranks_count_waiters_outside_the_display_limit() {
         "the actionable priority list is not truncated with telemetry"
     );
     assert_eq!(priorities.entries[0].item, repair);
+    assert!(priorities
+        .entries
+        .iter()
+        .all(|entry| entry.objective == entry.title
+            && entry.done_when == "completed"
+            && !entry.description_truncated));
     assert!(reply.queue_priorities.keys().all(|id| reply
         .work
         .items
