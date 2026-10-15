@@ -793,6 +793,31 @@ fn read_messages(db: &Path, id: &str) -> Result<Vec<Value>> {
     rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
 }
 
+/// A trial daemon's window: the provider-trim control's deliberately small
+/// one, else `--context-window`, else the default.
+fn trial_window(case: &str, requested: Option<u32>) -> u32 {
+    if case == "provider-trim-control" {
+        rustykrab_agent::local_model::MIN_CONTEXT_WINDOW
+    } else {
+        requested.unwrap_or(DEFAULT_TRIAL_WINDOW)
+    }
+}
+
+/// A trial's `models.toml`. The provider-trim control keeps its history far
+/// over the window and never compacts, so the provider refuses it before
+/// dispatch; its output cap is a quarter of its 4K window, since the daemon
+/// refuses an entry whose output allowance fills the whole window.
+fn trial_models_toml(case: &str, window: u32, strategy: &str, threshold: f64) -> String {
+    let output = if case == "provider-trim-control" {
+        format!("output_tokens = {}\n", window / 4)
+    } else {
+        String::new()
+    };
+    format!(
+        "[default]\ncontext_window = {window}\n{output}compaction_strategy = \"{strategy}\"\ncompaction_threshold = {threshold}\n"
+    )
+}
+
 /// The trial daemon's window when `--context-window` names none. The
 /// synthetic histories are sized to overflow it, so compaction runs.
 const DEFAULT_TRIAL_WINDOW: u32 = 65_536;
@@ -948,14 +973,10 @@ async fn trial(
     std::fs::write(dir.join("harness.toml"),"name=\"context-eval\"\nagent_name=\"RustyKrab\"\nmax_iterations=4\nsoft_iteration_warning=0\nmax_tool_retries=0\n")?;
     // The model's window and compaction policy are its models.toml entry,
     // as on a real daemon; a local model ignores harness.toml's budget.
-    let window = if case == "provider-trim-control" {
-        4096
-    } else {
-        args.context_window.unwrap_or(DEFAULT_TRIAL_WINDOW)
-    };
+    let window = trial_window(case, args.context_window);
     std::fs::write(
         dir.join(rustykrab_agent::local_model::MODELS_FILE),
-        format!("[default]\ncontext_window = {window}\ncompaction_strategy = \"{compaction_strategy}\"\ncompaction_threshold = {threshold}\n"),
+        trial_models_toml(case, window, compaction_strategy, threshold),
     )?;
     let port = pick_free_port()?;
     let base = format!("http://127.0.0.1:{port}");
@@ -1427,6 +1448,38 @@ impl CommandVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every case's trial config is one the daemon would load: a trial whose
+    /// daemon refuses its models.toml never starts, and its contract goes
+    /// unexercised.
+    #[test]
+    fn every_trial_models_toml_loads_at_every_window() {
+        for case in CASES {
+            for requested in [None, Some(32_768), Some(131_072)] {
+                for strategy in ["legacy", "structured-message-tail"] {
+                    for threshold in [0.0, 0.01, 0.85] {
+                        let window = trial_window(case, requested);
+                        let body = trial_models_toml(case, window, strategy, threshold);
+                        let model = rustykrab_agent::LocalModels::from_toml(&body)
+                            .unwrap_or_else(|e| panic!("{case} at {window}: {e}\n{body}"))
+                            .for_model("any");
+                        assert_eq!(model.context_window, window, "{case}");
+                    }
+                }
+            }
+        }
+        // The trim control's window is the smallest the daemon accepts, and
+        // its output cap leaves room for input.
+        let trim = rustykrab_agent::LocalModels::from_toml(&trial_models_toml(
+            "provider-trim-control",
+            trial_window("provider-trim-control", Some(131_072)),
+            "legacy",
+            0.0,
+        ))
+        .unwrap()
+        .for_model("any");
+        assert_eq!((trim.context_window, trim.output_tokens), (4_096, 1_024));
+    }
     #[test]
     fn availability_audit_detects_phantom_active_tools_and_missing_reports() {
         let first = json!({"wire_request":{"stream":true,"tools":[]},"response":{"tool_calls":[{"function":{"name":"tools_load"}}]}});

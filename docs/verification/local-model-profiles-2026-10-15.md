@@ -25,10 +25,11 @@ the daemon names each one it overrides.
 |---|---|
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
-| `cargo test --workspace --no-default-features --no-fail-fast` | 2,275 passed, 0 failed, 38 ignored |
+| `cargo test --workspace --no-default-features --no-fail-fast` | 2,277 passed, 0 failed, 38 ignored |
 | `python3 scripts/check_architecture_docs.py --fix` | OK, metrics current |
 | `python3 scripts/check_env_docs.py` | OK |
 | `scripts/e2e.sh` (scripted, no model) | 66 pass, 7 xfail, 0 fail, 0 xpass |
+| `scripts/e2e.sh --mode context --trial-timeout 30` with `RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY=structured-message-tail` (CI's second E2E step) | 28 of 28 trials pass; `provider-trim-control` refuses before dispatch with 0 wire requests on gateway and Telegram |
 | `rustykrab-cli models` against a sample file | each entry and the chat model resolved; `RUSTYKRAB_NUM_CTX` named as ignored; a 1,000-token window exits 1 naming the file and table |
 | Daemon startup, Ollama provider, a dead Ollama URL | a 1,000-token window stops it naming the file; a 49,152 `[default]` gives `num_ctx`, budget and ceiling of 49,152, with warnings naming `RUSTYKRAB_NUM_CTX` and the overridden `max_context_tokens`, `compaction_strategy`, `RUSTYKRAB_MAX_CONTEXT_TOKENS` |
 
@@ -36,6 +37,18 @@ An earlier workspace run, without `--no-fail-fast`, stopped at
 `controller::tests::workers::scenario_02_*` while a model eval and the build
 shared the machine. It passed alone 3/3. That is the known drain flake under
 load, which #716 fixes further up the stack.
+
+The first published head, `64c05f4`, failed CI's context step, which I had
+not run locally. `provider-trim-control` wrote a 4,096-token window with the
+default 4,096 output tokens. The daemon refuses an entry whose output fills
+the whole window, so the trial daemon never started, on either surface. The
+fixture now gives that case an explicit 1,024-token output cap. Before this
+change it sent `num_ctx` 4,096 with `num_predict` 4,096. Its history is still
+far over the 3,072 tokens left for input, so the provider still refuses before
+dispatch. The validator is unchanged. `toml_with_window` had the same flaw at
+small windows and now caps output at a quarter of the window. Two tests guard
+both: every case's trial config loads at every window and strategy, and the
+generated body loads from the smallest window to the largest.
 
 New tests:
 
@@ -47,6 +60,8 @@ New tests:
   a worker on a local model takes its entry's window, strategy and threshold,
   while the loop stays the preset's. A hosted provider keeps the preset.
 - `ollama::tests::default_config_pins_one_window_and_reads_no_environment`.
+- `context_suite::tests::every_trial_models_toml_loads_at_every_window` and
+  `local_model::tests::a_generated_body_loads_for_every_window_the_daemon_accepts`.
 - `models_cmd::tests`: the report names the file, each entry and what the
   chat and worker models resolve to, or the built-in defaults; a file the
   daemon would refuse is an error.

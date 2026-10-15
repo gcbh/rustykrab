@@ -238,9 +238,19 @@ impl LocalModels {
     }
 
     /// A `models.toml` body naming `window` for every model, for callers
-    /// (the evaluation harness) that set up a data directory.
+    /// (the evaluation harness) that set up a data directory. A window too
+    /// small for the default output allowance gets a quarter of itself, so
+    /// the body loads for every window the daemon accepts.
     pub fn toml_with_window(window: u32) -> String {
-        format!("[default]\ncontext_window = {window}\n")
+        let default_output = LocalModel::default().output_tokens;
+        if window / 4 < default_output {
+            format!(
+                "[default]\ncontext_window = {window}\noutput_tokens = {}\n",
+                (window / 4).max(1)
+            )
+        } else {
+            format!("[default]\ncontext_window = {window}\n")
+        }
     }
 }
 
@@ -446,6 +456,24 @@ mod tests {
         ] {
             let err = LocalModels::from_toml(body).unwrap_err();
             assert!(err.contains(needle), "{body:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn a_generated_body_loads_for_every_window_the_daemon_accepts() {
+        for window in [
+            MIN_CONTEXT_WINDOW,
+            8_192,
+            16_384,
+            32_768,
+            131_072,
+            MAX_CONTEXT_WINDOW,
+        ] {
+            let models = LocalModels::from_toml(&LocalModels::toml_with_window(window))
+                .unwrap_or_else(|e| panic!("window {window}: {e}"));
+            let model = models.for_model("any");
+            assert_eq!(model.context_window, window);
+            assert!(model.output_tokens < window, "window {window}");
         }
     }
 
