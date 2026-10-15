@@ -487,6 +487,14 @@ pub fn planner_worker(
             backend,
         )
         .with_transcripts(transcripts)
+        // The logs sit in the daemon's data directory, which a run's shell
+        // may not read.
+        .with_private_paths(
+            run_logs
+                .parent()
+                .map(|d| vec![d.to_path_buf()])
+                .unwrap_or_default(),
+        )
         .with_run_logs(run_logs)
         .with_slot(slot),
     )

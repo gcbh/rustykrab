@@ -292,6 +292,9 @@ pub struct LocalWorker {
     repository_shell: bool,
     /// Overrides the harness profile's `result_report_reminder`.
     result_report_reminder: Option<bool>,
+    /// Paths a run's shell may not read, beside the credential stores
+    /// `rustykrab_tools::Confinement` always keeps out of reach.
+    private_paths: Vec<std::path::PathBuf>,
     readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
@@ -351,6 +354,7 @@ impl LocalWorker {
             full_reports: false,
             repository_shell: false,
             result_report_reminder: None,
+            private_paths: Vec::new(),
             readable_files: Vec::new(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
@@ -387,6 +391,14 @@ impl LocalWorker {
     /// Only expose shell execution inside a controller-owned repository workspace.
     pub fn with_repository_shell(mut self) -> Self {
         self.repository_shell = true;
+        self
+    }
+
+    /// Keep `paths` out of a run's shell, which is confined to its worktree
+    /// (`rustykrab_tools::Confinement`): the daemon's data directory, where
+    /// its secrets file is.
+    pub fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.private_paths.extend(paths);
         self
     }
 
@@ -993,18 +1005,26 @@ impl LocalWorker {
         // A run in a worktree works there and nowhere else: its shell and
         // its file tools are bound to that directory, where the host's own
         // are bound to the daemon's workspace.
-        tools.extend(host_tools.into_iter().map(|t| match &workdir {
-            Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
-            Some(dir) => match t.name() {
-                "exec" => Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "write" => {
-                    Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone())) as Arc<dyn Tool>
+        tools.extend(host_tools.into_iter().map(|t| {
+            match &workdir {
+                Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
+                Some(dir) => {
+                    match t.name() {
+                        "exec" => Arc::new(
+                            rustykrab_tools::ExecTool::in_dir(dir.clone())
+                                .confined(self.private_paths.clone()),
+                        ) as Arc<dyn Tool>,
+                        "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        "write" => Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        _ => t,
+                    }
                 }
-                _ => t,
-            },
-            None => t,
+                None => t,
+            }
         }));
         // Every call is a step in the progress ledger (section 6, step 7).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));

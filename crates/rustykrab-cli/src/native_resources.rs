@@ -96,6 +96,7 @@ impl NativeWorker {
         .with_readable_files(&config.readable_files)
         // The host half's runs leave session logs where the native half's
         // do, so either is opened from the same evidence.
+        .with_private_paths(vec![config.data_dir.clone()])
         .with_run_logs(
             config
                 .data_dir

@@ -1512,6 +1512,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
             .with_run_logs(run_logs_dir.clone())
+            .with_private_paths(vec![data_dir.clone()])
             .with_late_tools(fleet.skills.clone())
             .with_slot(model_slot.clone()),
         ))
@@ -1596,7 +1597,8 @@ async fn main() -> anyhow::Result<()> {
                             &local_repositories,
                             integrations::enabled(),
                         )?
-                        .with_run_logs(run_logs_dir.clone()),
+                        .with_run_logs(run_logs_dir.clone())
+                        .with_private_paths(vec![data_dir.clone()]),
                     ) as Arc<dyn rustykrab_control::worker::Worker>
                 } else {
                     work_channel::planner_worker(
@@ -1630,7 +1632,8 @@ async fn main() -> anyhow::Result<()> {
                         &local_repositories,
                         true,
                     )?
-                    .with_run_logs(run_logs_dir.clone()),
+                    .with_run_logs(run_logs_dir.clone())
+                    .with_private_paths(vec![data_dir.clone()]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 local_resources.as_ref().map(|_| 1),
@@ -1652,7 +1655,8 @@ async fn main() -> anyhow::Result<()> {
                         scheduled_work::transcripts(&store, skill_registry.clone()),
                         local_slot.clone(),
                     )
-                    .with_run_logs(run_logs_dir.clone()),
+                    .with_run_logs(run_logs_dir.clone())
+                    .with_private_paths(vec![data_dir.clone()]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 Some(0),
@@ -1674,7 +1678,8 @@ async fn main() -> anyhow::Result<()> {
                             &local_repositories,
                             true,
                         )?
-                        .with_run_logs(run_logs_dir.clone()),
+                        .with_run_logs(run_logs_dir.clone())
+                        .with_private_paths(vec![data_dir.clone()]),
                     ),
                     serde_json::json!({"role":"general-agent", "resource_slot":true}),
                     Some(0),

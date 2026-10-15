@@ -137,7 +137,7 @@ pub use write::WriteTool;
 
 // Runtime
 pub use code_execution::CodeExecutionTool;
-pub use exec::ExecTool;
+pub use exec::{Confinement, ExecTool};
 pub use process::ProcessTool;
 
 // Web
