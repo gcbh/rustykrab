@@ -659,9 +659,22 @@ pub(crate) mod tests {
     fn a_failed_git_call_shows_its_stdout_and_status() {
         let repo = Repo::new();
         let failure = std::panic::catch_unwind(|| {
+            // An identity of its own, as `commit_all` has: without one, git
+            // on a host with no configured identity refuses before it looks
+            // for changes, and the refusal under test never happens.
             run_git(
                 repo.path(),
-                &["commit", "-q", "--no-gpg-sign", "-m", "empty"],
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-q",
+                    "--no-gpg-sign",
+                    "-m",
+                    "empty",
+                ],
             )
         })
         .unwrap_err();
