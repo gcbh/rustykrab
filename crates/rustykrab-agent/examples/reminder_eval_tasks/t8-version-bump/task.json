@@ -1,0 +1,5 @@
+{
+  "title": "Cut the tinyqueue 1.4.0 release",
+  "objective": "Prepare release 1.4.0: set the version to 1.4.0 in pyproject.toml and tinyqueue/__init__.py, and in CHANGELOG.md turn the Unreleased section into a section headed ## 1.4.0 - 2026-10-14 that keeps its entries, with a new empty ## Unreleased section above it.",
+  "done_when": "Both version strings read 1.4.0, CHANGELOG.md has an empty ## Unreleased section followed by ## 1.4.0 - 2026-10-14 holding the former Unreleased entries, python3 -m unittest discover passes, and the change is committed."
+}

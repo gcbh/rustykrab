@@ -1,0 +1,5 @@
+{
+  "title": "Region totals report from the September sales export",
+  "objective": "From data/sales.csv, write reports/region_totals.md: a markdown table with the header row | region | units | revenue |, then one row per region in alphabetical order, where units is the region's total units and revenue is the sum of units * unit_price over its rows, written with exactly two decimals; then a final row | TOTAL | <all units> | <all revenue> |.",
+  "done_when": "reports/region_totals.md holds that table with every number matching data/sales.csv, and the file is committed."
+}

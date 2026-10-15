@@ -1,0 +1,5 @@
+{
+  "title": "Answer: what does shipping_cost return for a member's remote express parcel?",
+  "objective": "Answer a question about this repository without changing it: what value does shipping_cost(12.5, \"express\", member=True, remote=True) from shipping/cost.py return?",
+  "done_when": "The report's summary states the exact value that call returns."
+}

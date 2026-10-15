@@ -54,6 +54,7 @@ run a peer's brief as a local worker inside the node's ceiling
 | `rlm/recursive_call.rs` | 573 | Recursive sub-query execution over context slices |
 | `rlm/repl_tools.rs` | 469 | `peek` / `search` / `sub_query` over externalised context |
 | `rlm/context_manager.rs` | 22 | One token-estimation function |
+| `examples/reminder_eval.rs` | — | Not part of the library: the `result_report` reminder eval, production-shaped `qwen-code` runs over the Python fixtures in `examples/reminder_eval_tasks/` (`docs/measurements/reminder-eval-qwen38-2026-10-14.md`). The crate's `tracing-subscriber` dev-dependency is its file log |
 
 ## The loop
 

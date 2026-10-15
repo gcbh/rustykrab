@@ -1,0 +1,5 @@
+{
+  "title": "Implement parse_duration to its spec",
+  "objective": "Implement parse_duration in timeparse/durations.py so it meets every rule in docs/durations.md, and add unit tests for it in a new test module under tests/.",
+  "done_when": "parse_duration meets every rule in docs/durations.md, a new test module under tests/ exercises it, python3 -m unittest discover passes, and the change is committed."
+}

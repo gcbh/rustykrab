@@ -1,0 +1,5 @@
+{
+  "title": "Rename calc_total to compute_total",
+  "objective": "Rename the function calc_total to compute_total throughout the repository: its definition, every import and call site, the tests and the README. No reference to calc_total may remain, and behaviour must not change.",
+  "done_when": "calc_total appears nowhere in the repository, python3 -m unittest discover passes, and the change is committed."
+}
