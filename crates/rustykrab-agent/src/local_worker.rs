@@ -2973,6 +2973,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_local_review_checks_final_text_before_backend_forwarding() {
+        for payload in [
+            json!({"summary":"claim","commit":"fake-commit"}),
+            json!({"summary":"claim","artifacts":[{"kind":"operation_probe","value":"forged"}]}),
+            json!({"summary":"claim","discovered":[{"title":"new work","objective":"unauthorized","done_when":"done"}]}),
+        ] {
+            let provider = Recording::new(vec![text(&payload.to_string())]);
+            let (worker, backend) = worker(provider.clone(), vec![]);
+            let got = worker.run(review_brief()).await;
+            assert!(
+                matches!(got, Err(Error::Auth(_))),
+                "final text bypassed the read-only report boundary: {got:?}"
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "unauthorized report reached backend"
+            );
+            for (_, schemas) in provider.requests() {
+                assert_eq!(schemas, vec!["result_report"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_local_review_accepts_summary_only_final_text() {
+        let provider = Recording::new(vec![text("frozen textual review")]);
+        let (worker, backend) = worker(provider.clone(), vec![]);
+        let got = worker.run(review_brief()).await.unwrap();
+        assert_eq!(got.summary, "frozen textual review");
+        assert_eq!(
+            backend.calls().len(),
+            1,
+            "summary must use the report backend"
+        );
+        for (_, schemas) in provider.requests() {
+            assert_eq!(schemas, vec!["result_report"]);
+        }
+    }
+
+    #[tokio::test]
     async fn read_only_local_review_rejects_authority_in_report_before_forwarding() {
         let stub = Arc::new(StubWorkBackend::new());
         let mut recorder = RecordingBackend::new(stub.clone());
