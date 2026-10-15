@@ -27,10 +27,10 @@ pub fn tool_timeout_secs(tool_name: &str) -> Option<u64> {
         "web_fetch" | "http_request" | "http_session" => Some(30),
         // Local network APIs (Obsidian REST, Notion proxy) should be fast.
         "obsidian" => Some(10),
-        // Shell exec: 30s is plenty for the kinds of commands the agent
-        // runs; longer-running scans use raw-net-discovery via the
-        // separate 300s budget.
-        "exec" => Some(30),
+        // Shell exec bounds each command itself (120 s unless the call asks
+        // for up to 600). A 30 s cap here cut every build and test run off
+        // whatever the call asked for; it now sits just above the tool's.
+        "exec" => Some(rustykrab_tools::EXEC_MAX_TIMEOUT_SECS + 5),
         _ => None,
     }
 }
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(tool_timeout_secs("web_fetch"), Some(30));
         assert_eq!(tool_timeout_secs("http_request"), Some(30));
         assert_eq!(tool_timeout_secs("obsidian"), Some(10));
-        assert_eq!(tool_timeout_secs("exec"), Some(30));
+        assert_eq!(tool_timeout_secs("exec"), Some(605));
         // Unknown tools fall back to the caller's default.
         assert_eq!(tool_timeout_secs("memory_save"), None);
         assert_eq!(tool_timeout_secs("unknown_tool"), None);

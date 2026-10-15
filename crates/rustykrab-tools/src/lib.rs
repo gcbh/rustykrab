@@ -137,7 +137,7 @@ pub use write::WriteTool;
 
 // Runtime
 pub use code_execution::CodeExecutionTool;
-pub use exec::{Confinement, ExecTool};
+pub use exec::{Confinement, ExecTool, MAX_TIMEOUT_SECS as EXEC_MAX_TIMEOUT_SECS};
 pub use process::ProcessTool;
 
 // Web

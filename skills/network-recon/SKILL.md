@@ -203,5 +203,5 @@ ssh -o BatchMode=yes user@192.168.1.1 'cat /tmp/dnsmasq.leases'
   in the same `exec` call rather than multiple round-trips.
 - `exec` truncates output at 100 KB — pre-filter with `head`, `grep -c`, or
   `wc -l` when a scan could produce more.
-- `exec` timeout defaults to 30 s, max 120 s. For full-port `nmap` scans set
+- `exec` timeout defaults to 120 s, max 600 s. For full-port `nmap` scans set
   `timeout_secs` explicitly.
