@@ -3739,12 +3739,14 @@ impl AgentRunner {
     }
 
     /// Compact under the configured strategy. When its summary cannot be
-    /// had (the call failed, ran out of room, or answered nothing), the
-    /// history is compacted again without a model call: the recent turns
-    /// kept verbatim, the rest archived for recall, and a note saying so.
-    /// A failed summary used to end the run (11 of qwen3.8's 30 real
-    /// failures, 2026-10-12 to 14); the model can work on from recent
-    /// turns and the archive instead.
+    /// had (the call failed, ran out of room, or answered nothing) in a
+    /// worker run, the history is compacted again without a model call: the
+    /// recent turns kept verbatim, the rest archived for recall, and a note
+    /// saying so. A failed summary used to end the run (11 of qwen3.8's 30
+    /// real failures, 2026-10-12 to 14); the model can work on from recent
+    /// turns and the archive instead, and the run's session log keeps every
+    /// message. A conversation's stored history is its only record, so an
+    /// interactive turn keeps it whole and fails as before.
     async fn compact_history_preserving(
         &self,
         conv: &mut Conversation,
@@ -3756,7 +3758,7 @@ impl AgentRunner {
             .compact_history_with(conv, tools, latest_user, strategy)
             .await
         {
-            Err(error) if strategy != CompactionStrategy::Extractive => {
+            Err(error) if strategy != CompactionStrategy::Extractive && in_worker_run() => {
                 tracing::warn!(
                     %error,
                     "compaction summary failed; keeping recent turns verbatim instead"
@@ -5651,7 +5653,20 @@ mod compaction_tests {
         let recent = conv.messages[2].id;
         let before = AgentRunner::estimate_conversation_tokens(&conv.messages);
 
-        runner.compact_history(&mut conv, &[]).await.unwrap();
+        // A chat turn keeps its history whole and fails, as before.
+        let stored = serde_json::to_value(&conv).unwrap();
+        assert!(runner.compact_history(&mut conv, &[]).await.is_err());
+        assert_eq!(serde_json::to_value(&conv).unwrap(), stored);
+
+        // A worker run goes on from its recent turns.
+        let binding = rustykrab_tools::WorkRunContext {
+            item: "item-1".into(),
+            actor: "worker:test".into(),
+        };
+        rustykrab_tools::WORK_RUN_CONTEXT
+            .scope(binding, runner.compact_history(&mut conv, &[]))
+            .await
+            .unwrap();
 
         assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) < before);
         assert!(
