@@ -22,7 +22,7 @@ usage: rustykrab workers
                                  repositories and routing record
   worker show <name>             one worker
   worker add <claude_code|codex> [--name N] --repos PATH[,PATH...]
-             [--command PATH] [--model M] [--max-turns N]
+             [--command PATH] [--model M]
              [--claude-config-dir PATH] [--require-max]
              [--codex-home PATH] [--require-chatgpt]
              [--permission-mode M] [--timeout SECONDS]
@@ -180,7 +180,6 @@ fn parse_add(kind: &str, rest: &[&str]) -> Result<WorkerSpec, String> {
                 continue;
             }
             "--permission-mode" => spec.permission_mode = Some(value(i)?.to_string()),
-            "--max-turns" => spec.max_turns = Some(number(value(i)?)? as u32),
             "--timeout" => spec.timeout_seconds = Some(number(value(i)?)?),
             "--cost-tier" => spec.cost_tier = Some(number(value(i)?)? as u32),
             "--allowed-tools" => {
@@ -341,7 +340,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let line = format!(
-            "worker add claude_code --name pinch --repos {},{} --max-turns 12 --timeout 600",
+            "worker add claude_code --name pinch --repos {},{} --timeout 600",
             repo.path().display(),
             other.path().display()
         );
@@ -355,7 +354,6 @@ mod tests {
             PathBuf::from(&spec.repos[0]),
             repo.path().canonicalize().unwrap()
         );
-        assert_eq!(spec.max_turns, Some(12));
         assert_eq!(spec.timeout_seconds, Some(600));
         assert!(spec.denied_tools.is_empty());
 
@@ -425,7 +423,8 @@ mod tests {
         assert!(parse(&words("worker add local --repos /tmp")).is_err());
         assert!(parse(&words("worker add claude_code")).is_err(), "no repos");
         assert!(parse(&words("worker add claude_code --repos /tmp --bogus")).is_err());
-        assert!(parse(&words("worker add claude_code --repos /tmp --max-turns x")).is_err());
+        // No turn cap to set: Claude Code runs to its own end.
+        assert!(parse(&words("worker add claude_code --repos /tmp --max-turns 12")).is_err());
     }
 
     #[test]

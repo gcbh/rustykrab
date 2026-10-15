@@ -98,8 +98,6 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_tools: Vec<String>,
     #[serde(default)]
-    pub max_turns: Option<u32>,
-    #[serde(default)]
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
@@ -958,6 +956,23 @@ mod tests {
         let spec: WorkerSpec = serde_json::from_value(old).unwrap();
         assert!(spec.denied_tools.is_empty());
         assert_eq!(spec.allowed_tools, ["Read"]);
+    }
+
+    #[test]
+    fn a_stored_spec_with_a_turn_cap_still_reads() {
+        let old = serde_json::json!({
+            "kind": "claude_code",
+            "name": "pinch",
+            "repos": ["/src/app"],
+            "max_turns": 30,
+        });
+        let spec: WorkerSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.name.as_deref(), Some("pinch"));
+        let stored = serde_json::to_value(&spec).unwrap();
+        assert!(
+            stored.get("max_turns").is_none(),
+            "dropped on the next write"
+        );
     }
 
     fn peer(name: &str) -> WorkerSpec {

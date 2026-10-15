@@ -7,7 +7,7 @@
 //! - `GET /api/workers/{name}` is one of them.
 //! - `POST /api/workers` adds an external worker from a
 //!   [`WorkerSpec`] (`kind`: `claude_code` or `codex`, optional `name`,
-//!   `repos`, `command`, `model`, `allowed_tools`, `denied_tools`, `max_turns`,
+//!   `repos`, `command`, `model`, `allowed_tools`, `denied_tools`,
 //!   `permission_mode`, `timeout_seconds`, `concurrency`, `cost_tier`,
 //!   `env`): 201 with the worker, 409 when the name is taken, 400 when the
 //!   spec is refused (among others, a codex spec with `denied_tools`, which

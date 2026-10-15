@@ -5,7 +5,7 @@
 //! One run is one headless invocation of the agent's own CLI:
 //!
 //! - **claude_code**: `claude -p <brief> --output-format stream-json
-//!   --verbose --max-turns <n> --permission-mode <mode> --allowedTools <list>
+//!   --verbose --permission-mode <mode> --allowedTools <list>
 //!   --disallowedTools <list>` (the built-in deny list, then the spec's
 //!   `denied_tools`), plus `--model`, for a capability build
 //!   `--add-dir <skills dir>`, and for a fix item `--add-dir` for each
@@ -45,21 +45,15 @@
 //! shell command the agent ran, as `command_run` artifacts (a model-written
 //! `command_run` is dropped), which is the evidence the controller checks
 //! `checks_run` against. A run that ends without a contract is a typed
-//! [`RunFailure`]: the turn cap is `budget/iterations`, the timeout
-//! `budget/wall`, a failed process `process/<code>`, an unreadable final
-//! message `model/format`.
+//! [`RunFailure`]: the timeout `budget/wall`, a failed process
+//! `process/<code>`, an unreadable final message `model/format`.
 //!
-//! **Its turn budget.** The brief tells a Claude Code agent how many turns a
-//! round has. One that stops at the cap (`error_max_turns`) and printed a
-//! session id is not finished and not failed: the same session is resumed
-//! (`--resume <session>`, the same allowlist, permission mode and
-//! directory) to keep working, up to [`CONTINUATIONS_MAX`] rounds and while
-//! the wall limit leaves more than the wrap-up's reserve. Still at the cap
-//! after that, it is resumed once more for at most [`WRAP_UP_TURNS`] turns
-//! and asked only for the contract for the work it already committed. That
-//! report is read and attested as usual, with a `known_limits` entry saying
-//! how it came about; if the wrap-up fails too, the run stays
-//! `budget/iterations`.
+//! **No turn budget.** A run is not capped in turns: the agent works until
+//! it returns its final message, in its own harness, and the wall limit
+//! (the worker's timeout, or the brief's wall budget when smaller) is the
+//! only stop. A Claude Code cap (`--max-turns`, 30 a round) used to end runs
+//! mid-work, resume them in rounds and finally ask for a contract; it
+//! limited nothing the wall limit did not, and cut work short.
 //!
 //! **Its session log.** Everything each invocation printed (the agent's
 //! own JSON event stream: every message, tool call and tool result) is
@@ -109,15 +103,6 @@ use serde_json::Value;
 const STDERR_TAIL: usize = 600;
 /// Commands recorded per run; the rest are counted, not kept.
 const COMMANDS_MAX: usize = 64;
-/// Turns the last resume of a run gets: only enough to commit nothing new
-/// and return the contract ([`wrap_up_prompt`]).
-pub const WRAP_UP_TURNS: u32 = 2;
-/// Times a run that stopped at its turn cap is resumed to keep working
-/// before the wrap-up. The wall limit ends a run sooner.
-pub const CONTINUATIONS_MAX: u32 = 8;
-/// Wall time kept back for the wrap-up: a run with less than this left is
-/// asked for its contract instead of being resumed to keep working.
-pub const WRAP_UP_RESERVE: Duration = Duration::from_secs(120);
 /// How long a run's session log is kept ([`Worker::run_log`]).
 pub(crate) const RUN_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 /// The directory under the daemon's data directory that holds every run's
@@ -424,12 +409,8 @@ pub struct ExternalConfig {
     /// Denied on top of [`CLAUDE_DENIED_TOOLS`] in Claude Code's
     /// `--disallowedTools`; empty for codex, which has no such flag.
     pub denied_tools: Vec<String>,
-    pub max_turns: u32,
     pub permission_mode: String,
     pub timeout: Duration,
-    /// Wall time kept back for the wrap-up after the turn cap
-    /// ([`WRAP_UP_RESERVE`]).
-    pub wrap_up_reserve: Duration,
     pub concurrency: usize,
     /// Extra environment variables passed through, by name.
     pub env: Vec<String>,
@@ -549,13 +530,11 @@ impl ExternalConfig {
             require_chatgpt: spec.require_chatgpt,
             allowed_tools: spec.allowed_tools.clone(),
             denied_tools,
-            max_turns: spec.max_turns.unwrap_or(30),
             permission_mode: spec
                 .permission_mode
                 .clone()
                 .unwrap_or_else(|| "acceptEdits".to_string()),
             timeout: Duration::from_secs(spec.timeout_seconds.unwrap_or(1_800)),
-            wrap_up_reserve: WRAP_UP_RESERVE,
             concurrency: spec.concurrency.unwrap_or(1).max(1),
             env: spec.env.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -584,29 +563,6 @@ pub struct ExternalWorker {
     logs: Mutex<HashMap<String, PathBuf>>,
 }
 
-/// Which invocation of a run this is: the first, a resume to keep working
-/// after the turn cap, or the last resume, asked only for the contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Resume<'a> {
-    KeepWorking(&'a str),
-    WrapUp(&'a str),
-}
-
-impl Resume<'_> {
-    fn session(&self) -> &str {
-        match self {
-            Resume::KeepWorking(s) | Resume::WrapUp(s) => s,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Resume::KeepWorking(_) => "continue",
-            Resume::WrapUp(_) => "wrap_up",
-        }
-    }
-}
-
 /// What one invocation printed, read.
 #[derive(Debug, Default, PartialEq)]
 struct Transcript {
@@ -617,8 +573,6 @@ struct Transcript {
     usage: RunUsage,
     /// Set when the agent's own result says it stopped on an error.
     failure: Option<RunFailure>,
-    /// Claude Code's session id, when it printed one.
-    session: Option<String>,
 }
 
 impl ExternalWorker {
@@ -778,8 +732,7 @@ impl ExternalWorker {
         run: &str,
         output: &std::process::Output,
         last: &Path,
-        resumed: bool,
-    ) -> (Result<ResultReport>, Option<String>) {
+    ) -> Result<ResultReport> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut transcript = match self.config.kind {
@@ -795,58 +748,34 @@ impl ExternalWorker {
         }
         {
             let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = usage.entry(run.to_string()).or_default();
-            if resumed {
-                entry.tokens += transcript.usage.tokens;
-                entry.iterations = entry.iterations.saturating_add(transcript.usage.iterations);
-            } else {
-                *entry = transcript.usage;
-            }
+            *usage.entry(run.to_string()).or_default() = transcript.usage;
         }
         {
             let mut commands = self.commands.lock().unwrap_or_else(|e| e.into_inner());
-            let ran = std::mem::take(&mut transcript.commands);
-            if resumed {
-                commands.entry(brief.item.clone()).or_default().extend(ran);
-            } else {
-                commands.insert(brief.item.clone(), ran);
-            }
+            commands.insert(brief.item.clone(), std::mem::take(&mut transcript.commands));
         }
         if self
             .max_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.observe_quota(&output.stdout))
         {
-            return (
-                Err(Error::ModelRateLimit(
-                    "Claude Max usage limit reached; no API fallback attempted".into(),
-                )),
-                None,
-            );
+            return Err(Error::ModelRateLimit(
+                "Claude Max usage limit reached; no API fallback attempted".into(),
+            ));
         }
         if self
             .codex_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.observe_quota(&output.stdout))
         {
-            return (
-                Err(Error::ModelRateLimit(
-                    "Codex subscription usage limit reached; no API fallback attempted".into(),
-                )),
-                None,
-            );
+            return Err(Error::ModelRateLimit(
+                "Codex subscription usage limit reached; no API fallback attempted".into(),
+            ));
         }
         if let Some(failure) = transcript.failure.take() {
-            let resume = match failure {
-                RunFailure::Budget {
-                    budget: BudgetKind::Iterations,
-                    ..
-                } if self.config.kind == WorkerKind::ClaudeCode => transcript.session.take(),
-                _ => None,
-            };
-            return (Err(failure.into_error()), resume);
+            return Err(failure.into_error());
         }
-        let outcome = match &transcript.final_message {
+        match &transcript.final_message {
             Some(text) => parse_contract(text).map_err(|why| {
                 RunFailure::Model {
                     problem: ProviderProblem::Format,
@@ -863,29 +792,16 @@ impl ExternalWorker {
                 ),
             }
             .into_error()),
-        };
-        (outcome, None)
+        }
     }
 
-    /// The turns a Claude Code run gets: the worker's cap, or the item's
-    /// iteration budget when that is smaller.
-    fn turn_limit(&self, brief: &Brief) -> u32 {
-        self.config
-            .max_turns
-            .min(brief.budget.iterations.max(1))
-            .max(1)
-    }
-
-    /// The process for one run, or with `resume`, the Claude Code session
-    /// to continue: for a full round of turns to keep working, or for
-    /// [`WRAP_UP_TURNS`] to hand in the contract.
+    /// The process for one run.
     fn command(
         &self,
         prompt: &str,
         dir: &Path,
         brief: &Brief,
         last: &Path,
-        resume: Option<Resume<'_>>,
     ) -> tokio::process::Command {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
@@ -939,21 +855,12 @@ impl ExternalWorker {
                 cmd.arg(prompt);
             }
             _ => {
-                let turns = match resume {
-                    Some(Resume::WrapUp(_)) => WRAP_UP_TURNS,
-                    Some(Resume::KeepWorking(_)) | None => self.turn_limit(brief),
-                }
-                .to_string();
                 let allowed = allowed_list(&c.allowed_tools);
                 cmd.arg("-p").arg(prompt);
                 if review {
                     cmd.args(["--tools", ""]);
                 }
-                if let Some(resume) = resume {
-                    cmd.args(["--resume", resume.session()]);
-                }
                 cmd.args(["--output-format", "stream-json", "--verbose"])
-                    .args(["--max-turns", &turns])
                     .args(["--permission-mode", &c.permission_mode])
                     .args(["--allowedTools", &allowed])
                     .args([
@@ -1124,116 +1031,6 @@ impl ExternalWorker {
             }
         }
     }
-
-    /// Resume a Claude Code session that stopped at its turn cap, within
-    /// `limit`: to keep working for another round of turns, or (the wrap-up)
-    /// only to hand in the result contract for what it already committed.
-    /// Returns what the resume ended with, the session to resume again when
-    /// it stopped at the cap once more, and whether daemon shutdown ended
-    /// it.
-    async fn resume(
-        &self,
-        brief: &Brief,
-        run: &str,
-        resume: Resume<'_>,
-        dir: &Path,
-        last: &Path,
-        limit: Duration,
-    ) -> (Result<ResultReport>, Option<String>, bool) {
-        let prompt = match resume {
-            Resume::KeepWorking(_) => continue_prompt(self.turn_limit(brief)),
-            Resume::WrapUp(_) => wrap_up_prompt(),
-        };
-        let cmd = self.command(&prompt, dir, brief, last, Some(resume));
-        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
-        match executed {
-            Ok(output) => {
-                self.append_log(run, resume.label(), &output);
-                let (outcome, again) = self.read_output(brief, run, &output, last, true);
-                (outcome, again, interrupted)
-            }
-            Err(e) => {
-                if let Some(partial) = &partial {
-                    self.append_log(run, resume.label(), partial);
-                    let _ = self.read_output(brief, run, partial, last, true);
-                }
-                (Err(e), None, interrupted)
-            }
-        }
-    }
-
-    /// The wrap-up: ask the session only for the contract. `None` when
-    /// there is no time left, it did not return one, or a run in a worktree
-    /// reported no commit; beside it, whether daemon shutdown ended it.
-    async fn wrap_up(
-        &self,
-        brief: &Brief,
-        run: &str,
-        session: &str,
-        dir: &Path,
-        last: &Path,
-        limit: Duration,
-    ) -> (Option<ResultReport>, bool) {
-        if limit.is_zero() {
-            return (None, false);
-        }
-        let (recovered, _, interrupted) = self
-            .resume(brief, run, Resume::WrapUp(session), dir, last, limit)
-            .await;
-        let report = match recovered {
-            // A worktree run that committed nothing has nothing to recover:
-            // it stays the budget/iterations failure it already was.
-            Ok(report) if brief.workspace.is_some() && report.commit.is_none() => {
-                tracing::warn!(
-                    worker = %self.name,
-                    item = %brief.item,
-                    "wrap-up after the turn cap reported no commit"
-                );
-                None
-            }
-            Ok(mut report) => {
-                report.known_limits.push(format!(
-                    "recovered after the turn cap: the run stopped at its {}-turn limit and this \
-                     report came from resuming its session for at most {WRAP_UP_TURNS} turns",
-                    self.turn_limit(brief)
-                ));
-                Some(report)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    worker = %self.name,
-                    item = %brief.item,
-                    error = %e,
-                    "wrap-up after the turn cap returned no contract"
-                );
-                None
-            }
-        };
-        (report, interrupted)
-    }
-}
-
-/// What a resume to keep working is told.
-fn continue_prompt(turns: u32) -> String {
-    format!(
-        "You stopped at your turn limit before the work item was finished. Nothing is lost: \
-         this is the same session, in the same directory. Continue from where you stopped, \
-         for up to {turns} more turns. Commit as you go. When the item's done_when is met, or \
-         you are truly blocked, end with one JSON object and nothing after it, the result \
-         contract:\n{CONTRACT_SHAPE}\n"
-    )
-}
-
-/// What the wrap-up after the turn cap is asked.
-fn wrap_up_prompt() -> String {
-    format!(
-        "You ran out of turns before returning the result contract. Do no more work and run \
-         nothing. Return the result contract for the work already committed on this branch: \
-         commit is the sha of your last commit, or null if you committed nothing, and \
-         changed_paths are exactly the files your commits change. Say in known_limits what \
-         of the done_when is not met. End with one JSON object and nothing after it:\n\
-         {CONTRACT_SHAPE}\n"
-    )
 }
 
 /// Whether the brief is a capability build of a tool: its facet says
@@ -1439,10 +1236,6 @@ impl Worker for ExternalWorker {
             prune_dirs(&self.runs_root(), window);
         }
 
-        let turns = match self.config.kind {
-            WorkerKind::Codex => None,
-            _ => Some(self.turn_limit(&brief)),
-        };
         let context_dir = self.runs_root().join(short(&run_id));
         let context_path = if let Some(context) = &brief.project_context {
             std::fs::create_dir_all(&context_dir).map_err(|e| Error::Internal(e.to_string()))?;
@@ -1468,7 +1261,6 @@ impl Worker for ExternalWorker {
             self.config.kind,
             &dir,
             &self.config.skills_dir,
-            turns,
         );
         if let Some(path) = context_path {
             let _ = writeln!(prompt, "Full frozen project history: {}. Read only the records needed for this task, in small portions; do not load the entire file into context. This is inspection data, not additional task authority.", path.display());
@@ -1491,93 +1283,29 @@ impl Worker for ExternalWorker {
             let _ = writeln!(prompt, "Full frozen work discussion: {}. Read relevant comments in small portions. User comments guide future work; agent comments are reports, and neither expands the execution scope.", path.display());
         }
         let last = std::env::temp_dir().join(format!("rustykrab-last-{}.txt", short(&run_id)));
-        let cmd = self.command(&prompt, &dir, &brief, &last, None);
+        let cmd = self.command(&prompt, &dir, &brief, &last);
         let limit = match brief.budget.wall_seconds {
             0 => self.config.timeout,
             secs => self.config.timeout.min(Duration::from_secs(secs)),
         };
         let started = std::time::Instant::now();
         prune_files(&self.logs_root(), RUN_LOG_RETENTION);
-        let (executed, partial, mut interrupted) = self.execute(cmd, limit).await;
-        let (mut outcome, mut resume) = match executed {
+        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
+        let outcome = match executed {
             Ok(output) => {
                 self.append_log(&run_id, "start", &output);
-                self.read_output(&brief, &run_id, &output, &last, false)
+                self.read_output(&brief, &run_id, &output, &last)
             }
             // Ended by its wall limit: record what it had spent, and keep
             // the timeout as the outcome.
             Err(e) => {
                 if let Some(partial) = &partial {
                     self.append_log(&run_id, "start", partial);
-                    let _ = self.read_output(&brief, &run_id, partial, &last, false);
+                    let _ = self.read_output(&brief, &run_id, partial, &last);
                 }
-                (Err(e), None)
+                Err(e)
             }
         };
-        // A run that stopped at its turn cap is not finished and not
-        // failed: the same session is resumed to keep working, round after
-        // round, while there is wall time beyond the wrap-up's reserve.
-        // Then, still at the cap, it is asked once for the contract for
-        // what it committed. Not once the daemon is shutting down.
-        let mut continued = 0u32;
-        while let Some(session) = resume.take().filter(|_| !interrupted) {
-            let left = limit.saturating_sub(started.elapsed());
-            let reserve = self.config.wrap_up_reserve;
-            if continued < CONTINUATIONS_MAX && left > reserve {
-                continued += 1;
-                let (next, again, stopped) = self
-                    .resume(
-                        &brief,
-                        &run_id,
-                        Resume::KeepWorking(&session),
-                        &dir,
-                        &last,
-                        left - reserve,
-                    )
-                    .await;
-                interrupted = stopped;
-                match next {
-                    Ok(mut report) => {
-                        report.known_limits.push(format!(
-                            "the run stopped at its {}-turn limit and was resumed {continued} \
-                             time(s) in the same session to finish",
-                            self.turn_limit(&brief)
-                        ));
-                        outcome = Ok(report);
-                    }
-                    // At the cap again: go round, with the session it
-                    // printed (the same one, unless the CLI forked it).
-                    Err(e) if again.is_some() => {
-                        outcome = Err(e);
-                        resume = again;
-                    }
-                    // The round ended some other way (its share of the wall
-                    // limit, a failed process): the reserve is still there
-                    // for the wrap-up of what it had committed.
-                    Err(e) => {
-                        outcome = Err(e);
-                        if !interrupted {
-                            let left = limit.saturating_sub(started.elapsed());
-                            let (report, stopped) = self
-                                .wrap_up(&brief, &run_id, &session, &dir, &last, left)
-                                .await;
-                            interrupted = stopped;
-                            if let Some(report) = report {
-                                outcome = Ok(report);
-                            }
-                        }
-                    }
-                }
-            } else {
-                let (report, stopped) = self
-                    .wrap_up(&brief, &run_id, &session, &dir, &last, left)
-                    .await;
-                interrupted = stopped;
-                if let Some(report) = report {
-                    outcome = Ok(report);
-                }
-            }
-        }
         // Shutdown ended the group: whatever the process said, the run was
         // interrupted, not failed. A report it managed to hand in stands.
         let outcome = match outcome {
@@ -1738,9 +1466,6 @@ fn read_claude(stdout: &str) -> Transcript {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if let Some(session) = event["session_id"].as_str().filter(|s| !s.is_empty()) {
-            t.session = Some(session.to_string());
-        }
         match event["type"].as_str() {
             Some("assistant") => {
                 let message = &event["message"];
@@ -2061,14 +1786,13 @@ fn sanitise(value: &mut Value) -> std::result::Result<(), String> {
 /// Render a brief as the delivery plan's executor brief (its section 5.2:
 /// the work-item slice, parent SHA, repository context, allowed tools and
 /// prior failed evidence), then the section 5 result contract the final
-/// message must be. `turns` is the run's turn limit, when it has one.
+/// message must be.
 pub fn render_executor_brief(
     brief: &Brief,
     name: &str,
     kind: WorkerKind,
     dir: &Path,
     skills_dir: &Path,
-    turns: Option<u32>,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -2178,15 +1902,6 @@ pub fn render_executor_brief(
     }
     out.push('\n');
     out.push_str("How to finish:\n");
-    if let Some(turns) = turns {
-        let _ = writeln!(
-            out,
-            "- You work in rounds of {turns} turns. A run that reaches the limit is resumed in \
-             the same session to keep going, a limited number of times and within its time \
-             limit, so commit as you go and return the result contract as soon as the \
-             done_when is met."
-        );
-    }
     if let Some(ws) = &brief.workspace {
         let _ = writeln!(
             out,
@@ -2479,13 +2194,7 @@ else:
             "pinch",
             ExternalConfig::from_spec(&spec, data.path()).unwrap(),
         );
-        let cmd = worker.command(
-            "go",
-            data.path(),
-            &brief(None),
-            &data.path().join("last"),
-            None,
-        );
+        let cmd = worker.command("go", data.path(), &brief(None), &data.path().join("last"));
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -2590,14 +2299,13 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         assert!(!ws.path.exists());
         assert_eq!(git(f.repo.path(), &["status", "--short"]), "");
         assert_eq!(git(f.repo.path(), &["rev-parse", "HEAD"]), ws.base);
-        // Headless, with a turn cap, a permission mode and an allowlist; and
-        // none of the daemon's environment.
+        // Headless, with a permission mode and an allowlist, no turn cap;
+        // and none of the daemon's environment.
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
         for want in [
             "-p",
             "stream-json",
             "--verbose",
-            "--max-turns",
             "--permission-mode",
             "acceptEdits",
             "--allowedTools",
@@ -2860,193 +2568,19 @@ wait
         assert!(!missing.healthy());
     }
 
-    /// A Claude Code stand-in that commits, then stops at its turn cap with
-    /// session `sess-1`. Resumed (`--resume`), it records its arguments and
-    /// runs `on_resume`.
-    fn capped_claude(on_resume: &str) -> String {
-        let first = r#"#!/bin/sh
-resume=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "--resume" ]; then resume="$a"; fi
-  prev="$a"
-done
-if [ -z "$resume" ]; then
-  printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/args.txt"
-  echo 'pub fn status() {}' >> src/lib.rs
-  git add src/lib.rs
-  git -c user.name=t -c user.email=t@x.invalid commit -q --no-gpg-sign -m change
-  echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
-  echo '{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p fixture"}}]}}'
-  echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":25,"session_id":"sess-1","usage":{"input_tokens":100,"output_tokens":20}}'
-  exit 1
-fi
-printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/resume.txt"
-"#;
-        format!("{first}{on_resume}\n")
-    }
-
-    /// The resume answers with the contract for the commit already made.
-    const RESUME_CONTRACT: &str = r#"sha=$(git rev-parse HEAD)
-echo '{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git log -1"}}]}}'
-contract="{\\\"summary\\\":\\\"added status\\\",\\\"changed_paths\\\":[\\\"src/lib.rs\\\"],\\\"commit\\\":\\\"$sha\\\",\\\"checks_run\\\":[\\\"cargo test -p fixture\\\"]}"
-echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"session_id\":\"sess-1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5},\"result\":\"$contract\"}""#;
-
+    /// Claude Code runs in its own harness without a turn cap: the wall
+    /// limit is the only stop, and the brief says nothing of rounds.
     #[tokio::test]
-    async fn the_brief_names_the_turn_limit() {
+    async fn a_claude_code_run_has_no_turn_cap() {
         let f = Fixture::new();
-        let mut worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
-        worker.config.max_turns = 12;
-        worker.run(brief(Some(f.workspace()))).await.unwrap();
-        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert!(args.contains("--max-turns\n12\n"), "{args}");
-        assert!(args.contains("You work in rounds of 12 turns"), "{args}");
-        assert!(args.contains("is resumed in the same session"), "{args}");
-        // Codex has no turn cap to name.
-        let codex = render_executor_brief(
-            &brief(None),
-            "pinch",
-            WorkerKind::Codex,
-            Path::new("/tmp/run"),
-            Path::new("/tmp/skills"),
-            None,
-        );
-        assert!(!codex.contains("rounds of"), "{codex}");
-    }
-
-    #[tokio::test]
-    async fn a_run_at_its_turn_cap_is_resumed_once_for_its_contract() {
-        let f = Fixture::new();
-        let worker = f.worker(
-            WorkerKind::ClaudeCode,
-            f.agent("claude", &capped_claude(RESUME_CONTRACT)),
-        );
-        let ws = f.workspace();
-        let report = worker.run(brief(Some(ws.clone()))).await.unwrap();
-
-        assert_eq!(report.summary, "added status");
-        assert_eq!(report.changed_paths, ["src/lib.rs"]);
-        let sha = report.commit.clone().unwrap();
-        assert_eq!(git(f.repo.path(), &["cat-file", "-t", &sha]), "commit");
-        assert!(
-            report
-                .known_limits
-                .iter()
-                .any(|l| l.contains("recovered after the turn cap")),
-            "{:?}",
-            report.known_limits
-        );
-        // Attested as usual, with what both invocations ran.
-        let ran: Vec<&str> = report
-            .artifacts
-            .iter()
-            .filter(|a| a.kind == COMMAND_RUN)
-            .map(|a| a.value.as_str())
-            .collect();
-        assert_eq!(ran, ["cargo test -p fixture", "git log -1"]);
-        let usage = worker.usage("run-1").unwrap();
-        assert_eq!((usage.tokens, usage.iterations), (135, 27));
-
-        // The same session, allowlist and permission mode, for two turns,
-        // asked only for the contract.
-        let first = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        let resume = std::fs::read_to_string(f.data.path().join("resume.txt")).unwrap();
-        assert!(resume.contains("--resume\nsess-1\n"), "{resume}");
-        assert!(resume.contains("--max-turns\n2\n"), "{resume}");
-        assert!(
-            resume.contains("--permission-mode\nacceptEdits\n"),
-            "{resume}"
-        );
-        let after = |args: &str, flag: &str| {
-            let mut lines = args.lines();
-            lines.find(|l| *l == flag);
-            lines.next().map(str::to_string)
-        };
-        assert_eq!(
-            after(&resume, "--allowedTools"),
-            after(&first, "--allowedTools")
-        );
-        assert_eq!(
-            after(&resume, "--disallowedTools"),
-            after(&first, "--disallowedTools")
-        );
-        assert!(resume.contains("already committed"), "{resume}");
-        assert!(!ws.path.exists(), "a recovered run gives its worktree back");
-    }
-
-    /// With wall time beyond the wrap-up's reserve, a capped run is not
-    /// wrapped up: its session is resumed for a full round to keep working.
-    #[tokio::test]
-    async fn a_run_at_its_turn_cap_with_time_left_is_resumed_to_keep_working() {
-        let f = Fixture::new();
-        let mut worker = f.worker(
-            WorkerKind::ClaudeCode,
-            f.agent("claude", &capped_claude(RESUME_CONTRACT)),
-        );
-        worker.config.max_turns = 12;
-        worker.config.wrap_up_reserve = Duration::from_secs(1);
-        let report = worker.run(brief(Some(f.workspace()))).await.unwrap();
-
-        assert_eq!(report.summary, "added status");
-        assert!(
-            report
-                .known_limits
-                .iter()
-                .any(|l| l.contains("was resumed 1 time(s) in the same session")),
-            "{:?}",
-            report.known_limits
-        );
-        let resume = std::fs::read_to_string(f.data.path().join("resume.txt")).unwrap();
-        assert!(resume.contains("--resume\nsess-1\n"), "{resume}");
-        assert!(
-            resume.contains("--max-turns\n12\n"),
-            "a full round, not the wrap-up's two turns: {resume}"
-        );
-        assert!(
-            resume.contains("Continue from where you stopped"),
-            "{resume}"
-        );
-    }
-
-    /// Every invocation's event stream is kept in one file per run, and the
-    /// worker names it, whether the run reported or not.
-    #[tokio::test]
-    async fn every_run_leaves_its_session_log() {
-        let f = Fixture::new();
-        // A run that reports.
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
-        assert_eq!(worker.run_log("run-1"), None, "no log before the run");
-        worker.run(brief(Some(f.workspace()))).await.unwrap();
-        let log = worker.run_log("run-1").expect("the run left a log");
-        assert_eq!(log, f.data.path().join(RUN_LOGS_DIR).join("run-1.jsonl"));
-        let text = std::fs::read_to_string(&log).unwrap();
-        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        assert_eq!(first["type"], "rustykrab.invocation");
-        assert_eq!(first["invocation"], "start");
-        assert_eq!(first["worker"], "pinch");
-        assert!(
-            text.contains("\"type\":\"result\""),
-            "the agent's own event stream follows the marker: {text}"
-        );
-
-        // A run that stops at its cap and whose wrap-up fails leaves both
-        // invocations, with what the failed one wrote to stderr.
-        std::fs::remove_file(&log).unwrap();
-        let capped = f.worker(
-            WorkerKind::ClaudeCode,
-            f.agent("claude", &capped_claude("echo 'resume failed' >&2\nexit 1")),
-        );
-        capped.run(brief(None)).await.unwrap_err();
-        let text = std::fs::read_to_string(capped.run_log("run-1").unwrap()).unwrap();
-        let invocations: Vec<String> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|v| v["type"] == "rustykrab.invocation")
-            .map(|v| v["invocation"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(invocations, ["start", "wrap_up"]);
-        assert!(text.contains("error_max_turns"), "{text}");
-        assert!(text.contains("resume failed"), "{text}");
+        let mut b = brief(Some(f.workspace()));
+        b.budget.iterations = 3;
+        worker.run(b).await.unwrap();
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        assert!(!args.lines().any(|l| l == "--max-turns"), "{args}");
+        assert!(!args.lines().any(|l| l == "--resume"), "{args}");
+        assert!(!args.contains("rounds of"), "{args}");
     }
 
     /// The toolset is Claude Code's default working tools; a spec adds to
@@ -3060,13 +2594,7 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
                 ExternalConfig::from_spec(spec, data.path()).unwrap(),
             );
             worker
-                .command(
-                    "go",
-                    data.path(),
-                    &brief(None),
-                    &data.path().join("last"),
-                    None,
-                )
+                .command("go", data.path(), &brief(None), &data.path().join("last"))
                 .as_std()
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -3105,26 +2633,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         assert!(!codex.iter().any(|a| a == "--ephemeral"), "{codex:?}");
         assert!(!codex.iter().any(|a| a.contains("web_search")), "{codex:?}");
         assert!(!codex.iter().any(|a| a == "--allowedTools"), "{codex:?}");
-    }
-
-    #[tokio::test]
-    async fn a_failed_resume_leaves_the_run_at_its_turn_cap() {
-        let f = Fixture::new();
-        for on_resume in [
-            "echo 'resume failed' >&2\nexit 1",
-            "echo '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"num_turns\":2,\"session_id\":\"sess-1\"}'",
-            "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"I could not finish.\"}'",
-        ] {
-            let worker = f.worker(
-                WorkerKind::ClaudeCode,
-                f.agent("claude", &capped_claude(on_resume)),
-            );
-            let err = worker.run(brief(None)).await.unwrap_err();
-            let e = classify(&run_failure_input(&err), &Context::default());
-            assert_eq!(e.subclass, ErrorSubclass::Iterations, "{on_resume}: {err}");
-            assert!(f.data.path().join("resume.txt").exists(), "resumed once");
-            std::fs::remove_file(f.data.path().join("resume.txt")).unwrap();
-        }
     }
 
     /// Holds `path` open for writing, and checks that this alone makes it
@@ -3181,33 +2689,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         );
     }
 
-    /// The resume answers with a contract that names no commit.
-    const RESUME_NO_COMMIT: &str = r#"contract="{\\\"summary\\\":\\\"ran out\\\",\\\"changed_paths\\\":[],\\\"commit\\\":null,\\\"checks_run\\\":[],\\\"error\\\":{\\\"class\\\":\\\"budget\\\",\\\"subclass\\\":\\\"iterations\\\",\\\"detail\\\":\\\"Turn limit reached before committing\\\"}}"
-echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"session_id\":\"sess-1\",\"result\":\"$contract\"}""#;
-
-    #[tokio::test]
-    async fn a_resume_in_a_worktree_that_committed_nothing_stays_at_the_turn_cap() {
-        let f = Fixture::new();
-        let worker = f.worker(
-            WorkerKind::ClaudeCode,
-            f.agent("claude", &capped_claude(RESUME_NO_COMMIT)),
-        );
-        let err = worker.run(brief(Some(f.workspace()))).await.unwrap_err();
-        assert!(f.data.path().join("resume.txt").exists(), "resumed once");
-        assert!(
-            matches!(
-                RunFailure::from_error(&err),
-                Some(RunFailure::Budget {
-                    budget: BudgetKind::Iterations,
-                    ..
-                })
-            ),
-            "{err}"
-        );
-        let e = classify(&run_failure_input(&err), &Context::default());
-        assert_eq!(e.subclass, ErrorSubclass::Iterations, "{err}");
-    }
-
     #[tokio::test]
     async fn a_capability_build_is_told_where_the_skills_are() {
         let f = Fixture::new();
@@ -3227,7 +2708,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             WorkerKind::ClaudeCode,
             Path::new("/tmp/run"),
             &f.data.path().join("skills"),
-            None,
         );
         assert!(!acquiring.contains("SKILL.md"), "{acquiring}");
         b.capability = Some(rustykrab_core::work::CapabilityMode::Build);
@@ -3237,7 +2717,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             WorkerKind::ClaudeCode,
             Path::new("/tmp/run"),
             &f.data.path().join("skills"),
-            None,
         );
         let skill = f.data.path().join("skills/tide_table/SKILL.md");
         assert!(prompt.contains(&skill.display().to_string()), "{prompt}");
@@ -3296,7 +2775,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             WorkerKind::ClaudeCode,
             &f.workspace().path,
             &f.data.path().join("skills"),
-            Some(30),
         );
         assert!(
             prompt.contains("investigation: this item investigates failure 0123456789abcdef"),
@@ -3318,7 +2796,6 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             WorkerKind::ClaudeCode,
             &f.workspace().path,
             &f.data.path().join("skills"),
-            Some(30),
         );
         assert!(!plain.contains("investigation:"), "{plain}");
 
@@ -3479,7 +2956,6 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
             WorkerKind::ClaudeCode,
             Path::new("/tmp/w"),
             Path::new("/tmp/skills"),
-            Some(80),
         );
         assert!(
             prompt.contains(
@@ -3497,7 +2973,6 @@ printf '{"summary":"added status","changed_paths":["src/lib.rs"],"checks_run":["
             WorkerKind::ClaudeCode,
             Path::new("/tmp/w"),
             Path::new("/tmp/skills"),
-            Some(80),
         );
         assert!(
             prompt.contains(
@@ -3851,13 +3326,7 @@ else:
         for kind in [WorkerKind::Codex, WorkerKind::ClaudeCode] {
             let mut worker = f.worker(kind, cli.clone());
             worker.config.require_chatgpt = kind == WorkerKind::Codex;
-            let command = worker.command(
-                "review",
-                f.data.path(),
-                &b,
-                &f.data.path().join("last"),
-                None,
-            );
+            let command = worker.command("review", f.data.path(), &b, &f.data.path().join("last"));
             let args: Vec<_> = command
                 .as_std()
                 .get_args()

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.9] - 2026-10-15
+
+- Let Claude Code run without a turn cap (#710)
+
 ## [6.5.8] - 2026-10-15
 
 - fix: wait out a momentarily busy CLI executable instead of failing the start (#702)
