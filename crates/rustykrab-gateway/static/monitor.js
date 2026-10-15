@@ -140,11 +140,41 @@
     card.append(node('div', num(value), 'number'), node('p', title), node('p', caption, 'caption'));
     return card;
   }
+  function renderDreamingAdmission(d) {
+    const descriptions = {
+      disabled: 'Reviews are disabled: no projects are enabled for review.',
+      controller_unavailable: 'Review deferred: the work manager is stopping, failing, or waiting for exclusive control.',
+      demand_unknown: 'Review deferred: current work demand has not been observed.',
+      demand_failed: 'Review deferred: the work manager could not read current work demand.',
+      demand_timed_out: 'Review deferred: reading current work demand exceeded its deadline.',
+      demand_stale: 'Review deferred: work demand is stale or ahead of the server clock.',
+      foreground_active: 'Review deferred: foreground work is active.',
+      foreground_runnable: 'Review deferred: foreground work can be dispatched.',
+      daily_limit: 'Review deferred: the three-cycle limit for the last 24 hours has been reached.',
+      no_due_project: 'No enabled project is due for review.',
+      review_in_progress: 'A project review cycle is already in progress.',
+      idle_review: 'An idle project review may start.',
+      incident_review: 'A waiting-only backlog permits a bounded incident review.'
+    };
+    const a = d.admission;
+    const description = Object.hasOwn(descriptions, a?.decision) ? descriptions[a.decision] : 'Review availability has not been reported by this build.';
+    const count = value => Number.isSafeInteger(value) && value >= 0 ? num(value) : 'not observed';
+    $('dreamMetrics').append(node('h3', 'Review availability'), node('p', 'Last decision: ' + description));
+    if (a) {
+      $('dreamMetrics').append(node('p', 'Decision check: ' + age(a.checked_at) + ' · Work-demand observation: ' + age(a.observed_at), 'note'));
+      $('dreamMetrics').append(node('p', 'Active foreground runs: ' + count(a.active_foreground_runs) + ' · Runnable foreground tasks: ' + count(a.dispatchable_foreground_leaves)));
+      const waiting = a.waiting && typeof a.waiting === 'object' && !Array.isArray(a.waiting) ? Object.entries(a.waiting) : null;
+      $('dreamMetrics').append(node('p', 'Waiting work: ' + (waiting === null ? 'not observed' : waiting.length ? waiting.map(([reason, n]) => human(reason).replaceAll('/', ' / ') + ': ' + count(n)).join(' · ') : 'none in this observation'), 'note'));
+    }
+    $('dreamMetrics').append(node('p', 'Last completed project review: ' + at(d.last_project_review_completed_at) + ' · Last failed project review: ' + at(d.last_project_review_failed_at), 'note'));
+    $('dreamMetrics').append(node('p', 'Review requests still follow work-capacity and daily review limits.', 'note'));
+  }
   function renderDreaming(d) {
     $('dreamRows').replaceChildren(); $('dreamMetrics').replaceChildren();
     $('dreamNow').disabled = !d?.enabled;
     $('dreamStatus').textContent = d ? (d.enabled ? 'Project reviews enabled · Interval ' + num(d.interval_seconds / 3600) + ' hours' : 'Project reviews are not configured') + ' · Expectation pass ' + age(d.last_evaluation) + ' · Outcome analysis ' + age(d.last_analysis) : 'Dreaming status unavailable';
     if (!d) return;
+    renderDreamingAdmission(d);
     const m = d.metrics;
     $('dreamMetrics').append(node('p', m.completed + ' completed reviews (' + m.calibrated_reviews + ' calibrated) · ' + m.pending + ' in progress · ' + m.failed + ' failed · ' + m.reviewed_projects + '/' + m.eligible_projects + ' projects reviewed this interval'));
     $('dreamMetrics').append(node('p', m.proposal_count + ' proposals · ' + m.pending_decisions + ' awaiting review · Acceptance ' + (m.acceptance_rate === null ? 'not yet measured' : Math.round(m.acceptance_rate * 100) + '%') + ' · Improvement ' + (m.improvement_rate === null ? 'not yet measured' : Math.round(m.improvement_rate * 100) + '%') + ' (' + m.measured_outcomes + ' measured outcomes)'));

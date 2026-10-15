@@ -350,6 +350,18 @@ monitor.html show cycle progress, spend, coverage, proxy quality grades and
 unmeasured/observed real outcomes. They use the existing bearer/origin/rate
 limit boundary; no token appears in a URL.
 
+The Systems view distinguishes configured reviews from the server's last
+admission decision. It renders the typed allow/defer reason, separate decision
+and demand-observation ages, known foreground/wait counts and latest completed
+and failed project-review timestamps. Missing fields in older daemon replies,
+unknown decision variants and absent counts remain unobserved, not zero or
+permission to run. The browser labels a recorded decision; it does not rerun
+the scheduler or turn review availability into a running cycle or recovery.
+The existing explicit review-request button keeps its server-side capacity and
+daily limits; rendering never posts work. All labels use textContent.
+scripts/test_dreaming_monitor.mjs runs the shipped renderer with waiting-backlog,
+deferred/stale/unknown, old-server, quota, refresh and literal-text fixtures in CI.
+
 ## Work-manager resources and schedule commands
 
 `resources.rs` defines the cached `ResourceObserver` seam and typed service
