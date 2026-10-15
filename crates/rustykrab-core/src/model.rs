@@ -96,6 +96,13 @@ pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
     fn name(&self) -> &str;
 
+    /// The tag of the model this provider runs on a local server, by which
+    /// the daemon's per-model configuration (`models.toml`) is looked up.
+    /// `None` for a hosted model, whose window is the service's.
+    fn local_model_tag(&self) -> Option<&str> {
+        None
+    }
+
     /// Ask the provider's server whether the configured model exists,
     /// without loading it. A local worker keeps the answer as its health,
     /// so the controller never leases an item to a model that is not

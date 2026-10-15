@@ -270,3 +270,26 @@ capability, the old completion is not new evidence and cannot restart it forever
 A live audit observed the same planner item repeatedly surfacing a missing
 controller-dispatch tool and being awakened by an already completed capability.
 The regression checks old, newly landed and subsequently stale completions.
+
+## One window per local model (2026-10-15)
+
+A local model's context window was set in up to six places that had to
+agree: `RUSTYKRAB_NUM_CTX` or `OLLAMA_NUM_CTX` (the Ollama `num_ctx`),
+`RUSTYKRAB_MAX_CONTEXT_TOKENS` or `harness.toml` (the harness budget),
+`RUSTYKRAB_COMPACTION_CONTEXT_CEILING` (the compaction ceiling), and
+`context_tokens` in the local-resources JSON for the resource slots. The live
+daemon ran a 32K `num_ctx` under a 96,000-token budget, and the e2e harness
+carried its own copy of the arithmetic. Workers built their harness profile
+from the definition's preset and ignored the operator's compaction strategy.
+
+`<data>/models.toml` (`rustykrab-agent/src/local_model.rs`) is now the one
+place: a `[default]` table and one entry per model tag, each naming only what
+differs. `context_window` sizes `num_ctx`, the budget and the ceiling
+together; the entry also carries output tokens, keep-alive, sampling, thinking,
+compaction strategy, threshold and summary window, and late tool binding. The
+daemon validates it at startup and refuses to start on a bad entry, the chat
+runner, `SubagentRunner` and `LocalWorker` all apply it, `rustykrab models`
+prints what each model resolves to, and the retired settings produce a startup
+warning instead of silently competing. This narrows OPINION §2 for providers
+(8 literal env reads to 3) without closing it. Hosted models keep
+`RUSTYKRAB_MAX_CONTEXT_TOKENS`.

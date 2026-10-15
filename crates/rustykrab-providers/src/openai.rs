@@ -131,6 +131,11 @@ impl OpenAiProvider {
         self
     }
 
+    /// The request settings in use.
+    pub fn config(&self) -> &OpenAiConfig {
+        &self.config
+    }
+
     pub fn with_config(mut self, config: OpenAiConfig) -> Self {
         self.config = config;
         self
@@ -502,6 +507,19 @@ impl OpenAiProvider {
 impl ModelProvider for OpenAiProvider {
     fn name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// A server on this machine (llama-server, mlx, LM Studio, ...) runs a
+    /// local model; a hosted endpoint does not.
+    fn local_model_tag(&self) -> Option<&str> {
+        let host = reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        matches!(
+            host.as_deref(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
+        .then_some(self.model.as_str())
     }
 
     fn supports_vision(&self) -> bool {

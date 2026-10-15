@@ -10,6 +10,7 @@ mod evaluation;
 mod fleet;
 mod integrations;
 mod local_resources;
+mod models_cmd;
 mod monitor_cmd;
 mod native_resources;
 mod overseer;
@@ -577,9 +578,12 @@ async fn build_distiller(
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
     let base_url =
         std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    // The distiller never thinks, whatever the model's entry says.
     let config = rustykrab_providers::OllamaConfig {
         think: Some(false),
-        ..Default::default()
+        ..rustykrab_agent::local_model::installed()
+            .for_model(&model)
+            .ollama_config(rustykrab_providers::OllamaConfig::default())
     };
     let p = rustykrab_providers::OllamaProvider::new(model.clone())
         .with_base_url(base_url)
@@ -679,6 +683,9 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && (args[1] == "workers" || args[1] == "worker") {
         return worker_cmd::run(&data_dir, &args[1..]).await;
     }
+    if args.len() >= 2 && args[1] == "models" {
+        return models_cmd::run(&data_dir);
+    }
     if args.len() >= 2 && args[1] == "monitor" {
         return monitor_cmd::run(&data_dir, &args[2..]).await;
     }
@@ -694,7 +701,7 @@ async fn main() -> anyhow::Result<()> {
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, update, monitor, questions, answer, judgment, consolidate");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, models, update, monitor, questions, answer, judgment, consolidate");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
@@ -704,6 +711,32 @@ async fn main() -> anyhow::Result<()> {
     let (mut profile, profile_context_tokens, pinned_profile_fields) =
         load_harness_profile(&data_dir)?;
     tracing::info!(profile = %profile.name, "harness profile loaded");
+
+    // --- Local models ---
+    // One configuration per local model (`<data>/models.toml`): the window
+    // every request pins, the compaction budget and ceiling, and the
+    // model's compaction policy. Installed once so every harness built for
+    // a local provider resolves the same settings.
+    let local_models =
+        rustykrab_agent::LocalModels::load(&data_dir).map_err(|e| anyhow::anyhow!(e))?;
+    for (name, model) in local_models.entries() {
+        tracing::info!(
+            model = name,
+            context_window = model.context_window,
+            output_tokens = model.output_tokens,
+            compaction_strategy = model.compaction_strategy.name(),
+            source = ?local_models.source(),
+            "local model configured"
+        );
+    }
+    let retired = models_cmd::retired_settings_in_env();
+    if !retired.is_empty() {
+        tracing::warn!(
+            settings = ?retired,
+            "these settings are no longer read; set a local model's window and harness in models.toml"
+        );
+    }
+    rustykrab_agent::local_model::install(local_models.clone());
 
     // --- Master key for credential encryption ---
     // On macOS: stored in the Data Protection Keychain (loaded after first
@@ -922,13 +955,15 @@ async fn main() -> anyhow::Result<()> {
             let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let config = rustykrab_providers::OllamaConfig::default();
+            let config = local_models
+                .for_model(&model)
+                .ollama_config(rustykrab_providers::OllamaConfig::default());
             tracing::info!(
                 %model,
                 %base_url,
                 num_ctx = ?config.num_ctx,
                 keep_alive = ?config.keep_alive,
-                "using Ollama provider (set RUSTYKRAB_NUM_CTX=server to defer to OLLAMA_CONTEXT_LENGTH)"
+                "using Ollama provider (window and keep_alive from models.toml)"
             );
             let p = rustykrab_providers::OllamaProvider::new(model)
                 .with_base_url(base_url)
@@ -968,6 +1003,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             tracing::info!(%model, %base_url, provider = %provider_name, "using OpenAI-compatible provider");
+            let local_tag = model.clone();
             let mut p = rustykrab_providers::OpenAiProvider::new(model)
                 .with_base_url(base_url)
                 .with_provider_name(provider_name.clone())
@@ -975,6 +1011,17 @@ async fn main() -> anyhow::Result<()> {
             // Optional — most local servers ignore it.
             if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                 p = p.with_api_key(key);
+            }
+            // A server on this machine runs a local model: its output
+            // allowance and any sampling its models.toml entry names apply.
+            if p.local_model_tag().is_some() {
+                let local = local_models.for_model(&local_tag);
+                let mut config = p.config().clone();
+                config.max_tokens = local.output_tokens;
+                if let Some(t) = local.temperature {
+                    config.temperature = t;
+                }
+                p = p.with_config(config);
             }
             Arc::new(p)
         }
@@ -994,16 +1041,31 @@ async fn main() -> anyhow::Result<()> {
     // local Ollama deployments on consumer hardware can't chew through
     // anywhere near that before the HTTP timeout fires, so default to
     // 32k for Ollama and keep the 128k default for everything else.
-    profile.max_context_tokens = resolve_max_context_tokens(&provider_name, profile_context_tokens);
-    // The runner resolves compaction from the profile and the model
-    // (`CompactionConfig::for_model`) and reads no environment; the two
-    // operator overrides that used to be read deep in the runner are read
-    // here, once, into the profile.
-    if let Some(ceiling) = positive_env("RUSTYKRAB_COMPACTION_CONTEXT_CEILING") {
-        profile.compaction_context_ceiling = ceiling;
-    }
-    if let Some(window) = positive_env("RUSTYKRAB_COMPACTION_EXPAND_CTX") {
-        profile.compaction_expand_ctx = u32::try_from(window).ok();
+    //
+    // A local model's budget is its window, from models.toml: the same
+    // number its requests pin, so the two can no longer disagree. A hosted
+    // model keeps the provider-aware default or RUSTYKRAB_MAX_CONTEXT_TOKENS.
+    match rustykrab_agent::local_model::for_provider(provider.as_ref()) {
+        Some(local) => {
+            let mut overridden: Vec<&str> = MODEL_OWNED_HARNESS_KEYS
+                .into_iter()
+                .filter(|key| pinned_profile_fields.iter().any(|named| named == key))
+                .collect();
+            if positive_env("RUSTYKRAB_MAX_CONTEXT_TOKENS").is_some() {
+                overridden.push("RUSTYKRAB_MAX_CONTEXT_TOKENS");
+            }
+            if !overridden.is_empty() {
+                tracing::warn!(
+                    settings = %overridden.join(", "),
+                    "these do not apply to a local model; its models.toml entry sets them"
+                );
+            }
+            local.apply_to(&mut profile);
+        }
+        None => {
+            profile.max_context_tokens =
+                resolve_max_context_tokens(&provider_name, profile_context_tokens);
+        }
     }
     tracing::info!(
         max_context_tokens = profile.max_context_tokens,
@@ -4321,6 +4383,15 @@ fn credential_backend_from_env(
 /// operator said nothing and serde filled in a default". The context
 /// resolver and the harness router both need that distinction, and both
 /// were silently overriding stated choices without it.
+/// `harness.toml` keys a local model's `models.toml` entry replaces.
+const MODEL_OWNED_HARNESS_KEYS: [&str; 5] = [
+    "max_context_tokens",
+    "compaction_context_ceiling",
+    "compaction_expand_ctx",
+    "compaction_strategy",
+    "compaction_threshold_pct",
+];
+
 fn load_harness_profile(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<(HarnessProfile, Option<usize>, Vec<String>)> {

@@ -74,16 +74,16 @@ pub struct ModelCase {
     /// touch memory at all. The assertions then run against the second
     /// conversation, where a correct answer can only have come from recall.
     pub split_conversation: bool,
-    /// The context window to give the provider, via RUSTYKRAB_NUM_CTX.
-    ///
-    /// This, not `harness.toml`, is what drives compaction: the runner
-    /// takes its limit from `provider.context_limit()` and only falls back
-    /// to the profile's `max_context_tokens` when the provider reports
-    /// nothing. Ollama always reports, so the profile value never applied.
+    /// The model's window: its `context_window` in the trial's
+    /// `models.toml`, which sizes both the requests' `num_ctx` and the
+    /// compaction budget. A `max_context_tokens` in `harness.toml` does not
+    /// apply to a local model.
     pub num_ctx: Option<u32>,
-    /// Extra environment for the daemon this case boots. The ablation
-    /// driver uses it to A/B `RUSTYKRAB_COMPACTION_EXPAND_CTX` on
-    /// otherwise-identical scenarios.
+    /// The model's `compaction_summary_window`: summary calls served at a
+    /// larger window. The ablation driver A/Bs it on otherwise-identical
+    /// scenarios.
+    pub summary_window: Option<u32>,
+    /// Extra environment for the daemon this case boots.
     pub extra_env: Vec<(String, String)>,
     pub assertions: Vec<Assertion>,
     pub judge: Option<JudgeSpec>,
@@ -107,6 +107,7 @@ impl ModelCase {
             harness_toml: None,
             split_conversation: false,
             num_ctx: None,
+            summary_window: None,
             extra_env: Vec::new(),
             assertions: Vec::new(),
             judge: None,
@@ -851,6 +852,17 @@ async fn run_once(
     let data_dir = tmp.path().to_path_buf();
     if let Some(toml) = &case.harness_toml {
         std::fs::write(data_dir.join("harness.toml"), toml)?;
+    }
+    if let Some(summary) = case.summary_window {
+        let window = ctx_override
+            .or(case.num_ctx)
+            .unwrap_or(rustykrab_agent::local_model::DEFAULT_CONTEXT_WINDOW);
+        std::fs::write(
+            data_dir.join(rustykrab_agent::local_model::MODELS_FILE),
+            format!(
+                "[default]\ncontext_window = {window}\ncompaction_summary_window = {summary}\n"
+            ),
+        )?;
     }
 
     let port = pick_free_port()?;

@@ -14,7 +14,7 @@
 //!   that cannot fire is not a scenario that failed.
 //! - **A compaction cost probe**: history seeded past that window's
 //!   trigger, run twice — expansion off, expansion on
-//!   (`RUSTYKRAB_COMPACTION_EXPAND_CTX`) — on otherwise-identical input.
+//!   (the model's `compaction_summary_window`) — on otherwise-identical input.
 //!   This is the direct measurement behind "should compaction expand the
 //!   window".
 //!
@@ -262,16 +262,9 @@ fn compaction_probe_cases(w: u32) -> Vec<ModelCase> {
     // exactly where the threshold sits.
     let notes = ((approx_threshold(w) * 130 / 100) / NOTE_TOKENS).clamp(1, 45);
     let mut variants = Vec::new();
-    for (mode, env) in [
-        ("baseline", Vec::new()),
-        (
-            "expanded",
-            vec![(
-                "RUSTYKRAB_COMPACTION_EXPAND_CTX".to_string(),
-                EXPAND_TARGET.to_string(),
-            )],
-        ),
-    ] {
+    // A summary window below the model's own would be no expansion at all.
+    let expanded = EXPAND_TARGET.max(w);
+    for (mode, summary_window) in [("baseline", None), ("expanded", Some(expanded))] {
         // Ids are per-window and per-arm; leaked because ModelCase ids are
         // &'static str. A handful per run, bounded by the window list.
         let id: &'static str =
@@ -294,7 +287,7 @@ fn compaction_probe_cases(w: u32) -> Vec<ModelCase> {
             .expect(Assertion::NoRunError)
             .expect(Assertion::Compacted(true))
             .expect(Assertion::FinalContainsAny(s(&["borealis"])));
-        case.extra_env = env;
+        case.summary_window = summary_window;
         variants.push(case);
     }
     variants
@@ -572,7 +565,7 @@ mod tests {
         );
         // The two arms differ only in environment.
         assert_eq!(large[0].turns, large[1].turns);
-        assert!(large[0].extra_env.is_empty());
-        assert_eq!(large[1].extra_env[0].0, "RUSTYKRAB_COMPACTION_EXPAND_CTX");
+        assert_eq!(large[0].summary_window, None);
+        assert_eq!(large[1].summary_window, Some(EXPAND_TARGET));
     }
 }

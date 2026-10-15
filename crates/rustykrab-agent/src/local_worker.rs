@@ -1081,7 +1081,7 @@ impl LocalWorker {
             spending.meter.clone(),
         ));
 
-        let profile = profile_for(&self.definition);
+        let profile = profile_for(&self.definition, self.provider.as_ref());
         let max_iterations = profile
             .max_iterations
             .min(usize::try_from(brief.budget.iterations).unwrap_or(usize::MAX))

@@ -68,7 +68,7 @@ persisted transcript is exactly what `pending_links` exists to prevent. The
 asymmetry looks like a bug if you do not know why, which makes it the most
 likely thing to be "fixed" by someone tidying up.
 
-### 2. Ambient configuration — **structural, measured, unchanged**
+### 2. Ambient configuration — **structural, measured, narrowed for providers**
 
 The 2026-10-02 measurement finds 56 literal-key environment reads in library
 src files: 30 tools, 8 providers, 5 gateway, 5 agent, 3 store, 3 dream, and
@@ -81,10 +81,15 @@ behaviour depends on process state its caller did not pass, two tests cannot
 configure one component differently, and a test that sets one races every
 other test in the binary — which has already happened once.
 
-`OllamaProvider` is the sharpest case: it has a full `OllamaConfig` and a
-builder, and the env reads bypass both, so a caller who constructs a provider
-explicitly can still be overridden by ambient state. That is the wrong
-precedence order regardless of the wider refactor.
+`OllamaProvider` was the sharpest case: it has a full `OllamaConfig` and a
+builder, and the env reads bypassed both, so a caller who constructed a
+provider explicitly could still be overridden by ambient state. The reads that
+sized a request (`RUSTYKRAB_NUM_CTX`, `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`)
+are gone: the window and keep-alive now come from the model's `models.toml`
+entry through the caller ([outcome](05-first-pass-outcome.md#one-window-per-local-model-2026-10-15)),
+so providers read 3 literal keys, not 8. `OLLAMA_TIMEOUT_SECS` and the
+`OLLAMA_VISION`/`OLLAMA_THINK` capability overrides still bypass the config,
+which is the same wrong precedence order on a smaller surface.
 
 `memory` and `runtime` read zero and are the two most portable crates here.
 That is not a coincidence.

@@ -23,7 +23,11 @@ pub(crate) const INTEGRATION_NAME: &str = "qwen-integrations";
 pub(crate) struct Config {
     pub model: String,
     pub url: String,
-    pub context_tokens: u32,
+    /// Retired: the model's window is its `context_window` in
+    /// `models.toml`. Still accepted so an existing file loads; ignored
+    /// with a warning.
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
     pub repositories: Vec<PathBuf>,
 }
 impl Config {
@@ -56,24 +60,32 @@ impl Config {
             "local inference URL must be an explicit loopback HTTP port"
         );
         anyhow::ensure!(!self.model.trim().is_empty(), "local model must be named");
-        anyhow::ensure!(
-            (4096..=131072).contains(&self.context_tokens),
-            "local context must be between 4096 and 131072 tokens"
-        );
+        if let Some(tokens) = self.context_tokens {
+            tracing::warn!(
+                context_tokens = tokens,
+                model = %self.model,
+                "local-resources context_tokens is no longer read; set this model's \
+                 context_window in models.toml"
+            );
+        }
         Ok(())
     }
+    /// The local workers' provider: this model's window and harness from
+    /// `models.toml`, sampling deterministically and without thinking
+    /// unless the model's entry says otherwise.
     pub(crate) async fn provider(&self) -> Arc<dyn ModelProvider> {
+        let worker_defaults = rustykrab_providers::OllamaConfig {
+            think: Some(false),
+            temperature: 0.0,
+            ..rustykrab_providers::OllamaConfig::default()
+        };
+        let config = rustykrab_agent::local_model::installed()
+            .for_model(&self.model)
+            .ollama_config(worker_defaults);
         Arc::new(
             rustykrab_providers::OllamaProvider::new(self.model.clone())
                 .with_base_url(self.url.trim_end_matches('/').to_string())
-                .with_config(rustykrab_providers::OllamaConfig {
-                    num_ctx: Some(self.context_tokens),
-                    think: Some(false),
-                    temperature: 0.0,
-                    keep_alive: Some("30m".into()),
-                    top_p: 0.9,
-                    num_predict: 4096,
-                })
+                .with_config(config)
                 .with_detected_context_window()
                 .await,
         )
@@ -187,11 +199,11 @@ impl Worker for CodingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn config(url: &str, context_tokens: u32) -> Config {
+    fn config(url: &str) -> Config {
         Config {
             model: "qwen3.8:27b-mlx".into(),
             url: url.into(),
-            context_tokens,
+            context_tokens: None,
             repositories: vec![],
         }
     }
@@ -205,22 +217,27 @@ mod tests {
             "http://127.0.0.1:11434/api/chat",
             "http://127.0.0.1:11434/?secret=x",
         ] {
-            assert!(config(url, 32768).validate().is_err(), "{url}");
+            assert!(config(url).validate().is_err(), "{url}");
         }
         for url in [
             "http://127.0.0.1:11434",
             "http://localhost:11434",
             "http://[::1]:11434",
         ] {
-            assert!(config(url, 32768).validate().is_ok(), "{url}");
+            assert!(config(url).validate().is_ok(), "{url}");
         }
     }
     #[test]
-    fn bounds_local_context_and_requires_model_identity() {
-        for size in [0, 4095, 131073] {
-            assert!(config("http://127.0.0.1:11434", size).validate().is_err());
-        }
-        let mut c = config("http://127.0.0.1:11434", 32768);
+    fn requires_model_identity_and_still_loads_a_retired_context_tokens() {
+        let mut retired = config("http://127.0.0.1:11434");
+        retired.context_tokens = Some(32768);
+        assert!(retired.validate().is_ok(), "an existing file keeps loading");
+        let parsed: Config = serde_json::from_str(
+            r#"{"model":"m","url":"http://127.0.0.1:11434","context_tokens":32768,"repositories":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.context_tokens, Some(32768));
+        let mut c = config("http://127.0.0.1:11434");
         c.model.clear();
         assert!(c.validate().is_err());
     }
@@ -249,7 +266,7 @@ mod tests {
     /// task-list tools the host has, not the shell alone.
     #[test]
     fn local_coding_gets_file_web_and_task_tools_beside_its_shell() {
-        let mut c = config("http://127.0.0.1:11434", 32768);
+        let mut c = config("http://127.0.0.1:11434");
         c.repositories = vec![PathBuf::from("/fixture")];
         let mut host: Vec<Arc<dyn Tool>> = vec![
             Arc::new(rustykrab_tools::ExecTool::new()),
@@ -279,7 +296,7 @@ mod tests {
     /// The wrapper names the session log its inner worker keeps.
     #[test]
     fn local_coding_names_the_session_log_its_worker_keeps() {
-        let mut c = config("http://127.0.0.1:11434", 32768);
+        let mut c = config("http://127.0.0.1:11434");
         c.repositories = vec![PathBuf::from("/fixture")];
         let dir = tempfile::tempdir().unwrap();
         let worker = CodingWorker::new(
@@ -299,7 +316,7 @@ mod tests {
 
     #[test]
     fn local_coding_advertises_actual_model_and_refuses_other_resources() {
-        let mut c = config("http://127.0.0.1:11434", 32768);
+        let mut c = config("http://127.0.0.1:11434");
         c.repositories = vec![PathBuf::from("/fixture")];
         let worker = CodingWorker::new(
             &c,

@@ -50,15 +50,17 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// grows is prompt processing on proportionally larger prompts (~517 → ~413
 /// tokens/s). A dense-attention model will not be this cheap.
 ///
-/// Lower it with `RUSTYKRAB_NUM_CTX` if the model won't fit, or halve the
-/// cache with `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
+/// The daemon sets a model's window in `models.toml` (`context_window`);
+/// lower it there if the model won't fit, or halve the cache with
+/// `OLLAMA_KV_CACHE_TYPE=q8_0` (see README).
 const DEFAULT_NUM_CTX: u32 = 131_072;
 
 /// Default `keep_alive` sent with every request: how long Ollama keeps the
 /// model (and its KV cache) resident after the request finishes. Ollama's own
 /// default is 5 minutes, which is far too short for a chat gateway that sees
 /// sporadic traffic — every message after a quiet spell pays a full model
-/// reload plus a cold-cache prompt eval. Override with `OLLAMA_KEEP_ALIVE`.
+/// reload plus a cold-cache prompt eval. The daemon sets it per model in
+/// `models.toml` (`keep_alive`).
 const DEFAULT_KEEP_ALIVE: &str = "30m";
 
 /// Configuration for Ollama model inference.
@@ -71,7 +73,7 @@ pub struct OllamaConfig {
     /// server agree on one stable window; see that constant for why pinning
     /// beats deferring. `None` restores the old behaviour of omitting the
     /// field so the server's `OLLAMA_CONTEXT_LENGTH` (or the per-model
-    /// default) wins — select it with `RUSTYKRAB_NUM_CTX=server`.
+    /// default) wins.
     pub num_ctx: Option<u32>,
     /// How long Ollama should keep the model resident after a request, in
     /// Ollama's duration syntax (`"30m"`, `"1h"`, `"-1"` for forever).
@@ -86,59 +88,6 @@ pub struct OllamaConfig {
     /// `think` outright for models that don't support it, so this must not
     /// be sent unconditionally.
     pub think: Option<bool>,
-}
-
-/// Resolve the `num_ctx` to pin from the environment.
-///
-/// Checks `RUSTYKRAB_NUM_CTX` first (the canonical RustyKrab-namespaced
-/// name), then falls back to `OLLAMA_NUM_CTX`. A numeric value pins that
-/// window; `server`/`default`/`0` defers to the Ollama server's own
-/// configuration (returning `None`); anything unset falls back to
-/// [`DEFAULT_NUM_CTX`].
-fn num_ctx_from_env() -> Option<u32> {
-    let raw = std::env::var("RUSTYKRAB_NUM_CTX")
-        .ok()
-        .or_else(|| std::env::var("OLLAMA_NUM_CTX").ok());
-
-    let Some(raw) = raw else {
-        return Some(DEFAULT_NUM_CTX);
-    };
-    let trimmed = raw.trim();
-
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "server" | "default" | "0" | ""
-    ) {
-        return None;
-    }
-
-    match trimmed.parse::<u32>() {
-        Ok(v) => Some(v),
-        Err(_) => {
-            tracing::warn!(
-                value = %raw,
-                default_num_ctx = DEFAULT_NUM_CTX,
-                "could not parse num_ctx override; falling back to the default"
-            );
-            Some(DEFAULT_NUM_CTX)
-        }
-    }
-}
-
-/// Resolve `keep_alive` from `OLLAMA_KEEP_ALIVE`. An empty value or the
-/// literal `server` omits the field and takes Ollama's own default.
-fn keep_alive_from_env() -> Option<String> {
-    match std::env::var("OLLAMA_KEEP_ALIVE") {
-        Ok(v) => {
-            let trimmed = v.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("server") {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Err(_) => Some(DEFAULT_KEEP_ALIVE.to_string()),
-    }
 }
 
 /// Rough UTF-8 bytes-per-token ratio used for client-side context budgeting.
@@ -171,8 +120,8 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             temperature: 0.1,
-            num_ctx: num_ctx_from_env(),
-            keep_alive: keep_alive_from_env(),
+            num_ctx: Some(DEFAULT_NUM_CTX),
+            keep_alive: Some(DEFAULT_KEEP_ALIVE.to_string()),
             top_p: 0.9,
             num_predict: 4096,
             think: None,
@@ -1108,6 +1057,10 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    fn local_model_tag(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     /// A tool-independent input budget for callers without a concrete tool set.
     /// Actual turns use context_limit_for_tools(), including the same output
     /// clamp and schema reservation as the send path. Zero means no usable
@@ -1715,7 +1668,7 @@ fn empty_response_error(
         "Ollama returned an empty response from {model}: no content, no tool calls, \
          and zero generated tokens (prompt_eval_count={}, done_reason={}). The prompt \
          most likely overran the model's context window — lower the prompt size or \
-         raise num_ctx (RUSTYKRAB_NUM_CTX / OLLAMA_NUM_CTX).",
+         raise the model's context_window in models.toml.",
         prompt_tokens
             .map(|n| n.to_string())
             .unwrap_or_else(|| "absent".to_string()),
@@ -2887,80 +2840,21 @@ mod tests {
         assert!(matches!(err, Error::ContextBudgetExceeded { .. }), "{err}");
     }
 
-    /// Run `f` with the two num_ctx env vars set to `rk` / `ollama`.
-    ///
-    /// `std::env` is process-global and `cargo test` is multi-threaded, so
-    /// every test that touches these vars serialises on one mutex and
-    /// restores the prior values on the way out.
-    fn with_num_ctx_env<T>(rk: Option<&str>, ollama: Option<&str>, f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let saved_rk = std::env::var("RUSTYKRAB_NUM_CTX").ok();
-        let saved_ollama = std::env::var("OLLAMA_NUM_CTX").ok();
-        // SAFETY: all writers of these vars hold ENV_LOCK for the duration.
-        unsafe {
-            match rk {
-                Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
-                None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
-            }
-            match ollama {
-                Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
-                None => std::env::remove_var("OLLAMA_NUM_CTX"),
-            }
-        }
-        let out = f();
-        unsafe {
-            match saved_rk {
-                Some(v) => std::env::set_var("RUSTYKRAB_NUM_CTX", v),
-                None => std::env::remove_var("RUSTYKRAB_NUM_CTX"),
-            }
-            match saved_ollama {
-                Some(v) => std::env::set_var("OLLAMA_NUM_CTX", v),
-                None => std::env::remove_var("OLLAMA_NUM_CTX"),
-            }
-        }
-        out
-    }
-
     #[test]
-    fn default_config_pins_num_ctx_when_env_unset() {
+    fn default_config_pins_one_window_and_reads_no_environment() {
         // Pinning one stable window is what lets Ollama keep a warm runner
-        // across requests, so every preset must land on the same value.
-        with_num_ctx_env(None, None, || {
-            assert_eq!(OllamaConfig::default().num_ctx, Some(DEFAULT_NUM_CTX));
-            assert_eq!(OllamaConfig::tool_calling().num_ctx, Some(DEFAULT_NUM_CTX));
-            assert_eq!(OllamaConfig::creative().num_ctx, Some(DEFAULT_NUM_CTX));
-        });
-    }
-
-    #[test]
-    fn num_ctx_env_override_is_honoured_with_rustykrab_taking_precedence() {
-        with_num_ctx_env(Some("16384"), None, || {
-            assert_eq!(num_ctx_from_env(), Some(16384));
-        });
-        with_num_ctx_env(None, Some("8192"), || {
-            assert_eq!(num_ctx_from_env(), Some(8192));
-        });
-        with_num_ctx_env(Some("16384"), Some("8192"), || {
-            assert_eq!(num_ctx_from_env(), Some(16384));
-        });
-    }
-
-    #[test]
-    fn num_ctx_server_sentinel_defers_to_ollama() {
-        for sentinel in ["server", "SERVER", "default", "0", " "] {
-            with_num_ctx_env(Some(sentinel), None, || {
-                assert_eq!(num_ctx_from_env(), None, "sentinel {sentinel:?}");
-            });
+        // across requests, so every preset lands on the same value. The
+        // daemon sets a model's window in models.toml; the retired
+        // RUSTYKRAB_NUM_CTX / OLLAMA_NUM_CTX / OLLAMA_KEEP_ALIVE change
+        // nothing here even when they are set.
+        for config in [
+            OllamaConfig::default(),
+            OllamaConfig::tool_calling(),
+            OllamaConfig::creative(),
+        ] {
+            assert_eq!(config.num_ctx, Some(DEFAULT_NUM_CTX));
+            assert_eq!(config.keep_alive.as_deref(), Some(DEFAULT_KEEP_ALIVE));
         }
-    }
-
-    #[test]
-    fn unparseable_num_ctx_falls_back_to_default_rather_than_deferring() {
-        with_num_ctx_env(Some("thirty-two thousand"), None, || {
-            assert_eq!(num_ctx_from_env(), Some(DEFAULT_NUM_CTX));
-        });
     }
 
     #[test]
