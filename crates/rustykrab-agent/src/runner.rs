@@ -3553,10 +3553,16 @@ impl AgentRunner {
 
             // If the model ignored the budget, recurse on its own output so
             // the next call can take another pass at shrinking it. Depth
-            // cap prevents runaway loops against non-compliant models.
+            // cap prevents runaway loops against non-compliant models, and
+            // a reduction pass (one whose input was already a summary) that
+            // did not shrink it ends the recursion: the caller truncates.
+            // Without that, qwen3.8 answered a 702-char summary with the same
+            // 702 chars ten times in a row, 4-7 s each, on every compaction
+            // of a tight window (2026-10-14).
             let summary_tokens = Self::estimate_text_tokens(&summary);
             if summary_tokens > max_output_tokens
                 && !summary.is_empty()
+                && (depth == 0 || summary_tokens < total_tokens)
                 && depth + 1 < MAX_RECURSIVE_SUMMARIZATION_DEPTH
             {
                 tracing::info!(
@@ -3972,6 +3978,7 @@ impl AgentRunner {
             // is cancelled. This costs one deep clone at the high-water mark.
             let mut summary_messages = conv.messages.clone();
             summary_messages.push(compaction_prompt);
+            let started = std::time::Instant::now();
             // Must follow the expanded window when one is set: the expanded
             // input budget is what routed this history to the fast path, and
             // a plain chat() would validate against the everyday window and
@@ -3992,6 +3999,14 @@ impl AgentRunner {
                 ));
             }
             let text = response.message.content.as_text().unwrap_or("").to_string();
+            tracing::info!(
+                before_tokens,
+                prompt_tokens = response.usage.prompt_tokens,
+                completion_tokens = response.usage.completion_tokens,
+                output_chars = text.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "compaction: one-call summary"
+            );
 
             // Offering the tool block is what keeps the cache warm, but it
             // also lets the model answer with a tool call instead of a
@@ -5937,6 +5952,28 @@ mod compaction_tests {
         assert!(
             calls > 1,
             "expected re-reduction when fast-path output exceeds cap, got {calls} call(s)"
+        );
+    }
+
+    /// A reduction pass that returns its input unshrunk is not repeated.
+    #[tokio::test]
+    async fn a_reduction_that_does_not_shrink_is_not_repeated() {
+        // Every call answers 40,000 chars, so the pass on its own output
+        // makes no progress.
+        let provider = Arc::new(OversizedProvider::new(40_000));
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        );
+        runner
+            .summarize_text_recursively(vec!["short input".to_string()], 32_000, 4_096, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.call_count.lock().unwrap(),
+            2,
+            "the summary, one pass at reducing it, and no more"
         );
     }
 
