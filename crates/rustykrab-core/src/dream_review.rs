@@ -256,6 +256,9 @@ pub struct DreamingView {
     /// Display text for this view's final admission decision; not authority.
     #[serde(default)]
     pub admission_explanation: Option<String>,
+    /// Availability at this decision's check, not a reservation or permission.
+    #[serde(default)]
+    pub admission_allows_review: Option<bool>,
     /// None on older servers; clients must not assume a numeric limit.
     #[serde(default)]
     pub daily_review_limit: Option<usize>,

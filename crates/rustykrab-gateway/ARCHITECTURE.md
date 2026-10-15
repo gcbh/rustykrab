@@ -359,13 +359,17 @@ permission to run. The browser labels a recorded decision; it does not rerun
 the scheduler or turn review availability into a running cycle or recovery.
 The existing explicit review-request button keeps its server-side capacity and
 daily limits; rendering never posts work. All labels use textContent.
-New server views supply `admission_explanation` and `daily_review_limit`.
+New server views supply `admission_explanation`, `admission_allows_review` and `daily_review_limit`.
 The renderer prefers that explanation as literal text, including future typed
 decisions, and displays the reported positive integer limit. Older replies
 retain the legacy reason fallback and show an unobserved numeric limit rather
 than assuming three. Missing/malformed/orphaned explanations and refreshed
 snapshots cannot reuse a prior server's text or limit. These fields describe
 the server's decision; the browser still makes no admission or policy change.
+An observed boolean labels the server reason as Review available or Review
+deferred. A missing or malformed boolean leaves availability explicitly
+unobserved; neither prose nor the typed reason is used to guess it. The label
+describes a snapshot, never a running review or a capacity reservation.
 scripts/test_dreaming_monitor.mjs runs the shipped renderer with waiting-backlog,
 deferred/stale/unknown, old-server, quota, refresh and literal-text fixtures in CI.
 

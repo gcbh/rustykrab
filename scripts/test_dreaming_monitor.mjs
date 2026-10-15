@@ -124,15 +124,32 @@ test('daily limits, due state and in-progress reviews stay distinct from permiss
 test('the server owns current admission wording and the numeric cycle limit', () => {
   const t = dashboard();
   t.render({ ...view(observed('daily_limit')), daily_review_limit: 7,
+    admission_allows_review: false,
     admission_explanation: 'Server policy: seven cycles used; <inspect receipt>' });
-  assert.match(t.text(), /Last decision: Server policy: seven cycles used; <inspect receipt>/);
+  assert.match(t.text(), /Last decision: Review deferred: Server policy: seven cycles used; <inspect receipt>/);
   assert.match(t.text(), /Review-cycle limit per 24 hours: 7/);
   assert.doesNotMatch(t.text(), /three-cycle|review-cycle limit for the last 24 hours has been reached/);
   assert.equal(t.$('dreamNow').disabled, false);
   t.render({ ...view({ decision: 'future_policy' }), daily_review_limit: 9,
+    admission_allows_review: true,
     admission_explanation: 'A future server supplied this decision' });
-  assert.match(t.text(), /Last decision: A future server supplied this decision/);
+  assert.match(t.text(), /Last decision: Review available: A future server supplied this decision/);
   assert.match(t.text(), /Review-cycle limit per 24 hours: 9/);
+});
+
+test('server availability stays explicit and unknown verdicts are not inferred from a reason or decision', () => {
+  const t = dashboard();
+  const snapshot = { ...view(observed('idle_review')), admission_explanation: 'a server-owned reason' };
+  for (const missing of [undefined, null, 0, 1, 'true', 'false', {}]) {
+    t.render({ ...snapshot, admission_allows_review: missing });
+    assert.match(t.text(), /Last decision: Review availability not reported: a server-owned reason/);
+    assert.doesNotMatch(t.text(), /Review available:|Review deferred:/);
+  }
+  t.render({ ...snapshot, admission_allows_review: false });
+  assert.match(t.text(), /Last decision: Review deferred: a server-owned reason/);
+  t.render({ ...snapshot, admission_allows_review: true });
+  assert.match(t.text(), /Last decision: Review available: a server-owned reason/);
+  assert.doesNotMatch(t.text(), /review is running|permission granted/i);
 });
 
 test('missing, malformed and orphaned display observations use legacy or unknown values', () => {

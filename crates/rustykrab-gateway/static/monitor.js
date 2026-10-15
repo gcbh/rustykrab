@@ -158,7 +158,8 @@
     };
     const a = d.admission;
     const serverExplanation = typeof a?.decision === 'string' && typeof d.admission_explanation === 'string' ? d.admission_explanation.trim() : '';
-    const description = serverExplanation || (Object.hasOwn(descriptions, a?.decision) ? descriptions[a.decision] : 'Review availability has not been reported by this build.');
+    const availability = d.admission_allows_review === true ? 'Review available: ' : d.admission_allows_review === false ? 'Review deferred: ' : 'Review availability not reported: ';
+    const description = serverExplanation ? availability + serverExplanation : (Object.hasOwn(descriptions, a?.decision) ? descriptions[a.decision] : 'Review availability has not been reported by this build.');
     const count = value => Number.isSafeInteger(value) && value >= 0 ? num(value) : 'not observed';
     $('dreamMetrics').append(node('h3', 'Review availability'), node('p', 'Last decision: ' + description));
     $('dreamMetrics').append(node('p', 'Review-cycle limit per 24 hours: ' + (Number.isSafeInteger(d.daily_review_limit) && d.daily_review_limit > 0 ? num(d.daily_review_limit) : 'not observed'), 'note'));
