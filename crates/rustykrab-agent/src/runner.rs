@@ -6184,6 +6184,21 @@ mod compaction_tests {
         for name in RECALL_READ_TOOLS {
             assert!(after.iter().any(|n| n == name), "{name}: {after:?}");
         }
+
+        // Activation never widens a run's ceiling: a session that may not
+        // use the readers (a review run allowed only its report) is still
+        // not shown them after the archive exists.
+        let narrow = Session::with_capabilities(
+            conv_id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&["tools_list"]),
+        );
+        let shown: Vec<String> = runner
+            .compute_schemas_versioned(&narrow, conv_id)
+            .1
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!shown.iter().any(|n| n.starts_with("recall_")), "{shown:?}");
     }
 
     /// A history over half the window still fits one summary call with its
