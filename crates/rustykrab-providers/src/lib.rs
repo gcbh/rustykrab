@@ -2,6 +2,7 @@ mod anthropic;
 mod backoff;
 mod claude_cli;
 mod claude_usage;
+pub mod cli_process;
 mod codex_cli;
 mod codex_turn;
 mod line_buffer;

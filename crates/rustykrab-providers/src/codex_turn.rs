@@ -134,9 +134,12 @@ impl CodexCliProvider {
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|_| Error::ModelProvider("Cannot start Codex model turn".into()))?;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut child = crate::cli_process::spawn(&mut cmd, deadline)
+            .await
+            .map_err(|e| {
+                Error::ModelProvider(format!("Cannot start Codex model turn ({})", e.kind()))
+            })?;
         let mut stdin = child.stdin.take().expect("piped input");
         let writer = async move {
             stdin.write_all(&prompt).await?;
@@ -144,7 +147,7 @@ impl CodexCliProvider {
         };
         let (written, finished) = tokio::join!(
             writer,
-            tokio::time::timeout(self.timeout, child.wait_with_output())
+            tokio::time::timeout_at(deadline, child.wait_with_output())
         );
         written.map_err(|_| Error::ModelProvider("Cannot send context to Codex".into()))?;
         let output = finished

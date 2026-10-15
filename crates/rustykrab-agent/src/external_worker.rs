@@ -1049,7 +1049,10 @@ impl ExternalWorker {
         Option<std::process::Output>,
         bool,
     ) {
-        let mut child = match cmd.spawn() {
+        // The wall limit counts from here, so a wait for a busy executable
+        // comes out of it rather than adding to it.
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut child = match rustykrab_providers::cli_process::spawn(&mut cmd, deadline).await {
             Ok(child) => child,
             Err(e) => {
                 let why = format!("cannot start {}: {e}", self.config.command.display());
@@ -1063,7 +1066,7 @@ impl ExternalWorker {
             .map(|pid| self.groups.enter(pid));
         let (stdout, mut stdout_task) = capture(child.stdout.take());
         let (stderr, mut stderr_task) = capture(child.stderr.take());
-        let finished = tokio::time::timeout(limit, async {
+        let finished = tokio::time::timeout_at(deadline, async {
             let status = child.wait().await;
             let _ = (&mut stdout_task).await;
             let _ = (&mut stderr_task).await;
@@ -3124,6 +3127,60 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         }
     }
 
+    /// Holds `path` open for writing, and checks that this alone makes it
+    /// busy, so the test's window is real before the run starts.
+    fn hold_busy(path: &Path) -> std::fs::File {
+        let writer = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let err = std::process::Command::new(path).output().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ExecutableFileBusy, "{err}");
+        writer
+    }
+
+    /// An agent whose executable something holds open for writing a moment
+    /// longer, as its updater or a fork from another thread can, still
+    /// starts: the run waits out ETXTBSY (`cli_process`) instead of failing.
+    /// The worktree and brief are made first, so the busy window covers the
+    /// run's start and not its setup.
+    #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "macOS executes a file open for writing"
+    )]
+    async fn an_agent_whose_executable_is_briefly_busy_still_starts() {
+        let f = Fixture::new();
+        let agent = f.agent("claude", CLAUDE);
+        let worker = f.worker(WorkerKind::ClaudeCode, agent.clone());
+        let brief = brief(Some(f.workspace()));
+        let writer = hold_busy(&agent);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(writer);
+        });
+        let report = worker.run(brief).await;
+        release.join().unwrap();
+        assert_eq!(report.unwrap().summary, "added status");
+    }
+
+    /// Busy through every wait, the run fails to start, naming the cause.
+    #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "macOS executes a file open for writing"
+    )]
+    async fn an_agent_whose_executable_stays_busy_does_not_start() {
+        let f = Fixture::new();
+        let agent = f.agent("claude", CLAUDE);
+        let worker = f.worker(WorkerKind::ClaudeCode, agent.clone());
+        let brief = brief(Some(f.workspace()));
+        let _writer = hold_busy(&agent);
+        let err = worker.run(brief).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("cannot start") && text.contains("busy"),
+            "{text}"
+        );
+    }
+
     /// The resume answers with a contract that names no commit.
     const RESUME_NO_COMMIT: &str = r#"contract="{\\\"summary\\\":\\\"ran out\\\",\\\"changed_paths\\\":[],\\\"commit\\\":null,\\\"checks_run\\\":[],\\\"error\\\":{\\\"class\\\":\\\"budget\\\",\\\"subclass\\\":\\\"iterations\\\",\\\"detail\\\":\\\"Turn limit reached before committing\\\"}}"
 echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"session_id\":\"sess-1\",\"result\":\"$contract\"}""#;
@@ -3545,7 +3602,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         );
         assert!(!worker.healthy());
         assert!(worker.refresh().await);
-        assert!(worker.healthy());
+        assert!(worker.healthy(), "{:?}", worker.unhealthy_reason());
         assert!(!worker.refresh().await);
         assert_eq!(worker.runtime_status().unwrap()["subscription"], "max");
         let report = worker.run(brief(None)).await.unwrap();
@@ -3659,7 +3716,7 @@ else:
         );
         assert!(!worker.healthy());
         assert!(worker.refresh().await);
-        assert!(worker.healthy());
+        assert!(worker.healthy(), "{:?}", worker.unhealthy_reason());
         assert!(!worker.refresh().await);
         let runtime = worker.runtime_status().unwrap();
         assert_eq!(runtime["subscription"], "pro");

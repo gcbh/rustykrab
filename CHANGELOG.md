@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.5.8] - 2026-10-15
+
+- fix: wait out a momentarily busy CLI executable instead of failing the start (#702)
+
 ## [6.5.7] - 2026-10-14
 
 - fix: restore parallel worker execution and queue progress (#693)
