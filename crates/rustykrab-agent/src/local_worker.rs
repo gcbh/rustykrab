@@ -3116,6 +3116,38 @@ mod tests {
         assert_eq!(w.usage(&run), None, "taken once");
     }
 
+    /// Only the report is declared up front; the other work tools are in
+    /// the ceiling and a run loads them when it needs one.
+    #[tokio::test]
+    async fn a_work_tool_left_out_of_the_front_block_can_still_be_loaded() {
+        let draft = json!({
+            "title": "Port the number",
+            "objective": "Move the number to plan B",
+            "done_when": "The number works on plan B",
+        });
+        let provider = Recording::new(vec![
+            call("tools_load", json!({ "names": ["work_file"] })),
+            call("work_file", draft),
+            report("Filed the follow-up."),
+        ]);
+        let (w, stub) = worker(
+            provider.clone(),
+            vec![Arc::new(rustykrab_tools::ToolsLoadTool::new())],
+        );
+        w.run(brief("item-50")).await.unwrap();
+
+        let (_, first) = provider.requests()[0].clone();
+        assert!(first.iter().any(|t| t == "result_report"), "{first:?}");
+        assert!(!first.iter().any(|t| t == "work_file"), "{first:?}");
+        assert!(
+            stub.calls()
+                .iter()
+                .any(|c| matches!(c, WorkCall::File { .. })),
+            "the loaded work_file ran: {:?}",
+            stub.calls()
+        );
+    }
+
     #[tokio::test]
     async fn without_the_reminder_text_ends_the_run() {
         let provider = Recording::new(vec![text("Plan B is cheapest.")]);
