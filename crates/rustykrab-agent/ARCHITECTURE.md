@@ -244,8 +244,9 @@ host resumes a kept one (below):
   seen before is no progress, and after `stall_steps` of those in a row
   (`DEFAULT_STALL_STEPS`, `with_stall_steps`) each repeating call's result
   carries a notice that it tells the model nothing new, and the run goes on;
-  a run that reaches its iteration cap still stalled names the stall in its
-  `budget/iterations` failure, so the repair run keeps the evidence;
+  a run that reaches its iteration cap still stalled fails as `model/loop`
+  with the stall's detail, so the controller repairs it with this attempt's
+  evidence;
 - the conversation id is the brief's `run` (the id the controller recorded
   as the item's `run` evidence) when it is one, and with `with_transcripts`
   the conversation is kept through the injected `RunTranscripts`: once with
@@ -474,8 +475,8 @@ same recorder `result_report` uses. With `result_report_reminder` on
 fired in 32 measured runs, `docs/measurements/reminder-eval-qwen38-2026-10-14.md`)
 the model is first reminded up to three times. A run that ends without a report returns
 `RunFailure` (defined beside the `Worker` trait in `rustykrab-control`):
-`budget/iterations` (naming the ledger's stall when there was one),
-`budget/wall`, or `model/empty` (no text). A provider error passes through
+`budget/iterations`, `model/loop` (the cap reached while the progress
+ledger called the run stalled), `budget/wall`, or `model/empty` (no text). A provider error passes through
 unchanged. The controller classifies either through
 `worker::run_failure_input`. `last_run()` keeps the numbers a report does not
 carry: iterations, reminders, rejected reports.

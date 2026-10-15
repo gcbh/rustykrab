@@ -1219,16 +1219,19 @@ impl LocalWorker {
             },
             // A provider or runner error: classified as the core reports it.
             Some(Err(e)) => return Err(e),
-            Some(Ok(())) if tracer.iteration_limit_reached() => RunFailure::Budget {
-                budget: BudgetKind::Iterations,
-                detail: match stalled {
-                    // Told it was repeating itself, the run went on to its
-                    // cap: the ledger's verdict is why, for the repair run.
-                    Some(stall) => format!(
+            // Told it was repeating itself, the run went on to its cap: the
+            // loop is why, and the repair run gets the ledger's evidence.
+            Some(Ok(())) if tracer.iteration_limit_reached() => match stalled {
+                Some(stall) => RunFailure::Model {
+                    problem: ProviderProblem::Loop,
+                    detail: format!(
                         "{max_iterations} iterations used without result_report; {}",
                         stall.detail()
                     ),
-                    None => format!(
+                },
+                None => RunFailure::Budget {
+                    budget: BudgetKind::Iterations,
+                    detail: format!(
                         "{max_iterations} iterations used without result_report \
                          ({} reminders)",
                         stats.reminders
@@ -2867,10 +2870,7 @@ mod tests {
         b.required_tools = vec!["noop".into()];
         b.budget.iterations = 5;
         let err = w.run(b).await.unwrap_err();
-        assert_eq!(
-            classified(&err),
-            (ErrorClass::Budget, ErrorSubclass::Iterations)
-        );
+        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
         assert!(err.to_string().contains("progress ledger"), "{err}");
     }
 

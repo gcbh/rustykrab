@@ -7,8 +7,8 @@
 //! not. Once `threshold` steps in a row bring nothing new, the run has
 //! stalled: the worker adapter says so in each repeating step's result and
 //! the run goes on, so the model can change course. A run that reaches its
-//! iteration cap still stalled carries [`Stall::detail`] in its failure, so
-//! the repair run's brief has this attempt's evidence. Deterministic and
+//! iteration cap still stalled fails as `model/loop` with [`Stall::detail`],
+//! so the repair run's brief has this attempt's evidence. Deterministic and
 //! pure: the same steps always give the same verdict.
 //!
 //! The subtree half of step 7 (a parent with nothing moving beneath it) is
