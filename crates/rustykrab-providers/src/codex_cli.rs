@@ -142,12 +142,13 @@ impl CodexChatGptRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let result = match crate::cli_process::spawn(&mut cmd).await {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let result = match crate::cli_process::spawn(&mut cmd, deadline).await {
             Err(_) => Err("Codex CLI could not be started for login verification".to_string()),
             Ok(mut child) => {
                 let input = child.stdin.take().expect("piped input");
                 let output = child.stdout.take().expect("piped output");
-                let result = tokio::time::timeout(Duration::from_secs(20), probe(input, output))
+                let result = tokio::time::timeout_at(deadline, probe(input, output))
                     .await
                     .unwrap_or_else(|_| Err("Codex CLI login verification timed out".into()));
                 let _ = child.kill().await;
