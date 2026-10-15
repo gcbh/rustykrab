@@ -24,9 +24,15 @@ own harness and give it RustyKrab's tools as tools.
 1. **A run-scoped grant.** When a native run is leased and its brief needs
    host tools, the daemon mints a grant: a random bearer token bound to
    - the work item and run id, and the actor `worker:<name>`;
-   - the tools it may call: the brief's `required_tools` (and MCP servers)
-     within the worker's host-tool ceiling, nothing else;
-   - read-only, when the brief is a review (`read_only_review`): no tools;
+   - the tools it may call: the same effective per-brief host filter the
+     host half uses today (the worker's ceiling and catalog, the brief's
+     resources, read-only), not only `required_tools`, which are minimum
+     needs, so dynamic discovery still works; required MCP servers resolve
+     to their actual permitted tools;
+   - read-only, when the brief is a review (`read_only_review`): no tools,
+     with the native agent's own-tool restrictions and the report guard
+     still applied (#696 restricts a local review to `result_report`;
+     #698's `read_only_guard` checks every worker's review report);
    - an expiry at the run's wall deadline, and a call quota.
    The grant is revoked when the run ends, however it ends.
 2. **A stdio bridge.** `rustykrab-cli mcp-bridge` speaks MCP over stdio
@@ -42,8 +48,9 @@ own harness and give it RustyKrab's tools as tools.
    integration attestation), so credentials never leave the daemon and
    every call is observed and attested as it is now.
 4. **One route per run.** `NativeWorker` sends a brief to the native half
-   whenever the grant covers its needs; the host half remains only for
-   what the grant cannot carry, and goes once nothing needs it.
+   whenever the grant covers its needs (coverage tested separately from
+   the grant's permission set); the host half remains only for what the
+   grant cannot carry, and goes once nothing needs it.
 
 ## The contract (from the anti-fragility review, 2026-10-15)
 
@@ -54,41 +61,68 @@ own harness and give it RustyKrab's tools as tools.
   not already give.
 - **Scope.** Work item, run, actor and read-only constraints come from the
   grant, never from the agent's arguments.
-- **Capacity.** One in-flight call per grant; calls count against the run's
-  quota and share the daemon's capacity with every other route.
+- **Capacity.** One in-flight call per grant, enforced by the server;
+  calls count against the run's quota and share the daemon's capacity with
+  every other route.
 - **One selection predicate.** The same predicate picks the route for the
   actual run and for its probe.
 - **Diagnostics are not proof.** Outcome capture of MCP calls in the run
   log (as #708 captures native outcomes) never becomes operation proof.
 
-Added in review (2026-10-15):
+Added in review (2026-10-15), with the native worker's owner's amendments:
 
-- **The grant stays out of argv and logs.** Claude's MCP config goes in a
-  0600 file in the run's scratch directory (`--mcp-config <path>`), not
-  inline JSON in `claude`'s argv. The token carries a recognisable prefix
-  so `redact.rs` keeps it out of the run log, the session log and #708's
-  summaries. The agent can read its own environment, so it can use the
-  token directly; that is acceptable only because the token does no more
-  than the bridge can: the same grant on the same route.
-- **A scoped route.** A grant authorizes the MCP route and nothing else:
-  never the owner bearer API or any other gateway route. Loopback only,
-  rate-limited per grant, and refused after revocation, mid-call included.
+- **The grant stays out of argv and every persisted record.** Claude's MCP
+  config goes in a 0600 file outside any committable worktree
+  (`--mcp-config <path>`), not inline JSON in `claude`'s argv, and is
+  deleted, and the grant revoked, on every exit path. A token prefix alone
+  does not make `redact.rs` run on session streams (#708 stores raw
+  captured output, and the investigation kit grants raw run logs), so
+  redaction is new work, applied and tested at every persistence boundary
+  that could see the grant: native stdout and stderr, #708's summaries,
+  the bridge's logs and errors, and model final reports, with raw
+  transient proof inputs kept apart from sanitized persisted diagnostics.
+  The agent can read its own environment and use the token directly; that
+  is acceptable only because the token does no more than the bridge can:
+  the same grant on the same route.
+- **A scoped route.** A grant has its own auth path, authorizes the MCP
+  route and nothing else, and never authenticates the owner bearer API or
+  any other gateway route. Loopback is checked by the connection's actual
+  identity, not forwarded headers; calls are rate-limited per grant and
+  refused after revocation, mid-call included.
 - **Integration policy and attestation hold over MCP.** `integrations.rs`'s
   `allowed()` (reads and dated briefings, nothing outside scope) and the
   rule that a report closes work only with observed calls apply to MCP
-  calls exactly as on the host half. The attestation trace is keyed by the
-  grant's item and run, so a native report claiming a Gmail action still
-  needs an observed call. `writable_resources` stay leased by the
-  controller (single writer); the grant carries only what the lease
-  reserved.
-- **A detectable bridge failure.** The daemon records a per-run "bridge
-  connected" event when the bridge's `initialize` and `tools/list` reach
-  the route. A native+MCP run whose brief needs host tools and whose
-  bridge never connected fails typed (`capability/mcp_unreachable`), not as
-  model confusion. That event is the route's first trusted proof of the
-  CLI leg; a daemon-side `ToolCallable` probe through the same route (a
-  probe-scoped grant) proves the server leg. Until both are observed the
-  route's probes stay Unobserved, and a host-route proof never stands in.
+  calls exactly as on the host half, and so does "attestation before an
+  early report closes work". This needs real plumbing: `WorkRunContext`
+  carries the item and actor but not the run, and the integration
+  `ObservedTool`/`AttestingBackend` share one `Option<Trace>`, so
+  observation is isolated per immutable grant, item, run and generation.
+  Tests: two concurrent runs on one worker, a late result from an old run,
+  and a forged target item or run; none may attest another run. A native
+  report claiming a Gmail action still needs an observed call.
+  `writable_resources` stay leased by the controller (single writer); the
+  grant carries only what the lease reserved.
+- **Revocation and deadlines hold against real effects.** Each call is
+  clamped to the remaining lease and run wall time and to the tool's own
+  cap (#712's exec limits included). Attempts are counted atomically across
+  reconnects; retry ids are deduplicated, or a conflicting payload under
+  one id refused. One in-flight call per grant is enforced by the server.
+  Expiry or revocation stops admission and cancels what can be cancelled,
+  but cannot undo an external effect already applied, so ambiguous and
+  completed outcomes are recorded as they are, and the controller keeps a
+  writable resource held while an old MCP call could still write.
+- **A detectable bridge failure, which is reachability, not proof.** The
+  daemon records a per-run "bridge connected" event when `initialize` and
+  `tools/list` reach the route, and a native+MCP run whose brief needs
+  host tools and whose bridge never connected fails typed
+  (`capability/mcp_unreachable`), not as model confusion. Since the agent
+  can use its own token, a handshake proves only that some holder of the
+  grant reached the server, not that the CLI made a tool round trip: it is
+  never combined with a daemon-side probe into NativeMcp proof. A NativeMcp
+  producer needs one fresh, bound challenge: an actual call and result on
+  the intended grant, run, path and context that meets the registered
+  postcondition. Until then NativeMcp probes stay Unobserved, and a
+  real-Codex connectivity e2e is evidence, not a per-run producer.
 - **Selection.** A distinct `ExecutionPath` (`NativeMcp`) in `ProbeScope`,
   so the #707 binding sees a route change and regenerates, and the "flag
   on, grant covers the needs" choice lives in the one shared predicate
