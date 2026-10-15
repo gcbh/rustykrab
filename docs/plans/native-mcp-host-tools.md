@@ -61,6 +61,39 @@ own harness and give it RustyKrab's tools as tools.
 - **Diagnostics are not proof.** Outcome capture of MCP calls in the run
   log (as #708 captures native outcomes) never becomes operation proof.
 
+Added in review (2026-10-15):
+
+- **The grant stays out of argv and logs.** Claude's MCP config goes in a
+  0600 file in the run's scratch directory (`--mcp-config <path>`), not
+  inline JSON in `claude`'s argv. The token carries a recognisable prefix
+  so `redact.rs` keeps it out of the run log, the session log and #708's
+  summaries. The agent can read its own environment, so it can use the
+  token directly; that is acceptable only because the token does no more
+  than the bridge can: the same grant on the same route.
+- **A scoped route.** A grant authorizes the MCP route and nothing else:
+  never the owner bearer API or any other gateway route. Loopback only,
+  rate-limited per grant, and refused after revocation, mid-call included.
+- **Integration policy and attestation hold over MCP.** `integrations.rs`'s
+  `allowed()` (reads and dated briefings, nothing outside scope) and the
+  rule that a report closes work only with observed calls apply to MCP
+  calls exactly as on the host half. The attestation trace is keyed by the
+  grant's item and run, so a native report claiming a Gmail action still
+  needs an observed call. `writable_resources` stay leased by the
+  controller (single writer); the grant carries only what the lease
+  reserved.
+- **A detectable bridge failure.** The daemon records a per-run "bridge
+  connected" event when the bridge's `initialize` and `tools/list` reach
+  the route. A native+MCP run whose brief needs host tools and whose
+  bridge never connected fails typed (`capability/mcp_unreachable`), not as
+  model confusion. That event is the route's first trusted proof of the
+  CLI leg; a daemon-side `ToolCallable` probe through the same route (a
+  probe-scoped grant) proves the server leg. Until both are observed the
+  route's probes stay Unobserved, and a host-route proof never stands in.
+- **Selection.** A distinct `ExecutionPath` (`NativeMcp`) in `ProbeScope`,
+  so the #707 binding sees a route change and regenerates, and the "flag
+  on, grant covers the needs" choice lives in the one shared predicate
+  (the successor of `uses_host`) that both the run and its probe use.
+
 ## Rollout
 
 1. Grant store and gateway route, with tests: a call outside the grant,
@@ -72,12 +105,14 @@ own harness and give it RustyKrab's tools as tools.
 4. Measure on real briefs (daily briefing, an integration task), then
    retire the host half for what MCP covers.
 
-## Open questions
+## Answered in review
 
-- Which host tools go first: the work tools alone, or the integrations
-  too (Gmail, CalDAV, Obsidian), which carry the attestation rules?
-- Codex's MCP support in `codex exec` under `--sandbox workspace-write`:
-  whether the bridge's loopback call is allowed, or needs the sandbox's
-  network permission.
-- Whether the grant should be per run or per invocation, now that a run
-  is one invocation (#710).
+- **First tools:** the work tools (`work_status`, `work_file`, the question
+  tools) through the same `WorkBackend` and #698's `read_only_guard`; the
+  integrations second, once attestation over MCP is tested.
+- **Codex's sandbox:** Codex is believed to start MCP servers itself,
+  outside the shell sandbox, but that is unverified: rollout step 2's e2e
+  asserts it with a real `codex exec --sandbox workspace-write` (bridge
+  connected, a call attested) rather than assuming it.
+- **Per run or per invocation:** per run, since a run is one invocation
+  (#710); per invocation if resumes ever return.
