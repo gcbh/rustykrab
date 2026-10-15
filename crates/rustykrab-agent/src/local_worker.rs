@@ -89,6 +89,15 @@ use crate::trace::ExecutionTracer;
 /// injected backend. Every agent can file a graph as well as execute a slice.
 const WORK_TOOL_NAMES: [&str; 4] = ["work_file", "work_status", "work_discuss", "result_report"];
 
+/// The work tools declared from a run's first turn: only the report. The
+/// rest are in the ceiling and loadable (`tools_list`), as the question
+/// tools are: filing follow-ups goes in the report's `discovered`, and the
+/// brief carries the item's inputs and discussion. In the front block their
+/// schemas were most of what a coding worker was shown on every request,
+/// and on 2026-10-14 qwen3.8 spent 55 of its calls on `work_status` and
+/// `work_discuss` (50 of them refused) instead of the work.
+const FRONT_WORK_TOOLS: [&str; 1] = ["result_report"];
+
 /// A worker's typed questions (plan section 7): in every worker's ceiling,
 /// built per run, loadable rather than in the front block, since a report
 /// can carry `blocked` and `questions` too.
@@ -613,7 +622,11 @@ impl LocalWorker {
         brief: &Brief,
         ceiling: &[String],
     ) -> std::result::Result<Vec<String>, RunFailure> {
-        let mut names: Vec<String> = WORK_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        let mut names: Vec<String> = FRONT_WORK_TOOLS.iter().map(|n| n.to_string()).collect();
+        // The brief names inputs it does not inline: their reader comes with it.
+        if !brief.more_inputs.is_empty() {
+            names.push("work_status".into());
+        }
         names.extend(
             self.definition
                 .visible_set(ceiling.iter().map(String::as_str)),
@@ -1440,7 +1453,10 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     }
     out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
-    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete.");
+    // How to shape a draft (tmp names, edges, inputs_from) is the report
+    // tool's schema to say, on the one run in many that files one; every
+    // brief used to carry it as a paragraph.
+    out.push_str(" Finish this item's done_when and stop there: further work you find goes in the report's discovered drafts, for another run. Do not claim an unfinished done_when as complete.");
     out
 }
 
@@ -2526,9 +2542,6 @@ mod tests {
                 "mcp__linear__create_issue",
                 "mcp__linear__search",
                 "result_report",
-                "work_discuss",
-                "work_file",
-                "work_status",
             ]
         );
 
@@ -2577,17 +2590,9 @@ mod tests {
         first.sort();
         assert_eq!(
             first,
-            [
-                "exec",
-                "mcp__linear__search",
-                "read",
-                "result_report",
-                "work_discuss",
-                "work_file",
-                "work_status"
-            ],
+            ["exec", "mcp__linear__search", "read", "result_report"],
             "the coder's filesystem and runtime tools the host has, its server's \
-             tools, and the work tools; not the rest of the catalog"
+             tools, and the report; not the rest of the catalog"
         );
     }
 
@@ -3109,6 +3114,38 @@ mod tests {
         assert_eq!(usage.tokens, 2_100);
         assert_eq!(usage.iterations, 3);
         assert_eq!(w.usage(&run), None, "taken once");
+    }
+
+    /// Only the report is declared up front; the other work tools are in
+    /// the ceiling and a run loads them when it needs one.
+    #[tokio::test]
+    async fn a_work_tool_left_out_of_the_front_block_can_still_be_loaded() {
+        let draft = json!({
+            "title": "Port the number",
+            "objective": "Move the number to plan B",
+            "done_when": "The number works on plan B",
+        });
+        let provider = Recording::new(vec![
+            call("tools_load", json!({ "names": ["work_file"] })),
+            call("work_file", draft),
+            report("Filed the follow-up."),
+        ]);
+        let (w, stub) = worker(
+            provider.clone(),
+            vec![Arc::new(rustykrab_tools::ToolsLoadTool::new())],
+        );
+        w.run(brief("item-50")).await.unwrap();
+
+        let (_, first) = provider.requests()[0].clone();
+        assert!(first.iter().any(|t| t == "result_report"), "{first:?}");
+        assert!(!first.iter().any(|t| t == "work_file"), "{first:?}");
+        assert!(
+            stub.calls()
+                .iter()
+                .any(|c| matches!(c, WorkCall::File { .. })),
+            "the loaded work_file ran: {:?}",
+            stub.calls()
+        );
     }
 
     #[tokio::test]
