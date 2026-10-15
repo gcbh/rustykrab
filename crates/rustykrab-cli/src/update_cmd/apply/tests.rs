@@ -2072,46 +2072,60 @@ fn reads_lsof_listeners() {
 
 /// The real lookup reads what the kernel runs, not `argv[0]`: a child whose
 /// `argv[0]` claims to be the installed binary is named by its real
-/// executable. The child is this test's own `sleep`, killed at the end.
+/// executable. A marker acknowledges that this test's own shell has executed;
+/// observing immediately after spawn can still catch the parent's image on Linux.
 #[test]
 fn the_system_executable_is_the_real_one_not_argv0() {
     use std::os::unix::process::CommandExt;
+    struct Fixture(std::process::Child);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     let installed = root.path().join(BINARY_NAME);
     std::fs::write(&installed, OLD).unwrap();
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-        .into_iter()
-        .map(Path::new)
-        .find(|p| p.exists())
-        .expect("a sleep binary");
-    let mut child = Command::new(sleep)
-        .arg0(&installed)
-        .arg("30")
-        .spawn()
-        .unwrap();
-    // On Linux the kernel can briefly expose the parent's executable after
-    // spawn, before the child finishes exec. Observe readiness, not a delay.
-    let expected = std::fs::canonicalize(sleep).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let found = loop {
-        let found = SystemProcesses.executable(child.id());
-        let ready = found
-            .as_ref()
-            .ok()
-            .and_then(|path| std::fs::canonicalize(path).ok())
-            .is_some_and(|path| path == expected);
-        if ready || std::time::Instant::now() >= deadline {
-            break found;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // macOS /bin/sh may launch /bin/bash; select that executable directly.
+    let shell = if cfg!(target_os = "macos") {
+        Path::new("/bin/bash")
+    } else {
+        Path::new("/bin/sh")
     };
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let ready = root.path().join("fixture-ready");
+    let mut child = Fixture(
+        Command::new(shell)
+            .env_clear()
+            .arg0(&installed)
+            .args(["-c", "printf ready > \"$1\"; read -r ignored", "fixture"])
+            .arg(&ready)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !std::fs::read(&ready).is_ok_and(|bytes| bytes == b"ready") {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "fixture exited before acknowledging execution"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture {} never acknowledged execution",
+            child.0.id()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let found = SystemProcesses.executable(child.0.id());
+    drop(child);
     let found = found.unwrap();
     assert!(found.is_absolute(), "{}", found.display());
     assert_eq!(
         std::fs::canonicalize(&found).unwrap(),
-        std::fs::canonicalize(sleep).unwrap()
+        std::fs::canonicalize(shell).unwrap()
     );
 }
 
