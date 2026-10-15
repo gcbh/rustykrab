@@ -48,10 +48,14 @@ use uuid::Uuid;
 /// under [`LateToolBinding::Append`] appended, with its definition riding on
 /// the completion reminder, so the tools array the run started with is the
 /// one it keeps.
-const META_TOOL_NAMES: &[&str] = &[
-    "tools_list",
-    "tools_load",
-    "recall_append",
+const META_TOOL_NAMES: &[&str] = &["tools_list", "tools_load", "recall_append"];
+
+/// The tools that read a conversation's recall archive. Declared once the
+/// archive has something in it (compaction, or a run that starts on a
+/// compacted conversation), not from the first turn: before that they
+/// return nothing, and their four schemas were a quarter of a coding
+/// worker's tool block on every request.
+const RECALL_READ_TOOLS: &[&str] = &[
     "recall_info",
     "recall_peek",
     "recall_search",
@@ -2173,6 +2177,11 @@ impl AgentRunner {
         // And notices stored as system messages by older builds become the
         // user turns every notice is now, so no request of this run carries
         // a system message after the first (plan section 12.1).
+        // A conversation compacted before this run has an archive to read.
+        if self.recall.get(conv.id).is_some() {
+            self.active_tools
+                .activate(conv.id, RECALL_READ_TOOLS.iter().copied());
+        }
         let reshaped = portable_shape(conv) + answer_unresolved_calls(conv);
         if reshaped > 0 {
             tracing::debug!(
@@ -4153,6 +4162,8 @@ impl AgentRunner {
         // Commit the archive and history replacement only after validation.
         if !displaced.is_empty() {
             self.recall.append(conv.id, &displaced.join("\n\n"));
+            self.active_tools
+                .activate(conv.id, RECALL_READ_TOOLS.iter().copied());
             tracing::info!(conversation_id = %conv.id, displaced_messages = displaced.len(), archived_chars,
                 "compaction: archived displaced history for recall");
         }
@@ -6120,6 +6131,59 @@ mod compaction_tests {
         // Recursive path should have issued more than one provider call.
         let calls = *provider.call_count.lock().unwrap();
         assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
+
+    /// The recall readers are declared once there is an archive to read.
+    #[tokio::test]
+    async fn recall_readers_are_declared_once_compaction_archives() {
+        let provider = Arc::new(CountingProvider::new(Some(100_000)));
+        let tools = crate::recall_tools(
+            provider.clone() as Arc<dyn ModelProvider>,
+            rustykrab_core::orchestration::OrchestrationConfig::default(),
+        );
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        let runner =
+            AgentRunner::new(provider, tools, Arc::new(NoSandbox)).with_config(AgentConfig {
+                compaction_target_tokens: Some(2_000),
+                ..AgentConfig::default()
+            });
+        let conv_id = Uuid::new_v4();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let session = Session::with_capabilities(
+            conv_id,
+            rustykrab_core::capability::CapabilitySet::for_tools_permissive(&names),
+        );
+        let declared = |runner: &AgentRunner| -> Vec<String> {
+            runner
+                .compute_schemas_versioned(&session, conv_id)
+                .1
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        let before = declared(&runner);
+        assert!(before.iter().any(|n| n == "recall_append"), "{before:?}");
+        assert!(!before.iter().any(|n| n == "recall_search"), "{before:?}");
+
+        let text = |role, t: String| Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(t),
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+        let mut conv = study_conversation(vec![
+            text(Role::User, "fix the parser".into()),
+            text(Role::Assistant, "z".repeat(20_000)),
+            text(Role::Assistant, "found it".into()),
+        ]);
+        conv.id = conv_id;
+        runner.compact_history(&mut conv, &[]).await.unwrap();
+
+        let after = declared(&runner);
+        for name in RECALL_READ_TOOLS {
+            assert!(after.iter().any(|n| n == name), "{name}: {after:?}");
+        }
     }
 
     /// A history over half the window still fits one summary call with its
