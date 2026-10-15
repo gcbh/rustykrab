@@ -63,6 +63,56 @@ async fn seeded(items: Vec<WorkItem>, edges: Vec<Edge>) -> Store {
     store
 }
 
+#[tokio::test]
+async fn priority_updates_are_atomic_and_cannot_reopen_closed_work() {
+    let store = seeded(
+        vec![
+            item("a", Status::Blocked(BlockedReason::NeedsConsent)),
+            item("b", Status::Queued),
+            item("closed", Status::Done),
+        ],
+        vec![],
+    )
+    .await;
+    let original = store.work_get("a").await.unwrap().unwrap();
+    assert!(store
+        .work_apply(vec![
+            WorkOp::SetPriority {
+                item: "a".into(),
+                expected: 0,
+                priority: 10
+            },
+            WorkOp::SetPriority {
+                item: "b".into(),
+                expected: 99,
+                priority: 9
+            }
+        ])
+        .await
+        .is_err());
+    assert_eq!(store.work_get("a").await.unwrap().unwrap(), original);
+    assert!(store
+        .work_apply(vec![WorkOp::SetPriority {
+            item: "closed".into(),
+            expected: 0,
+            priority: 20
+        }])
+        .await
+        .is_err());
+    store
+        .work_apply(vec![WorkOp::SetPriority {
+            item: "a".into(),
+            expected: 0,
+            priority: 10,
+        }])
+        .await
+        .unwrap();
+    let actual = store.work_get("a").await.unwrap().unwrap();
+    let mut expected = original;
+    expected.priority = 10;
+    assert_eq!(actual, expected);
+}
+
 fn sql(store: &Store, statement: &str) {
     store.conn.lock().unwrap().execute(statement, []).unwrap();
 }

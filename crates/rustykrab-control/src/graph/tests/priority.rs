@@ -1,8 +1,9 @@
 use super::*;
 use crate::graph::scheduling_priorities;
+use rustykrab_core::work::BlockedReason;
 
 #[test]
-fn blocker_impact_precedes_explicit_urgency_and_inactive_plan_b_donates_nothing() {
+fn explicit_urgency_precedes_blocker_impact_and_inactive_plan_b_donates_nothing() {
     let g = G::new()
         .add("repair")
         .add("first")
@@ -19,7 +20,7 @@ fn blocker_impact_precedes_explicit_urgency_and_inactive_plan_b_donates_nothing(
     let ranks = scheduling_priorities(&g.snap(), now());
     assert_eq!(ranks["repair"].waiters, 2);
     assert_eq!(ranks["repair"].priority, 0);
-    assert!(ranks["repair"].compare(&ranks["urgent"]).is_lt());
+    assert!(ranks["repair"].compare(&ranks["urgent"]).is_gt());
     let failed = g.status("attempt", Status::Failed);
     assert_eq!(
         scheduling_priorities(&failed.snap(), now())["repair"].waiters,
@@ -36,6 +37,46 @@ fn blocker_impact_precedes_explicit_urgency_and_inactive_plan_b_donates_nothing(
         scheduling_priorities(&parent.snap(), now())["repair"].waiters,
         0,
         "a parent does not donate through an unreleased fallback"
+    );
+}
+
+#[test]
+fn one_priority_list_retains_blocked_leaves_and_excludes_goals_and_history() {
+    let g = G::new()
+        .add("goal")
+        .child("work", "goal")
+        .add("repair")
+        .add("held")
+        .add("closed")
+        .set("work", |i| i.priority = 20)
+        .set("held", |i| {
+            i.priority = 30;
+            i.held_by = Some("consent".into());
+            i.status = Status::Blocked(BlockedReason::NeedsConsent);
+        })
+        .status("closed", Status::Done)
+        .edge("work", EdgeKind::Blocks, "repair");
+    let list = crate::graph::priority_list(&g.snap(), now());
+    assert_eq!(
+        list.entries
+            .iter()
+            .map(|e| e.item.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held", "repair", "work"]
+    );
+    assert_eq!(list.entries[0].wait_reason, "Waiting for your approval");
+    assert_eq!(list.entries[1].effective_priority, 20);
+    assert_eq!(list.entries[2].waiting_on[0].item, "repair");
+    assert_eq!(list.entries[2].goal.as_ref().unwrap().item, "goal");
+    assert_eq!(
+        list.entries.iter().map(|e| e.position).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(list, crate::graph::priority_list(&g.snap(), now()));
+    let changed = g.set("held", |i| i.priority = 1);
+    assert_ne!(
+        list.revision,
+        crate::graph::priority_list(&changed.snap(), now()).revision
     );
 }
 

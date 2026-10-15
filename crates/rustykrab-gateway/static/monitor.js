@@ -5,6 +5,7 @@
   const closed = new Set(['done', 'failed', 'cancelled', 'expired']);
   const access = window.RustyKrabAccess;
   let snapshot = null, pending = false, paused = false, interval = null, generation = 0;
+  let priorityMoving = false, priorityError = '', priorityVersion = 0;
   let lastQuestions = '', detailRequest = 0;
   const linkedWork = new URLSearchParams(window.location.search).get('work');
   const node = (tag, text, cls) => {
@@ -58,6 +59,7 @@
     generation++; detailRequest++; pending = false;
     clearInterval(interval); interval = null;
     access.disconnect(); snapshot = null; lastQuestions = ''; discussionDrafts.clear();
+    priorityMoving = false; priorityError = ''; $('priorityRows').replaceChildren(); $('priorityError').hidden = true;
     $('accessStatus').textContent = ''; $('accessMessage').textContent = access.message({disconnected: true});
     $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
     $('loginError').textContent = message; $('token').value = '';
@@ -273,7 +275,7 @@
       if (w.items_truncated) card.append(node('p', 'Assignments cover displayed items.', 'note'));
       $('agents').append(card);
     }
-    renderWork();
+    renderPriorityList(); renderWork();
     renderPriorityViews(reply);
     $('events').replaceChildren();
     for (const row of [...w.events].reverse()) {
@@ -296,6 +298,64 @@
     if (!reply.expectation_metrics.length) $('quality').append(node('p', 'No evaluation recorded yet.', 'empty'));
     $('build').textContent = 'RustyKrab ' + reply.version + (reply.commit ? ' · ' + reply.commit.slice(0, 12) : '') + ' · Usage covers completed run records. Active run totals may still be pending.';
   }
+  function priorityTitle(entry) {
+    const match = /^Stop recurring ([^ ]+) failure [a-f0-9]{16}$/.exec(entry.title);
+    if (!match) return entry.title;
+    const labels = {'budget/tokens':'token-budget stops','tool/upstream_error':'model-provider failures','verification/incomplete':'incomplete results'};
+    return 'Repair repeated ' + (labels[match[1]] || human(match[1]) + ' failures');
+  }
+  async function movePriority(index, offset) {
+    if (priorityMoving || !snapshot?.priority_list) return;
+    const list = snapshot.priority_list, ordered = list.entries.map(e => e.item), to = index + offset;
+    if (to < 0 || to >= ordered.length) return;
+    [ordered[index], ordered[to]] = [ordered[to], ordered[index]];
+    const g = generation;
+    priorityMoving = true; priorityVersion++; priorityError = ''; renderPriorityList();
+    try {
+      const updated = await api('/api/work/priority', {revision:list.revision, ordered});
+      if (g !== generation || !snapshot) return;
+      priorityVersion++;
+      snapshot.priority_list = updated;
+      renderWork();
+    } catch (e) {
+      if (g === generation) priorityError = e.message;
+    } finally {
+      if (g === generation) { priorityMoving = false; renderPriorityList(); }
+    }
+  }
+  function renderPriorityList() {
+    const list = snapshot?.priority_list, rows = $('priorityRows');
+    rows.replaceChildren();
+    $('priorityError').hidden = !priorityError;
+    $('priorityError').textContent = priorityError;
+    if (!list) {
+      $('priorityCount').textContent = 'Unavailable';
+      rows.append(node('li', 'The controller has not supplied its priority list.', 'empty'));
+      return;
+    }
+    $('priorityCount').textContent = num(list.entries.length) + ' pending steps' + (priorityMoving ? ' · Saving…' : '');
+    for (const [index, entry] of list.entries.entries()) {
+      const row = node('li', undefined, 'priority-item'), position = node('span', num(entry.position), 'priority-position');
+      const content = node('div', undefined, 'priority-content');
+      content.append(itemButton(entry.item, priorityTitle(entry)), node('p', entry.wait_reason, 'priority-wait'));
+      if (entry.goal) content.append(node('p', 'Goal: ' + entry.goal.title, 'note'));
+      if (entry.waiters) content.append(node('p', 'Needed by ' + num(entry.waiters) + ' open items', 'note'));
+      if (entry.waiting_on.length) {
+        const waiting = node('div', undefined, 'priority-dependencies'); waiting.append(node('span', 'Waiting on: '));
+        for (const dependency of entry.waiting_on) waiting.append(itemButton(dependency.item, dependency.title));
+        content.append(waiting);
+      }
+      const controls = node('div', undefined, 'priority-controls');
+      for (const [label, offset] of [['Move up',-1],['Move down',1]]) {
+        const b = node('button', label); b.type = 'button';
+        b.setAttribute('aria-label', label + ': ' + priorityTitle(entry));
+        b.disabled = priorityMoving || index + offset < 0 || index + offset >= list.entries.length;
+        b.addEventListener('click', () => movePriority(index, offset)); controls.append(b);
+      }
+      row.append(position, content, controls); rows.append(row);
+    }
+    if (!list.entries.length) rows.append(node('li', 'No pending work.', 'empty'));
+  }
   function renderWork() {
     if (!snapshot) return;
     const w = snapshot.work, needle = $('search').value.trim().toLowerCase(), filter = $('status').value;
@@ -305,11 +365,9 @@
         (!needle || [row.item.id, row.item.title, row.last_worker].join(' ').toLowerCase().includes(needle));
     });
     const ranks = snapshot.queue_priorities || {};
+    const positions = new Map((snapshot.priority_list?.entries || []).map(e => [e.item,e.position]));
     selected.sort((a,b) => {
-      const active = s => ['leased','running','verifying'].includes(status(s.item));
-      const ar = ranks[a.item.id] || {waiters:0,priority:a.item.priority || 0};
-      const br = ranks[b.item.id] || {waiters:0,priority:b.item.priority || 0};
-      return Number(active(b)) - Number(active(a)) || br.waiters-ar.waiters || br.priority-ar.priority || Date.parse(a.item.created_at)-Date.parse(b.item.created_at) || a.item.id.localeCompare(b.item.id);
+      return (positions.get(a.item.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(b.item.id) ?? Number.MAX_SAFE_INTEGER) || Date.parse(a.item.created_at)-Date.parse(b.item.created_at) || a.item.id.localeCompare(b.item.id);
     });
     $('workCount').textContent = num(selected.length) + ' displayed';
     $('workRows').replaceChildren();
@@ -332,15 +390,15 @@
       const tr = node('tr'), td = node('td', 'No work matches this view.', 'empty'); td.colSpan = 5;
       tr.append(td); $('workRows').append(tr);
     }
-    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items, with active work first. ' : '') + 'Queue order: blocking impact, then urgency and age. Open an item to discuss direction and inspect progress.';
+    $('workNote').textContent = 'Counts cover all work. ' + (w.items_truncated ? 'Showing ' + num(w.items.length) + ' of ' + num(w.total_live) + ' items. ' : '') + 'Pending steps follow the controller’s priority list. Open an item to discuss direction and inspect progress.';
   }
   const progressStates = new Set(['queued', 'ready', 'leased', 'running', 'verifying']);
-  const views = new Set(['attention', 'progress', 'results', 'automatic', 'systems']);
-  let currentView = views.has(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'attention';
+  const views = new Set(['priority', 'attention', 'progress', 'results', 'automatic', 'systems']);
+  let currentView = views.has(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'priority';
   let preferences = null, preferenceSignature = '', preferencePending = false;
   const startDrafts = new Map();
   function selectView(view, updateLocation = true) {
-    currentView = views.has(view) ? view : 'attention';
+    currentView = views.has(view) ? view : 'priority';
     for (const pane of document.querySelectorAll('[data-pane]')) pane.hidden = pane.dataset.pane !== currentView;
     for (const button of document.querySelectorAll('[data-view]')) button.setAttribute('aria-pressed', String(button.dataset.view === currentView));
     if (updateLocation) window.history.replaceState(null, '', window.location.pathname + window.location.search + '#' + currentView);
@@ -532,11 +590,13 @@
     timeline.scrollTop = timeline.scrollHeight;
   }
   async function refresh() {
-    if (pending || !access.connected) return;
-    pending = true; const g = generation; $('refresh').disabled = true;
+    if (pending || priorityMoving || !access.connected) return;
+    pending = true; const g = generation, observedPriority = priorityVersion; $('refresh').disabled = true;
     try {
       const reply = await api('/api/monitor');
       if (g !== generation) return;
+      // An observation started before a move cannot undo its returned order.
+      if (observedPriority !== priorityVersion && snapshot) reply.priority_list = snapshot.priority_list;
       snapshot = reply; render(reply);
       await refreshQuestions(g);
       if (currentView === 'automatic') await refreshPreferences(g);

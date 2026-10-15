@@ -61,7 +61,10 @@ pub use aging::aging_candidates;
 pub use cascade::{
     cancel_subtree, cascade, cascade_from, hold_recompute, hold_recompute_all, settle, step,
 };
-pub use priority::{scheduling_priorities, SchedulingPriority};
+pub use priority::{
+    priority_list, scheduling_priorities, PriorityDependency, PriorityEntry, PriorityList,
+    SchedulingPriority,
+};
 pub use ready::{
     due_expiries, edge_summary, is_ready, readiness, stale_ready, CascadeCancel, EdgeSummary, Hold,
 };

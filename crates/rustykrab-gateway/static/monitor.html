@@ -28,13 +28,18 @@
 <div id="error" class="error" role="alert" hidden></div>
 <div class="stats" id="stats"></div>
 <nav class="view-nav" aria-label="Work manager views">
-<button type="button" data-view="attention" aria-pressed="true">Attention</button>
+<button type="button" data-view="priority" aria-pressed="true">Priority list</button>
+<button type="button" data-view="attention" aria-pressed="false">Attention</button>
 <button type="button" data-view="progress" aria-pressed="false">In progress</button>
 <button type="button" data-view="results" aria-pressed="false">Results</button>
 <button type="button" data-view="automatic" aria-pressed="false">Automatic work</button>
 <button type="button" data-view="systems" aria-pressed="false">Systems</button>
 </nav>
-<section data-pane="attention">
+<section data-pane="priority">
+<div class="view-intro"><h2>Priority list</h2><p>The scheduler tries work in this order. It skips blocked items and items waiting for eligible capacity, and can assign independent work to several agents.</p></div>
+<section class="card"><div class="section-heading"><h2>Next work</h2><span id="priorityCount"></span></div><p class="note">Move items to change future assignments. Dependencies and approval holds still apply. Running work continues.</p><p id="priorityError" class="error" role="alert" hidden></p><ol id="priorityRows" class="priority-list"></ol></section>
+</section>
+<section data-pane="attention" hidden>
 <div class="view-intro"><h2>Decisions and failures</h2><p>Give direction on a work item, or inspect what needs recovery. Comments and decisions stay with the work.</p></div>
 <section id="alerts" class="card" aria-labelledby="alertsTitle"><h2 id="alertsTitle">System failures</h2><div id="alertRows"></div></section>
 <section id="questions" class="card" hidden><h2>Needs your direction</h2><div id="questionRows"></div></section>

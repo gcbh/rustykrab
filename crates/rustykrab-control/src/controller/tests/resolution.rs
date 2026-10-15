@@ -3,7 +3,7 @@ use crate::controller::batch::Batch;
 use rustykrab_core::work::{BlockedReason, ErrorClass, WorkKind};
 
 #[tokio::test]
-async fn shared_blockers_run_before_independent_work_even_with_lower_explicit_priority() {
+async fn shared_blockers_run_before_independent_work_at_equal_priority() {
     let h = Harness::new(&["agent"]);
     let repair = h.file_one(draft("repair", "shared prerequisite")).await;
     for title in ["blocked first", "blocked second"] {
@@ -15,7 +15,7 @@ async fn shared_blockers_run_before_independent_work_even_with_lower_explicit_pr
         h.file_one(d).await;
     }
     let mut urgent = draft("urgent", "independent urgent work");
-    urgent.priority = 999;
+    urgent.priority = 0;
     h.file_one(urgent).await;
     let gate = Arc::new(Notify::new());
     h.script.push(

@@ -208,6 +208,21 @@ pub trait ControlHandle: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// The same ordered pending leaves used by dispatch, including held work.
+    async fn priority_list(&self) -> Result<Option<crate::graph::PriorityList>, Error> {
+        Ok(None)
+    }
+
+    /// Human-owned ordering; changes urgency, never authorization or status.
+    async fn reorder_priority(
+        &self,
+        _revision: &str,
+        _ordered: &[WorkItemId],
+        _actor: &str,
+    ) -> Result<crate::graph::PriorityList, Error> {
+        Err(unsupported("priority ordering"))
+    }
+
     /// Everything on record about a failure, for `work investigate` and
     /// `GET /api/work/investigate/{target}`: `target` is a failure
     /// fingerprint (or an unambiguous prefix of one) or a work item's id.

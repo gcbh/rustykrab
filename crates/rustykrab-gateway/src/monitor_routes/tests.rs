@@ -265,11 +265,117 @@ async fn bounded_monitor_ranks_count_waiters_outside_the_display_limit() {
     assert_eq!(reply.work.items.len(), 3);
     assert!(reply.work.items_truncated);
     assert_eq!(reply.queue_priorities[&repair].waiters, 2);
+    let priorities = reply.priority_list.as_ref().unwrap();
+    assert_eq!(
+        priorities.entries.len(),
+        4,
+        "the actionable priority list is not truncated with telemetry"
+    );
+    assert_eq!(priorities.entries[0].item, repair);
     assert!(reply.queue_priorities.keys().all(|id| reply
         .work
         .items
         .iter()
         .any(|row| &row.item.id == id)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn priority_route_requires_human_auth_and_origin_and_rejects_stale_orders() {
+    use rustykrab_control::graph::PriorityList;
+    use rustykrab_core::work::{PlanOutcome, WorkItemDraft};
+    let (base, client, store, control, task) = serve().await;
+    let mut ids = vec![];
+    for title in ["First task", "Second task"] {
+        let outcome = control
+            .file_draft(
+                WorkItemDraft {
+                    title: title.into(),
+                    objective: title.into(),
+                    done_when: "completed".into(),
+                    ..Default::default()
+                },
+                rustykrab_control::Provenance {
+                    actor: "user".into(),
+                    conversation_id: None,
+                    filed_by_item: None,
+                },
+            )
+            .await
+            .unwrap();
+        let PlanOutcome::Accepted(accepted) = outcome else {
+            panic!("fixture draft rejected: {outcome:?}");
+        };
+        ids.push(accepted.root);
+    }
+    let path = format!("{base}/api/work/priority");
+    let before_event = store.work_events_last_id().await.unwrap();
+    let before_loop = control.loop_status().unwrap();
+    assert_eq!(
+        client
+            .get(&path)
+            .header("Origin", &base)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let list: PriorityList = client
+        .get(&path)
+        .bearer_auth("test-monitor-token")
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(store.work_events_last_id().await.unwrap(), before_event);
+    assert_eq!(control.loop_status().unwrap(), before_loop);
+    ids.reverse();
+    let body = serde_json::json!({"revision": list.revision, "ordered": ids});
+    let command = client
+        .post(&path)
+        .bearer_auth("test-monitor-token")
+        .json(&body);
+    assert_eq!(
+        command.try_clone().unwrap().send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        command
+            .try_clone()
+            .unwrap()
+            .header("Origin", "https://outside.example")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = command
+        .try_clone()
+        .unwrap()
+        .header("Origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let moved: PriorityList = response.json().await.unwrap();
+    assert_eq!(moved.entries[0].item, ids[0]);
+    assert_ne!(moved.revision, list.revision);
+    let stale = command.header("Origin", &base).send().await.unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let refusal: serde_json::Value = stale.json().await.unwrap();
+    assert!(refusal["message"].as_str().unwrap().contains("Refresh"));
+    assert_eq!(control.priority_list().await.unwrap().unwrap(), moved);
+    assert!(store
+        .work_events(&ids[0])
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| event.actor == "user:master"));
     task.abort();
 }
 
