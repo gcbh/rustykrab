@@ -803,18 +803,15 @@ fn trial_window(case: &str, requested: Option<u32>) -> u32 {
     }
 }
 
-/// A trial's `models.toml`. The provider-trim control keeps its history far
-/// over the window and never compacts, so the provider refuses it before
-/// dispatch; its output cap is a quarter of its 4K window, since the daemon
-/// refuses an entry whose output allowance fills the whole window.
-fn trial_models_toml(case: &str, window: u32, strategy: &str, threshold: f64) -> String {
-    let output = if case == "provider-trim-control" {
-        format!("output_tokens = {}\n", window / 4)
-    } else {
-        String::new()
-    };
+/// A trial's `models.toml`: the window's own body (which caps output below a
+/// small window, since the daemon refuses an entry whose output fills it)
+/// plus the trial's compaction policy. The provider-trim control's history
+/// stays far over its 4K window and it never compacts, so the provider
+/// refuses it before dispatch.
+fn trial_models_toml(window: u32, strategy: &str, threshold: f64) -> String {
     format!(
-        "[default]\ncontext_window = {window}\n{output}compaction_strategy = \"{strategy}\"\ncompaction_threshold = {threshold}\n"
+        "{}compaction_strategy = \"{strategy}\"\ncompaction_threshold = {threshold}\n",
+        rustykrab_agent::LocalModels::toml_with_window(window)
     )
 }
 
@@ -976,7 +973,7 @@ async fn trial(
     let window = trial_window(case, args.context_window);
     std::fs::write(
         dir.join(rustykrab_agent::local_model::MODELS_FILE),
-        trial_models_toml(case, window, compaction_strategy, threshold),
+        trial_models_toml(window, compaction_strategy, threshold),
     )?;
     let port = pick_free_port()?;
     let base = format!("http://127.0.0.1:{port}");
@@ -1455,11 +1452,18 @@ mod tests {
     #[test]
     fn every_trial_models_toml_loads_at_every_window() {
         for case in CASES {
-            for requested in [None, Some(32_768), Some(131_072)] {
+            for requested in [
+                None,
+                Some(rustykrab_agent::local_model::MIN_CONTEXT_WINDOW),
+                Some(8_192),
+                Some(32_768),
+                Some(131_072),
+                Some(rustykrab_agent::local_model::MAX_CONTEXT_WINDOW),
+            ] {
                 for strategy in ["legacy", "structured-message-tail"] {
                     for threshold in [0.0, 0.01, 0.85] {
                         let window = trial_window(case, requested);
-                        let body = trial_models_toml(case, window, strategy, threshold);
+                        let body = trial_models_toml(window, strategy, threshold);
                         let model = rustykrab_agent::LocalModels::from_toml(&body)
                             .unwrap_or_else(|e| panic!("{case} at {window}: {e}\n{body}"))
                             .for_model("any");
@@ -1471,7 +1475,6 @@ mod tests {
         // The trim control's window is the smallest the daemon accepts, and
         // its output cap leaves room for input.
         let trim = rustykrab_agent::LocalModels::from_toml(&trial_models_toml(
-            "provider-trim-control",
             trial_window("provider-trim-control", Some(131_072)),
             "legacy",
             0.0,

@@ -41,14 +41,19 @@ load, which #716 fixes further up the stack.
 The first published head, `64c05f4`, failed CI's context step, which I had
 not run locally. `provider-trim-control` wrote a 4,096-token window with the
 default 4,096 output tokens. The daemon refuses an entry whose output fills
-the whole window, so the trial daemon never started, on either surface. The
-fixture now gives that case an explicit 1,024-token output cap. Before this
-change it sent `num_ctx` 4,096 with `num_predict` 4,096. Its history is still
-far over the 3,072 tokens left for input, so the provider still refuses before
-dispatch. The validator is unchanged. `toml_with_window` had the same flaw at
-small windows and now caps output at a quarter of the window. Two tests guard
-both: every case's trial config loads at every window and strategy, and the
-generated body loads from the smallest window to the largest.
+the whole window, so the trial daemon never started, on either surface.
+Before this change that case sent `num_ctx` 4,096 with `num_predict` 4,096.
+
+Every model-backed trial now builds its `models.toml` from
+`LocalModels::toml_with_window`. That body caps output at a quarter of any
+window too small for the default allowance, so the trim control gets 1,024
+output tokens. Any case run at `--context-window 4096` also gets a config the
+daemon loads; Rusty cast found that edge in review of the first fix. The trim
+control's history is still far over the 3,072 tokens left for input, so the
+provider still refuses before dispatch. The validator is unchanged. Two tests
+cover it: every case's trial config loads at every window from 4,096 to
+262,144, under both strategies and every threshold; and the generated body
+loads at every window the daemon accepts.
 
 New tests:
 

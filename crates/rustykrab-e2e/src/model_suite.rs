@@ -860,7 +860,8 @@ async fn run_once(
         std::fs::write(
             data_dir.join(rustykrab_agent::local_model::MODELS_FILE),
             format!(
-                "[default]\ncontext_window = {window}\ncompaction_summary_window = {summary}\n"
+                "{}compaction_summary_window = {summary}\n",
+                rustykrab_agent::LocalModels::toml_with_window(window)
             ),
         )?;
     }
