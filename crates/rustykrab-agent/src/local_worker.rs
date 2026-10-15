@@ -461,52 +461,31 @@ impl LocalWorker {
             .map(|dir| dir.join(format!("{}.jsonl", crate::external_worker::file_id(run))))
     }
 
-    /// Write `conv` as the session log of `run`, replacing an earlier save.
-    /// Best effort: a log that cannot be written is logged and the run goes
-    /// on.
-    fn write_log(&self, run: &str, conv: &Conversation) {
-        let Some(path) = self.log_path(run) else {
-            return;
-        };
-        let written = (|| -> std::io::Result<()> {
-            use std::io::Write as _;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = std::io::BufWriter::new(options.open(&path)?);
-            let marker = serde_json::json!({
-                "type": "rustykrab.invocation",
-                "invocation": "local",
-                "run": run,
-                "worker": self.name,
-                "kind": WorkerKind::Local.as_str(),
-                "model": self.provider.name(),
-                "conversation": conv.id,
-                "at": chrono::Utc::now().to_rfc3339(),
-                "messages": conv.messages.len(),
-            });
-            writeln!(file, "{marker}")?;
-            for message in &conv.messages {
-                let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
-                writeln!(file, "{line}")?;
-            }
-            file.flush()
-        })();
-        if let Err(e) = written {
-            tracing::warn!(
-                worker = %self.name,
-                run = %run,
-                error = %e,
-                "session log not written"
-            );
+    /// Start the session log of `run` with `conv` as it stands, when this
+    /// worker keeps logs.
+    fn start_log(&self, run: &str, conv: &Conversation) -> Option<Arc<RunLog>> {
+        let path = self.log_path(run)?;
+        let header = serde_json::json!({
+            "type": "rustykrab.invocation",
+            "invocation": "local",
+            "run": run,
+            "worker": self.name,
+            "kind": WorkerKind::Local.as_str(),
+            "model": self.provider.name(),
+            "conversation": conv.id,
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        let log = Arc::new(RunLog {
+            path,
+            header,
+            worker: self.name.clone(),
+            messages: Mutex::new(Vec::new()),
+        });
+        for message in &conv.messages {
+            log.note(message);
         }
+        log.rewrite();
+        Some(log)
     }
 
     /// Add the tools `late` hands back to the catalog of every run.
@@ -1106,7 +1085,11 @@ impl LocalWorker {
         if let Some(dir) = &self.run_logs {
             crate::external_worker::prune_files(dir, crate::external_worker::RUN_LOG_RETENTION);
         }
-        self.write_log(&log_id, &conv);
+        let log = self.start_log(&log_id, &conv);
+        if let Some(log) = &log {
+            let log = log.clone();
+            runner = runner.with_on_message(Arc::new(move |m: &Message| log.record(m)));
+        }
         let tracer = spending.tracer.clone();
         let binding = WorkRunContext {
             item: brief.item.clone(),
@@ -1125,7 +1108,9 @@ impl LocalWorker {
 
         *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
-        self.write_log(&log_id, &conv);
+        if let Some(log) = &log {
+            log.finish(&conv);
+        }
         let reports = recorder.take();
         let stats = LocalRun {
             item: brief.item.clone(),
@@ -1481,6 +1466,117 @@ fn one_line(text: &str, max: usize) -> String {
     let mut cut: String = flat.chars().take(max.saturating_sub(3)).collect();
     cut.push_str("...");
     cut
+}
+
+// ── the session log ──────────────────────────────────────────────────────
+
+/// A run's session log: every message the run ever held, in the order it
+/// came, behind one marker line. Compaction replaces a conversation's
+/// history with a summary, and a log written from the conversation as the
+/// run ended lost everything before it: a run in the 2026-10-14 reminder
+/// eval kept 11 of its 25 tool calls. Each message the runner adds is
+/// appended as it comes (`AgentRunner::with_on_message`), and the file is
+/// rewritten once at the end with the marker's count. Best effort: a log
+/// that cannot be written is logged and the run goes on.
+struct RunLog {
+    path: std::path::PathBuf,
+    header: serde_json::Value,
+    worker: String,
+    messages: Mutex<Vec<Message>>,
+}
+
+impl RunLog {
+    /// Keep `message` unless the log already has it; whether it was new.
+    fn note(&self, message: &Message) -> bool {
+        let mut messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
+        if messages.iter().any(|m| m.id == message.id) {
+            return false;
+        }
+        messages.push(message.clone());
+        true
+    }
+
+    /// A message the runner added: kept, and appended to the file.
+    fn record(&self, message: &Message) {
+        if !self.note(message) {
+            return;
+        }
+        self.write(
+            |file| {
+                use std::io::Write as _;
+                let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
+                writeln!(file, "{line}")
+            },
+            false,
+        );
+    }
+
+    /// The run ended: anything in `conv` the log has not seen (reshaped
+    /// before the first turn), then the whole file with its count.
+    fn finish(&self, conv: &Conversation) {
+        for message in &conv.messages {
+            self.note(message);
+        }
+        self.rewrite();
+    }
+
+    fn rewrite(&self) {
+        let messages = self
+            .messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut header = self.header.clone();
+        header["messages"] = serde_json::json!(messages.len());
+        self.write(
+            |file| {
+                use std::io::Write as _;
+                writeln!(file, "{header}")?;
+                for message in &messages {
+                    let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
+                    writeln!(file, "{line}")?;
+                }
+                Ok(())
+            },
+            true,
+        );
+    }
+
+    fn write(
+        &self,
+        body: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+        replace: bool,
+    ) {
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true);
+            if replace {
+                options.write(true).truncate(true);
+            } else {
+                options.append(true);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = std::io::BufWriter::new(options.open(&self.path)?);
+            body(&mut file)?;
+            file.flush()
+        })();
+        if let Err(e) = written {
+            tracing::warn!(
+                worker = %self.worker,
+                path = %self.path.display(),
+                error = %e,
+                "session log not written"
+            );
+        }
+    }
 }
 
 // ── the progress ledger ───────────────────────────────────────────────────
@@ -2066,6 +2162,50 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("every line is one JSON value"))
             .collect()
+    }
+
+    /// Compaction swaps the history for a summary; the log keeps both.
+    #[test]
+    fn the_session_log_keeps_what_compaction_took_out_of_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = |role, t: &str| Message::stamped(role, MessageContent::Text(t.into()));
+        let brief = text(Role::User, "work item: #item-40");
+        let early = text(Role::Assistant, "early exploration");
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![text(Role::System, "you are pinch"), brief.clone()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let log = RunLog {
+            path: dir.path().join("run.jsonl"),
+            header: json!({ "type": "rustykrab.invocation" }),
+            worker: "pinch".into(),
+            messages: Mutex::new(Vec::new()),
+        };
+        for m in &conv.messages {
+            log.note(m);
+        }
+        log.rewrite();
+        log.record(&early);
+        let summary = text(Role::Assistant, "summary of the early work");
+        log.record(&summary);
+        // Compacted: the early turn is gone from the conversation.
+        conv.messages = vec![conv.messages[0].clone(), brief, summary];
+        log.finish(&conv);
+
+        let lines = log_lines(&log.path);
+        assert_eq!(lines[0]["messages"], 4);
+        assert_eq!(lines.len(), 5);
+        let all = lines.iter().map(Value::to_string).collect::<String>();
+        assert!(all.contains("early exploration"), "{all}");
+        assert!(all.contains("summary of the early work"), "{all}");
     }
 
     #[tokio::test]
