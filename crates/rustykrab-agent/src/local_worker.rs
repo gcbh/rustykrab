@@ -30,11 +30,10 @@
 //!   run and removed after it, with `exec` bound to it, so the run works
 //!   and commits in the isolated checkout the controller verifies
 //!   (section 5);
-//! - the brief's token budget enforced at the provider (`metered.rs`): once
-//!   the run's calls have used it, the next call is refused with a typed
-//!   `budget/tokens` failure, and what the run spent is kept for the
-//!   controller's [`Worker::usage`] (tokens, wall time, iterations and
-//!   completion reminders).
+//! - what the run spends counted at the provider (`metered.rs`) and kept
+//!   for the controller's [`Worker::usage`] (tokens, wall time, iterations
+//!   and completion reminders). Tokens are counted, never refused: the
+//!   prompt's size is compaction's to manage.
 //!
 //! A run whose id names a conversation the host keeps (a scheduled job's
 //! persistent conversation, [`RunTranscripts::resume`]) continues it
@@ -77,7 +76,7 @@ use rustykrab_tools::work_backend::{
     AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, ToolState,
     WorkBackend, WorkRunContext, WorkStatusView, WORK_RUN_CONTEXT,
 };
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use crate::metered::{Meter, MeteredProvider};
@@ -107,8 +106,6 @@ const LINE_MAX: usize = 400;
 const SUMMARY_MAX: usize = 160;
 /// Pointers listed per list; the rest are counted, not rendered.
 const REFS_MAX: usize = 8;
-/// Characters of the model's last text quoted in a failure's detail.
-const QUOTE_MAX: usize = 200;
 
 /// Where a [`LocalWorker`] keeps its runs' transcripts. A run is a
 /// conversation like any other (plan section 16, Phase 1 exit: a task is
@@ -293,6 +290,11 @@ pub struct LocalWorker {
     stall_steps: u32,
     full_reports: bool,
     repository_shell: bool,
+    /// Overrides the harness profile's `result_report_reminder`.
+    result_report_reminder: Option<bool>,
+    /// Paths a run's shell may not read, beside the credential stores
+    /// `rustykrab_tools::Confinement` always keeps out of reach.
+    private_paths: Vec<std::path::PathBuf>,
     readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
@@ -351,6 +353,8 @@ impl LocalWorker {
             stall_steps: DEFAULT_STALL_STEPS,
             full_reports: false,
             repository_shell: false,
+            result_report_reminder: None,
+            private_paths: Vec::new(),
             readable_files: Vec::new(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
@@ -387,6 +391,21 @@ impl LocalWorker {
     /// Only expose shell execution inside a controller-owned repository workspace.
     pub fn with_repository_shell(mut self) -> Self {
         self.repository_shell = true;
+        self
+    }
+
+    /// Keep `paths` out of a run's shell, which is confined to its worktree
+    /// (`rustykrab_tools::Confinement`): the daemon's data directory, where
+    /// its secrets file is.
+    pub fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.private_paths.extend(paths);
+        self
+    }
+
+    /// Whether a run that ends with text is first reminded to call
+    /// `result_report`. Either way its text is then taken as the answer.
+    pub fn with_result_report_reminder(mut self, remind: bool) -> Self {
+        self.result_report_reminder = Some(remind);
         self
     }
 
@@ -454,52 +473,31 @@ impl LocalWorker {
             .map(|dir| dir.join(format!("{}.jsonl", crate::external_worker::file_id(run))))
     }
 
-    /// Write `conv` as the session log of `run`, replacing an earlier save.
-    /// Best effort: a log that cannot be written is logged and the run goes
-    /// on.
-    fn write_log(&self, run: &str, conv: &Conversation) {
-        let Some(path) = self.log_path(run) else {
-            return;
-        };
-        let written = (|| -> std::io::Result<()> {
-            use std::io::Write as _;
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = std::io::BufWriter::new(options.open(&path)?);
-            let marker = serde_json::json!({
-                "type": "rustykrab.invocation",
-                "invocation": "local",
-                "run": run,
-                "worker": self.name,
-                "kind": WorkerKind::Local.as_str(),
-                "model": self.provider.name(),
-                "conversation": conv.id,
-                "at": chrono::Utc::now().to_rfc3339(),
-                "messages": conv.messages.len(),
-            });
-            writeln!(file, "{marker}")?;
-            for message in &conv.messages {
-                let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
-                writeln!(file, "{line}")?;
-            }
-            file.flush()
-        })();
-        if let Err(e) = written {
-            tracing::warn!(
-                worker = %self.name,
-                run = %run,
-                error = %e,
-                "session log not written"
-            );
+    /// Start the session log of `run` with `conv` as it stands, when this
+    /// worker keeps logs.
+    fn start_log(&self, run: &str, conv: &Conversation) -> Option<Arc<RunLog>> {
+        let path = self.log_path(run)?;
+        let header = serde_json::json!({
+            "type": "rustykrab.invocation",
+            "invocation": "local",
+            "run": run,
+            "worker": self.name,
+            "kind": WorkerKind::Local.as_str(),
+            "model": self.provider.name(),
+            "conversation": conv.id,
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        let log = Arc::new(RunLog {
+            path,
+            header,
+            worker: self.name.clone(),
+            messages: Mutex::new(Vec::new()),
+        });
+        for message in &conv.messages {
+            log.note(message);
         }
+        log.rewrite();
+        Some(log)
     }
 
     /// Add the tools `late` hands back to the catalog of every run.
@@ -1007,29 +1005,35 @@ impl LocalWorker {
         // A run in a worktree works there and nowhere else: its shell and
         // its file tools are bound to that directory, where the host's own
         // are bound to the daemon's workspace.
-        tools.extend(host_tools.into_iter().map(|t| match &workdir {
-            Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
-            Some(dir) => match t.name() {
-                "exec" => Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone())) as Arc<dyn Tool>,
-                "write" => {
-                    Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone())) as Arc<dyn Tool>
+        tools.extend(host_tools.into_iter().map(|t| {
+            match &workdir {
+                Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
+                Some(dir) => {
+                    match t.name() {
+                        "exec" => Arc::new(
+                            rustykrab_tools::ExecTool::in_dir(dir.clone())
+                                .confined(self.private_paths.clone()),
+                        ) as Arc<dyn Tool>,
+                        "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        "write" => Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone()))
+                            as Arc<dyn Tool>,
+                        _ => t,
+                    }
                 }
-                _ => t,
-            },
-            None => t,
+                None => t,
+            }
         }));
         // Every call is a step in the progress ledger (section 6, step 7).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
-        let stall = Arc::new(Notify::new());
         let tools: Vec<Arc<dyn Tool>> = tools
             .into_iter()
             .map(|inner| {
                 Arc::new(LedgerTool {
                     inner,
                     ledger: ledger.clone(),
-                    stall: stall.clone(),
                     commands: recorder.commands.clone(),
                 }) as Arc<dyn Tool>
             })
@@ -1048,10 +1052,9 @@ impl LocalWorker {
         // Kept to read the run's tool gaps once it ends.
         let registry = active.clone();
 
-        // What the run spends, kept for the controller whatever happens to
-        // it, and its token budget enforced at the provider.
+        // What the run spends, kept for the controller whatever happens to it.
         let spending = Arc::new(Spending {
-            meter: Arc::new(Meter::new(brief.budget.tokens)),
+            meter: Arc::new(Meter::new()),
             tracer: Arc::new(ExecutionTracer::new()),
             started: Instant::now(),
             wall: Mutex::new(None),
@@ -1074,6 +1077,9 @@ impl LocalWorker {
             max_iterations,
             // No budget warnings: the controller owns the budget.
             soft_iteration_warning: 0,
+            result_report_reminder: self
+                .result_report_reminder
+                .unwrap_or(profile.result_report_reminder),
             ..profile.to_agent_config()
         };
         let mut runner = AgentRunner::new(provider, tools, self.sandbox.clone())
@@ -1099,7 +1105,11 @@ impl LocalWorker {
         if let Some(dir) = &self.run_logs {
             crate::external_worker::prune_files(dir, crate::external_worker::RUN_LOG_RETENTION);
         }
-        self.write_log(&log_id, &conv);
+        let log = self.start_log(&log_id, &conv);
+        if let Some(log) = &log {
+            let log = log.clone();
+            runner = runner.with_on_message(Arc::new(move |m: &Message| log.record(m)));
+        }
         let tracer = spending.tracer.clone();
         let binding = WorkRunContext {
             item: brief.item.clone(),
@@ -1107,18 +1117,10 @@ impl LocalWorker {
         };
         let wall = brief.budget.wall_seconds;
         let run = WORK_RUN_CONTEXT.scope(binding, runner.run_traced(&mut conv, &session, &tracer));
-        // A run the ledger calls stalled stops at once rather than taking
-        // more turns; it reads as ended, and the stall decides the failure.
-        let guarded = async {
-            tokio::select! {
-                ended = run => ended,
-                _ = stall.notified() => Ok(()),
-            }
-        };
         // `None`: the wall budget ran out and the run was dropped mid-step.
         let ended = match wall {
-            0 => Some(guarded.await),
-            secs => tokio::time::timeout(Duration::from_secs(secs), guarded)
+            0 => Some(run.await),
+            secs => tokio::time::timeout(Duration::from_secs(secs), run)
                 .await
                 .ok(),
         };
@@ -1126,7 +1128,9 @@ impl LocalWorker {
 
         *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
-        self.write_log(&log_id, &conv);
+        if let Some(log) = &log {
+            log.finish(&conv);
+        }
         let reports = recorder.take();
         let stats = LocalRun {
             item: brief.item.clone(),
@@ -1183,18 +1187,27 @@ impl LocalWorker {
             .into_error());
         }
 
-        if let Some(stall) = stalled {
-            tracing::info!(
-                worker = %self.name,
-                item = %brief.item,
-                steps = stall.steps,
-                "local worker run stalled"
-            );
-            return Err(RunFailure::Model {
-                problem: ProviderProblem::Loop,
-                detail: stall.detail(),
+        // A run that stopped on text gave its answer (feather's rule): the
+        // text is the report, filed through the backend `result_report`
+        // uses, so attestation and the controller see it the same way.
+        if matches!(ended, Some(Ok(())))
+            && !tracer.iteration_limit_reached()
+            && !tracer.ended_by_tool()
+        {
+            if let Some(text) = last_assistant_text(&conv) {
+                let provenance = Provenance {
+                    conversation_id: Some(conv_id.to_string()),
+                    filed_by_item: Some(brief.item.clone()),
+                    actor: format!("worker:{}", self.name),
+                };
+                let report = report_from_text(text, self.full_reports);
+                recorder
+                    .report(brief.item.clone(), report, provenance)
+                    .await?;
+                if let Some(report) = recorder.take().into_iter().next() {
+                    return Ok(report);
+                }
             }
-            .into_error());
         }
         let failure = match ended {
             None => RunFailure::Budget {
@@ -1206,34 +1219,62 @@ impl LocalWorker {
             },
             // A provider or runner error: classified as the core reports it.
             Some(Err(e)) => return Err(e),
-            Some(Ok(())) if tracer.iteration_limit_reached() => RunFailure::Budget {
-                budget: BudgetKind::Iterations,
-                detail: format!(
-                    "{max_iterations} iterations used without result_report \
-                     ({} reminders)",
-                    stats.reminders
-                ),
-            },
-            Some(Ok(())) => match last_assistant_text(&conv) {
-                None => RunFailure::Model {
-                    problem: ProviderProblem::Empty,
+            // Told it was repeating itself, the run went on to its cap: the
+            // loop is why, and the repair run gets the ledger's evidence.
+            Some(Ok(())) if tracer.iteration_limit_reached() => match stalled {
+                Some(stall) => RunFailure::Model {
+                    problem: ProviderProblem::Loop,
                     detail: format!(
-                        "the model stopped with no text and no result_report \
+                        "{max_iterations} iterations used without result_report; {}",
+                        stall.detail()
+                    ),
+                },
+                None => RunFailure::Budget {
+                    budget: BudgetKind::Iterations,
+                    detail: format!(
+                        "{max_iterations} iterations used without result_report \
                          ({} reminders)",
                         stats.reminders
                     ),
                 },
-                Some(text) => RunFailure::Model {
-                    problem: ProviderProblem::Format,
-                    detail: format!(
-                        "the run ended with text and no result_report ({} reminders): {}",
-                        stats.reminders,
-                        one_line(text, QUOTE_MAX)
-                    ),
-                },
+            },
+            Some(Ok(())) => RunFailure::Model {
+                problem: ProviderProblem::Empty,
+                detail: format!(
+                    "the model stopped with no text and no result_report \
+                     ({} reminders)",
+                    stats.reminders
+                ),
             },
         };
         Err(failure.into_error())
+    }
+}
+
+/// The report a run's final text stands for: the result contract the text
+/// carries, as Claude Code and Codex runs give theirs, else the text itself
+/// as the summary, cut to the report's bound.
+fn report_from_text(text: &str, full_report: bool) -> ResultReport {
+    if let Ok(report) = crate::external_worker::parse_contract(text) {
+        // Any trailing JSON object parses as a contract with every field
+        // defaulted; only one that says something is the answer.
+        if !report.summary.trim().is_empty() {
+            return report;
+        }
+    }
+    let max = if full_report {
+        rustykrab_tools::FULL_REPORT_MAX
+    } else {
+        rustykrab_tools::REPORT_SUMMARY_MAX
+    };
+    let text = text.trim();
+    let summary = match text.char_indices().nth(max) {
+        Some((cut, _)) => text[..cut].to_string(),
+        None => text.to_string(),
+    };
+    ResultReport {
+        summary,
+        ..ResultReport::default()
     }
 }
 
@@ -1399,7 +1440,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     }
     out.push_str("If you cannot finish, set blocked or error (what failed). ");
     out.push_str(&rustykrab_core::work::BLOCKED_SHAPE_GUIDANCE);
-    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete. Text alone does not end this run.");
+    out.push_str(" Work in a small, verifiable execution slice. Finish this item's done_when, then create post-tasks in discovered for further work instead of continuing through the whole project. Each draft needs a tmp name, a precise objective and done_when, required resources, and inspection pointers to the committed results. Use inputs_from plus a blocks edge for tasks that need an earlier result; independent tasks may run in parallel. Keep tasks sharing a writable resource ordered. A future task can be picked up by another agent; your run ends after this report. Do not claim an unfinished done_when as complete.");
     out
 }
 
@@ -1450,6 +1491,117 @@ fn one_line(text: &str, max: usize) -> String {
     cut
 }
 
+// ── the session log ──────────────────────────────────────────────────────
+
+/// A run's session log: every message the run ever held, in the order it
+/// came, behind one marker line. Compaction replaces a conversation's
+/// history with a summary, and a log written from the conversation as the
+/// run ended lost everything before it: a run in the 2026-10-14 reminder
+/// eval kept 11 of its 25 tool calls. Each message the runner adds is
+/// appended as it comes (`AgentRunner::with_on_message`), and the file is
+/// rewritten once at the end with the marker's count. Best effort: a log
+/// that cannot be written is logged and the run goes on.
+struct RunLog {
+    path: std::path::PathBuf,
+    header: serde_json::Value,
+    worker: String,
+    messages: Mutex<Vec<Message>>,
+}
+
+impl RunLog {
+    /// Keep `message` unless the log already has it; whether it was new.
+    fn note(&self, message: &Message) -> bool {
+        let mut messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
+        if messages.iter().any(|m| m.id == message.id) {
+            return false;
+        }
+        messages.push(message.clone());
+        true
+    }
+
+    /// A message the runner added: kept, and appended to the file.
+    fn record(&self, message: &Message) {
+        if !self.note(message) {
+            return;
+        }
+        self.write(
+            |file| {
+                use std::io::Write as _;
+                let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
+                writeln!(file, "{line}")
+            },
+            false,
+        );
+    }
+
+    /// The run ended: anything in `conv` the log has not seen (reshaped
+    /// before the first turn), then the whole file with its count.
+    fn finish(&self, conv: &Conversation) {
+        for message in &conv.messages {
+            self.note(message);
+        }
+        self.rewrite();
+    }
+
+    fn rewrite(&self) {
+        let messages = self
+            .messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut header = self.header.clone();
+        header["messages"] = serde_json::json!(messages.len());
+        self.write(
+            |file| {
+                use std::io::Write as _;
+                writeln!(file, "{header}")?;
+                for message in &messages {
+                    let line = serde_json::to_string(message).map_err(std::io::Error::other)?;
+                    writeln!(file, "{line}")?;
+                }
+                Ok(())
+            },
+            true,
+        );
+    }
+
+    fn write(
+        &self,
+        body: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+        replace: bool,
+    ) {
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true);
+            if replace {
+                options.write(true).truncate(true);
+            } else {
+                options.append(true);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = std::io::BufWriter::new(options.open(&self.path)?);
+            body(&mut file)?;
+            file.flush()
+        })();
+        if let Err(e) = written {
+            tracing::warn!(
+                worker = %self.worker,
+                path = %self.path.display(),
+                error = %e,
+                "session log not written"
+            );
+        }
+    }
+}
+
 // ── the progress ledger ───────────────────────────────────────────────────
 
 /// A tool as a run sees it, with every call recorded as a step in the run's
@@ -1457,8 +1609,17 @@ fn one_line(text: &str, max: usize) -> String {
 struct LedgerTool {
     inner: Arc<dyn Tool>,
     ledger: Arc<Mutex<StepLedger>>,
-    stall: Arc<Notify>,
     commands: Arc<Mutex<Vec<String>>>,
+}
+
+/// What a call that repeats an earlier call and its result carries back,
+/// once the ledger calls the run stalled: the run goes on, told so.
+fn repeat_notice(stall: &rustykrab_control::progress::Stall) -> String {
+    format!(
+        "Note: this is call {} in a row that repeats an earlier call with the same result, so \
+         it tells you nothing new. Change the approach, or finish with what you have.",
+        stall.without_progress
+    )
 }
 
 #[async_trait]
@@ -1513,12 +1674,28 @@ impl Tool for LedgerTool {
         let stalled = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.record(self.inner.name(), &args, &outcome);
-            ledger.stalled().is_some()
+            ledger.stalled()
         };
-        if stalled {
-            self.stall.notify_one();
+        // A repeat is answered as text the model can act on, never by ending
+        // the run: the iteration cap is the only stop (feather's rule).
+        let Some(stall) = stalled else {
+            return result;
+        };
+        let notice = repeat_notice(&stall);
+        match result {
+            Ok(serde_json::Value::Object(mut object)) => {
+                object.insert("notice".into(), serde_json::Value::String(notice));
+                Ok(serde_json::Value::Object(object))
+            }
+            Ok(other) => Ok(serde_json::json!({ "result": other, "notice": notice })),
+            Err(Error::ToolExecution(error)) => {
+                Err(Error::ToolExecution(rustykrab_core::ToolError {
+                    kind: error.kind,
+                    message: format!("{}\n\n{notice}", error.message),
+                }))
+            }
+            Err(other) => Err(other),
         }
-        result
     }
 }
 
@@ -1914,7 +2091,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.ends_with("Text alone does not end this run."),
+            rendered.ends_with("Do not claim an unfinished done_when as complete."),
             "{rendered}"
         );
 
@@ -2010,6 +2187,50 @@ mod tests {
             .collect()
     }
 
+    /// Compaction swaps the history for a summary; the log keeps both.
+    #[test]
+    fn the_session_log_keeps_what_compaction_took_out_of_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = |role, t: &str| Message::stamped(role, MessageContent::Text(t.into()));
+        let brief = text(Role::User, "work item: #item-40");
+        let early = text(Role::Assistant, "early exploration");
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: vec![text(Role::System, "you are pinch"), brief.clone()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let log = RunLog {
+            path: dir.path().join("run.jsonl"),
+            header: json!({ "type": "rustykrab.invocation" }),
+            worker: "pinch".into(),
+            messages: Mutex::new(Vec::new()),
+        };
+        for m in &conv.messages {
+            log.note(m);
+        }
+        log.rewrite();
+        log.record(&early);
+        let summary = text(Role::Assistant, "summary of the early work");
+        log.record(&summary);
+        // Compacted: the early turn is gone from the conversation.
+        conv.messages = vec![conv.messages[0].clone(), brief, summary];
+        log.finish(&conv);
+
+        let lines = log_lines(&log.path);
+        assert_eq!(lines[0]["messages"], 4);
+        assert_eq!(lines.len(), 5);
+        let all = lines.iter().map(Value::to_string).collect::<String>();
+        assert!(all.contains("early exploration"), "{all}");
+        assert!(all.contains("summary of the early work"), "{all}");
+    }
+
     #[tokio::test]
     async fn a_run_leaves_its_session_log_as_a_file_named_through_run_log() {
         let provider = Recording::new(vec![report("B is cheapest.")]);
@@ -2057,7 +2278,7 @@ mod tests {
     /// A run that ends without a report is the one an investigation opens.
     #[tokio::test]
     async fn a_failed_run_leaves_its_session_log_too() {
-        let provider = Recording::new(vec![text("I think it is plan B.")]);
+        let provider = Recording::new(vec![text("  ")]);
         let (worker, _) = worker(provider, Vec::new());
         let dir = tempfile::tempdir().unwrap();
         let worker = worker.with_run_logs(dir.path());
@@ -2071,8 +2292,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.to_string().contains("I think it is plan B.")),
-            "what the model said before the run failed is kept"
+                .any(|l| l.to_string().contains("work item: #item-9")),
+            "the brief the run failed on is kept"
         );
     }
 
@@ -2147,25 +2368,29 @@ mod tests {
         assert_eq!(provider.requests().len(), 2);
         assert!(stub.calls().is_empty());
 
-        // Prose to every reminder, until the reminders run out.
+        // Prose to every reminder: once they run out, the prose is the answer.
         let provider = Recording::new(
             (0..4)
                 .map(|i| text(&format!("Plan B, I think ({i}).")))
                 .collect(),
         );
-        let (w, _) = worker(provider.clone(), Vec::new());
-        let err = w.run(brief("item-2")).await.unwrap_err();
-        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Format));
-        assert!(
-            err.to_string()
-                .contains("(3 reminders): Plan B, I think (3)."),
-            "{err}"
-        );
+        let (w, stub) = worker(provider.clone(), Vec::new());
+        let w = w.with_result_report_reminder(true);
+        let answered = w.run(brief("item-2")).await.unwrap();
+        assert_eq!(answered.summary, "Plan B, I think (3).");
         assert_eq!(w.last_run().unwrap().reminders, 3);
+        assert!(
+            stub.calls()
+                .iter()
+                .any(|c| matches!(c, WorkCall::Report { .. })),
+            "the text answer is filed like a result_report: {:?}",
+            stub.calls()
+        );
 
         // Blank replies to every reminder.
         let provider = Recording::new((0..4).map(|_| text("  ")).collect());
         let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(true);
         let err = w.run(brief("item-3")).await.unwrap_err();
         assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Empty));
 
@@ -2610,24 +2835,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_that_repeats_itself_stalls_into_a_loop_failure() {
-        let provider = Recording::new((0..12).map(|_| call("noop", json!({}))).collect());
-        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+    async fn a_run_that_repeats_itself_is_told_and_goes_on() {
+        let mut script: Vec<ModelResponse> = (0..5).map(|_| call("noop", json!({}))).collect();
+        script.push(report("Tried noop five times; it never changes."));
+        let provider = Recording::new(script);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
         let w = w.with_stall_steps(3);
         let mut b = brief("item-stall");
         b.required_tools = vec!["noop".into()];
+        let report = w.run(b).await.unwrap();
+        assert_eq!(report.summary, "Tried noop five times; it never changes.");
+        assert_eq!(
+            provider.requests().len(),
+            6,
+            "the stall did not stop the run"
+        );
+        let (last, _) = provider.requests()[5].clone();
+        let told = last
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::ToolResult(r) => Some(r.output.to_string()),
+                _ => None,
+            })
+            .any(|output| output.contains("repeats an earlier call"));
+        assert!(told, "the repeat notice reached the model");
+    }
+
+    #[tokio::test]
+    async fn a_run_still_repeating_at_its_cap_names_the_stall() {
+        let provider = Recording::new((0..6).map(|_| call("noop", json!({}))).collect());
+        let (w, _) = worker(provider, vec![Arc::new(Named("noop"))]);
+        let w = w.with_stall_steps(2);
+        let mut b = brief("item-stall-cap");
+        b.required_tools = vec!["noop".into()];
+        b.budget.iterations = 5;
         let err = w.run(b).await.unwrap_err();
         assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
-        assert!(
-            err.to_string().contains("stalled") && err.to_string().contains("progress ledger"),
-            "{err}"
-        );
-        assert!(
-            provider.requests().len() <= 5,
-            "the stall stopped the run, not the budget: {} calls",
-            provider.requests().len()
-        );
-        assert!(stub.calls().is_empty());
+        assert!(err.to_string().contains("progress ledger"), "{err}");
     }
 
     /// Scenario 31's shape: the worker keeps its own scratch list, and the
@@ -2796,7 +3040,6 @@ mod tests {
         let tool = LedgerTool {
             inner: Arc::new(rustykrab_tools::ExecTool::new()),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
-            stall: Arc::new(Notify::new()),
             commands: recorder.commands.clone(),
         };
         tool.execute(json!({"command":"echo observed"}))
@@ -2845,46 +3088,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_token_budget_stops_the_run_at_its_next_model_call() {
+    async fn tokens_are_counted_but_never_stop_the_run() {
         let provider = Recording::new(vec![
             costing(call("noop", json!({})), 700),
             costing(call("noop", json!({})), 700),
-            costing(report("too late"), 700),
+            costing(report("done"), 700),
         ]);
-        let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
         let mut b = brief("item-20");
+        b.required_tools = vec!["noop".into()];
         b.budget.tokens = 1_000;
         b.run = Some(Uuid::new_v4().to_string());
         let run = b.run.clone().unwrap();
 
-        let err = w.run(b).await.unwrap_err();
+        let report = w.run(b).await.unwrap();
 
-        assert!(
-            matches!(
-                RunFailure::from_error(&err),
-                Some(RunFailure::Budget {
-                    budget: BudgetKind::Tokens,
-                    ..
-                })
-            ),
-            "{err}"
-        );
-        assert_eq!(
-            classified(&err),
-            (ErrorClass::Budget, ErrorSubclass::Tokens)
-        );
-        assert_eq!(
-            provider.requests().len(),
-            2,
-            "the third call never went out"
-        );
-        assert!(stub.calls().is_empty());
-
+        assert_eq!(report.summary, "done");
+        assert_eq!(provider.requests().len(), 3);
         let usage = w.usage(&run).expect("the run's spend");
-        assert_eq!(usage.tokens, 1_400);
-        // The third turn began and was refused at its model call.
+        assert_eq!(usage.tokens, 2_100);
         assert_eq!(usage.iterations, 3);
         assert_eq!(w.usage(&run), None, "taken once");
+    }
+
+    #[tokio::test]
+    async fn without_the_reminder_text_ends_the_run() {
+        let provider = Recording::new(vec![text("Plan B is cheapest.")]);
+        let (w, _) = worker(provider.clone(), Vec::new());
+        let w = w.with_result_report_reminder(false);
+        let report = w.run(brief("item-30")).await.unwrap();
+        assert_eq!(report.summary, "Plan B is cheapest.");
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(w.last_run().unwrap().reminders, 0);
+    }
+
+    #[tokio::test]
+    async fn a_contract_in_the_final_text_is_the_report() {
+        let provider = Recording::new(vec![text(
+            "Done.\n```json\n{\"summary\": \"Plan B\", \"checks_run\": [\"pytest\"]}\n```",
+        )]);
+        let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(false);
+        let report = w.run(brief("item-31")).await.unwrap();
+        assert_eq!(report.summary, "Plan B");
+        assert_eq!(report.checks_run, vec!["pytest".to_string()]);
+    }
+
+    #[test]
+    fn a_trailing_json_object_without_a_summary_is_not_a_contract() {
+        let report = report_from_text("Use this config: {\"retries\": 3}", false);
+        assert_eq!(report.summary, "Use this config: {\"retries\": 3}");
     }
 
     #[tokio::test]
@@ -2894,6 +3147,7 @@ mod tests {
             costing(report("B is cheapest."), 200),
         ]);
         let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(true);
         let mut b = brief("item-21");
         b.run = Some("run-21".into());
         w.run(b).await.unwrap();

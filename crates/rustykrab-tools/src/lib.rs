@@ -137,7 +137,7 @@ pub use write::WriteTool;
 
 // Runtime
 pub use code_execution::CodeExecutionTool;
-pub use exec::ExecTool;
+pub use exec::{Confinement, ExecTool};
 pub use process::ProcessTool;
 
 // Web
@@ -230,8 +230,8 @@ pub use task_complete::TaskCompleteTool;
 // Control-layer work tools
 pub use ask_user::{AskUserTool, CapabilityRequestTool};
 pub use result_report::{
-    run_end_summary, worker_run_end_summary, ResultReportTool, RUN_ENDING_TOOLS,
-    WORKER_RUN_ENDING_TOOLS,
+    run_end_summary, worker_run_end_summary, ResultReportTool, FULL_REPORT_MAX, RUN_ENDING_TOOLS,
+    SUMMARY_MAX as REPORT_SUMMARY_MAX, WORKER_RUN_ENDING_TOOLS,
 };
 pub use work_backend::{
     AskOutcome, AskRequest, CapabilityAsk, Principal, Provenance, StatusQuery, StatusSelector,

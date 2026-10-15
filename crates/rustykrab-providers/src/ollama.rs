@@ -3,7 +3,7 @@ use crate::line_buffer::LineBuffer;
 use async_trait::async_trait;
 use rustykrab_core::error::Result;
 use rustykrab_core::model::{
-    ModelCheck, ModelProvider, ModelResponse, StopReason, StreamEvent, Usage,
+    CallOptions, ModelCheck, ModelProvider, ModelResponse, StopReason, StreamEvent, Usage,
 };
 use rustykrab_core::tool_block::{self, ToolBlockObservation, ToolBlockTracker};
 use rustykrab_core::types::{Message, MessageContent, Role, ToolCall, ToolSchema};
@@ -30,7 +30,7 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// prompt that overshoots gets silently truncated server-side — which moves
 /// the truncation point every turn and defeats prefix caching completely.
 ///
-/// 128k matches `DEFAULT_COMPACTION_CONTEXT_CEILING` in the agent runner, so
+/// 128k matches `DEFAULT_CONTEXT_CEILING` in the agent's compaction config, so
 /// the provider's window and the compaction budget agree instead of one
 /// silently capping the other. It is clamped down to the model's own native
 /// length at startup, so a smaller model still gets a sane value.
@@ -326,17 +326,30 @@ impl OllamaProvider {
     /// Effective context window used for client-side input validation.
     /// Prefers the user's explicit `num_ctx`, then the value detected from
     /// the model via `/api/show`, else `None` (budget unknown).
-    /// The real chat implementation. `window_override` serves this one
+    /// `think` for one call: the call's own choice where the model can
+    /// think (sending the field to one that cannot is a 400), else the
+    /// provider's.
+    fn think_field_for(&self, wanted: Option<bool>) -> Option<bool> {
+        match wanted {
+            Some(think) if model_can_think(&self.model, self.detected_caps) => Some(think),
+            _ => self.think_field(),
+        }
+    }
+
+    /// The real chat implementation. `options.num_ctx` serves this one
     /// call at a different context window: both the client-side validation and
     /// the `num_ctx` sent to the server use it, so an expanded
     /// summarization call is not incorrectly refused against the everyday
-    /// window before the model ever sees it.
+    /// window before the model ever sees it. `options.max_output_tokens`
+    /// and `options.think` replace the configured `num_predict` and
+    /// thinking for this call.
     async fn chat_at(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
-        window_override: Option<u32>,
+        options: CallOptions,
     ) -> Result<ModelResponse> {
+        let window_override = options.num_ctx;
         let window = window_override.or(self.effective_ctx());
         Self::validate_tool_history(messages)?;
         let ollama_messages = Self::build_messages(messages, self.supports_vision())?;
@@ -351,8 +364,14 @@ impl OllamaProvider {
         let tool_tokens = estimate_tool_tokens(&ollama_tools);
         self.note_tool_block(&ollama_tools, tool_tokens);
 
-        let num_predict = clamp_num_predict(window, self.config.num_predict);
+        let configured = options
+            .max_output_tokens
+            .map_or(self.config.num_predict, |n| {
+                i32::try_from(n).unwrap_or(i32::MAX)
+            });
+        let num_predict = clamp_num_predict(window, configured);
         Self::validate_input_budget(&ollama_messages, window, num_predict, tool_tokens)?;
+        let think = self.think_field_for(options.think);
 
         let mut options = serde_json::json!({
             "temperature": self.config.temperature,
@@ -375,7 +394,7 @@ impl OllamaProvider {
         // `think` is rejected outright by models that don't support it, so
         // the field is omitted there. For a capable model both polarities are
         // sent explicitly — omitting it would leave thinking on.
-        if let Some(think) = self.think_field() {
+        if let Some(think) = think {
             body["think"] = serde_json::json!(think);
         }
         // Keep the model — and with it the KV cache built from this prompt —
@@ -493,9 +512,11 @@ impl OllamaProvider {
                 error_body = %error_body,
                 "Ollama API error"
             );
-            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
             // Fix #186: map status codes to specific error variants.
-            last_err = Some(Self::map_status_error(status, &error_body));
+            let error = Self::map_status_error(status, &error_body);
+            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
+                && !matches!(error, Error::ModelMalformedOutput(_));
+            last_err = Some(error);
 
             if !is_retryable {
                 break;
@@ -1056,6 +1077,20 @@ impl OllamaProvider {
 
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
+        // Ollama answers 500 when it cannot parse the model's own output as a
+        // tool call. Typed, so the agent loop can tell the model rather than
+        // resend a request that would fail the same way.
+        if status.as_u16() == 500
+            && [
+                "XML syntax error",
+                "error parsing tool call",
+                "failed to parse tool call",
+            ]
+            .iter()
+            .any(|marker| body.contains(marker))
+        {
+            return Error::ModelMalformedOutput(format!("Ollama API: {body}"));
+        }
         match status.as_u16() {
             400 => Error::ModelBadRequest(format!("Ollama API: {body}")),
             401 | 403 => Error::ModelAuthError(format!("Ollama API: {body}")),
@@ -1154,7 +1189,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
-        self.chat_at(messages, tools, None).await
+        self.chat_at(messages, tools, CallOptions::default()).await
     }
 
     async fn chat_with_ctx(
@@ -1163,7 +1198,24 @@ impl ModelProvider for OllamaProvider {
         tools: &[ToolSchema],
         num_ctx: u32,
     ) -> Result<ModelResponse> {
-        self.chat_at(messages, tools, Some(num_ctx)).await
+        self.chat_at(
+            messages,
+            tools,
+            CallOptions {
+                num_ctx: Some(num_ctx),
+                ..CallOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        options: CallOptions,
+    ) -> Result<ModelResponse> {
+        self.chat_at(messages, tools, options).await
     }
 
     /// Fix #175: streaming implementation using Ollama NDJSON.
@@ -1292,8 +1344,10 @@ impl ModelProvider for OllamaProvider {
                     error_body = %error_body,
                     "Ollama streaming API error"
                 );
-                let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-                last_err = Some(Self::map_status_error(status, &error_body));
+                let error = Self::map_status_error(status, &error_body);
+                let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
+                    && !matches!(error, Error::ModelMalformedOutput(_));
+                last_err = Some(error);
                 if !is_retryable {
                     break;
                 }
@@ -1939,6 +1993,98 @@ mod tests {
         );
         assert!(matches!(err, Error::NotFound(ref m) if m.contains("llama9")));
         assert_eq!(err.kind(), rustykrab_core::ToolErrorKind::NotFound);
+    }
+
+    /// Serves one `/api/chat` request on a loopback port and hands back the
+    /// JSON body it was sent.
+    async fn capture_one_chat() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            let body = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length: usize = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= split + 4 + length {
+                        break text[split + 4..split + 4 + length].to_string();
+                    }
+                }
+            };
+            let reply = r#"{"model":"m","message":{"role":"assistant","content":"- summary"},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":3}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            serde_json::from_str(&body).unwrap()
+        });
+        (url, served)
+    }
+
+    #[tokio::test]
+    async fn a_summary_call_sends_its_own_allowance_with_thinking_off() {
+        let (url, served) = capture_one_chat().await;
+        let provider = OllamaProvider::new("qwen3.8:27b-mlx".to_string())
+            .with_base_url(url)
+            .with_config(OllamaConfig {
+                num_ctx: Some(32_768),
+                num_predict: 4_096,
+                think: Some(true),
+                ..OllamaConfig::default()
+            });
+        let messages = vec![Message {
+            id: uuid::Uuid::new_v4(),
+            role: Role::User,
+            content: MessageContent::Text("summarize this".into()),
+            created_at: Utc::now(),
+            agent_version: None,
+        }];
+        let options = CallOptions {
+            max_output_tokens: Some(7_680),
+            think: Some(false),
+            ..CallOptions::default()
+        };
+        let response = provider
+            .chat_with_options(&messages, &[], options)
+            .await
+            .unwrap();
+        assert_eq!(response.message.content.as_text(), Some("- summary"));
+        let body = served.await.unwrap();
+        assert_eq!(body["options"]["num_predict"], 7_680);
+        assert_eq!(
+            body["think"], false,
+            "the call's choice, not the provider's"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_reply_maps_to_malformed_output() {
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"XML syntax error on line 41: unexpected EOF"}"#,
+        );
+        assert!(matches!(err, Error::ModelMalformedOutput(ref m) if m.contains("line 41")));
+        let err = OllamaProvider::map_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"llama runner process has terminated"}"#,
+        );
+        assert!(
+            matches!(err, Error::ModelProvider(_)),
+            "an ordinary 500 stays retryable"
+        );
     }
 
     fn user_msg(content: &str) -> OllamaMessage {

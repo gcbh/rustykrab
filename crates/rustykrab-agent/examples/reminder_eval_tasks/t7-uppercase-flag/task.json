@@ -1,0 +1,5 @@
+{
+  "title": "Add an --uppercase option to greet",
+  "objective": "Add an uppercase option to the greet package: greet/config.py's DEFAULTS gains \"uppercase\": False; greet/formatter.py's format_greeting returns the whole greeting upper-cased when cfg[\"uppercase\"] is true; greet/cli.py gains an --uppercase flag that turns it on. Add tests for the new behaviour under tests/.",
+  "done_when": "python3 -m greet.cli --uppercase Ada prints HELLO, ADA!, output without the flag is unchanged, python3 -m unittest discover passes including the new tests, and the change is committed."
+}

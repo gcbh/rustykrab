@@ -1,0 +1,5 @@
+{
+  "title": "Fix the failing median tests",
+  "objective": "The test suite fails: python3 -m unittest discover reports failures in tests/test_summary.py. Find the bug in the library code and fix it so every test passes. Do not change the tests.",
+  "done_when": "python3 -m unittest discover passes with tests/ unchanged, and the fix is committed."
+}

@@ -253,6 +253,7 @@ pub(super) fn failure_class(err: &Error) -> &'static str {
         Error::ModelRateLimit(_) => "model_rate_limit",
         Error::ModelAuthError(_) => "model_auth",
         Error::ModelBadRequest(_) => "model_bad_request",
+        Error::ModelMalformedOutput(_) => "model_malformed_output",
         Error::ContextBudgetExceeded { .. } => "context_budget_exceeded",
         Error::ModelOverloaded(_) => "model_overloaded",
         Error::ContentPolicy => "content_policy",

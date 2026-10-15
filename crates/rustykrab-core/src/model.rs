@@ -78,6 +78,19 @@ pub enum ModelCheck {
 }
 
 /// Trait implemented by every model provider (e.g. Anthropic, OpenAI).
+/// Settings for one model call that differ from the provider's own; see
+/// [`ModelProvider::chat_with_options`]. `None` keeps the provider's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallOptions {
+    /// Serve this call with at least this much context, where the provider
+    /// can resize per request.
+    pub num_ctx: Option<u32>,
+    /// Generate at most this many tokens on this call.
+    pub max_output_tokens: Option<u32>,
+    /// Think, or not, on this call, where the model can be told.
+    pub think: Option<bool>,
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     /// Human-readable name of the provider.
@@ -168,7 +181,7 @@ pub trait ModelProvider: Send + Sync {
     /// Ollama tears the runner down and reloads the model on a `num_ctx`
     /// change, discarding every cached prefix (measured at tens of
     /// seconds round-trip plus a full re-prefill; see
-    /// `compaction_expand_ctx` in rustykrab-agent for numbers), so
+    /// `CompactionConfig::expand_ctx` in rustykrab-agent for numbers), so
     /// callers should treat this as an expensive escape hatch, not a
     /// per-call knob.
     ///
@@ -181,6 +194,26 @@ pub trait ModelProvider: Send + Sync {
         _num_ctx: u32,
     ) -> Result<ModelResponse> {
         self.chat(messages, tools).await
+    }
+
+    /// Like [`Self::chat`], with settings for this one call: how the runner
+    /// asks for a compaction summary, which needs its own generation
+    /// allowance (a turn's `num_predict` is too small for a summary of a
+    /// long run) and no thinking, which would spend that allowance before
+    /// the summary is written.
+    ///
+    /// The default honours `num_ctx` through [`Self::chat_with_ctx`] and
+    /// ignores the rest: cloud providers already allow long outputs.
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        options: CallOptions,
+    ) -> Result<ModelResponse> {
+        match options.num_ctx {
+            Some(num_ctx) => self.chat_with_ctx(messages, tools, num_ctx).await,
+            None => self.chat(messages, tools).await,
+        }
     }
 
     /// Send a conversation to the model with an explicit tool-choice constraint.

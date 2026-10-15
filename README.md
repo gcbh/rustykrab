@@ -145,9 +145,18 @@ Two consequences worth knowing:
   pre-empt compaction" warning, the loaded tool schemas have grown large
   enough to invert it — raise `RUSTYKRAB_NUM_CTX` or load fewer tools.
 
+- **Compaction is configured once per model.** When an agent is built,
+  `CompactionConfig::for_model` resolves the threshold, the summary's size
+  cap, what one summary call may read, and what it may generate, from the
+  harness profile and the provider's window. A summary call gets its own
+  output allowance (the summary cap plus 1,024 tokens) with thinking off,
+  rather than a turn's `num_predict`. If the summary still cannot be had,
+  compaction keeps the recent turns verbatim and archives the rest for
+  `recall_*` instead of ending the run.
+
 - **Going above ~64k takes two settings, not one.** `RUSTYKRAB_NUM_CTX` sizes
   the window; `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` caps the budget the agent
-  loop will actually grow into, and defaults to 65,536. Raise only the first
+  loop will actually grow into, and defaults to 131,072. Raise only the first
   and compaction still fires at ~56k — the extra window goes unused. RustyKrab
   logs a warning when the ceiling is clipping the window, but the pairing is
   easy to miss:
@@ -205,8 +214,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_SERVICE_RESOURCES` | unset | Absolute path to operator-owned JSON registering local launchd services for cached monitoring and tracked ensure-running/restart actions. Health URLs must be loopback on another explicit port; binary/plist paths must exist. No services are registered by default |
 | `RUSTYKRAB_CRON_WORK_ITEMS` | `0` | `1` fires each scheduled job as a work item using its persisted runtime/tool/resource requirements. Native CLI workers receive the scheduled instructions; local workers retain the job conversation and SKILL.md path. Manager mode enables this automatically instead of as a task-queue conversation. The run ends with `result_report`, whose summary is the message delivered. Off by default while the local-model suites have not measured that path; the e2e daemon turns it on |
 | `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
-| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `131072` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window |
-| `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS` | `8192` | Env-configurable upper bound on the final compaction summary. The effective cap is further bounded by `RUSTYKRAB_MAX_CONTEXT_TOKENS / 4`, so on a 32k local-Ollama deployment the summary stays under 8k regardless of this value. If the summarizer returns a summary larger than the effective cap, it is re-summarized (up to 3 passes) and eventually truncated |
+| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `131072` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window. Read once at startup into the harness profile's `compaction_context_ceiling` |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
 | `RUSTYKRAB_NUM_CTX` | `131072` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. The whole window is allocated as KV cache when the model loads, so lower this (or enable KV quantization, below) if the model won't fit in VRAM. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
@@ -305,8 +313,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_APNS_ENVIRONMENT` | `sandbox` | APNs host for push notifications: `production` (or `prod`) sends to `api.push.apple.com`; anything else uses the sandbox |
 | `RUSTYKRAB_WORKSPACE` | current directory | Base directory the file tools are confined to |
 | `RUSTYKRAB_SSRF_ALLOW_HOSTS` | unset | Comma-separated host names exempt from the web tools' private-address block. Exact, case-insensitive, no wildcards. The evaluation harness forwards it to the daemons it boots |
-| `RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO` | `0.5` | Fraction of the effective context limit a single compaction call may take as input. Values are clamped to (0, 1]; one that does not parse keeps the default |
-| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | unset | A positive integer runs every summarization call at that context window; anything else leaves compaction at the everyday window. Each switch costs a KV-cache resize on local servers |
+| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | unset | A positive integer runs every summarization call at that context window; anything else leaves compaction at the everyday window. Each switch costs a KV-cache resize on local servers. Read once at startup into the harness profile's `compaction_expand_ctx` |
 | `RUSTYKRAB_BROWSER_ISOLATED_ROOT` | unset | Directory the browser tool isolates its profiles under, instead of redirecting `HOME`. The evaluation harness sets it per boot |
 | `RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE` | off | `1` symlinks the account's active system-Chrome profile into RustyKrab's user-data directory to reuse its sessions. Unsafe while that Chrome is running |
 | `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT` | unset | Root for browser downloads, one subdirectory per profile. Unset, downloads stay under the profile's user-data directory |

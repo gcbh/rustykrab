@@ -652,6 +652,10 @@ mod tests {
             (Error::NotFound("item 7".into()), S::NotFound),
             (Error::ModelBadRequest("bad".into()), S::InvalidArgs),
             (
+                Error::ModelMalformedOutput("XML syntax error".into()),
+                S::Format,
+            ),
+            (
                 Error::ToolExecution(rustykrab_core::ToolError::timeout("slow")),
                 S::Timeout,
             ),

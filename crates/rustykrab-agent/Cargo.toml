@@ -27,3 +27,5 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The reminder eval example (examples/reminder_eval.rs) logs the runner to a file.
+tracing-subscriber.workspace = true

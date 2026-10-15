@@ -469,6 +469,11 @@ impl IntegrationWorker {
         self.worker = self.worker.with_run_logs(dir);
         self
     }
+    /// Keep `paths` out of the worker's shell (`LocalWorker::with_private_paths`).
+    pub(crate) fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.worker = self.worker.with_private_paths(paths);
+        self
+    }
 }
 #[async_trait]
 impl Worker for IntegrationWorker {

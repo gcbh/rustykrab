@@ -1,41 +1,33 @@
-//! A model provider that counts what a run spends and stops it at its
-//! token budget: how [`crate::LocalWorker`] enforces a work item's
-//! `budget.tokens` (control-layer plan, section 4).
+//! A model provider that counts what a run spends: how [`crate::LocalWorker`]
+//! reports a work item's token use to the controller (control-layer plan,
+//! section 4).
 //!
-//! Every response's prompt and completion tokens are added to a
-//! [`Meter`] shared with the worker. Once the total reaches the budget, the
-//! next call is refused with a typed [`RunFailure::Budget`] instead of
-//! reaching the model, so the run ends at its next model call with an error
-//! the controller classifies as `budget/tokens`. A budget of zero is no
-//! limit. Everything else passes straight through to the wrapped provider.
+//! Every response's prompt and completion tokens are added to a [`Meter`]
+//! shared with the worker. Nothing is refused: the meter counts the whole
+//! prompt on every call, so a limit on it stopped healthy runs once their
+//! history grew (6 of qwen's 30 real failures on 2026-10-12 to 14), while
+//! keeping the prompt inside the window is compaction's job. Everything
+//! passes straight through to the wrapped provider.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rustykrab_control::errors::BudgetKind;
-use rustykrab_control::worker::RunFailure;
 use rustykrab_core::model::{
-    ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
+    CallOptions, ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
 };
 use rustykrab_core::types::{Message, ToolSchema};
 use rustykrab_core::Result;
 
-/// Tokens one run has consumed, and its limit.
+/// Tokens one run has consumed.
 #[derive(Debug, Default)]
 pub struct Meter {
     used: AtomicU64,
-    limit: u64,
 }
 
 impl Meter {
-    /// A meter that refuses further calls once `limit` tokens are used;
-    /// `0` never refuses.
-    pub fn new(limit: u64) -> Meter {
-        Meter {
-            used: AtomicU64::new(0),
-            limit,
-        }
+    pub fn new() -> Meter {
+        Meter::default()
     }
 
     pub fn used(&self) -> u64 {
@@ -45,19 +37,6 @@ impl Meter {
     fn add(&self, usage: &Usage) {
         let n = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
         self.used.fetch_add(n, Ordering::AcqRel);
-    }
-
-    /// The refusal for a call made after the budget ran out.
-    fn check(&self) -> Result<()> {
-        let used = self.used();
-        if self.limit > 0 && used >= self.limit {
-            return Err(RunFailure::Budget {
-                budget: BudgetKind::Tokens,
-                detail: format!("{used} of {} tokens used before result_report", self.limit),
-            }
-            .into_error());
-        }
-        Ok(())
     }
 }
 
@@ -114,9 +93,24 @@ impl ModelProvider for MeteredProvider {
         self.inner.requires_paired_tool_results()
     }
 
+    // Without this the trait default (`false`) answered for every metered
+    // run, so every worker run re-rendered its tools array on a late load
+    // and paid a cold prefill, whatever its provider accepts.
+    fn accepts_undeclared_tool_calls(&self) -> bool {
+        self.inner.accepts_undeclared_tool_calls()
+    }
+
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
-        self.meter.check()?;
         self.count(self.inner.chat(messages, tools).await)
+    }
+
+    async fn chat_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        options: CallOptions,
+    ) -> Result<ModelResponse> {
+        self.count(self.inner.chat_with_options(messages, tools, options).await)
     }
 
     async fn chat_with_ctx(
@@ -125,7 +119,6 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         num_ctx: u32,
     ) -> Result<ModelResponse> {
-        self.meter.check()?;
         self.count(self.inner.chat_with_ctx(messages, tools, num_ctx).await)
     }
 
@@ -135,7 +128,6 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         choice: ToolChoice,
     ) -> Result<ModelResponse> {
-        self.meter.check()?;
         self.count(self.inner.chat_with_choice(messages, tools, choice).await)
     }
 
@@ -145,7 +137,6 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
-        self.meter.check()?;
         self.count(self.inner.chat_stream(messages, tools, on_event).await)
     }
 
@@ -156,11 +147,38 @@ impl ModelProvider for MeteredProvider {
         choice: ToolChoice,
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
-        self.meter.check()?;
         self.count(
             self.inner
                 .chat_stream_with_choice(messages, tools, choice, on_event)
                 .await,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Appends;
+
+    #[async_trait]
+    impl ModelProvider for Appends {
+        fn name(&self) -> &str {
+            "appends"
+        }
+        fn accepts_undeclared_tool_calls(&self) -> bool {
+            true
+        }
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            unreachable!("capability data only")
+        }
+    }
+
+    /// The runner reads late binding from the provider it holds, which in a
+    /// worker run is this wrapper.
+    #[test]
+    fn forwards_the_late_binding_capability() {
+        let metered = MeteredProvider::new(Arc::new(Appends), Arc::new(Meter::new()));
+        assert!(metered.accepts_undeclared_tool_calls());
     }
 }

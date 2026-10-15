@@ -995,8 +995,20 @@ async fn main() -> anyhow::Result<()> {
     // anywhere near that before the HTTP timeout fires, so default to
     // 32k for Ollama and keep the 128k default for everything else.
     profile.max_context_tokens = resolve_max_context_tokens(&provider_name, profile_context_tokens);
+    // The runner resolves compaction from the profile and the model
+    // (`CompactionConfig::for_model`) and reads no environment; the two
+    // operator overrides that used to be read deep in the runner are read
+    // here, once, into the profile.
+    if let Some(ceiling) = positive_env("RUSTYKRAB_COMPACTION_CONTEXT_CEILING") {
+        profile.compaction_context_ceiling = ceiling;
+    }
+    if let Some(window) = positive_env("RUSTYKRAB_COMPACTION_EXPAND_CTX") {
+        profile.compaction_expand_ctx = u32::try_from(window).ok();
+    }
     tracing::info!(
         max_context_tokens = profile.max_context_tokens,
+        compaction_context_ceiling = profile.compaction_context_ceiling,
+        compaction_expand_ctx = ?profile.compaction_expand_ctx,
         provider = %provider_name,
         "compaction context budget configured"
     );
@@ -1500,6 +1512,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
             .with_run_logs(run_logs_dir.clone())
+            .with_private_paths(vec![data_dir.clone()])
             .with_late_tools(fleet.skills.clone())
             .with_slot(model_slot.clone()),
         ))
@@ -1584,7 +1597,8 @@ async fn main() -> anyhow::Result<()> {
                             &local_repositories,
                             integrations::enabled(),
                         )?
-                        .with_run_logs(run_logs_dir.clone()),
+                        .with_run_logs(run_logs_dir.clone())
+                        .with_private_paths(vec![data_dir.clone()]),
                     ) as Arc<dyn rustykrab_control::worker::Worker>
                 } else {
                     work_channel::planner_worker(
@@ -1618,7 +1632,8 @@ async fn main() -> anyhow::Result<()> {
                         &local_repositories,
                         true,
                     )?
-                    .with_run_logs(run_logs_dir.clone()),
+                    .with_run_logs(run_logs_dir.clone())
+                    .with_private_paths(vec![data_dir.clone()]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 local_resources.as_ref().map(|_| 1),
@@ -1640,7 +1655,8 @@ async fn main() -> anyhow::Result<()> {
                         scheduled_work::transcripts(&store, skill_registry.clone()),
                         local_slot.clone(),
                     )
-                    .with_run_logs(run_logs_dir.clone()),
+                    .with_run_logs(run_logs_dir.clone())
+                    .with_private_paths(vec![data_dir.clone()]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 Some(0),
@@ -1662,7 +1678,8 @@ async fn main() -> anyhow::Result<()> {
                             &local_repositories,
                             true,
                         )?
-                        .with_run_logs(run_logs_dir.clone()),
+                        .with_run_logs(run_logs_dir.clone())
+                        .with_private_paths(vec![data_dir.clone()]),
                     ),
                     serde_json::json!({"role":"general-agent", "resource_slot":true}),
                     Some(0),
@@ -4250,6 +4267,14 @@ fn resolve_max_context_tokens(provider_name: &str, profile_set: Option<usize>) -
         "ollama" => 32_000,
         _ => 128_000,
     }
+}
+
+/// A positive integer from the environment variable `key`, else `None`.
+fn positive_env(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
 }
 
 /// Choose where live credential values are kept.

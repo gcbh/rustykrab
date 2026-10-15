@@ -82,9 +82,27 @@ pub fn worker_run_end_summary(tool_name: &str, output: &Value) -> Option<String>
         .map(str::to_string)
 }
 
-const SUMMARY_MAX: usize = 1_500;
-const FULL_REPORT_MAX: usize = 32_000;
+pub const SUMMARY_MAX: usize = 1_500;
+pub const FULL_REPORT_MAX: usize = 32_000;
 const DETAIL_MAX: usize = 600;
+
+/// A `blocked` or `error` detail, cut to [`DETAIL_MAX`] rather than refused.
+/// Refused, qwen3.8 resent the same 794-1,233-character detail until its
+/// iteration cap in 3 of 4 runs of a blocked task (reminder eval,
+/// 2026-10-14): a model cannot count characters, and the cut loses only
+/// the tail of a note the run log keeps whole.
+fn take_detail(
+    obj: &serde_json::Map<String, Value>,
+    at: &str,
+    required: bool,
+    out: &mut Vec<Problem>,
+) -> String {
+    let detail = take_text(obj, "detail", at, usize::MAX, required, out);
+    match detail.char_indices().nth(DETAIL_MAX) {
+        Some((cut, _)) => format!("{}…", &detail[..cut]),
+        None => detail,
+    }
+}
 const ARTIFACTS_MAX: usize = 20;
 
 /// What a result's `artifacts` may point at: a draft's pointer kinds, plus
@@ -212,7 +230,7 @@ fn parse_blocked(v: &Value, out: &mut Vec<Problem>) -> Option<BlockedReport> {
     let at = "blocked.";
     check_keys(obj, &["reason", "detail", "needs"], at, out);
     let raw = take_text(obj, "reason", at, NAME_MAX, true, out);
-    let detail = take_text(obj, "detail", at, DETAIL_MAX, false, out);
+    let detail = take_detail(obj, at, false, out);
     let needs = take_text_list(obj, "needs", at, LIST_MAX, ENTRY_MAX, out);
     let reason = match BlockedReason::parse(&raw) {
         Some(r) if r.is_cascade() => {
@@ -273,7 +291,7 @@ fn parse_error(v: &Value, out: &mut Vec<Problem>) -> Option<WorkError> {
     );
     let raw_class = take_text(obj, "class", at, NAME_MAX, true, out);
     let raw_sub = take_text(obj, "subclass", at, NAME_MAX, true, out);
-    let detail = take_text(obj, "detail", at, DETAIL_MAX, true, out);
+    let detail = take_detail(obj, at, true, out);
     let artifact_refs = take_artifacts(obj, "artifact_refs", at, LIST_MAX, out);
 
     let class = parse_class(&raw_class);
@@ -997,6 +1015,29 @@ mod tests {
             report.blocked.unwrap().reason,
             BlockedReason::NeedsCredential
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_blocked_detail_is_cut_not_refused() {
+        let stub = Arc::new(StubWorkBackend::new());
+        let detail = "The passphrase file vault/passphrase.txt does not exist. ".repeat(20);
+        WORK_RUN_CONTEXT
+            .scope(
+                run("item-1"),
+                tool(&stub).execute(json!({
+                    "summary": "cannot decrypt the vault",
+                    "blocked": { "reason": "needs_credential", "detail": detail, "needs": ["vault_passphrase"] }
+                })),
+            )
+            .await
+            .unwrap();
+        let blocked = reports(&stub).pop().unwrap().1.blocked.unwrap();
+        assert_eq!(
+            blocked.detail.chars().count(),
+            DETAIL_MAX + 1,
+            "cut, with a marker"
+        );
+        assert!(blocked.detail.ends_with('…'));
     }
 
     #[tokio::test]

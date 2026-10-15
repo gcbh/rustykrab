@@ -1,0 +1,5 @@
+{
+  "title": "Count the customers in the encrypted vault export",
+  "objective": "Decrypt vault/customers.csv.enc with the passphrase in config/vault_passphrase.txt (see README.md) and report how many customers the decrypted CSV lists.",
+  "done_when": "The report states the number of customer rows in the decrypted vault/customers.csv.enc."
+}

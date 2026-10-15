@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -121,7 +120,7 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
     "payment_request",
 ];
 
-use crate::compaction::CompactionStrategy;
+use crate::compaction::{CompactionConfig, CompactionStrategy};
 use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
@@ -249,6 +248,10 @@ const PLANNING_ONLY_RETRY_LIMIT: usize = 2;
 /// learn to call `task_complete` thus degrade to the legacy behavior.
 const TASK_COMPLETE_RETRY_LIMIT: usize = 3;
 
+/// Replies in a row the provider could not parse (a tool call cut off)
+/// that the runner answers with a notice before the error ends the run.
+const MALFORMED_REPLY_RETRY_LIMIT: usize = 3;
+
 /// Maximum consecutive `MaxTokens` responses before the runner gives up
 /// rather than re-prompting "Continue." again. Each retry re-sends the
 /// whole prompt, and when the cutoff was caused by the context *window*
@@ -267,137 +270,10 @@ const MAX_TOKENS_RETRY_LIMIT: usize = 3;
 /// templates cost a few tokens the usage figures don't itemize.
 const MAX_TOKENS_WINDOW_SLACK: usize = 64;
 
-/// Default upper bound on the effective context window used when computing
-/// the compaction threshold. Guards against a model that *advertises* a
-/// window its GPU cannot evaluate in reasonable time — the budget would
-/// otherwise be derived from a number nothing can serve.
-///
-/// It must track `DEFAULT_NUM_CTX` in the Ollama provider. When the ceiling
-/// sits below the served window the symptom is silent: compaction keeps
-/// triggering at the old threshold, the extra context goes unused, and
-/// "I raised RUSTYKRAB_NUM_CTX and nothing changed" is the only visible
-/// effect. `effective_context_limit` warns once when that happens.
-///
-/// Raised to 128k alongside the provider default on measured evidence:
-/// across 4k→128k on gemma4:26b, generation throughput held at ~51 t/s and
-/// the whole KV cache grew by 1.2 GB. Override with
-/// `RUSTYKRAB_COMPACTION_CONTEXT_CEILING`.
-const DEFAULT_COMPACTION_CONTEXT_CEILING: usize = 131_072;
-
-/// Return the compaction context ceiling, reading the env var once.
-fn compaction_context_ceiling() -> usize {
-    static CEILING: OnceLock<usize> = OnceLock::new();
-    *CEILING.get_or_init(|| {
-        std::env::var("RUSTYKRAB_COMPACTION_CONTEXT_CEILING")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(DEFAULT_COMPACTION_CONTEXT_CEILING)
-    })
-}
-
-/// Parse `RUSTYKRAB_COMPACTION_EXPAND_CTX`. A positive integer expands
-/// every summarization call to that context window; anything else (unset,
-/// `off`, `0`, garbage) leaves compaction at the everyday window.
-fn parse_expand_ctx(raw: Option<&str>) -> Option<u32> {
-    raw?.trim().parse::<u32>().ok().filter(|&v| v > 0)
-}
-
-/// The expanded context window for compaction calls, read once.
-///
-/// Compaction is the one moment the agent genuinely wants a bigger window
-/// than it runs its turns at: the summarizer's input budget derives from
-/// the window, and a small window forces the history into chunks — one
-/// model call each. Ollama resizes its KV cache in about three seconds, so
-/// paying that twice around a summarization that would otherwise chunk is
-/// usually a large win. Off by default; a provider that cannot resize
-/// ignores the hint via the `chat_with_ctx` default.
-fn compaction_expand_ctx() -> Option<u32> {
-    static EXPAND: OnceLock<Option<u32>> = OnceLock::new();
-    *EXPAND.get_or_init(|| {
-        let v = parse_expand_ctx(
-            std::env::var("RUSTYKRAB_COMPACTION_EXPAND_CTX")
-                .ok()
-                .as_deref(),
-        );
-        if let Some(ctx) = v {
-            tracing::info!(
-                ctx,
-                "compaction will expand the context window per summarization call"
-            );
-        }
-        v
-    })
-}
-
-/// Tokens reserved for the summarizer's response + prompt framing when
-/// deciding whether a single-shot summarization call will fit. Subtracted
-/// from `effective_context_limit()` to derive the input budget.
-const SUMMARIZER_RESPONSE_RESERVE_TOKENS: usize = 4_096;
-
-/// Floor for a single compaction call's input budget. Chunking history
-/// into pieces smaller than this costs one model call per piece and
-/// summarizes too little context per call to be worth it.
-const MIN_COMPACTION_INPUT_TOKENS: usize = 512;
-
-/// Fraction of `effective_context_limit()` that any single compaction call
-/// may consume as input. Kept well below a regular request's budget
-/// because local models (Ollama on Metal with a 26B-parameter backbone)
-/// spend minutes on prompt evaluation, and compaction calls tend to
-/// exceed the provider HTTP timeout well before a regular agent turn
-/// does. Override with `RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO`.
-const DEFAULT_COMPACTION_INPUT_BUDGET_RATIO: f64 = 0.5;
-
-/// Read the compaction input-budget ratio once. Accepts values in (0, 1].
-/// Values outside that range are clamped.
-fn compaction_input_budget_ratio() -> f64 {
-    static RATIO: OnceLock<f64> = OnceLock::new();
-    *RATIO.get_or_init(|| {
-        std::env::var("RUSTYKRAB_COMPACTION_INPUT_BUDGET_RATIO")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| v.clamp(f64::MIN_POSITIVE, 1.0))
-            .unwrap_or(DEFAULT_COMPACTION_INPUT_BUDGET_RATIO)
-    })
-}
-
-/// Input-token budget for a single compaction call against a context
-/// `ceiling`, at the given input-budget `ratio`.
-///
-/// The response reserve is a fixed 4096, which is larger than the whole
-/// ratioed budget once the context limit is modest. Subtracting it flat then
-/// yields 0, and an input budget of 0 does not fail — it sends the recursive
-/// path into chunks of nothing, one model call per fragment. Observed cost: a
-/// compaction that should take seconds ran for 31 minutes.
-///
-/// Cap the reserve at half the budget it is being taken out of, so there is
-/// always room left to actually put history in.
-///
-/// `ratio` is passed in rather than read here so the formula stays pure: the
-/// process-wide `OnceLock` in `compaction_input_budget_ratio` cannot be varied
-/// per test.
-fn compaction_input_budget(ceiling: usize, ratio: f64) -> usize {
-    let ratioed = (ceiling as f64 * ratio) as usize;
-    let reserve = SUMMARIZER_RESPONSE_RESERVE_TOKENS.min(ratioed / 2);
-    ratioed
-        .saturating_sub(reserve)
-        .max(MIN_COMPACTION_INPUT_TOKENS)
-}
-
 /// Maximum recursion depth for chunked summarization. Guards against runaway
 /// loops in the (unlikely) case a model returns summaries that aren't
 /// materially smaller than their inputs.
 const MAX_RECURSIVE_SUMMARIZATION_DEPTH: usize = 5;
-
-/// Default hard upper bound on the final compaction summary, in tokens. The
-/// summarizer is instructed to stay under 1000 words (~1500 tokens), but
-/// that's a soft hint — a misbehaving model can produce a summary larger
-/// than the original conversation, and the recursion depth-limit fallback
-/// concatenates intermediates without further compression. When the final
-/// summary exceeds this cap we re-summarize and eventually truncate.
-/// Override with `RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS`.
-const DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS: usize = 8_192;
 
 /// Number of resummarize-passes attempted before falling back to
 /// hard-truncation of an oversized compaction summary.
@@ -455,23 +331,6 @@ fn render_tool_output_for_summary(output: &serde_json::Value) -> String {
          the full result is in the recall archive]",
         &text[..end]
     )
-}
-
-/// Read the env-configurable compaction summary cap once. Treats
-/// non-positive values as unset and falls back to the default. This is
-/// the *upper* bound from configuration; the effective cap used at
-/// runtime is further bounded by `max_context_tokens / 4` via
-/// [`AgentRunner::effective_compaction_summary_cap`] so summaries on
-/// small-context (local) deployments can't eclipse the context window.
-fn compaction_summary_max_tokens() -> usize {
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("RUSTYKRAB_COMPACTION_SUMMARY_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS)
-    })
 }
 
 /// Classification of a model response that didn't include tool calls.
@@ -577,6 +436,131 @@ fn portable_shape(conv: &mut Conversation) -> usize {
         changed += 1;
     }
     changed
+}
+
+/// Give every tool call that has no result one that says so, placed where
+/// its batch's results belong. A run that ended mid-step (its wall budget,
+/// a crash) leaves such calls in a kept conversation, and a provider that
+/// pairs calls with results (Ollama) refused the whole history, so the
+/// next run on it failed before its first model call (a scheduled job's
+/// conversation, 2026-10-13). Answered, the model reads what happened and
+/// goes on. Returns how many results it added.
+fn answer_unresolved_calls(conv: &mut Conversation) -> usize {
+    fn unresolved(call_id: String) -> Message {
+        Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id,
+                output: serde_json::json!({
+                    "error": "this call did not return: the run that made it ended first",
+                    "outcome": "unknown",
+                    "next_step": "Inspect the state before retrying; the action may already have happened.",
+                }),
+                is_error: true,
+                images: Vec::new(),
+            }),
+        )
+    }
+    let mut added = 0;
+    let mut pending: Vec<String> = Vec::new();
+    let mut messages = Vec::with_capacity(conv.messages.len());
+    for message in std::mem::take(&mut conv.messages) {
+        if let MessageContent::ToolResult(result) = &message.content {
+            pending.retain(|id| *id != result.call_id);
+            messages.push(message);
+            continue;
+        }
+        added += pending.len();
+        messages.extend(pending.drain(..).map(unresolved));
+        pending.extend(message.content.tool_calls().iter().map(|c| c.id.clone()));
+        messages.push(message);
+    }
+    added += pending.len();
+    messages.extend(pending.drain(..).map(unresolved));
+    conv.messages = messages;
+    added
+}
+
+#[cfg(test)]
+mod unresolved_call_tests {
+    use super::*;
+
+    fn calls(ids: &[&str]) -> Message {
+        Message::stamped(
+            Role::Assistant,
+            MessageContent::MultiToolCall(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: (*id).into(),
+                        name: "noop".into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    fn result(id: &str) -> Message {
+        Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id: id.into(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        )
+    }
+
+    fn shape(conv: &Conversation) -> Vec<String> {
+        conv.messages
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::ToolResult(r) if r.is_error => format!("unresolved:{}", r.call_id),
+                MessageContent::ToolResult(r) => format!("result:{}", r.call_id),
+                MessageContent::MultiToolCall(c) => format!("calls:{}", c.len()),
+                _ => "text".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_left_without_a_result_is_answered_where_its_batch_ends() {
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        conv.messages = vec![
+            Message::stamped(Role::User, MessageContent::Text("brief".into())),
+            calls(&["a", "b"]),
+            result("a"),
+            // The run ended here; the next one appended its brief.
+            Message::stamped(Role::User, MessageContent::Text("again".into())),
+            calls(&["c"]),
+        ];
+        assert_eq!(answer_unresolved_calls(&mut conv), 2);
+        assert_eq!(
+            shape(&conv),
+            [
+                "text",
+                "calls:2",
+                "result:a",
+                "unresolved:b",
+                "text",
+                "calls:1",
+                "unresolved:c"
+            ]
+        );
+        assert_eq!(answer_unresolved_calls(&mut conv), 0, "idempotent");
+    }
 }
 
 /// Whether `message` is a completion reminder the runner sent: the
@@ -1052,6 +1036,13 @@ pub struct AgentConfig {
     /// Optional total compacted message budget (not just summary size).
     /// Mandatory user anchors that cannot fit cause an explicit refusal.
     pub compaction_target_tokens: Option<usize>,
+    /// Upper bound on the window compaction budgets derive from
+    /// ([`crate::compaction::DEFAULT_CONTEXT_CEILING`]).
+    pub compaction_context_ceiling: usize,
+    /// Serve compaction's summary calls at this window, where the provider
+    /// can resize per request: more history per call, fewer chunks, at the
+    /// cost of a KV-cache resize each way. Off by default.
+    pub compaction_expand_ctx: Option<u32>,
     /// Strategy for when to call the LLM after tool results start arriving.
     pub llm_trigger_strategy: LlmTriggerStrategy,
     /// When `true`, the first LLM call of the run is made with
@@ -1073,6 +1064,13 @@ pub struct AgentConfig {
     /// run before the next is answered as final: no tool provides it, and
     /// the need is recorded as a tool gap (`rustykrab-tools`' `tools_list`).
     pub tool_search_miss_limit: usize,
+    /// Whether a worker run that ends with text is reminded to call
+    /// `result_report` (up to `TASK_COMPLETE_RETRY_LIMIT` times) before the
+    /// text is taken as its answer. Off by default: the text ends the run at
+    /// once and the worker turns it into the report. Measured on qwen3.8 over
+    /// 32 runs, the reminder never fired: every finished run called
+    /// `result_report` itself (docs/measurements/reminder-eval-qwen38-2026-10-14.md).
+    pub result_report_reminder: bool,
 }
 
 impl Default for AgentConfig {
@@ -1086,11 +1084,14 @@ impl Default for AgentConfig {
             compaction_threshold_pct: 0.85,
             compaction_strategy: CompactionStrategy::default(),
             compaction_target_tokens: None,
+            compaction_context_ceiling: crate::compaction::DEFAULT_CONTEXT_CEILING,
+            compaction_expand_ctx: None,
             llm_trigger_strategy: LlmTriggerStrategy::Debounce(Duration::from_secs(2)),
             force_tool_use_first_iteration: false,
             tool_heartbeat_interval_secs: 30,
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
+            result_report_reminder: false,
         }
     }
 }
@@ -1178,6 +1179,9 @@ pub struct AgentRunner {
     tool_index: Arc<ToolIndex>,
     sandbox: Arc<dyn Sandbox>,
     config: AgentConfig,
+    /// Compaction for this provider's model under `config`, resolved
+    /// whenever either is set.
+    compaction: CompactionConfig,
     tracer: ExecutionTracer,
     on_message: Option<OnMessageCallback>,
     active_tools: Arc<ActiveToolsRegistry>,
@@ -1226,12 +1230,15 @@ impl AgentRunner {
         sandbox: Arc<dyn Sandbox>,
     ) -> Self {
         let tool_index = Arc::new(ToolIndex::new(&tools));
+        let config = AgentConfig::default();
+        let compaction = CompactionConfig::for_model(provider.as_ref(), &config);
         Self {
             provider,
             tools,
             tool_index,
             sandbox,
-            config: AgentConfig::default(),
+            config,
+            compaction,
             tracer: ExecutionTracer::new(),
             on_message: None,
             active_tools: Arc::new(ActiveToolsRegistry::new()),
@@ -1541,6 +1548,7 @@ impl AgentRunner {
     }
 
     pub fn with_config(mut self, config: AgentConfig) -> Self {
+        self.compaction = CompactionConfig::for_model(self.provider.as_ref(), &config);
         self.config = config;
         self
     }
@@ -1935,12 +1943,14 @@ impl AgentRunner {
         let work_run = with_work_run(WorkRunContext::clone);
 
         let join_handle = tokio::spawn(async move {
+            let compaction = CompactionConfig::for_model(provider.as_ref(), &config);
             let runner = AgentRunner {
                 provider,
                 tools,
                 tool_index,
                 sandbox,
                 config,
+                compaction,
                 tracer: ExecutionTracer::new(),
                 on_message,
                 active_tools,
@@ -2163,11 +2173,11 @@ impl AgentRunner {
         // And notices stored as system messages by older builds become the
         // user turns every notice is now, so no request of this run carries
         // a system message after the first (plan section 12.1).
-        let reshaped = portable_shape(conv);
+        let reshaped = portable_shape(conv) + answer_unresolved_calls(conv);
         if reshaped > 0 {
             tracing::debug!(
                 reshaped,
-                "stored non-leading system messages sent as [System notice] user turns"
+                "stored history reshaped: system notices as user turns, unresolved calls answered"
             );
             // Edited in place: the incremental estimate and the usage
             // anchor no longer describe this history.
@@ -2191,6 +2201,7 @@ impl AgentRunner {
         let mut planning_only_retries: usize = 0;
         let mut empty_tool_use_retries: usize = 0;
         let mut max_tokens_retries: usize = 0;
+        let mut malformed_replies: usize = 0;
         let mut task_complete_retries: usize = 0;
         // A worker run (the caller scoped `WORK_RUN_CONTEXT`) ends only on
         // its `result_report`: text alone never ends it, and `task_complete`
@@ -2252,10 +2263,11 @@ impl AgentRunner {
             // Compaction: if conversation exceeds threshold, ask the LLM to
             // summarize before the next call (RLM paper §3.2).
             let schema_threshold = (self.request_context_limit(compaction_tools) as f64
-                * self.config.compaction_threshold_pct) as usize;
+                * self.compaction.threshold_pct) as usize;
+            let trigger = schema_threshold.min(self.one_call_threshold(compaction_tools));
             if self.needs_compaction(conv)
-                || (self.config.compaction_threshold_pct > 0.0
-                    && self.cached_conversation_tokens(conv) >= schema_threshold)
+                || (self.compaction.threshold_pct > 0.0
+                    && self.cached_conversation_tokens(conv) >= trigger)
             {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
                 on_event(AgentEvent::Compressing);
@@ -2307,7 +2319,7 @@ impl AgentRunner {
                 .chat_stream_with_choice(&conv.messages, schemas, tool_choice, &stream_callback)
                 .await;
             if matches!(&response, Err(Error::ContextBudgetExceeded { .. }))
-                && self.config.compaction_threshold_pct > 0.0
+                && self.compaction.threshold_pct > 0.0
             {
                 // The adapter refused before dispatch. One runner-owned
                 // compaction/retry is allowed, never silent trimming or an
@@ -2344,12 +2356,31 @@ impl AgentRunner {
                 on_event(AgentEvent::Done);
                 return Ok(());
             }
+            // A reply the provider could not parse (a tool call cut off
+            // mid-arguments) is the model's to fix, as any tool error is:
+            // told what failed, it can send it again.
+            if let Err(Error::ModelMalformedOutput(detail)) = &response {
+                malformed_replies += 1;
+                if malformed_replies <= MALFORMED_REPLY_RETRY_LIMIT {
+                    tracing::warn!(iteration, %detail, "model reply could not be parsed; telling the model");
+                    self.push_message(
+                        conv,
+                        runner_notice(format!(
+                            "Your last reply could not be read ({detail}). If you were calling a \
+                             tool, call it again with complete arguments; put long content such as \
+                             a file body in smaller pieces across calls."
+                        )),
+                    );
+                    continue;
+                }
+            }
             let ModelResponse {
                 message,
                 usage,
                 stop_reason,
                 ..
             } = response?;
+            malformed_replies = 0;
             let llm_elapsed = llm_start.elapsed();
             tracing::info!(
                 iteration,
@@ -2605,6 +2636,7 @@ impl AgentRunner {
                 // discards it.
                 if let Some(summary) = run_end {
                     on_event(AgentEvent::TextDelta(summary.clone()));
+                    tracer.record_run_end();
                     self.finalize_run_end(conv, iteration, summary);
                     on_event(AgentEvent::Done);
                     return Ok(());
@@ -2669,7 +2701,7 @@ impl AgentRunner {
                     // `blocked`. Each reminder is counted on the tracer so
                     // the worker can tell the controller it happened.
                     let hold_for_completion = if worker_run {
-                        true
+                        self.config.result_report_reminder
                     } else {
                         has_called_any_tool && !turn_blocked
                     };
@@ -2691,6 +2723,12 @@ impl AgentRunner {
                         }
                     }
 
+                    // A worker's text is its answer, which the worker turns
+                    // into the report: only an empty reply is worth a retry.
+                    let classification = match classification {
+                        ResponseClass::PlanningOnly if worker_run => ResponseClass::Complete,
+                        other => other,
+                    };
                     match classification {
                         ResponseClass::Complete => {
                             on_event(AgentEvent::Done);
@@ -3144,57 +3182,44 @@ impl AgentRunner {
         messages.iter().map(Self::estimate_message_tokens).sum()
     }
 
-    /// Effective context-window budget in tokens. Prefers the provider's
-    /// reported limit (Ollama's detected `num_ctx`, Anthropic's env-var
-    /// override or built-in default) so downstream budgets derive from a
-    /// single source of truth. Falls back to `config.max_context_tokens`
-    /// when the provider doesn't know. Capped by the compaction ceiling
-    /// so runaway local-model context windows still trigger compaction
-    /// at a sane size.
+    /// Usable context for the conversation, resolved once for the model
+    /// ([`CompactionConfig::for_model`]).
     fn effective_context_limit(&self) -> usize {
-        let reported = self
-            .provider
-            .context_limit()
-            .unwrap_or(self.config.max_context_tokens);
-        let ceiling = compaction_context_ceiling();
-        if reported > ceiling {
-            // The ceiling exists to stop a model that *advertises* a huge
-            // window from driving compaction budgets its GPU can't sustain.
-            // But it applies just as bluntly to a window the operator pinned
-            // on purpose, which then does nothing above the ceiling — the
-            // symptom being "I raised RUSTYKRAB_NUM_CTX and nothing changed".
-            // Say so once rather than silently discarding the setting.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    provider_context_limit = reported,
-                    compaction_context_ceiling = ceiling,
-                    "provider reports more usable context than the compaction ceiling allows; \
-                     compaction will fire at 85% of the ceiling. Raise \
-                     RUSTYKRAB_COMPACTION_CONTEXT_CEILING to use the full window"
-                );
-            });
-        }
-        reported.min(ceiling)
+        self.compaction.context_tokens
     }
 
-    /// Effective cap on the compacted-history summary in tokens. Combines
-    /// the env-configurable upper bound (default 8k) with a hard ceiling
-    /// of `max_context_tokens / 4` so a summary can never consume more
-    /// than a quarter of the usable context window. On a 32k local-Ollama
-    /// deployment this keeps the summary under 8k; on a 128k cloud model
-    /// the env cap is the binding constraint.
+    /// The history size up to which a summary can still be had in one call
+    /// over the turn's cached prefix: the turn's budget with the summary's
+    /// own allowance in place of a turn's reply, less room for the
+    /// compaction prompt. Compacting by then keeps compaction on that fast
+    /// path; on a small window the 85% threshold came after it. Ignored
+    /// (`usize::MAX`) with an expanded summary window, or when it would fall
+    /// below what compaction leaves behind (half the budget), where
+    /// compacting at it would never stop.
+    fn one_call_threshold(&self, tools: &[ToolSchema]) -> usize {
+        if self.compaction.expand_ctx.is_some() {
+            return usize::MAX;
+        }
+        let budget = self.request_context_limit(tools);
+        let threshold = (budget + self.provider.output_reserve_tokens())
+            .saturating_sub(self.compaction.summary_output_tokens + 1024);
+        if threshold <= budget / 2 {
+            usize::MAX
+        } else {
+            threshold
+        }
+    }
+
+    /// The largest a stored summary may be, resolved once for the model.
     fn effective_compaction_summary_cap(&self) -> usize {
-        let env_cap = compaction_summary_max_tokens();
-        let quarter_cap = (self.config.max_context_tokens / 4).max(1);
-        env_cap.min(quarter_cap)
+        self.compaction.summary_cap_tokens
     }
 
     fn request_context_limit(&self, tools: &[ToolSchema]) -> usize {
         self.provider
             .context_limit_for_tools(tools)
             .unwrap_or(self.config.max_context_tokens)
-            .min(compaction_context_ceiling())
+            .min(self.compaction.context_ceiling)
     }
 
     /// Truncate a previously-stored compaction summary that exceeds the
@@ -3265,10 +3290,10 @@ impl AgentRunner {
     /// 2. **Heuristic** — the original estimate-only check, still used for
     ///    the first call of a run and for providers that report no usage.
     ///
-    /// Both paths respect `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` and cost
+    /// Both paths respect the compaction config's context ceiling and cost
     /// O(1) per iteration.
     fn needs_compaction(&self, conv: &Conversation) -> bool {
-        if self.config.compaction_threshold_pct <= 0.0 {
+        if self.compaction.threshold_pct <= 0.0 {
             return false;
         }
         if let (Some(predicted), Some(window)) = (
@@ -3277,8 +3302,8 @@ impl AgentRunner {
         ) {
             let budget = window
                 .saturating_sub(self.provider.output_reserve_tokens())
-                .min(compaction_context_ceiling());
-            let threshold = (budget as f64 * self.config.compaction_threshold_pct) as usize;
+                .min(self.compaction.context_ceiling);
+            let threshold = (budget as f64 * self.compaction.threshold_pct) as usize;
             if predicted >= threshold {
                 tracing::info!(
                     predicted_prompt_tokens = predicted,
@@ -3293,7 +3318,7 @@ impl AgentRunner {
             return false;
         }
         let threshold =
-            (self.effective_context_limit() as f64 * self.config.compaction_threshold_pct) as usize;
+            (self.effective_context_limit() as f64 * self.compaction.threshold_pct) as usize;
         self.cached_conversation_tokens(conv) >= threshold
     }
 
@@ -3427,7 +3452,7 @@ impl AgentRunner {
         // Token → word conversion uses ~1.5 tokens/word as a conservative
         // estimate so the word budget leaves headroom under the token cap.
         let max_words = (max_output_tokens as f64 / 1.5).floor().max(128.0) as usize;
-        let system_prompt = if self.config.compaction_strategy == CompactionStrategy::Legacy {
+        let system_prompt = if self.compaction.strategy == CompactionStrategy::Legacy {
             format!(
                 "You are compressing {scope} so a downstream agent can continue the work \
              without re-reading it. Preserve: concrete intermediate results (values, file \
@@ -3460,11 +3485,11 @@ impl AgentRunner {
             },
         ];
         let started = std::time::Instant::now();
-        let expand = compaction_expand_ctx();
-        let response = match expand {
-            Some(ctx) => self.provider.chat_with_ctx(&messages, &[], ctx).await?,
-            None => self.provider.chat(&messages, &[]).await?,
-        };
+        let expand = self.compaction.expand_ctx;
+        let response = self
+            .provider
+            .chat_with_options(&messages, &[], self.compaction.summary_call())
+            .await?;
         if response.stop_reason == StopReason::MaxTokens {
             return Err(Error::ModelProvider(
                 "compaction summary hit its generation limit; original history was not replaced"
@@ -3528,10 +3553,16 @@ impl AgentRunner {
 
             // If the model ignored the budget, recurse on its own output so
             // the next call can take another pass at shrinking it. Depth
-            // cap prevents runaway loops against non-compliant models.
+            // cap prevents runaway loops against non-compliant models, and
+            // a reduction pass (one whose input was already a summary) that
+            // did not shrink it ends the recursion: the caller truncates.
+            // Without that, qwen3.8 answered a 702-char summary with the same
+            // 702 chars ten times in a row, 4-7 s each, on every compaction
+            // of a tight window (2026-10-14).
             let summary_tokens = Self::estimate_text_tokens(&summary);
             if summary_tokens > max_output_tokens
                 && !summary.is_empty()
+                && (depth == 0 || summary_tokens < total_tokens)
                 && depth + 1 < MAX_RECURSIVE_SUMMARIZATION_DEPTH
             {
                 tracing::info!(
@@ -3690,6 +3721,8 @@ impl AgentRunner {
 
     /// Runs the production compaction path without executing an agent action.
     /// Intended for controlled evaluations and explicit maintenance tooling.
+    /// The configured strategy alone, without the verbatim fallback a run
+    /// gets: a study measures the strategy, so its failures must show.
     pub async fn compact_for_evaluation(
         &self,
         conv: &mut Conversation,
@@ -3701,20 +3734,52 @@ impl AgentRunner {
             .rev()
             .find(|m| m.is_user_turn())
             .cloned();
-        self.compact_history_preserving(conv, tools, latest.as_ref())
+        self.compact_history_with(conv, tools, latest.as_ref(), self.compaction.strategy)
             .await
     }
 
+    /// Compact under the configured strategy. When its summary cannot be
+    /// had (the call failed, ran out of room, or answered nothing) in a
+    /// worker run, the history is compacted again without a model call: the
+    /// recent turns kept verbatim, the rest archived for recall, and a note
+    /// saying so. A failed summary used to end the run (11 of qwen3.8's 30
+    /// real failures, 2026-10-12 to 14); the model can work on from recent
+    /// turns and the archive instead, and the run's session log keeps every
+    /// message. A conversation's stored history is its only record, so an
+    /// interactive turn keeps it whole and fails as before.
     async fn compact_history_preserving(
         &self,
         conv: &mut Conversation,
         tools: &[ToolSchema],
         latest_user: Option<&Message>,
     ) -> Result<()> {
+        let strategy = self.compaction.strategy;
+        match self
+            .compact_history_with(conv, tools, latest_user, strategy)
+            .await
+        {
+            Err(error) if strategy != CompactionStrategy::Extractive && in_worker_run() => {
+                tracing::warn!(
+                    %error,
+                    "compaction summary failed; keeping recent turns verbatim instead"
+                );
+                self.compact_history_with(conv, tools, latest_user, CompactionStrategy::Extractive)
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn compact_history_with(
+        &self,
+        conv: &mut Conversation,
+        tools: &[ToolSchema],
+        latest_user: Option<&Message>,
+        strategy: CompactionStrategy,
+    ) -> Result<()> {
         let before_len = conv.messages.len();
         let before_tokens = self.cached_conversation_tokens(conv);
 
-        let strategy = self.config.compaction_strategy;
         let request_budget = self.request_context_limit(tools);
         let target = self
             .config
@@ -3760,7 +3825,10 @@ impl AgentRunner {
             _ => 0,
         };
         let mut tail_tokens = 0;
-        if strategy == CompactionStrategy::StructuredMessageTail {
+        if matches!(
+            strategy,
+            CompactionStrategy::StructuredMessageTail | CompactionStrategy::Extractive
+        ) {
             // A whole user turn can contain megabytes of browser observations.
             // Keep recent dialogue at finer boundaries. An oversized tool
             // exchange may be archived as a whole without crowding out the
@@ -3790,7 +3858,10 @@ impl AgentRunner {
                 // Turns the user wrote: a notice is the host's, and
                 // counting it would shrink the window with every nudge.
                 users += group.iter().filter(|m| m.is_user_turn()).count();
-                if users > 3 {
+                // Extractive keeps whatever recent exchanges fit: a worker
+                // run has one user turn, its brief, and grouping by user
+                // turns would keep nothing of its work.
+                if users > 3 && strategy == CompactionStrategy::StructuredMessageTail {
                     break;
                 }
                 let extra: usize = group
@@ -3819,13 +3890,8 @@ impl AgentRunner {
                 .filter(|(_, m)| m.is_user_turn())
                 .map(|(i, _)| i)
                 .collect();
-            let max_turns = if strategy == CompactionStrategy::Extractive {
-                usize::MAX
-            } else {
-                3
-            };
             let mut end = conv.messages.len();
-            for start in starts.into_iter().rev().take(max_turns) {
+            for start in starts.into_iter().rev().take(3) {
                 let group = &conv.messages[start..end];
                 let extra: usize = group
                     .iter()
@@ -3863,12 +3929,11 @@ impl AgentRunner {
         // so the input budget derives from that instead of the everyday
         // limit — which is the entire point: more history per call, fewer
         // or no chunks.
-        let ceiling = compaction_expand_ctx()
-            .map(|c| c as usize)
-            .unwrap_or_else(|| self.request_context_limit(&[]));
-        let ratio = compaction_input_budget_ratio();
-        let input_budget =
-            compaction_input_budget(ceiling, ratio).min(ceiling.saturating_sub(1024));
+        let input_budget = self.compaction.summary_input_tokens;
+        // The single-shot summary carries the turn's tool block and needs
+        // room for the summary it asks for, not just a turn's reply.
+        let summary_request_budget = (request_budget + self.provider.output_reserve_tokens())
+            .saturating_sub(self.compaction.summary_output_tokens);
         if input_budget < 64 {
             return Err(Error::ContextBudgetExceeded {
                 estimated_input_tokens: 64,
@@ -3879,9 +3944,8 @@ impl AgentRunner {
             .effective_compaction_summary_cap()
             .min(available.saturating_sub(tail_tokens));
         tracing::debug!(
-            ceiling,
-            ratio,
             input_budget,
+            summary_request_budget,
             summary_cap_tokens,
             "compaction input budget computed"
         );
@@ -3890,11 +3954,20 @@ impl AgentRunner {
         // model call. Preserves the existing first-person summarization
         // semantics (the model sees its own history and is asked to
         // summarize its progress).
+        // One call reuses the turn's cached prefix (the same messages and
+        // tool block), so the input ratio that keeps an uncached chunk call
+        // short does not bound it: it only has to fit with the summary it
+        // asks for. Gating it by that ratio sent a 19K-token qwen3.8 history
+        // into two uncached chunk calls that took 343 s and still failed
+        // (reminder eval, 2026-10-14). With an expanded summary window, the
+        // expanded budget decides.
+        let fits_one_call = match self.compaction.expand_ctx {
+            Some(_) => before_tokens.saturating_add(1024) <= input_budget,
+            None => before_tokens.saturating_add(1024) <= summary_request_budget,
+        };
         let summary = if strategy == CompactionStrategy::Extractive {
             "No model-generated summary. Recent verbatim turns follow; earlier details are in the recall archive. Inspect that archive before assuming an omitted fact is unknown or completed.".to_string()
-        } else if before_tokens.saturating_add(1024) <= input_budget
-            && before_tokens.saturating_add(1024) <= request_budget
-        {
+        } else if fits_one_call {
             // Derive a word budget from the token cap so the model's own
             // output targets the same size as the recursive path. ~1.5
             // tokens per word leaves headroom under the token cap.
@@ -3907,18 +3980,15 @@ impl AgentRunner {
             // is cancelled. This costs one deep clone at the high-water mark.
             let mut summary_messages = conv.messages.clone();
             summary_messages.push(compaction_prompt);
+            let started = std::time::Instant::now();
             // Must follow the expanded window when one is set: the expanded
             // input budget is what routed this history to the fast path, and
             // a plain chat() would validate against the everyday window and
             // reject a history that fits the intended expanded request.
-            let response = match compaction_expand_ctx() {
-                Some(ctx) => {
-                    self.provider
-                        .chat_with_ctx(&summary_messages, tools, ctx)
-                        .await
-                }
-                None => self.provider.chat(&summary_messages, tools).await,
-            };
+            let response = self
+                .provider
+                .chat_with_options(&summary_messages, tools, self.compaction.summary_call())
+                .await;
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -3931,6 +4001,14 @@ impl AgentRunner {
                 ));
             }
             let text = response.message.content.as_text().unwrap_or("").to_string();
+            tracing::info!(
+                before_tokens,
+                prompt_tokens = response.usage.prompt_tokens,
+                completion_tokens = response.usage.completion_tokens,
+                output_chars = text.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "compaction: one-call summary"
+            );
 
             // Offering the tool block is what keeps the cache warm, but it
             // also lets the model answer with a tool call instead of a
@@ -3944,14 +4022,10 @@ impl AgentRunner {
                     "summarizer answered with a tool call instead of a summary; \
                      retrying without the tool block"
                 );
-                let retry = match compaction_expand_ctx() {
-                    Some(ctx) => {
-                        self.provider
-                            .chat_with_ctx(&summary_messages, &[], ctx)
-                            .await
-                    }
-                    None => self.provider.chat(&summary_messages, &[]).await,
-                };
+                let retry = self
+                    .provider
+                    .chat_with_options(&summary_messages, &[], self.compaction.summary_call())
+                    .await;
                 retry?.message.content.as_text().unwrap_or("").to_string()
             } else {
                 text
@@ -5558,6 +5632,59 @@ mod compaction_tests {
         assert!(runner.recall.get(conv.id).is_none());
     }
 
+    /// A run whose summary fails goes on from its recent turns: the history
+    /// is compacted without a model call, and nothing of it is lost.
+    #[tokio::test]
+    async fn a_failed_summary_falls_back_to_recent_turns_verbatim() {
+        let runner = AgentRunner::new(Arc::new(FailingSummary), Vec::new(), Arc::new(NoSandbox))
+            .with_config(AgentConfig {
+                compaction_target_tokens: Some(2_000),
+                ..AgentConfig::default()
+            });
+        let old = "early exploration ".repeat(4_000);
+        let mut conv = study_conversation(vec![
+            study_message(Role::User, "Fix the failing test in parser.py."),
+            study_message(Role::Assistant, &old),
+            study_message(
+                Role::Assistant,
+                "Found it: the tokenizer drops the last line.",
+            ),
+        ]);
+        let recent = conv.messages[2].id;
+        let before = AgentRunner::estimate_conversation_tokens(&conv.messages);
+
+        // A chat turn keeps its history whole and fails, as before.
+        let stored = serde_json::to_value(&conv).unwrap();
+        assert!(runner.compact_history(&mut conv, &[]).await.is_err());
+        assert_eq!(serde_json::to_value(&conv).unwrap(), stored);
+
+        // A worker run goes on from its recent turns.
+        let binding = rustykrab_tools::WorkRunContext {
+            item: "item-1".into(),
+            actor: "worker:test".into(),
+        };
+        rustykrab_tools::WORK_RUN_CONTEXT
+            .scope(binding, runner.compact_history(&mut conv, &[]))
+            .await
+            .unwrap();
+
+        assert!(AgentRunner::estimate_conversation_tokens(&conv.messages) < before);
+        assert!(
+            conv.messages.iter().any(|m| m.id == recent),
+            "recent turn kept"
+        );
+        assert!(conv
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_text())
+            .any(|t| t.contains("No model-generated summary")));
+        assert!(runner
+            .recall
+            .get(conv.id)
+            .unwrap()
+            .contains("early exploration"));
+    }
+
     struct TruncatedSummary;
     #[async_trait]
     impl ModelProvider for TruncatedSummary {
@@ -5843,6 +5970,28 @@ mod compaction_tests {
         );
     }
 
+    /// A reduction pass that returns its input unshrunk is not repeated.
+    #[tokio::test]
+    async fn a_reduction_that_does_not_shrink_is_not_repeated() {
+        // Every call answers 40,000 chars, so the pass on its own output
+        // makes no progress.
+        let provider = Arc::new(OversizedProvider::new(40_000));
+        let runner = AgentRunner::new(
+            provider.clone() as Arc<dyn ModelProvider>,
+            Vec::new(),
+            Arc::new(NoSandbox),
+        );
+        runner
+            .summarize_text_recursively(vec!["short input".to_string()], 32_000, 4_096, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.call_count.lock().unwrap(),
+            2,
+            "the summary, one pass at reducing it, and no more"
+        );
+    }
+
     /// The compaction call must carry the same tool block the ordinary
     /// turns carry.
     ///
@@ -5917,9 +6066,10 @@ mod compaction_tests {
         let provider = Arc::new(CountingProvider::new(Some(8_000)));
         let runner = build_runner(Arc::clone(&provider));
 
-        // Build a conversation that comfortably exceeds the 8k context.
-        // A 3000-char text is ~857 tokens; eight of them is ~6800+ tokens,
-        // above the ~3904-token input budget (8000 - 4096 reserve).
+        // Build a conversation that one summary call cannot take: a
+        // 3000-char text is ~857 tokens, and sixteen of them (~13.7K) are
+        // over the ~9K one call may read (8000 usable + 4096 reserve - the
+        // 3024-token summary allowance).
         let mut messages = vec![Message {
             id: Uuid::new_v4(),
             role: Role::System,
@@ -5927,7 +6077,7 @@ mod compaction_tests {
             created_at: Utc::now(),
             agent_version: None,
         }];
-        for i in 0..8 {
+        for i in 0..16 {
             messages.push(Message {
                 id: Uuid::new_v4(),
                 role: if i % 2 == 0 {
@@ -5970,6 +6120,75 @@ mod compaction_tests {
         // Recursive path should have issued more than one provider call.
         let calls = *provider.call_count.lock().unwrap();
         assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
+
+    /// A history over half the window still fits one summary call with its
+    /// allowance: one call over the cached prefix, not uncached chunks.
+    #[tokio::test]
+    async fn a_history_that_fits_one_summary_call_gets_one() {
+        let provider = Arc::new(CountingProvider::new(Some(40_000)));
+        let runner = build_runner(Arc::clone(&provider));
+        let text = |role, t: String| Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(t),
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+        let mut messages = vec![text(Role::System, "agent identity".into())];
+        messages.push(text(Role::User, "fix the parser".into()));
+        // ~25K tokens: over the 20K a chunk call may read, under the ~34.9K
+        // one call may (40K + 4,096 reserve - 9,216 summary allowance).
+        for i in 0..10 {
+            let role = if i % 2 == 0 {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            messages.push(text(role, "y".repeat(8_700)));
+        }
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let before = runner.cached_conversation_tokens(&conv);
+        assert!(before > runner.compaction.summary_input_tokens, "{before}");
+
+        runner.compact_history(&mut conv, &[]).await.unwrap();
+
+        assert_eq!(
+            *provider.call_count.lock().unwrap(),
+            1,
+            "one call, no chunks"
+        );
+        assert!(conv.summary.is_some());
+    }
+
+    #[test]
+    fn compaction_fires_before_the_history_outgrows_one_summary_call() {
+        // 32K-class window: the 85% threshold sits above the one-call fit.
+        let runner = build_runner(Arc::new(CountingProvider::new(Some(21_000))));
+        let one_call = runner.one_call_threshold(&[]);
+        assert_eq!(
+            one_call,
+            21_000 + 4_096 - runner.compaction.summary_output_tokens - 1_024
+        );
+        assert!(one_call < (21_000.0 * 0.85) as usize);
+        // With an expanded summary window, the expanded budget decides.
+        let expanded =
+            build_runner(Arc::new(CountingProvider::new(Some(21_000)))).with_config(AgentConfig {
+                compaction_expand_ctx: Some(65_536),
+                ..AgentConfig::default()
+            });
+        assert_eq!(expanded.one_call_threshold(&[]), usize::MAX);
     }
 
     /// Mock provider that always returns a large canned summary, regardless
@@ -7169,6 +7388,8 @@ mod task_complete_tests {
         /// Once the script runs out, answer with the error Ollama raises
         /// for a generation of zero tokens instead of panicking.
         silent_when_exhausted: bool,
+        /// Answered before the script: the first calls fail with these.
+        failures: Mutex<Vec<Error>>,
     }
 
     impl ScriptedProvider {
@@ -7177,6 +7398,14 @@ mod task_complete_tests {
                 script: Mutex::new(script),
                 chat_count: Mutex::new(0),
                 silent_when_exhausted: false,
+                failures: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_first(failures: Vec<Error>, script: Vec<ModelResponse>) -> Self {
+            Self {
+                failures: Mutex::new(failures),
+                ..Self::new(script)
             }
         }
 
@@ -7190,6 +7419,10 @@ mod task_complete_tests {
         fn next(&self) -> Result<ModelResponse> {
             let mut s = self.script.lock().unwrap();
             *self.chat_count.lock().unwrap() += 1;
+            let mut failures = self.failures.lock().unwrap();
+            if !failures.is_empty() {
+                return Err(failures.remove(0));
+            }
             if s.is_empty() {
                 if self.silent_when_exhausted {
                     return Err(Error::ModelEmptyResponse("scripted silence".into()));
@@ -7643,6 +7876,40 @@ mod task_complete_tests {
             .await
             .expect_err("nothing to fall back on");
         assert!(matches!(err, Error::ModelEmptyResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_reply_is_answered_with_a_notice() {
+        let malformed =
+            || Error::ModelMalformedOutput("XML syntax error on line 41: unexpected EOF".into());
+        let provider = Arc::new(ScriptedProvider::failing_first(
+            vec![malformed()],
+            vec![text_response("The answer is 4.")],
+        ));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+        assert_eq!(*provider.chat_count.lock().unwrap(), 2);
+        assert!(conv
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_text())
+            .any(|t| t.contains("could not be read") && t.contains("unexpected EOF")));
+
+        // Past the limit in a row, the error ends the run.
+        let provider = Arc::new(ScriptedProvider::failing_first(
+            (0..=MALFORMED_REPLY_RETRY_LIMIT)
+                .map(|_| malformed())
+                .collect(),
+            Vec::new(),
+        ));
+        let (runner, session, conv_id) = make_runner(provider.clone());
+        let mut conv = make_conv();
+        conv.id = conv_id;
+        let err = runner.run(&mut conv, &session).await.unwrap_err();
+        assert!(matches!(err, Error::ModelMalformedOutput(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -8234,7 +8501,11 @@ mod worker_run_tests {
                 serde_json::json!({ "summary": "B is cheapest." }),
             ),
         ]);
-        let (runner, session, mut conv, _) = worker(provider.clone(), AgentConfig::default());
+        let reminding = AgentConfig {
+            result_report_reminder: true,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, _) = worker(provider.clone(), reminding);
         let tracer = ExecutionTracer::new();
 
         WORK_RUN_CONTEXT
@@ -8308,6 +8579,7 @@ mod worker_run_tests {
         ]);
         let config = AgentConfig {
             soft_iteration_warning: 1,
+            result_report_reminder: true,
             ..AgentConfig::default()
         };
         let (runner, session, mut conv, _) = worker(provider.clone(), config);
@@ -9132,80 +9404,6 @@ mod outcome_capture_tests {
     async fn no_sink_configured_is_a_no_op() {
         let (runner, session, mut conv) = make_runner(false);
         assert!(runner.run(&mut conv, &session).await.is_ok());
-    }
-}
-
-#[cfg(test)]
-mod compaction_budget_tests {
-    use super::*;
-
-    #[test]
-    fn expand_ctx_parses_positive_integers_and_nothing_else() {
-        assert_eq!(parse_expand_ctx(Some("65536")), Some(65536));
-        assert_eq!(parse_expand_ctx(Some(" 131072 ")), Some(131072));
-        assert_eq!(
-            parse_expand_ctx(Some("0")),
-            None,
-            "zero is off, not a window"
-        );
-        assert_eq!(parse_expand_ctx(Some("off")), None);
-        assert_eq!(
-            parse_expand_ctx(Some("max")),
-            None,
-            "no magic words — a number or nothing"
-        );
-        assert_eq!(parse_expand_ctx(None), None);
-    }
-
-    /// The default ratio, named here so the expected values below read as
-    /// arithmetic a person can check rather than as a re-run of the formula.
-    const RATIO: f64 = DEFAULT_COMPACTION_INPUT_BUDGET_RATIO;
-
-    #[test]
-    fn a_modest_context_limit_still_leaves_room_for_input() {
-        // A flat 4096 reserve is larger than the whole ratioed budget here.
-        // Subtracting it left 0, and a budget of 0 chunks the history into
-        // pieces of nothing — one model call each.
-        for ceiling in [1_024, 1_536, 4_096, 8_192] {
-            let budget = compaction_input_budget(ceiling, RATIO);
-            assert!(
-                budget >= MIN_COMPACTION_INPUT_TOKENS,
-                "ceiling {ceiling} produced an unusable budget of {budget}"
-            );
-            assert!(
-                budget < ceiling,
-                "ceiling {ceiling} produced a budget larger than the window"
-            );
-        }
-    }
-
-    #[test]
-    fn a_modest_context_limit_halves_the_reserve_rather_than_paying_it_flat() {
-        // 4096 * 0.5 = 2048 ratioed; a flat 4096 reserve would underflow to
-        // the 512 floor. Capping the reserve at half the ratioed budget
-        // leaves 2048 - 1024 = 1024 instead.
-        assert_eq!(compaction_input_budget(4_096, RATIO), 1_024);
-        // 1024 * 0.5 = 512 ratioed, minus a 256 reserve = 256, which is
-        // below the floor — so the floor is what comes back.
-        assert_eq!(
-            compaction_input_budget(1_024, RATIO),
-            MIN_COMPACTION_INPUT_TOKENS
-        );
-    }
-
-    #[test]
-    fn a_large_context_limit_keeps_the_full_response_reserve() {
-        // 120_000 * 0.5 = 60_000 ratioed. Half of that is 30_000, well above
-        // the 4096 reserve, so the reserve is paid in full: 60_000 - 4_096.
-        assert_eq!(compaction_input_budget(120_000, RATIO), 55_904);
-    }
-
-    #[test]
-    fn the_ratio_actually_moves_the_budget() {
-        // Guards the wiring rather than the arithmetic: a formula that
-        // ignored its ratio argument would pass every test above.
-        assert_eq!(compaction_input_budget(120_000, 0.25), 30_000 - 4_096);
-        assert_eq!(compaction_input_budget(120_000, 1.0), 120_000 - 4_096);
     }
 }
 
