@@ -144,7 +144,10 @@ impl CodexChatGptRuntime {
             .kill_on_drop(true);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let result = match crate::cli_process::spawn(&mut cmd, deadline).await {
-            Err(_) => Err("Codex CLI could not be started for login verification".to_string()),
+            Err(e) => Err(format!(
+                "Codex CLI could not be started for login verification ({})",
+                e.kind()
+            )),
             Ok(mut child) => {
                 let input = child.stdin.take().expect("piped input");
                 let output = child.stdout.take().expect("piped output");
@@ -416,7 +419,8 @@ mod tests {
         assert!(
             r.observe_quota(br#"{"type":"turn.failed","error":{"message":"Usage limit reached"}}"#)
         );
-        assert!(matches!(r.readiness(false), Err(Error::ModelRateLimit(_))));
+        let got = r.readiness(false);
+        assert!(matches!(got, Err(Error::ModelRateLimit(_))), "{got:?}");
         assert!(r.status().rate_limited_until.is_some());
     }
 }

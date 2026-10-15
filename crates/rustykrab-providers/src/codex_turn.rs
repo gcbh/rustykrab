@@ -137,7 +137,9 @@ impl CodexCliProvider {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut child = crate::cli_process::spawn(&mut cmd, deadline)
             .await
-            .map_err(|_| Error::ModelProvider("Cannot start Codex model turn".into()))?;
+            .map_err(|e| {
+                Error::ModelProvider(format!("Cannot start Codex model turn ({})", e.kind()))
+            })?;
         let mut stdin = child.stdin.take().expect("piped input");
         let writer = async move {
             stdin.write_all(&prompt).await?;
