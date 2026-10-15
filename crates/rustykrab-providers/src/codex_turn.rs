@@ -134,8 +134,8 @@ impl CodexCliProvider {
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::cli_process::spawn(&mut cmd)
+            .await
             .map_err(|_| Error::ModelProvider("Cannot start Codex model turn".into()))?;
         let mut stdin = child.stdin.take().expect("piped input");
         let writer = async move {

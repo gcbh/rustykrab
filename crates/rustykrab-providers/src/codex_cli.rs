@@ -142,7 +142,7 @@ impl CodexChatGptRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let result = match cmd.spawn() {
+        let result = match crate::cli_process::spawn(&mut cmd).await {
             Err(_) => Err("Codex CLI could not be started for login verification".to_string()),
             Ok(mut child) => {
                 let input = child.stdin.take().expect("piped input");

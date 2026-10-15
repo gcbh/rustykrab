@@ -1049,7 +1049,7 @@ impl ExternalWorker {
         Option<std::process::Output>,
         bool,
     ) {
-        let mut child = match cmd.spawn() {
+        let mut child = match rustykrab_providers::cli_process::spawn(&mut cmd).await {
             Ok(child) => child,
             Err(e) => {
                 let why = format!("cannot start {}: {e}", self.config.command.display());
@@ -3122,6 +3122,31 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             assert!(f.data.path().join("resume.txt").exists(), "resumed once");
             std::fs::remove_file(f.data.path().join("resume.txt")).unwrap();
         }
+    }
+
+    /// An agent whose executable something holds open for writing a moment
+    /// longer, as its updater or a fork from another thread can, still
+    /// starts: the run waits out ETXTBSY (`cli_process`) instead of failing.
+    #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "macOS executes a file open for writing"
+    )]
+    async fn an_agent_whose_executable_is_briefly_busy_still_starts() {
+        let f = Fixture::new();
+        let agent = f.agent("claude", CLAUDE);
+        let worker = f.worker(WorkerKind::ClaudeCode, agent.clone());
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&agent)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        let report = worker.run(brief(Some(f.workspace()))).await;
+        release.join().unwrap();
+        assert_eq!(report.unwrap().summary, "added status");
     }
 
     /// The resume answers with a contract that names no commit.
