@@ -26,6 +26,12 @@
 //! the declared type is left alone, so validation rejects it as it always
 //! did. No schema opts out: a value is only ever changed where its schema
 //! already forbids a string, so a call that validated before is untouched.
+//!
+//! A string given where the schema declares an array of strings becomes
+//! that array: the array it spells as JSON, else a list of one. qwen3.8
+//! sent `checks_run` as one string in every run of a task that asked for a
+//! check, and each rejection cost it an iteration (reminder eval,
+//! 2026-10-14).
 
 use serde_json::Value;
 
@@ -38,7 +44,7 @@ pub struct Coercion {
     /// Where the value sits in the arguments, as a JSON pointer
     /// (`/duration_minutes`, `/items/0/count`).
     pub pointer: String,
-    /// The type it became: `integer`, `number` or `boolean`.
+    /// The type it became: `integer`, `number`, `boolean` or `array`.
     pub to: &'static str,
 }
 
@@ -124,6 +130,9 @@ fn collect_coercions(
 /// integer, number or boolean type, also allows a string, or `text` is not
 /// exactly a value of it.
 fn exact_scalar(schema: &Value, text: &str) -> Option<(Value, &'static str)> {
+    if let Some(list) = string_list(schema, text) {
+        return Some((list, "array"));
+    }
     let types: Vec<&str> = match schema.get("type")? {
         Value::String(t) => vec![t.as_str()],
         Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect(),
@@ -143,6 +152,24 @@ fn exact_scalar(schema: &Value, text: &str) -> Option<(Value, &'static str)> {
         },
         _ => None,
     })
+}
+
+/// `text` as the array of strings `schema` declares: the JSON array it
+/// spells, else a list of one. `None` where the schema takes a string or
+/// is not an array of strings.
+fn string_list(schema: &Value, text: &str) -> Option<Value> {
+    if schema.get("type")?.as_str()? != "array" {
+        return None;
+    }
+    if schema.pointer("/items/type")?.as_str()? != "string" {
+        return None;
+    }
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text.trim()) {
+        if items.iter().all(Value::is_string) {
+            return Some(Value::Array(items));
+        }
+    }
+    Some(Value::Array(vec![Value::String(text.to_string())]))
 }
 
 /// An integer in canonical decimal form (it prints back as the same text)
@@ -719,6 +746,30 @@ mod tests {
         assert_eq!(coerce_tool_args(&untyped, &json!({ "n": "3" })), None);
         let unknown = json!({ "type": "object", "properties": {} });
         assert_eq!(coerce_tool_args(&unknown, &json!({ "n": "3" })), None);
+    }
+
+    #[test]
+    fn a_string_for_a_list_of_strings_becomes_the_list() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "checks_run": { "type": "array", "items": { "type": "string" } },
+                "counts": { "type": "array", "items": { "type": "integer" } },
+            }
+        });
+        let (args, _) = coerced(&schema, json!({ "checks_run": "python3 -m unittest" }));
+        assert_eq!(args, json!({ "checks_run": ["python3 -m unittest"] }));
+        let (args, _) = coerced(&schema, json!({ "checks_run": "[\"a\", \"b\"]" }));
+        assert_eq!(
+            args,
+            json!({ "checks_run": ["a", "b"] }),
+            "a JSON array spelled as text"
+        );
+        assert_eq!(
+            coerce_tool_args(&schema, &json!({ "counts": "3" })),
+            None,
+            "only lists of strings"
+        );
     }
 
     #[test]
