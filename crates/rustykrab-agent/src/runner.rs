@@ -2264,9 +2264,10 @@ impl AgentRunner {
             // summarize before the next call (RLM paper §3.2).
             let schema_threshold = (self.request_context_limit(compaction_tools) as f64
                 * self.compaction.threshold_pct) as usize;
+            let trigger = schema_threshold.min(self.one_call_threshold(compaction_tools));
             if self.needs_compaction(conv)
                 || (self.compaction.threshold_pct > 0.0
-                    && self.cached_conversation_tokens(conv) >= schema_threshold)
+                    && self.cached_conversation_tokens(conv) >= trigger)
             {
                 tracing::info!(iteration, "conversation crossed compaction threshold");
                 on_event(AgentEvent::Compressing);
@@ -3187,6 +3188,28 @@ impl AgentRunner {
         self.compaction.context_tokens
     }
 
+    /// The history size up to which a summary can still be had in one call
+    /// over the turn's cached prefix: the turn's budget with the summary's
+    /// own allowance in place of a turn's reply, less room for the
+    /// compaction prompt. Compacting by then keeps compaction on that fast
+    /// path; on a small window the 85% threshold came after it. Ignored
+    /// (`usize::MAX`) with an expanded summary window, or when it would fall
+    /// below what compaction leaves behind (half the budget), where
+    /// compacting at it would never stop.
+    fn one_call_threshold(&self, tools: &[ToolSchema]) -> usize {
+        if self.compaction.expand_ctx.is_some() {
+            return usize::MAX;
+        }
+        let budget = self.request_context_limit(tools);
+        let threshold = (budget + self.provider.output_reserve_tokens())
+            .saturating_sub(self.compaction.summary_output_tokens + 1024);
+        if threshold <= budget / 2 {
+            usize::MAX
+        } else {
+            threshold
+        }
+    }
+
     /// The largest a stored summary may be, resolved once for the model.
     fn effective_compaction_summary_cap(&self) -> usize {
         self.compaction.summary_cap_tokens
@@ -3923,11 +3946,20 @@ impl AgentRunner {
         // model call. Preserves the existing first-person summarization
         // semantics (the model sees its own history and is asked to
         // summarize its progress).
+        // One call reuses the turn's cached prefix (the same messages and
+        // tool block), so the input ratio that keeps an uncached chunk call
+        // short does not bound it: it only has to fit with the summary it
+        // asks for. Gating it by that ratio sent a 19K-token qwen3.8 history
+        // into two uncached chunk calls that took 343 s and still failed
+        // (reminder eval, 2026-10-14). With an expanded summary window, the
+        // expanded budget decides.
+        let fits_one_call = match self.compaction.expand_ctx {
+            Some(_) => before_tokens.saturating_add(1024) <= input_budget,
+            None => before_tokens.saturating_add(1024) <= summary_request_budget,
+        };
         let summary = if strategy == CompactionStrategy::Extractive {
             "No model-generated summary. Recent verbatim turns follow; earlier details are in the recall archive. Inspect that archive before assuming an omitted fact is unknown or completed.".to_string()
-        } else if before_tokens.saturating_add(1024) <= input_budget
-            && before_tokens.saturating_add(1024) <= summary_request_budget
-        {
+        } else if fits_one_call {
             // Derive a word budget from the token cap so the model's own
             // output targets the same size as the recursive path. ~1.5
             // tokens per word leaves headroom under the token cap.
@@ -5982,9 +6014,10 @@ mod compaction_tests {
         let provider = Arc::new(CountingProvider::new(Some(8_000)));
         let runner = build_runner(Arc::clone(&provider));
 
-        // Build a conversation that comfortably exceeds the 8k context.
-        // A 3000-char text is ~857 tokens; eight of them is ~6800+ tokens,
-        // above the ~3904-token input budget (8000 - 4096 reserve).
+        // Build a conversation that one summary call cannot take: a
+        // 3000-char text is ~857 tokens, and sixteen of them (~13.7K) are
+        // over the ~9K one call may read (8000 usable + 4096 reserve - the
+        // 3024-token summary allowance).
         let mut messages = vec![Message {
             id: Uuid::new_v4(),
             role: Role::System,
@@ -5992,7 +6025,7 @@ mod compaction_tests {
             created_at: Utc::now(),
             agent_version: None,
         }];
-        for i in 0..8 {
+        for i in 0..16 {
             messages.push(Message {
                 id: Uuid::new_v4(),
                 role: if i % 2 == 0 {
@@ -6035,6 +6068,75 @@ mod compaction_tests {
         // Recursive path should have issued more than one provider call.
         let calls = *provider.call_count.lock().unwrap();
         assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
+
+    /// A history over half the window still fits one summary call with its
+    /// allowance: one call over the cached prefix, not uncached chunks.
+    #[tokio::test]
+    async fn a_history_that_fits_one_summary_call_gets_one() {
+        let provider = Arc::new(CountingProvider::new(Some(40_000)));
+        let runner = build_runner(Arc::clone(&provider));
+        let text = |role, t: String| Message {
+            id: Uuid::new_v4(),
+            role,
+            content: MessageContent::Text(t),
+            created_at: Utc::now(),
+            agent_version: None,
+        };
+        let mut messages = vec![text(Role::System, "agent identity".into())];
+        messages.push(text(Role::User, "fix the parser".into()));
+        // ~25K tokens: over the 20K a chunk call may read, under the ~34.9K
+        // one call may (40K + 4,096 reserve - 9,216 summary allowance).
+        for i in 0..10 {
+            let role = if i % 2 == 0 {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            messages.push(text(role, "y".repeat(8_700)));
+        }
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        let before = runner.cached_conversation_tokens(&conv);
+        assert!(before > runner.compaction.summary_input_tokens, "{before}");
+
+        runner.compact_history(&mut conv, &[]).await.unwrap();
+
+        assert_eq!(
+            *provider.call_count.lock().unwrap(),
+            1,
+            "one call, no chunks"
+        );
+        assert!(conv.summary.is_some());
+    }
+
+    #[test]
+    fn compaction_fires_before_the_history_outgrows_one_summary_call() {
+        // 32K-class window: the 85% threshold sits above the one-call fit.
+        let runner = build_runner(Arc::new(CountingProvider::new(Some(21_000))));
+        let one_call = runner.one_call_threshold(&[]);
+        assert_eq!(
+            one_call,
+            21_000 + 4_096 - runner.compaction.summary_output_tokens - 1_024
+        );
+        assert!(one_call < (21_000.0 * 0.85) as usize);
+        // With an expanded summary window, the expanded budget decides.
+        let expanded =
+            build_runner(Arc::new(CountingProvider::new(Some(21_000)))).with_config(AgentConfig {
+                compaction_expand_ctx: Some(65_536),
+                ..AgentConfig::default()
+            });
+        assert_eq!(expanded.one_call_threshold(&[]), usize::MAX);
     }
 
     /// Mock provider that always returns a large canned summary, regardless

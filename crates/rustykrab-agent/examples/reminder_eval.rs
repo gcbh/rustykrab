@@ -113,7 +113,7 @@ async fn main() -> Res<()> {
         OllamaProvider::new(args.model.clone())
             .with_base_url(args.url.trim_end_matches('/').to_string())
             .with_config(OllamaConfig {
-                num_ctx: Some(32_768),
+                num_ctx: Some(args.num_ctx),
                 think: Some(false),
                 temperature: 0.0,
                 keep_alive: Some("30m".into()),
@@ -188,6 +188,9 @@ struct Args {
     model: String,
     url: String,
     work_root: PathBuf,
+    /// The served window; production's is 32768. A smaller one makes a run
+    /// compact, to measure compaction.
+    num_ctx: u32,
 }
 
 impl Args {
@@ -209,6 +212,7 @@ impl Args {
             model: "qwen3.8:27b-mlx".into(),
             url: "http://127.0.0.1:11434".into(),
             work_root: std::env::temp_dir().join("rk-reminder-eval"),
+            num_ctx: 32_768,
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut it = raw.iter();
@@ -223,6 +227,7 @@ impl Args {
                 "--model" => args.model = value()?,
                 "--url" => args.url = value()?,
                 "--work-root" => args.work_root = PathBuf::from(value()?),
+                "--num-ctx" => args.num_ctx = value()?.parse()?,
                 other => return Err(format!("unknown flag {other}").into()),
             }
         }
