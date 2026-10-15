@@ -1066,8 +1066,10 @@ pub struct AgentConfig {
     pub tool_search_miss_limit: usize,
     /// Whether a worker run that ends with text is reminded to call
     /// `result_report` (up to `TASK_COMPLETE_RETRY_LIMIT` times) before the
-    /// text is taken as its answer. Off, the text ends the run at once and
-    /// the worker turns it into the report.
+    /// text is taken as its answer. Off by default: the text ends the run at
+    /// once and the worker turns it into the report. Measured on qwen3.8 over
+    /// 32 runs, the reminder never fired: every finished run called
+    /// `result_report` itself (docs/measurements/reminder-eval-qwen38-2026-10-14.md).
     pub result_report_reminder: bool,
 }
 
@@ -1089,7 +1091,7 @@ impl Default for AgentConfig {
             tool_heartbeat_interval_secs: 30,
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
-            result_report_reminder: true,
+            result_report_reminder: false,
         }
     }
 }
@@ -8345,7 +8347,11 @@ mod worker_run_tests {
                 serde_json::json!({ "summary": "B is cheapest." }),
             ),
         ]);
-        let (runner, session, mut conv, _) = worker(provider.clone(), AgentConfig::default());
+        let reminding = AgentConfig {
+            result_report_reminder: true,
+            ..AgentConfig::default()
+        };
+        let (runner, session, mut conv, _) = worker(provider.clone(), reminding);
         let tracer = ExecutionTracer::new();
 
         WORK_RUN_CONTEXT
@@ -8419,6 +8425,7 @@ mod worker_run_tests {
         ]);
         let config = AgentConfig {
             soft_iteration_warning: 1,
+            result_report_reminder: true,
             ..AgentConfig::default()
         };
         let (runner, session, mut conv, _) = worker(provider.clone(), config);

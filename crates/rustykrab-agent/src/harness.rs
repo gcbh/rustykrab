@@ -81,7 +81,7 @@ impl Default for HarnessProfile {
             compaction_expand_ctx: None,
             late_tool_binding: None,
             tool_search_miss_limit: rustykrab_core::DEFAULT_SEARCH_MISS_LIMIT,
-            result_report_reminder: true,
+            result_report_reminder: false,
         }
     }
 }

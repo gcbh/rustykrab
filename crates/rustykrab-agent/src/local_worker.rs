@@ -2212,6 +2212,7 @@ mod tests {
                 .collect(),
         );
         let (w, stub) = worker(provider.clone(), Vec::new());
+        let w = w.with_result_report_reminder(true);
         let answered = w.run(brief("item-2")).await.unwrap();
         assert_eq!(answered.summary, "Plan B, I think (3).");
         assert_eq!(w.last_run().unwrap().reminders, 3);
@@ -2226,6 +2227,7 @@ mod tests {
         // Blank replies to every reminder.
         let provider = Recording::new((0..4).map(|_| text("  ")).collect());
         let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(true);
         let err = w.run(brief("item-3")).await.unwrap_err();
         assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Empty));
 
@@ -2985,6 +2987,7 @@ mod tests {
             costing(report("B is cheapest."), 200),
         ]);
         let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(true);
         let mut b = brief("item-21");
         b.run = Some("run-21".into());
         w.run(b).await.unwrap();
