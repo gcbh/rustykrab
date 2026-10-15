@@ -799,6 +799,7 @@ mod error_typing_tests {
         assert!(!dir.path().join("sub/note.txt").exists());
     }
 
+    #[cfg(target_os = "macos")]
     async fn run_in(tool: &ExecTool, command: &str) -> (i64, String) {
         let out = tool.execute(json!({ "command": command })).await.unwrap();
         let text = format!(
