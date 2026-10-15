@@ -555,7 +555,10 @@ impl Controller {
         // repair generation (`proof.rs`); one without is availability only.
         for id in parked_on_landed_capability(&b.snap) {
             let reason = match self.revival_proven(&b.snap, &id).await? {
-                false => continue,
+                false => {
+                    changed.extend(self.investigate_revival_refusal(&mut b, &id).await?);
+                    continue;
+                }
                 true if super::proof::has_registered_need(&b.snap, &id) => {
                     "capability landed and its operation was proven on its executor"
                 }

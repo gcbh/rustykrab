@@ -62,7 +62,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) use crate::capability_proof::registered_action;
 use crate::capability_proof::{
     capability_proven_in_generation, probe_inputs_digest, ExpectedOperation, Missing,
-    OperationProbe, ProbeRequest, RegisteredAction, OPERATION_PROBE,
+    OperationProbe, ProbeContext, ProbeRequest, ProbeScope, RegisteredAction, WorkspaceIdentity,
+    OPERATION_PROBE,
 };
 use crate::errors::VerifierVerdict;
 use crate::graph::Snapshot;
@@ -114,10 +115,27 @@ pub(super) struct RepairGeneration {
     /// The executor's effective-access digest at this generation
     /// (`Controller::access_digest`); `None` when no executor is known.
     pub permission_digest: Option<String>,
+    /// None on legacy rows. Some also records an unavailable executor/scope
+    /// explicitly, so unchanged unknowns do not generate a probe every tick.
+    #[serde(default)]
+    pub binding: Option<RepairBinding>,
     /// The probes that judge this generation, as the controller asked for
     /// them: one per registered need it could ask a probe for.
     #[serde(default)]
     pub probes: Vec<PlannedProbe>,
+}
+
+/// Stable selection observed by the controller. A transient probe directory,
+/// receipt outcome, run id, health or available slot is never identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RepairBinding {
+    pub executor: Option<String>,
+    pub scope: Option<ProbeScope>,
+    pub context_digest: String,
+    /// Trusted landed internal prerequisites, not model repair claims or time.
+    pub repairs_digest: String,
+    /// The controller's actual configured build identity, stable across ticks.
+    pub daemon_build: String,
 }
 
 /// One probe a generation is judged by: the capability item whose operation
@@ -126,6 +144,25 @@ pub(super) struct RepairGeneration {
 pub(super) struct PlannedProbe {
     pub capability: String,
     pub expected: ExpectedOperation,
+}
+
+/// Only diagnoses this controller recorded allocating for this waiter may
+/// trigger a repair generation. Unrelated internal prerequisites are not repair
+/// signals. This is an existing rung record, not a second incident ledger.
+fn revival_investigations(item: &str, events: &[WorkEvent]) -> std::collections::BTreeSet<String> {
+    let prefix = format!("capability revival action {item}:");
+    events
+        .iter()
+        .filter(|e| e.actor == BY_CONTROLLER)
+        .filter_map(super::load::decode_rung)
+        .filter(|r| r.rung == rustykrab_core::work::Rung::Improve && r.outcome.starts_with(&prefix))
+        .filter_map(|r| {
+            r.outcome
+                .split_once("; investigation ")
+                .and_then(|(_, tail)| tail.split_once(';'))
+                .map(|(id, _)| id.to_string())
+        })
+        .collect()
 }
 
 /// The generation string a probe binds to.
@@ -317,6 +354,74 @@ impl Controller {
         Ok(CapabilityVerdict::AvailabilityOnly(proofs))
     }
 
+    /// Reuse the real brief's post-activatable requirements. Planning a scope
+    /// does not allocate a worktree; only actual dispatch does.
+    pub(super) async fn repair_context(
+        &self,
+        w: &WorkItem,
+        events: &[WorkEvent],
+    ) -> Result<ProbeContext, Error> {
+        let history = self.activatable(super::load::history(events));
+        let mut requirements = super::brief::effective_requirements(w, &history);
+        if self.config.worktree_root.is_some() {
+            requirements.workspace = self.workspace_of(&w.id).await?.map(|ws| WorkspaceIdentity {
+                repo: ws.repo,
+                base: ws.base,
+            });
+        }
+        Ok(ProbeContext {
+            requirements,
+            bound_dir: None,
+        })
+    }
+
+    pub(super) async fn repair_binding(
+        &self,
+        snap: &Snapshot,
+        item: &str,
+        events: &[WorkEvent],
+        context: &ProbeContext,
+    ) -> Result<RepairBinding, Error> {
+        let executor = failing_worker(events);
+        let scope = executor
+            .as_deref()
+            .and_then(|e| self.worker(e))
+            .and_then(|worker| {
+                worker
+                    .probe_scope(context)
+                    .filter(|s| s.worker == worker.name())
+            });
+        let owned = revival_investigations(item, events);
+        let mut repairs = Vec::new();
+        for edge in snap
+            .edges_held_by(item)
+            .filter(|e| e.kind == EdgeKind::Blocks)
+        {
+            let Some(up) = snap.item(&edge.depends_on).filter(|up| {
+                owned.contains(&up.id) && up.kind == WorkKind::Internal && up.status == Status::Done
+            }) else {
+                continue;
+            };
+            for e in self.store.work_evidence_list(&up.id).await? {
+                if e.kind == "commit" && e.verified_by.as_deref() == Some("git")
+                    || e.kind == crate::errors::CLASSIFIER_RULE
+                        && e.verified_by.as_deref() == Some("replay")
+                {
+                    repairs.push((up.id.clone(), e.kind, e.reference, e.hash));
+                }
+            }
+        }
+        repairs.sort();
+        repairs.dedup();
+        Ok(RepairBinding {
+            executor,
+            scope,
+            context_digest: context.requirements.digest(),
+            repairs_digest: crate::capability_proof::binding_digest(&repairs),
+            daemon_build: self.build_label(),
+        })
+    }
+
     /// Open a new repair generation on waiting item `w` because `cap`
     /// claims done, probe each of `w`'s registered needs whose capability is
     /// `cap` or already done, and say whether `cap`'s own need is proven.
@@ -334,7 +439,9 @@ impl Controller {
         let evidence = self.store.work_evidence_list(&w.id).await?;
         let n = latest_generation(&evidence).map_or(1, |g| g.n + 1);
         let generation = generation_of(&w.id, n);
-        let executor = failing_worker(&events);
+        let mut context = self.repair_context(w, &events).await?;
+        let binding = self.repair_binding(snap, &w.id, &events, &context).await?;
+        let executor = &binding.executor;
         let worker = executor.as_deref().and_then(|e| self.worker(e));
 
         // Where a run of the waiting item would run: a fresh worktree for a
@@ -354,7 +461,10 @@ impl Controller {
                 worker.name()
             )),
             (Some(worker), Ok(ws)) => worker
-                .probe_scope(ws.as_ref().map(|ws| ws.path.clone()))
+                .probe_scope(&ProbeContext {
+                    bound_dir: ws.as_ref().map(|ws| ws.path.clone()),
+                    ..context.clone()
+                })
                 .filter(|s| s.worker == worker.name())
                 .ok_or_else(|| {
                     format!(
@@ -364,6 +474,18 @@ impl Controller {
                     )
                 }),
         };
+        context.bound_dir = workspace
+            .as_ref()
+            .ok()
+            .and_then(|ws| ws.as_ref())
+            .map(|ws| ws.path.clone());
+        let scope = scope.and_then(|scope| {
+            if binding.scope.as_ref() == Some(&scope) {
+                Ok(scope)
+            } else {
+                Err("effective binding changed while preparing probe directory".into())
+            }
+        });
         let deadline = self
             .config
             .probe_deadline
@@ -375,7 +497,7 @@ impl Controller {
                     let expected = ExpectedOperation {
                         operation: action.operation(),
                         executor: scope.worker.clone(),
-                        inputs_digest: probe_inputs_digest(&action, &scope),
+                        inputs_digest: probe_inputs_digest(&action, &scope, &context),
                         generation: generation.clone(),
                         run: format!("probe-{}", uuid::Uuid::new_v4()),
                     };
@@ -383,6 +505,7 @@ impl Controller {
                         expected,
                         action,
                         scope,
+                        context: context.clone(),
                         deadline,
                     };
                     if request.valid() {
@@ -411,6 +534,7 @@ impl Controller {
             cause: "capability".to_string(),
             source_item: cap.id.clone(),
             permission_digest,
+            binding: Some(binding),
             probes: plans
                 .iter()
                 .filter_map(|p| {
@@ -515,6 +639,45 @@ impl Controller {
         )
     }
 
+    /// Record a terminal refusal once per durable generation, on the original
+    /// work item's existing event trail. This is an observation, not an owner
+    /// question, a new attempt, a spend grant or permission to resume.
+    async fn warn_revival_refusal(
+        &self,
+        item: &str,
+        current: &RepairGeneration,
+        failure: (VerifierVerdict, String),
+    ) -> Result<(), Error> {
+        let generation = generation_of(item, current.n);
+        let reference = format!("capability_revival_blocked:{generation}");
+        if self.store.work_events(item).await?.iter().any(|e| {
+            e.kind == EventKind::Warning
+                && e.actor == BY_CONTROLLER
+                && e.evidence_ref.as_deref() == Some(reference.as_str())
+        }) {
+            return Ok(());
+        }
+        let executor = current
+            .binding
+            .as_ref()
+            .and_then(|b| b.executor.as_deref())
+            .unwrap_or("unknown");
+        let path = current
+            .binding
+            .as_ref()
+            .and_then(|b| b.scope.as_ref())
+            .map(|s| format!("{:?}", s.path))
+            .unwrap_or_else(|| "unknown".into());
+        let reason: String = failure.1.chars().take(1024).collect();
+        self.store.work_event_append(&WorkEvent {
+            item: item.into(), kind: EventKind::Warning, actor: BY_CONTROLLER.into(),
+            reason: Some(format!("Capability revival blocked at generation {generation}; executor {executor}; path {path}; {:?}: {reason}", failure.0)),
+            evidence_ref: Some(reference), from: None, to: None, origin: None,
+            upstream: Some(current.source_item.clone()), at: self.clock.now(),
+        }).await?;
+        Ok(())
+    }
+
     /// Gate 2: whether `item`, parked behind capability items, may resume.
     /// Every one of its registered needs must have `Proof` for its current
     /// generation, bound as that generation's row recorded it. An item whose
@@ -524,10 +687,57 @@ impl Controller {
         if needs.is_empty() {
             return Ok(true);
         }
-        let evidence = self.store.work_evidence_list(item).await?;
-        let Some(current) = latest_generation(&evidence) else {
+        // An allocated investigation never releases the original by landing
+        // alone. Wait until it is done, then bind its verified repair and probe.
+        if snap.edges_held_by(item).any(|e| {
+            e.kind == EdgeKind::Blocks
+                && snap
+                    .item(&e.depends_on)
+                    .is_some_and(|up| up.kind == WorkKind::Internal && up.status != Status::Done)
+        }) {
+            return Ok(false);
+        }
+        let Some(waiter) = snap.item(item) else {
             return Ok(false);
         };
+        let events = self.store.work_events(item).await?;
+        let context = self.repair_context(waiter, &events).await?;
+        let binding = self.repair_binding(snap, item, &events, &context).await?;
+        let worker = binding.executor.as_deref().and_then(|e| self.worker(e));
+        let permission_digest = match &worker {
+            Some(w) => Some(self.access_digest(w.as_ref()).await),
+            None => None,
+        };
+        let evidence = self.store.work_evidence_list(item).await?;
+        let mut current = latest_generation(&evidence);
+        let matches = current.as_ref().is_some_and(|g| {
+            g.binding.as_ref() == Some(&binding) && g.permission_digest == permission_digest
+        });
+        if !matches {
+            // Use the existing dispatch/capacity path; no synthetic observation
+            // and no model-authored change to the item's holds or budget.
+            if worker.as_ref().is_some_and(|w| {
+                !self.dispatch_available(w.as_ref()) || !self.has_free_slot(w.as_ref())
+            }) {
+                return Ok(false);
+            }
+            let Some((cap, _)) = needs.iter().find(|(cap, _)| cap.status == Status::Done) else {
+                return Ok(false);
+            };
+            let observed = self.probe_waiter(snap, waiter, cap).await?;
+            current = latest_generation(&self.store.work_evidence_list(item).await?);
+            if let (Some(generation), Err(failure)) = (&current, observed) {
+                self.warn_revival_refusal(item, generation, failure).await?;
+            }
+        }
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if current.binding.as_ref() != Some(&binding)
+            || current.permission_digest != permission_digest
+        {
+            return Ok(false);
+        }
         let generation = generation_of(item, current.n);
         for (capability, action) in needs {
             let Some(planned) = current
@@ -535,19 +745,171 @@ impl Controller {
                 .iter()
                 .find(|p| p.capability == capability.id)
             else {
+                self.warn_revival_refusal(
+                    item,
+                    &current,
+                    (
+                        VerifierVerdict::Incomplete,
+                        format!(
+                            "{} has no planned observation on the current executor",
+                            action.operation()
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            };
+            let Some(scope) = binding.scope.as_ref() else {
+                self.warn_revival_refusal(
+                    item,
+                    &current,
+                    (
+                        VerifierVerdict::Incomplete,
+                        "the current executor has no observation scope".into(),
+                    ),
+                )
+                .await?;
                 return Ok(false);
             };
             if planned.expected.generation != generation
                 || planned.expected.operation != action.operation()
+                || planned.expected.executor != scope.worker
+                || planned.expected.inputs_digest != probe_inputs_digest(&action, scope, &context)
             {
                 return Ok(false);
             }
             let rows = self.store.work_evidence_list(&capability.id).await?;
-            if capability_proven_in_generation(&capability, &rows, &planned.expected).is_err() {
+            if let Err(missing) =
+                capability_proven_in_generation(&capability, &rows, &planned.expected)
+            {
+                let (verdict, why) = unproven(&missing, None);
+                self.warn_revival_refusal(
+                    item,
+                    &current,
+                    (verdict, format!("{}: {why}", action.operation())),
+                )
+                .await?;
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Allocate/reuse bounded diagnosis for a terminal current-generation
+    /// refusal, without changing the waiter's status or granting execution.
+    /// The action marker is an ordinary controller rung, not RESOLUTION_WAIT;
+    /// generic resolution recovery therefore cannot release this waiter.
+    pub(super) async fn investigate_revival_refusal(
+        &self,
+        b: &mut super::batch::Batch,
+        item: &str,
+    ) -> Result<Vec<String>, Error> {
+        let Some(waiter) = b.snap.item(item).cloned() else {
+            return Ok(vec![]);
+        };
+        if waiter.held_by.is_some() {
+            return Ok(vec![]);
+        }
+        let Some(current) = latest_generation(&self.store.work_evidence_list(item).await?) else {
+            return Ok(vec![]);
+        };
+        let events = self.store.work_events(item).await?;
+        let context = self.repair_context(&waiter, &events).await?;
+        if current.binding.as_ref()
+            != Some(
+                &self
+                    .repair_binding(&b.snap, item, &events, &context)
+                    .await?,
+            )
+        {
+            return Ok(vec![]); // A normal capacity wait for a changed selection.
+        }
+        let generation = generation_of(item, current.n);
+        let reference = format!("capability_revival_blocked:{generation}");
+        let Some(warning) = events.iter().find(|e| {
+            e.kind == EventKind::Warning
+                && e.actor == BY_CONTROLLER
+                && e.evidence_ref.as_deref() == Some(&reference)
+        }) else {
+            return Ok(vec![]); // No terminal refusal observed.
+        };
+        let marker = format!("capability revival action {generation};");
+        if events
+            .iter()
+            .filter_map(super::load::decode_rung)
+            .any(|r| r.outcome.starts_with(&marker))
+        {
+            return Ok(vec![]);
+        }
+        let mut ladder = super::load::ladder_from(&events, &waiter);
+        let mut error = crate::errors::classify(
+            &crate::errors::FailureInput::Verifier {
+                verdict: VerifierVerdict::Incomplete,
+                detail: warning
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "capability proof unobserved".into()),
+            },
+            &crate::errors::Context {
+                tool: Some("capability_probe"),
+                worker_kind: current
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b.executor.as_deref())
+                    .map(|worker| self.worker_kind(worker)),
+            },
+        );
+        error.observed_by = "capability_revival".into();
+        // The investigation index is the existing error-evidence ledger. This
+        // records the real probe refusal, explicitly attributed to this guard;
+        // it is not a failed original run, attempt record or spend charge.
+        b.evidence.push(Evidence {
+            item: item.into(),
+            kind: super::brief::ERROR.into(),
+            reference: format!(
+                "{}/{}: {}",
+                error.class.as_str(),
+                error.subclass.as_str(),
+                error.detail
+            ),
+            hash: Some(error.fingerprint.clone()),
+            verified_by: Some(error.observed_by.clone()),
+            at: b.now,
+        });
+        let result = if ladder.left(rustykrab_core::work::Rung::Improve) == 0 {
+            Err("no remaining Improve rung for capability proof diagnosis".into())
+        } else {
+            let source = self.source_checkout(&[]).await;
+            self.file_internal(b, &waiter, &error, source.as_ref())
+        };
+        let (rung, outcome, changed) = match result {
+            Ok(id) => (
+                rustykrab_core::work::Rung::Improve,
+                format!("{marker} investigation {id}; waiter stays parked until functional Proof"),
+                vec![id],
+            ),
+            Err(why) => {
+                b.notify(item, super::notice::Cause::Asked {
+                    item: item.into(),
+                    text: format!("Revival remains blocked at generation {generation}: {}; no investigation could be allocated: {why}. Functional Proof is still required.", warning.reason.as_deref().unwrap_or("operation unobserved")),
+                });
+                (rustykrab_core::work::Rung::Surface,
+                    format!("{marker} investigation unavailable: {why}; waiter stays parked until functional Proof"), vec![])
+            }
+        };
+        // A question on NeedsTool can currently requeue on answer, bypassing
+        // Proof. Keep the typed failure visible instead of creating that path.
+        b.rung(
+            item,
+            &mut ladder,
+            rustykrab_core::work::RungEvent {
+                rung,
+                at: b.now,
+                error: Some(error),
+                outcome,
+            },
+        );
+        Ok(changed)
     }
 
     /// Whether a finished capability item's done claim has to wait for its
@@ -676,6 +1038,7 @@ mod tests {
                 cause: "capability".into(),
                 source_item: "c".into(),
                 permission_digest: None,
+                binding: None,
                 probes: vec![],
             })
             .unwrap(),

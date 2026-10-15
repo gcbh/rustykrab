@@ -5,7 +5,8 @@
 //! state; an adapter records what it actually observed. Neither a model's
 //! artifact nor its choice of expected bindings can establish this proof.
 //!
-//! This module performs no operation and changes no work state or authority.
+//! Validation changes no work state or authority. The trusted wrapper relay
+//! delegates a fixed observation to Worker; concrete execution stays in adapters.
 //! Producers must strip model-authored `operation_probe` artifacts before
 //! forwarding reports and write these evidence rows through a trusted path.
 use chrono::{DateTime, Utc};
@@ -130,13 +131,115 @@ impl RegisteredAction {
     }
 }
 
+/// Stable repository identity. A fresh worktree path is deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceIdentity {
+    pub repo: PathBuf,
+    pub base: String,
+}
+
+/// The execution-relevant portion of the real brief, never prompt text or grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveRequirements {
+    pub kind: rustykrab_core::work::WorkKind,
+    pub required_tools: Vec<String>,
+    pub required_mcp_servers: Vec<String>,
+    pub writable_resources: Vec<String>,
+    pub read_only_review: bool,
+    pub workspace: Option<WorkspaceIdentity>,
+}
+
+impl EffectiveRequirements {
+    pub fn from_item(item: &rustykrab_core::work::WorkItem) -> Self {
+        Self {
+            kind: item.kind,
+            required_tools: item.required_tools.clone(),
+            required_mcp_servers: item.required_mcp_servers.clone(),
+            writable_resources: item.writable_resources.clone(),
+            read_only_review: item
+                .artifact_refs
+                .iter()
+                .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true"),
+            workspace: None,
+        }
+    }
+
+    pub fn from_brief(brief: &crate::worker::Brief) -> Self {
+        Self {
+            kind: brief.kind,
+            required_tools: brief.required_tools.clone(),
+            required_mcp_servers: brief.required_mcp_servers.clone(),
+            writable_resources: brief.writable_resources.clone(),
+            read_only_review: brief
+                .artifact_refs
+                .iter()
+                .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true"),
+            workspace: brief.workspace.as_ref().map(|w| WorkspaceIdentity {
+                repo: w.repo.clone(),
+                base: w.base.clone(),
+            }),
+        }
+    }
+
+    /// The actual subscription wrapper's host/native predicate, shared by run
+    /// and probe selection. It confers no eligibility or permission.
+    pub fn uses_host(&self) -> bool {
+        !self.required_tools.is_empty()
+            || self
+                .writable_resources
+                .iter()
+                .any(|r| !r.starts_with("repo:"))
+    }
+
+    pub fn digest(&self) -> String {
+        // Encode the path losslessly; serialization of a non-UTF8 PathBuf must
+        // not panic or alias a different repository identity.
+        binding_digest(&(
+            self.kind,
+            sorted(&self.required_tools),
+            sorted(&self.required_mcp_servers),
+            sorted(&self.writable_resources),
+            self.read_only_review,
+            self.workspace
+                .as_ref()
+                .map(|w| (w.repo.as_os_str().as_encoded_bytes(), &w.base)),
+        ))
+    }
+}
+
+/// Controller-owned execution context. Only this request carries a transient dir.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeContext {
+    pub requirements: EffectiveRequirements,
+    pub bound_dir: Option<PathBuf>,
+}
+
+impl ProbeContext {
+    pub fn from_brief(brief: &crate::worker::Brief) -> Self {
+        Self {
+            requirements: EffectiveRequirements::from_brief(brief),
+            bound_dir: brief.workspace.as_ref().map(|w| w.path.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPath {
+    Local,
+    Host,
+    Native,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeScope {
     pub worker: String,
-    /// Controller-owned execution directory, never inferred from model text.
-    pub bound_dir: Option<PathBuf>,
-    /// Digest of the effective tool ceiling, using tool_ceiling_digest.
+    pub path: ExecutionPath,
+    pub policy_digest: String,
     pub ceiling_digest: String,
 }
 
@@ -146,27 +249,73 @@ pub struct ProbeRequest {
     pub expected: ExpectedOperation,
     pub action: RegisteredAction,
     pub scope: ProbeScope,
+    pub context: ProbeContext,
     pub deadline: Duration,
+}
+
+pub fn sorted(names: &[String]) -> Vec<String> {
+    let mut names = names.to_vec();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Controlled, credential-free structural data only. Callers normalize set fields;
+/// ordered arrays such as command arguments must retain their order.
+pub fn binding_digest(value: &impl Serialize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("serializable binding"))
+    )
 }
 
 /// Stable across registry order and duplicate names; contains no secret values.
 pub fn tool_ceiling_digest(names: &[String]) -> String {
-    let mut names = names.to_vec();
-    names.sort();
-    names.dedup();
-    format!("{:x}", Sha256::digest(serde_json::to_vec(&names).unwrap()))
+    binding_digest(&sorted(names))
 }
 
-/// The first two actions establish availability independent of repository
-/// content. Incidental worktree paths and deadlines do not change that claim.
-/// Effective permission/configuration changes also require a fresh generation.
-pub fn probe_inputs_digest(action: &RegisteredAction, scope: &ProbeScope) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&(action, &scope.worker, &scope.ceiling_digest)).unwrap()
-        )
-    )
+/// Availability proof binds current requirements/path/policy, excluding incidental
+/// run/worktree/deadline values. It still does not attest repository contents.
+pub fn probe_inputs_digest(
+    action: &RegisteredAction,
+    scope: &ProbeScope,
+    context: &ProbeContext,
+) -> String {
+    binding_digest(&(action, scope, context.requirements.digest()))
+}
+
+/// Trusted wrapper relay: validate its current outer boundary, ask the child
+/// through the child's own boundary, then re-attest only a matching observation.
+/// A model report cannot enter this path. No authority or action is expanded.
+pub async fn probe_through(
+    parent: &dyn crate::worker::Worker,
+    child: &dyn crate::worker::Worker,
+    request: &ProbeRequest,
+) -> OperationProbe {
+    let unobserved = |why| request.expected.observation(ProbeOutcome::Unobserved, why);
+    if !request.valid() || parent.probe_scope(&request.context).as_ref() != Some(&request.scope) {
+        return unobserved("effective wrapper binding changed since probe selection");
+    }
+    let Some(scope) = child.probe_scope(&request.context) else {
+        return unobserved("selected child has no probe scope");
+    };
+    let mut child_request = request.clone();
+    child_request.expected.executor = scope.worker.clone();
+    child_request.expected.inputs_digest =
+        probe_inputs_digest(&request.action, &scope, &request.context);
+    child_request.scope = scope;
+    let observed = child.probe(&child_request).await;
+    let matches = observed.operation == child_request.expected.operation
+        && observed.executor == child_request.expected.executor
+        && observed.inputs_digest == child_request.expected.inputs_digest
+        && observed.generation == child_request.expected.generation
+        && observed.run == child_request.expected.run;
+    if !matches {
+        return unobserved("child observation does not match the delegated binding");
+    }
+    request
+        .expected
+        .observation(observed.outcome, observed.observation)
 }
 
 impl ProbeRequest {
@@ -176,12 +325,21 @@ impl ProbeRequest {
             && self.expected.executor == self.scope.worker
             && self.expected.operation == self.action.operation()
             && digest(&self.scope.ceiling_digest)
-            && self.expected.inputs_digest == probe_inputs_digest(&self.action, &self.scope)
+            && digest(&self.scope.policy_digest)
+            && self.expected.inputs_digest
+                == probe_inputs_digest(&self.action, &self.scope, &self.context)
             && self
-                .scope
+                .context
                 .bound_dir
                 .as_ref()
                 .is_none_or(|p| p.is_absolute())
+            && (self.context.bound_dir.is_none() || self.context.requirements.workspace.is_some())
+            && self
+                .context
+                .requirements
+                .workspace
+                .as_ref()
+                .is_none_or(|w| w.repo.is_absolute() && !w.base.trim().is_empty())
             && !self.deadline.is_zero()
             && self.deadline <= Duration::from_secs(30)
     }
@@ -508,9 +666,21 @@ mod tests {
             tool_ceiling_digest(&names),
             tool_ceiling_digest(&["work_resources".into(), "exec".into(), "exec".into()])
         );
+        let context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec![],
+                read_only_review: false,
+                workspace: None,
+            },
+            bound_dir: None,
+        };
         let scope = ProbeScope {
             worker: "pinch".into(),
-            bound_dir: None,
+            path: ExecutionPath::Local,
+            policy_digest: tool_ceiling_digest(&[]),
             ceiling_digest: tool_ceiling_digest(&names),
         };
         let action = RegisteredAction::ToolCallable {
@@ -521,12 +691,13 @@ mod tests {
             expected: ExpectedOperation {
                 operation: action.operation(),
                 executor: scope.worker.clone(),
-                inputs_digest: probe_inputs_digest(&action, &scope),
+                inputs_digest: probe_inputs_digest(&action, &scope, &context),
                 generation: "original:2".into(),
                 run: "probe-1".into(),
             },
             action,
             scope,
+            context,
             deadline: Duration::from_secs(30),
         };
         assert!(request.valid());
@@ -543,12 +714,18 @@ mod tests {
                     }
                 }
                 4 => changed.deadline = Duration::from_secs(31),
-                _ => changed.scope.bound_dir = Some("relative".into()),
+                _ => changed.context.bound_dir = Some("relative".into()),
             }
             assert!(!changed.valid(), "change {change}");
         }
         let mut moved = request.clone();
-        moved.scope.bound_dir = Some("/tmp/new-probe-worktree".into());
+        moved.context.requirements.workspace = Some(WorkspaceIdentity {
+            repo: "/fixture".into(),
+            base: "base".into(),
+        });
+        moved.expected.inputs_digest =
+            probe_inputs_digest(&moved.action, &moved.scope, &moved.context);
+        moved.context.bound_dir = Some("/tmp/new-probe-worktree".into());
         assert!(
             moved.valid(),
             "the registered availability claims do not attest repository content"
@@ -834,5 +1011,65 @@ mod tests {
             store.work_get(&item.id).await.unwrap().unwrap().status,
             Status::Queued
         );
+    }
+    #[test]
+    fn probe_identity_normalizes_sets_but_changes_with_policy_path_or_requirements() {
+        let mut context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec!["exec".into(), "read".into()],
+                required_mcp_servers: vec!["fixture".into()],
+                writable_resources: vec!["repo:/fixture".into()],
+                read_only_review: false,
+                workspace: Some(WorkspaceIdentity {
+                    repo: "/fixture".into(),
+                    base: "commit-a".into(),
+                }),
+            },
+            bound_dir: Some("/tmp/first-probe".into()),
+        };
+        let scope = ProbeScope {
+            worker: "same-worker".into(),
+            path: ExecutionPath::Host,
+            policy_digest: tool_ceiling_digest(&["policy-a".into()]),
+            ceiling_digest: tool_ceiling_digest(&["exec".into()]),
+        };
+        let action = RegisteredAction::BinaryAvailable {
+            binary: "node".into(),
+        };
+        let original = probe_inputs_digest(&action, &scope, &context);
+        context.requirements.required_tools = vec!["read".into(), "exec".into(), "exec".into()];
+        context
+            .requirements
+            .required_mcp_servers
+            .push("fixture".into());
+        context
+            .requirements
+            .writable_resources
+            .push("repo:/fixture".into());
+        context.bound_dir = Some("/tmp/different-invocation".into());
+        assert_eq!(original, probe_inputs_digest(&action, &scope, &context));
+        for case in 0..8 {
+            let mut c = context.clone();
+            let mut s = scope.clone();
+            match case {
+                0 => s.path = ExecutionPath::Native,
+                1 => s.policy_digest = tool_ceiling_digest(&["policy-b".into()]),
+                2 => c.requirements.workspace.as_mut().unwrap().base = "commit-b".into(),
+                3 => c.requirements.read_only_review = true,
+                4 => c.requirements.required_tools.push("work_resources".into()),
+                5 => c.requirements.required_mcp_servers.push("different".into()),
+                6 => c
+                    .requirements
+                    .writable_resources
+                    .push("file:/different".into()),
+                _ => s.worker = "another-worker".into(),
+            }
+            assert_ne!(
+                original,
+                probe_inputs_digest(&action, &s, &c),
+                "binding change {case}"
+            );
+        }
     }
 }

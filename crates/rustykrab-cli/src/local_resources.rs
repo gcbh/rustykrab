@@ -190,9 +190,9 @@ impl Worker for CodingWorker {
     }
     fn probe_scope(
         &self,
-        bound_dir: Option<PathBuf>,
+        context: &rustykrab_control::capability_proof::ProbeContext,
     ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
-        self.worker.probe_scope(bound_dir)
+        self.worker.probe_scope(context)
     }
     async fn probe(
         &self,
@@ -286,8 +286,8 @@ mod tests {
     #[tokio::test]
     async fn local_coding_forwards_probes_to_its_local_worker() {
         use rustykrab_control::capability_proof::{
-            probe_inputs_digest, ExpectedOperation, ProbeOutcome, ProbeRequest, ProbeScope,
-            RegisteredAction,
+            probe_inputs_digest, EffectiveRequirements, ExpectedOperation, ProbeContext,
+            ProbeOutcome, ProbeRequest, ProbeScope, RegisteredAction, WorkspaceIdentity,
         };
         let mut c = config("http://127.0.0.1:11434");
         c.repositories = vec![PathBuf::from("/fixture")];
@@ -308,26 +308,38 @@ mod tests {
         let node = RegisteredAction::BinaryAvailable {
             binary: "node".into(),
         };
-        let request = |scope: ProbeScope| ProbeRequest {
+        let context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec![],
+                read_only_review: false,
+                workspace: None,
+            },
+            bound_dir: None,
+        };
+        let request = |scope: ProbeScope, context: ProbeContext| ProbeRequest {
             expected: ExpectedOperation {
                 operation: node.operation(),
                 executor: worker.name().to_string(),
-                inputs_digest: probe_inputs_digest(&node, &scope),
+                inputs_digest: probe_inputs_digest(&node, &scope, &context),
                 generation: "fixture:1".into(),
                 run: "probe-fixture".into(),
             },
             action: node.clone(),
             scope,
+            context,
             deadline: std::time::Duration::from_secs(10),
         };
 
         // Without a bound directory the repository shell has no exec, so the
         // probe cannot run and says so.
         let unbound = worker
-            .probe_scope(None)
+            .probe_scope(&context)
             .expect("the wrapper has its local worker's probe scope");
         assert_eq!(unbound.worker, worker.name());
-        let probe = worker.probe(&request(unbound)).await;
+        let probe = worker.probe(&request(unbound, context.clone())).await;
         assert_eq!(
             probe.outcome,
             ProbeOutcome::Unobserved,
@@ -343,11 +355,18 @@ mod tests {
         // there through its own exec: Ok where the host has node, Failed
         // where it does not, never unobserved.
         let dir = tempfile::tempdir().unwrap();
+        let mut context = context;
+        context.bound_dir = Some(dir.path().to_path_buf());
+        context.requirements.workspace = Some(WorkspaceIdentity {
+            repo: "/fixture".into(),
+            base: "base".into(),
+        });
+        context.requirements.writable_resources = vec!["repo:/fixture".into()];
         let bound = worker
-            .probe_scope(Some(dir.path().to_path_buf()))
+            .probe_scope(&context)
             .expect("the wrapper has its local worker's probe scope");
-        assert_eq!(bound.bound_dir.as_deref(), Some(dir.path()));
-        let probe = worker.probe(&request(bound)).await;
+        assert_eq!(context.bound_dir.as_deref(), Some(dir.path()));
+        let probe = worker.probe(&request(bound, context)).await;
         let host_has_node = std::process::Command::new("node")
             .arg("--version")
             .current_dir(dir.path())

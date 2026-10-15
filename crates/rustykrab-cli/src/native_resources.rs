@@ -107,19 +107,8 @@ impl NativeWorker {
             host,
         })
     }
-    fn uses_host(brief: &Brief) -> bool {
-        !brief.required_tools.is_empty()
-            || brief
-                .writable_resources
-                .iter()
-                .any(|r| !r.starts_with("repo:"))
-    }
 }
 #[async_trait]
-/// `probe_scope` and `probe` keep the trait's defaults (no scope,
-/// `Unobserved`) on purpose: a run goes to the native CLI or to the host half
-/// per brief, and a probe through the host half would not attest the native
-/// CLI's boundary. Binding a probe to the path a run would take is open work.
 impl Worker for NativeWorker {
     fn name(&self) -> &str {
         self.native.name()
@@ -140,16 +129,59 @@ impl Worker for NativeWorker {
         caps
     }
     fn accepts(&self, item: &WorkItem) -> bool {
-        let host = !item.required_tools.is_empty()
-            || item
-                .writable_resources
-                .iter()
-                .any(|r| !r.starts_with("repo:"));
+        let host =
+            rustykrab_control::capability_proof::EffectiveRequirements::from_item(item).uses_host();
         if host {
             self.host.accepts(item)
         } else {
             self.native.accepts(item)
         }
+    }
+    fn access_profile(&self) -> Value {
+        serde_json::json!({"native": self.native.access_profile(), "host": self.host.access_profile()})
+    }
+    fn probe_scope(
+        &self,
+        context: &rustykrab_control::capability_proof::ProbeContext,
+    ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
+        use rustykrab_control::capability_proof::{
+            binding_digest, tool_ceiling_digest, ExecutionPath, ProbeScope,
+        };
+        let host = context.requirements.uses_host();
+        let ceiling_digest = if host {
+            self.host.probe_scope(context)?.ceiling_digest
+        } else {
+            tool_ceiling_digest(&[])
+        };
+        Some(ProbeScope {
+            worker: self.name().into(),
+            path: if host {
+                ExecutionPath::Host
+            } else {
+                ExecutionPath::Native
+            },
+            policy_digest: binding_digest(&self.access_profile()),
+            ceiling_digest,
+        })
+    }
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        use rustykrab_control::capability_proof::{probe_through, ExecutionPath, ProbeOutcome};
+        if !request.valid() || self.probe_scope(&request.context).as_ref() != Some(&request.scope) {
+            return request.expected.observation(
+                ProbeOutcome::Unobserved,
+                "effective native binding changed since probe selection",
+            );
+        }
+        if request.scope.path != ExecutionPath::Host {
+            return request.expected.observation(
+                ProbeOutcome::Unobserved,
+                "native CLI execution boundary has no registered observation producer",
+            );
+        }
+        probe_through(self, &self.host, request).await
     }
     fn isolates_worktree(&self) -> bool {
         self.native.isolates_worktree() && self.host.isolates_worktree()
@@ -181,7 +213,9 @@ impl Worker for NativeWorker {
         self.native.stop(run);
     }
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error> {
-        if Self::uses_host(&brief) {
+        if rustykrab_control::capability_proof::EffectiveRequirements::from_brief(&brief)
+            .uses_host()
+        {
             self.host.run(brief).await
         } else {
             self.native.run(brief).await
@@ -265,5 +299,171 @@ mod tests {
             );
             assert!(worker.capabilities().tools.iter().any(|t| t == "work_plan"));
         }
+    }
+    fn context() -> rustykrab_control::capability_proof::ProbeContext {
+        use rustykrab_control::capability_proof::*;
+        ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec!["repo:/fixture".into()],
+                read_only_review: false,
+                workspace: Some(WorkspaceIdentity {
+                    repo: "/fixture".into(),
+                    base: "fixture-base".into(),
+                }),
+            },
+            bound_dir: None,
+        }
+    }
+    fn request(
+        worker: &NativeWorker,
+        context: rustykrab_control::capability_proof::ProbeContext,
+    ) -> rustykrab_control::capability_proof::ProbeRequest {
+        use rustykrab_control::capability_proof::*;
+        let scope = worker.probe_scope(&context).unwrap();
+        let action = RegisteredAction::BinaryAvailable {
+            binary: "node".into(),
+        };
+        ProbeRequest {
+            expected: ExpectedOperation {
+                operation: action.operation(),
+                executor: worker.name().into(),
+                inputs_digest: probe_inputs_digest(&action, &scope, &context),
+                generation: "fixture:1".into(),
+                run: "native-probe-fixture".into(),
+            },
+            action,
+            scope,
+            context,
+            deadline: std::time::Duration::from_secs(10),
+        }
+    }
+    fn fixture_worker(
+        root: &std::path::Path,
+        kind: WorkerKind,
+        denied: &[&str],
+        model: &str,
+    ) -> NativeWorker {
+        let spec: rustykrab_control::registry::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "kind":kind, "repos":["/fixture"], "model":model,
+            "require_max":kind == WorkerKind::ClaudeCode, "require_chatgpt":kind == WorkerKind::Codex,
+            "denied_tools":denied,
+        })).unwrap();
+        let mut config = ExternalConfig::from_spec(&spec, root).unwrap();
+        config.command = root.join("cli-must-stay-idle");
+        NativeWorker::new(
+            "fixture",
+            config,
+            HostTools {
+                tools: vec![Arc::new(rustykrab_tools::ExecTool::new())],
+                backend: Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
+                transcripts: Arc::new(Discard),
+                integrations: false,
+            },
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn subscription_probes_bind_the_real_host_path_and_never_substitute_for_native() {
+        use rustykrab_control::capability_proof::*;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let cli = root.path().join("cli-must-stay-idle");
+        std::fs::write(&cli, b"#!/bin/sh\ntouch \"$0.invoked\"\nexit 1\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for kind in [WorkerKind::ClaudeCode, WorkerKind::Codex] {
+            let worker = fixture_worker(root.path(), kind, &[], "fixture-model");
+            let native = request(&worker, context());
+            assert_eq!(native.scope.path, ExecutionPath::Native);
+            assert_eq!(
+                worker.probe(&native).await.outcome,
+                ProbeOutcome::Unobserved
+            );
+            let mut host_context = native.context.clone();
+            host_context.bound_dir = Some(root.path().to_path_buf());
+            host_context.requirements.required_tools = vec!["exec".into()];
+            let host = request(&worker, host_context.clone());
+            assert_eq!(host.scope.path, ExecutionPath::Host);
+            let receipt = worker.probe(&host).await;
+            let node = std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            assert_eq!(
+                receipt.outcome,
+                if node {
+                    ProbeOutcome::Ok
+                } else {
+                    ProbeOutcome::Failed
+                },
+                "{}",
+                receipt.observation
+            );
+            assert_eq!(
+                receipt.inputs_digest, host.expected.inputs_digest,
+                "outer wrapper binding is attested"
+            );
+            // Reusing a valid host receipt/request cannot prove a native run.
+            let mut changed = host.clone();
+            changed.context = native.context;
+            changed.expected.inputs_digest =
+                probe_inputs_digest(&changed.action, &changed.scope, &changed.context);
+            assert!(changed.valid());
+            assert_eq!(
+                worker.probe(&changed).await.outcome,
+                ProbeOutcome::Unobserved
+            );
+            let other_policy = fixture_worker(root.path(), kind, &[], "different-model");
+            assert_eq!(
+                other_policy.probe_scope(&host_context).unwrap().path,
+                ExecutionPath::Host
+            );
+            assert_ne!(
+                other_policy
+                    .probe_scope(&host_context)
+                    .unwrap()
+                    .policy_digest,
+                host.scope.policy_digest
+            );
+            assert_eq!(
+                other_policy.probe(&host).await.outcome,
+                ProbeOutcome::Unobserved
+            );
+            host_context.requirements.read_only_review = true;
+            assert_eq!(
+                worker.probe(&request(&worker, host_context)).await.outcome,
+                ProbeOutcome::Unobserved
+            );
+        }
+        assert!(
+            !root.path().join("cli-must-stay-idle.invoked").exists(),
+            "no probe launched a CLI/model"
+        );
+    }
+    #[tokio::test]
+    async fn subscription_host_probe_cannot_bypass_denied_shell_or_missing_workspace() {
+        use rustykrab_control::capability_proof::*;
+        let root = tempfile::tempdir().unwrap();
+        let worker = fixture_worker(
+            root.path(),
+            WorkerKind::ClaudeCode,
+            &["Bash(git push*)"],
+            "fixture",
+        );
+        let mut context = context();
+        context.requirements.required_tools = vec!["exec".into()];
+        context.bound_dir = Some(root.path().to_path_buf());
+        let probe = request(&worker, context);
+        assert_eq!(probe.scope.path, ExecutionPath::Host);
+        assert_eq!(worker.probe(&probe).await.outcome, ProbeOutcome::Unobserved);
+        let worker = fixture_worker(root.path(), WorkerKind::Codex, &[], "fixture");
+        let mut context = probe.context;
+        context.bound_dir = None;
+        assert_eq!(
+            worker.probe(&request(&worker, context)).await.outcome,
+            ProbeOutcome::Unobserved
+        );
     }
 }

@@ -255,15 +255,14 @@ pub trait Worker: Send + Sync {
         false
     }
 
-    /// The scope a registered probe on this worker runs in, for the run
-    /// directory `bound_dir` the controller chose: the worker's name, that
-    /// directory and a digest of its effective tool ceiling there
-    /// ([`crate::capability_proof::ProbeScope`]). The controller binds an
-    /// expected operation to it before asking for a probe. Default: `None`,
-    /// a worker that cannot run registered probes.
+    /// The selected execution path and current policy/tool ceiling for the
+    /// controller's effective brief requirements. Transient directories live
+    /// only in ProbeContext and never enter stable identity. A scope alone is
+    /// not proof; the actual producer may still return Unobserved. Default:
+    /// None, a worker with no registered observation boundary.
     fn probe_scope(
         &self,
-        _bound_dir: Option<std::path::PathBuf>,
+        _context: &crate::capability_proof::ProbeContext,
     ) -> Option<crate::capability_proof::ProbeScope> {
         None
     }
@@ -673,10 +672,22 @@ mod discussion_excerpt_tests {
     #[tokio::test]
     async fn a_worker_without_probes_observes_nothing() {
         use crate::capability_proof::{
-            ExpectedOperation, ProbeOutcome, ProbeRequest, ProbeScope, RegisteredAction,
+            EffectiveRequirements, ExecutionPath, ExpectedOperation, ProbeContext, ProbeOutcome,
+            ProbeRequest, ProbeScope, RegisteredAction,
         };
         let w = Silent;
-        assert!(w.probe_scope(None).is_none());
+        let context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec![],
+                read_only_review: false,
+                workspace: None,
+            },
+            bound_dir: None,
+        };
+        assert!(w.probe_scope(&context).is_none());
         assert_eq!(
             w.access_profile(),
             serde_json::to_value(w.capabilities()).unwrap()
@@ -695,9 +706,11 @@ mod discussion_excerpt_tests {
             },
             scope: ProbeScope {
                 worker: "silent".into(),
-                bound_dir: None,
+                path: ExecutionPath::Local,
+                policy_digest: "0".repeat(64),
                 ceiling_digest: "0".repeat(64),
             },
+            context,
             deadline: std::time::Duration::from_secs(5),
         };
         let probe = w.probe(&request).await;
