@@ -17,6 +17,15 @@ tokens, API keys and arbitrary parent variables remain excluded. No toolchain
 installation, user configuration edit, native inference or live daemon change
 is part of the repair.
 
+The command environment also forces `RUSTUP_AUTO_INSTALL=0`: project toolchain
+overrides and `cargo +<toolchain>` must use an installed toolchain instead of
+implicitly downloading into the host Rustup store. This flag was introduced in
+[Rustup 1.28.1](https://blog.rust-lang.org/2025/03/04/Rustup-1.28.1/) and is
+documented in the [Rustup environment contract](https://rust-lang.github.io/rustup/environment-variables.html).
+The execution fixture used Rustup 1.29.0. Older releases may ignore the flag;
+this default does not replace filesystem/network permissions or prevent an
+explicit environment override in a permitted command.
+
 The existing registered `binary.available/cargo` probe still means version
 discovery at the actual host boundary. It does not establish that any requested
 repository builds, dependencies are cached or private registries are authorized.
@@ -35,15 +44,27 @@ Actual host verification also passed through the same ExecTool API: Cargo
 1.98.0 version discovery and `cargo check --offline` on a dependency-free Rust
 library, each exit 0. The fixture used synthetic parent credential canaries;
 CARGO_HOME, registry tokens and API keys did not reach the command environment.
-It installed nothing and edited no operator configuration.
+The host Rustup settings hash and toolchain-entry listing hash were unchanged
+before/after that execution. It installed nothing and edited no operator
+configuration.
 
-Two negative controls each fail all three subprocess regressions (exit 101):
-omit the RUSTUP_HOME forwarding, or omit environment clearing. The first loses
-the installation binding; the second exposes the synthetic credential canaries.
+Three negative controls each fail all three subprocess regressions (exit 101):
+omit the RUSTUP_HOME forwarding, omit environment clearing, or enable automatic
+installation. They catch missing installation binding, exposed synthetic
+credential canaries, and an overridden no-auto-install default respectively.
 The exact production source was restored, all three regressions passed again,
 and the real Cargo version/offline check passed again. The relative-location
 fixture initially compared macOS `/var` and `/private/var` spellings; its assertion
 now compares canonical locations, with no runtime behavior change for that fix.
+
+Actual missing-toolchain checks use an empty private RUSTUP_HOME and a Cargo
+wrapper that confines Rustup's distribution/update URLs to a loopback-only 404
+mirror. Through ExecTool, both a project `rust-toolchain.toml` and explicit
+`cargo +stable` fail with "not installed": zero mirror requests and no installed
+toolchain directories. Controls using the same real Rustup with automatic
+installation enabled each attempt two requests to that private mirror. Nothing
+is downloaded from the public service or written to the operator's store.
+Receipt: `cargo-env-missing-toolchain.json` and its log.
 
 Task receipts: `cargo-env-preflight.json`, `cargo-env-real-exec.json`, and
 `cargo-env-negative-controls.json`, with their associated logs. Required local checks passed: **2,333 workspace tests, 0 failed, 32 ignored**

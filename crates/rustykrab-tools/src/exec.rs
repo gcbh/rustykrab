@@ -657,7 +657,10 @@ impl Tool for ExecTool {
             .env_clear()
             .env("PATH", &path)
             .env("HOME", "/tmp/rustykrab-home")
-            .env("LANG", "C.UTF-8");
+            .env("LANG", "C.UTF-8")
+            // Use installed toolchains; an ordinary Cargo invocation must not
+            // implicitly download into the operator's shared Rustup store.
+            .env("RUSTUP_AUTO_INSTALL", "0");
         if let Some(home) = rustup_home() {
             process.env("RUSTUP_HOME", home);
         }
@@ -743,6 +746,7 @@ mod environment_tests {
             .env("RK_EXEC_WORKER_DIR", &worker)
             .env("CARGO_HOME", root.path().join("credential-canary"))
             .env("CARGO_REGISTRIES_CRATES_IO_TOKEN", "fixture-only-token")
+            .env("RUSTUP_AUTO_INSTALL", "1")
             .env("ANTHROPIC_API_KEY", "fixture-only-key")
             .env("RK_EXEC_PARENT_SECRET", "fixture-only-secret");
         if let Some(explicit) = explicit {
@@ -793,6 +797,7 @@ mod environment_tests {
                     .filter_map(|line| line.split_once('='))
                     .collect();
                 assert_eq!(vars.get("HOME"), Some(&"/tmp/rustykrab-home"));
+                assert_eq!(vars.get("RUSTUP_AUTO_INSTALL"), Some(&"0"));
                 let home = vars.get("RUSTUP_HOME").expect("Rustup location is missing");
                 assert_eq!(
                     Path::new(home).canonicalize().unwrap(),
@@ -838,8 +843,20 @@ mod environment_tests {
                         json!({"cargo_version":cargo,"offline_check":check,
                             "isolated_home":vars.get("HOME"),
                             "rustup_location_forwarded":true,
+                            "rustup_auto_install":vars.get("RUSTUP_AUTO_INSTALL"),
                             "cargo_home_or_credentials_forwarded":false})
                     );
+                }
+                if std::env::var_os("RK_EXEC_VERIFY_MISSING_CARGO").is_some() {
+                    for command in ["cargo --version", "cargo +stable --version"] {
+                        let cargo = tool.execute(json!({"command":command})).await.unwrap();
+                        assert_ne!(cargo["exit_code"], 0, "{cargo}");
+                        assert!(cargo["stderr"].as_str().unwrap().contains("not installed"));
+                        println!(
+                            "MISSING_EXEC_RECEIPT {}",
+                            json!({"command":command,"result":cargo})
+                        );
+                    }
                 }
             });
     }
