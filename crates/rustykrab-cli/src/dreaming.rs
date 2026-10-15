@@ -285,7 +285,7 @@ impl Dreaming {
                 .iter()
                 .filter(|r| r.created_at > Utc::now() - TimeDelta::hours(24))
                 .count()
-                >= 3
+                >= PROJECT_REVIEW_DAILY_LIMIT
             {
                 admission.decision = ReviewAdmissionDecision::DailyLimit;
             } else if !projects.iter().any(|p| {
@@ -319,6 +319,8 @@ impl Dreaming {
             rubric: RUBRIC.into(),
             metrics,
             reviews: reviews.into_iter().take(10).map(Into::into).collect(),
+            admission_explanation: Some(admission.decision.explanation()),
+            daily_review_limit: Some(PROJECT_REVIEW_DAILY_LIMIT),
             admission: Some(admission),
             last_project_review_completed_at,
             last_project_review_failed_at,
@@ -365,7 +367,7 @@ impl Dreaming {
                 .iter()
                 .filter(|r| r.created_at > Utc::now() - TimeDelta::hours(24))
                 .count()
-                >= 3
+                >= PROJECT_REVIEW_DAILY_LIMIT
             {
                 return Ok(());
             }
@@ -1949,15 +1951,17 @@ mod tests {
             let mut old = serde_json::to_value(&view).unwrap();
             for key in [
                 "admission",
+                "admission_explanation",
+                "daily_review_limit",
                 "last_project_review_completed_at",
                 "last_project_review_failed_at",
             ] {
                 old.as_object_mut().unwrap().remove(key);
             }
-            assert!(serde_json::from_value::<DreamingView>(old)
-                .unwrap()
-                .admission
-                .is_none());
+            let legacy = serde_json::from_value::<DreamingView>(old).unwrap();
+            assert!(legacy.admission.is_none());
+            assert!(legacy.admission_explanation.is_none());
+            assert!(legacy.daily_review_limit.is_none());
         }
     }
 
@@ -1990,6 +1994,11 @@ mod tests {
         fresh.advance(true).await.unwrap();
         let view = fresh.view().await.unwrap();
         assert_eq!(view.metrics.reviews, 3);
+        assert_eq!(view.daily_review_limit, Some(PROJECT_REVIEW_DAILY_LIMIT));
+        assert_eq!(
+            view.admission_explanation.as_deref(),
+            Some("the 3-cycle limit for the last 24 hours has been reached")
+        );
         assert_eq!(
             view.admission.unwrap().decision,
             ReviewAdmissionDecision::DailyLimit
