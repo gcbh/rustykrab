@@ -7,6 +7,13 @@ use tokio::time::timeout;
 
 const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100KB
 
+/// A command's time limit when the call names none: long enough for a
+/// test suite or a build step, as feather-harness's 120 s default is.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// The longest a call may ask for. The runner's own limit on an exec call
+/// sits just above it, so the command's limit is the one that applies.
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+
 /// Commands that are explicitly allowed for execution.
 /// All other commands are rejected to prevent arbitrary command injection.
 const ALLOWED_COMMANDS: &[&str] = &[
@@ -573,7 +580,7 @@ impl Tool for ExecTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 30, max: 120)"
+                        "description": "Timeout in seconds (default: 120, max: 600). Raise it for a long build or test run."
                     }
                 },
                 "required": ["command"]
@@ -593,7 +600,10 @@ impl Tool for ExecTool {
             )))
         })?;
 
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30).min(120);
+        let timeout_secs = args["timeout_secs"]
+            .as_u64()
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(MAX_TIMEOUT_SECS);
 
         // Inherit the user's PATH so tools installed via homebrew, cargo,
         // pip, nvm, etc. are available. Fall back to a sensible default.
