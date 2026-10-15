@@ -231,6 +231,10 @@ pub(super) const SCRIPTED_USAGE: crate::worker::RunUsage = crate::worker::RunUsa
     reminders: 2,
 };
 
+/// How long [`Harness::drain_settled`] waits for runs still working
+/// before it fails the test.
+pub(super) const SETTLE_LIMIT: Duration = Duration::from_secs(30);
+
 // ── canned results and drafts ───────────────────────────────────────────
 
 pub(super) fn slug(title: &str) -> String {
@@ -538,6 +542,59 @@ impl Harness {
             if quiet && settled {
                 break;
             }
+        }
+        total
+    }
+
+    /// [`Harness::step`] that waits for every live run to finish, up to
+    /// [`SETTLE_LIMIT`], before it ticks: for a test that steps by hand and
+    /// needs the runs in flight reconciled by this tick, not the next.
+    pub async fn step_settled(&self) -> TickReport {
+        self.ctl.wait_for_runs(SETTLE_LIMIT).await;
+        let running: Vec<String> = {
+            let state = self.ctl.state();
+            state
+                .runs
+                .iter()
+                .filter(|(_, r)| !r.handle.is_finished())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        assert!(
+            running.is_empty(),
+            "step_settled: still in flight after {SETTLE_LIMIT:?}: {running:?}"
+        );
+        self.tick().await
+    }
+
+    /// [`Harness::drain`] for a script in which no run hangs or waits on a
+    /// gate still closed: settled means every run has finished and been
+    /// reconciled, not that one 300 ms step was quiet. `drain` takes a run
+    /// still working after a quiet step for one parked on purpose, so a
+    /// slow run (real git under machine load) ended the drain early and
+    /// the test saw half the work. A run still in flight after
+    /// [`SETTLE_LIMIT`] fails the test and names it.
+    pub async fn drain_settled(&self) -> TickReport {
+        let deadline = tokio::time::Instant::now() + SETTLE_LIMIT;
+        let mut total = TickReport::default();
+        loop {
+            let r = self.step().await;
+            let quiet = r.leased.is_empty()
+                && r.reconciled.is_empty()
+                && r.transitions == 0
+                && r.notices == 0;
+            merge(&mut total, r);
+            let running: Vec<String> = {
+                let state = self.ctl.state();
+                if quiet && state.finished.is_empty() && state.runs.is_empty() {
+                    break;
+                }
+                state.runs.keys().cloned().collect()
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drain_settled: still in flight after {SETTLE_LIMIT:?}: {running:?}"
+            );
         }
         total
     }

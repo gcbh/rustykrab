@@ -32,7 +32,7 @@ async fn repaired_handoffs_resume_old_size_holds_and_integrate_verified_history(
     let first = h
         .file_one(code(&repo, WorkerKind::ClaudeCode, "first", None))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&first).await, Status::Done);
     std::fs::write(repo.path().join("upstream.txt"), "new repository work").unwrap();
     let repository_head = commit_all(repo.path(), "upstream change");
@@ -69,7 +69,7 @@ async fn repaired_handoffs_resume_old_size_holds_and_integrate_verified_history(
         ),
     );
     h.ctl.commit(batch, &mut Default::default()).await.unwrap();
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&next).await, Status::Done);
     assert_eq!(head(repo.path()).unwrap(), repository_head);
     let brief = {
@@ -131,7 +131,7 @@ async fn handoff_recovery_preserves_an_independent_user_decision() {
     );
     h.ctl.record_question(&mut batch, question).await.unwrap();
     h.ctl.commit(batch, &mut Default::default()).await.unwrap();
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(
         h.status(&item).await,
         Status::Blocked(BlockedReason::NeedsDecision)
@@ -199,7 +199,7 @@ async fn handoff_recovery_does_not_discard_oversized_current_requirements() {
         )
         .await
         .unwrap();
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(
         h.status(&item).await,
         Status::Blocked(BlockedReason::NeedsDecision)
@@ -348,7 +348,7 @@ async fn claude_to_codex_rehydrates_archived_progress_after_a_fresh_controller()
     let first = h
         .file_one(code(&repo, WorkerKind::ClaudeCode, "first", None))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&first).await, Status::Done);
     let first_commit = h
         .store()
@@ -420,7 +420,7 @@ async fn claude_to_codex_rehydrates_archived_progress_after_a_fresh_controller()
             Some(project.project.id),
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&next).await, Status::Done);
     let received = codex.received.lock().unwrap()[0].clone();
     assert_eq!(received.workspace.as_ref().unwrap().base, first_commit);
@@ -472,7 +472,7 @@ async fn missing_or_ambiguous_project_does_not_start_a_worker() {
             Some(ProjectId::new()),
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(
         h.status(&item).await,
         Status::Blocked(BlockedReason::NeedsDecision)
@@ -491,7 +491,7 @@ async fn missing_or_ambiguous_project_does_not_start_a_worker() {
     let item = h
         .file_one(code(&repo, WorkerKind::Codex, "ambiguous", None))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(
         h.status(&item).await,
         Status::Blocked(BlockedReason::NeedsDecision)
@@ -539,7 +539,7 @@ async fn unfinished_attempts_have_inspection_pointers_and_never_supply_the_code_
             Some(project.project.id),
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_ne!(h.status(&first).await, Status::Done);
     let codex = Coder::new(WorkerKind::Codex, &repo);
     h.ctl = Controller::new(h.store().clone(), vec![codex.clone()], h.config.clone())
@@ -552,7 +552,7 @@ async fn unfinished_attempts_have_inspection_pointers_and_never_supply_the_code_
             Some(project.project.id),
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&next).await, Status::Done);
     let received = codex.received.lock().unwrap()[0].clone();
     assert_eq!(received.workspace.unwrap().base, original);
@@ -589,7 +589,7 @@ async fn accumulated_project_history_does_not_overflow_a_small_execution_slice()
             value: project.project.id.to_string(),
         });
         h.file_one(old).await;
-        h.drain().await;
+        h.drain_settled().await;
     }
     let coder = Coder::new(WorkerKind::Codex, &repo);
     h.ctl = Controller::new(h.store().clone(), vec![coder.clone()], h.config.clone())
@@ -602,7 +602,7 @@ async fn accumulated_project_history_does_not_overflow_a_small_execution_slice()
             Some(project.project.id),
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&next).await, Status::Done);
     let brief = coder.received.lock().unwrap()[0].clone();
     let context = brief.project_context.unwrap();

@@ -273,7 +273,7 @@ async fn two_claim_mismatches(h: &Harness, agent: &Agent, repo: &Repo) -> (Strin
     agent.on("First", &[Act::ClaimWrongPath, Act::ClaimWrongPath]);
     agent.on("Second", &[Act::ClaimWrongPath]);
     let first = h.file_one(code_draft("First change", repo)).await;
-    h.drain().await;
+    h.drain_settled().await;
     let second = h.file_one(code_draft("Second change", repo)).await;
     (first, second)
 }
@@ -296,7 +296,7 @@ async fn a_fix_item_that_lands_nothing_parks_with_its_conclusion_and_is_not_done
         )],
     );
     let ledger = h.file_one(draft("ledger", "Reconcile the ledger")).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let fix = fix_items(&h).await.pop().expect("a fix item was filed");
     assert_eq!(
@@ -380,7 +380,7 @@ async fn the_owners_answer_puts_a_parked_fix_item_back_to_work_with_the_answer()
         ],
     );
     h.file_one(draft("ledger", "Reconcile the ledger")).await;
-    h.drain().await;
+    h.drain_settled().await;
     let fix = fix_items(&h).await.pop().unwrap();
     let question = h
         .store()
@@ -401,7 +401,7 @@ async fn the_owners_answer_puts_a_parked_fix_item_back_to_work_with_the_answer()
     )
     .await
     .unwrap();
-    h.drain().await;
+    h.drain_settled().await;
 
     assert_eq!(h.status(&fix.id).await, Status::Done);
     let second = agent.briefs_for("Classify unknown failure").pop().unwrap();
@@ -430,7 +430,7 @@ async fn a_fix_item_that_lands_a_commit_git_verifies_is_done() {
         &[Act::Commit("Fixed the path bookkeeping.")],
     );
     let (_, second) = two_claim_mismatches(&h, &agent, &repo).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let fix = fix_items(&h).await.pop().expect("a fix item was filed");
     assert_eq!(h.status(&fix.id).await, Status::Done);
@@ -463,7 +463,7 @@ async fn a_rule_for_a_failure_the_classifier_already_knows_is_not_a_landing() {
         &[Act::Rule("Added a rule.", "process: changed paths")],
     );
     two_claim_mismatches(&h, &agent, &repo).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let fix = fix_items(&h).await.pop().unwrap();
     assert_ne!(h.status(&fix.id).await, Status::Done);
@@ -490,7 +490,7 @@ async fn a_new_failure_does_not_wait_behind_a_fix_item_parked_for_its_owner() {
         &[Act::Nothing("Could not find it.")],
     );
     h.file_one(draft("ledger", "Reconcile the ledger")).await;
-    h.drain().await;
+    h.drain_settled().await;
     let fix = fix_items(&h).await.pop().unwrap();
     assert_eq!(
         h.status(&fix.id).await,
@@ -504,7 +504,7 @@ async fn a_new_failure_does_not_wait_behind_a_fix_item_parked_for_its_owner() {
     let again = h
         .file_one(draft("again", "Reconcile the ledger again"))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
 
     assert_eq!(
         fix_items(&h).await.len(),
@@ -546,7 +546,7 @@ async fn the_history_of_a_fingerprint_is_every_occurrence_run_by_run() {
         &[Act::Nothing("Not done: could not read the verifier.")],
     );
     let (first, second) = two_claim_mismatches(&h, &agent, &repo).await;
-    h.drain().await;
+    h.drain_settled().await;
     let fix = fix_items(&h).await.pop().unwrap();
     let fp = fingerprint_of(&fix);
 
@@ -679,7 +679,7 @@ async fn a_fix_item_is_leased_in_a_worktree_at_the_failing_runs_commit_with_its_
     // Reconcile the second failure without leasing the fix item it files.
     h.tick().await;
     h.ctl.set_draining(true);
-    h.step().await;
+    h.step_settled().await;
     let fix = fix_items(&h).await.pop().expect("a fix item was filed");
     let fp = fingerprint_of(&fix);
 
@@ -707,7 +707,7 @@ async fn a_fix_item_is_leased_in_a_worktree_at_the_failing_runs_commit_with_its_
 
     h.ctl.set_draining(false);
     assert_eq!(h.tick().await.leased, vec![fix.id.clone()]);
-    h.drain().await;
+    h.drain_settled().await;
 
     // The worktree it ran in is a checkout of the failing item's repository
     // at the commit the failing run started from, not at the new HEAD.
@@ -821,7 +821,7 @@ async fn the_daemons_own_source_is_found_among_its_workers_repositories_and_name
     let h = Harness::on_wall_clock(data.config(Some(build)), vec![agent.clone()]);
     agent.on("Stop recurring", &[Act::Nothing("Not done.")]);
     two_claim_mismatches(&h, &agent, &source).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let kit = agent
         .briefs_for("Stop recurring")
@@ -864,7 +864,7 @@ async fn a_failure_that_comes_back_after_a_done_fix_says_so_and_carries_what_it_
     );
     agent.on("Third", &[Act::ClaimWrongPath]);
     two_claim_mismatches(&h, &agent, &repo).await;
-    h.drain().await;
+    h.drain_settled().await;
     let first_fix = fix_items(&h).await.pop().unwrap();
     assert_eq!(h.status(&first_fix.id).await, Status::Done);
     let fp = fingerprint_of(&first_fix);
@@ -879,7 +879,7 @@ async fn a_failure_that_comes_back_after_a_done_fix_says_so_and_carries_what_it_
         .reference;
 
     let third = h.file_one(code_draft("Third change", &repo)).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let fixes = fix_items(&h).await;
     assert_eq!(fixes.len(), 2, "a second fix item for the recurrence");
@@ -948,7 +948,7 @@ async fn a_failure_that_comes_back_after_a_done_fix_says_so_and_carries_what_it_
     run_git(repo.path(), &["merge", "-q", "--ff-only", &landed]);
     agent.on("Fourth", &[Act::ClaimWrongPath, Act::ClaimWrongPath]);
     let fourth = h.file_one(code_draft("Fourth change", &repo)).await;
-    h.drain().await;
+    h.drain_settled().await;
     let got = history(&h, &fp).await;
     let record = got
         .fixes
@@ -1040,7 +1040,7 @@ async fn a_failure_in_the_daemons_own_code_is_fixed_in_its_source_at_the_running
         )],
     );
     let ledger = h.file_one(draft("ledger", "Reconcile the ledger")).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     let fix = fix_items(&h).await.pop().expect("a fix item was filed");
     let resource = format!("{REPO_PREFIX}{}", source.path().display());
@@ -1126,7 +1126,7 @@ async fn a_failure_in_a_repository_that_is_the_daemons_source_starts_from_the_bu
         &[Act::Commit("Fixed the path bookkeeping.")],
     );
     let (first, _) = two_claim_mismatches(&h, &agent, &source).await;
-    h.drain().await;
+    h.drain_settled().await;
 
     // The failing runs started from the checkout's HEAD, which is later
     // than the build; the fix item starts from the build.

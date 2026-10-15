@@ -217,7 +217,7 @@ async fn scenario_02_a_commit_and_its_paths_are_verified_and_a_false_claim_is_ca
             WorkerKind::ClaudeCode,
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&task).await, Status::Done);
     let evidence = h.store().work_evidence_list(&task).await.unwrap();
     let commit = evidence
@@ -265,7 +265,7 @@ async fn scenario_02_a_commit_and_its_paths_are_verified_and_a_false_claim_is_ca
             WorkerKind::ClaudeCode,
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(
         h.status(&claimed).await,
         Status::Blocked(BlockedReason::VerificationFailed)
@@ -333,7 +333,7 @@ async fn scenario_17_a_local_code_result_counts_and_a_failed_verification_escala
     let first = h
         .file_one(code_draft("Document the helper", &repo, WorkerKind::Any))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&first).await, Status::Done);
     assert_eq!((local_good.runs(), claude.runs()), (1, 0));
     let record = h.ctl.registry().record_of("krabby", CODE).unwrap();
@@ -352,7 +352,7 @@ async fn scenario_17_a_local_code_result_counts_and_a_failed_verification_escala
             WorkerKind::Any,
         ))
         .await;
-    h.drain().await;
+    h.drain_settled().await;
     assert_eq!(h.status(&second).await, Status::Done);
     assert_eq!((local_bad.runs(), claude.runs()), (2, 1));
     let events = h.events(&second).await;
@@ -786,7 +786,7 @@ async fn three_models_execute_the_same_repository_in_distinct_worktrees_and_pres
     for release in releases {
         release.notify_one();
     }
-    h.drain().await;
+    h.drain_settled().await;
     let mut commits = vec![];
     for id in &ids {
         assert_eq!(h.status(id).await, Status::Done);
