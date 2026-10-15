@@ -1743,21 +1743,14 @@ impl Controller {
 
     async fn select_and_lease(&self, report: &mut TickReport) -> Result<(), Error> {
         let snap = self.load().await?;
-        let mut ready: Vec<WorkItem> = snap
-            .items()
+        let list = graph::priority_list(&snap, self.clock.now());
+        let ready: Vec<WorkItem> = list
+            .entries
             .iter()
-            .filter(|i| i.status == Status::Ready && !snap.has_children(&i.id))
+            .filter_map(|entry| snap.item(&entry.item))
+            .filter(|item| item.status == Status::Ready)
             .cloned()
             .collect();
-        let priorities = graph::scheduling_priorities(&snap, self.clock.now());
-        ready.sort_by(|a, b| {
-            let a_rank = &priorities[&a.id];
-            let b_rank = &priorities[&b.id];
-            a_rank
-                .compare(b_rank)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.id.cmp(&b.id))
-        });
         // The single-writer rule, over every active item whatever its tree.
         let mut busy: Vec<(Vec<String>, Option<String>)> = snap
             .items()

@@ -87,7 +87,10 @@ impl Tool for WorkPlanTool {
          verifiable execution slices within each run's context and budget. Use blocks and \
          inputs_from for dependent slices; independent tasks may run in parallel, while \
          tasks sharing writable resources stay ordered. The parent retains the whole \
-         request's done_when. The \
+         request's done_when. Write every title as a plain-language action and subject; \
+         explain what changes and why in objective, and the observable result in done_when. \
+         The owner must understand each task without chat history. Keep error codes and IDs \
+         in artifact_refs. The \
          controller accepts the graph whole or rejects it whole with every failed check."
     }
 

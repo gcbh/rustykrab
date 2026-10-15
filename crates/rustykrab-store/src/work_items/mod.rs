@@ -80,6 +80,11 @@ pub enum WorkStoreError {
     NotFound(String),
     /// An insert named an id that is already live.
     AlreadyExists(String),
+    PriorityMismatch {
+        item: WorkItemId,
+        expected: i32,
+        actual: i32,
+    },
     /// Closed is final: the item is already `done`, `failed`, `cancelled` or
     /// `expired`, and no transition leaves it.
     Closed { item: WorkItemId, status: Status },
@@ -105,6 +110,14 @@ impl fmt::Display for WorkStoreError {
         match self {
             WorkStoreError::NotFound(what) => write!(f, "not found: {what}"),
             WorkStoreError::AlreadyExists(what) => write!(f, "already exists: {what}"),
+            WorkStoreError::PriorityMismatch {
+                item,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "priority changed for {item}: expected {expected}, found {actual}"
+            ),
             WorkStoreError::Closed { item, status } => {
                 write!(f, "work item {item} is closed ({status}); closed is final")
             }
@@ -358,6 +371,13 @@ impl Spend {
 pub enum WorkOp {
     /// Insert a new item. Fails if the id is live.
     Insert(Box<WorkItem>),
+    /// Change only ordering metadata. Never change status, scope or the
+    /// timestamp used to decide whether a capability landed after a hold.
+    SetPriority {
+        item: WorkItemId,
+        expected: i32,
+        priority: i32,
+    },
     /// Record an accepted `work_plan` call.
     Plan(WorkPlanRow),
     /// Add an edge; the downstream must be live. An existing identical row

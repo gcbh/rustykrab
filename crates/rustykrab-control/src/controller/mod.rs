@@ -62,6 +62,7 @@ mod load;
 mod notice;
 mod planning;
 mod preferences;
+mod priority;
 mod project_context;
 mod questions;
 mod queue_waits;
@@ -683,6 +684,23 @@ pub(crate) fn merge(total: &mut TickReport, add: TickReport) {
 
 #[async_trait]
 impl ControlHandle for Controller {
+    async fn priority_list(&self) -> Result<Option<crate::graph::PriorityList>, Error> {
+        Ok(Some(crate::graph::priority_list(
+            &self.load().await?,
+            self.clock.now(),
+        )))
+    }
+
+    async fn reorder_priority(
+        &self,
+        revision: &str,
+        ordered: &[WorkItemId],
+        actor: &str,
+    ) -> Result<crate::graph::PriorityList, Error> {
+        let _loop = self.loop_lock.lock().await;
+        self.reorder_priority_locked(revision, ordered, actor).await
+    }
+
     async fn queue_priorities(
         &self,
     ) -> Result<std::collections::HashMap<WorkItemId, crate::graph::SchedulingPriority>, Error>

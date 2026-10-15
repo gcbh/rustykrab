@@ -52,6 +52,31 @@ pub(super) fn apply(
 ) -> Result<(), WorkStoreError> {
     match op {
         WorkOp::Insert(item) => insert_item(conn, item),
+        WorkOp::SetPriority {
+            item,
+            expected,
+            priority,
+        } => {
+            let row = require_item(conn, item)?;
+            if row.status.is_closed() {
+                return Err(WorkStoreError::Closed {
+                    item: item.clone(),
+                    status: row.status,
+                });
+            }
+            if row.priority != *expected {
+                return Err(WorkStoreError::PriorityMismatch {
+                    item: item.clone(),
+                    expected: *expected,
+                    actual: row.priority,
+                });
+            }
+            conn.execute(
+                "UPDATE work_items SET priority = ?2 WHERE id = ?1",
+                params![item, priority],
+            )?;
+            Ok(())
+        }
         WorkOp::Plan(plan) => insert_plan(conn, plan),
         WorkOp::AddEdge(edge) => add_edge(conn, edge).map(|_| ()),
         WorkOp::RemoveOrderingEdgesOf(item) => remove_ordering_edges_of(conn, item).map(|_| ()),

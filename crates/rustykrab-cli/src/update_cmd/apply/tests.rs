@@ -2089,7 +2089,22 @@ fn the_system_executable_is_the_real_one_not_argv0() {
         .arg("30")
         .spawn()
         .unwrap();
-    let found = SystemProcesses.executable(child.id());
+    // On Linux the kernel can briefly expose the parent's executable after
+    // spawn, before the child finishes exec. Observe readiness, not a delay.
+    let expected = std::fs::canonicalize(sleep).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let found = loop {
+        let found = SystemProcesses.executable(child.id());
+        let ready = found
+            .as_ref()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_some_and(|path| path == expected);
+        if ready || std::time::Instant::now() >= deadline {
+            break found;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     child.kill().unwrap();
     child.wait().unwrap();
     let found = found.unwrap();

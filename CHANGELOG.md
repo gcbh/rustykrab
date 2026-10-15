@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.0] - 2026-10-15
+
+- feat: make task priorities authoritative and tasks readable (#714)
+
 ## [6.5.9] - 2026-10-15
 
 - Let Claude Code run without a turn cap (#710)

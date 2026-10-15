@@ -70,6 +70,10 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/work", get(list_items).post(file_one))
         .route("/api/work/ready", get(ready_items))
+        .route(
+            "/api/work/priority",
+            get(priority_list).post(reorder_priority),
+        )
         .route("/api/work/preferences", get(work_preferences))
         .route("/api/work/{id}/start", post(start_work))
         .route("/api/work/events", get(event_stream))
@@ -690,6 +694,52 @@ fn finished_in(graph: Option<&GraphView>, cancelled: &[WorkItemId]) -> Vec<Finis
 }
 
 // ── read handlers ──────────────────────────────────────────────────────
+
+async fn priority_list(
+    State(state): State<AppState>,
+) -> Result<Json<rustykrab_control::graph::PriorityList>, WorkApiError> {
+    control(&state)?
+        .priority_list()
+        .await?
+        .map(Json)
+        .ok_or_else(WorkApiError::unavailable)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityOrderBody {
+    revision: String,
+    ordered: Vec<WorkItemId>,
+}
+
+async fn reorder_priority(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Json(body): Json<PriorityOrderBody>,
+) -> Result<Json<rustykrab_control::graph::PriorityList>, WorkApiError> {
+    if body.revision.len() != 64 || body.ordered.len() > 10_000 {
+        return Err(WorkApiError::bad_request(
+            "Invalid priority list revision or size.",
+        ));
+    }
+    Ok(Json(
+        control(&state)?
+            .reorder_priority(&body.revision, &body.ordered, &actor_of(principal))
+            .await
+            .map_err(|error| match error {
+                Error::ToolExecution(error)
+                    if error.kind == rustykrab_core::error::ToolErrorKind::InvalidInput =>
+                {
+                    WorkApiError::new(
+                        StatusCode::CONFLICT,
+                        "priority_order_conflict",
+                        error.message,
+                    )
+                }
+                other => other.into(),
+            })?,
+    ))
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct ListQuery {

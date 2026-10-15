@@ -67,6 +67,8 @@ pub struct MonitorReply {
     #[serde(default)]
     pub queue_priorities:
         std::collections::HashMap<String, rustykrab_control::graph::SchedulingPriority>,
+    #[serde(default)]
+    pub priority_list: Option<rustykrab_control::graph::PriorityList>,
     pub expectation_metrics: Vec<MetricValue>,
     #[serde(default)]
     pub dreaming: Option<rustykrab_core::dream_review::DreamingView>,
@@ -344,6 +346,10 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
     };
     let displayed: std::collections::HashSet<_> = work.items.iter().map(|r| &r.item.id).collect();
     queue_priorities.retain(|id, _| displayed.contains(id));
+    let priority_list = match &state.control {
+        Some(control) => control.priority_list().await.map_err(|e| e.to_string())?,
+        None => None,
+    };
     let mut alerts = assess(controller.as_ref(), &workers, &work, Utc::now());
     let dreaming = match state.evaluation.as_ref() {
         Some(h) => h.dreaming_status().await.ok(),
@@ -482,6 +488,7 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         workers,
         work,
         queue_priorities,
+        priority_list,
         alerts,
         health,
         stale_after_seconds: STALE_SECONDS,

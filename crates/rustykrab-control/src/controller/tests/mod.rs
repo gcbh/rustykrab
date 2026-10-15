@@ -13,6 +13,7 @@ mod loop_status;
 mod model_check;
 mod paths;
 mod peers;
+mod priority;
 mod project_context;
 mod questions;
 mod resolution;

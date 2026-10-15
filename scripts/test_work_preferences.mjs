@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 const source=readFileSync(new URL('../crates/rustykrab-gateway/static/monitor.js',import.meta.url),'utf8');
+const taskFragment=source.slice(source.indexOf('  function taskOverview('),source.indexOf('  const badge ='));
 new vm.Script(source);
 const fragment=source.slice(source.indexOf('  const progressStates ='),source.indexOf('  const discussionDrafts ='));
 class Element {
@@ -16,7 +17,7 @@ class Element {
 const all=e=>[e,...e.children.flatMap(all)];
 const item=(id,kind='code',state='running')=>({id,title:'Task '+id,kind,status:{status:state},objective:'Read my mail',done_when:'Summary saved',constraints:[],writable_resources:['mailbox'],required_tools:['email'],required_mcp_servers:[],budget:{tokens:200,wall_seconds:60},updated_at:'2026-10-12T01:00:00Z'});
 function client(data={preferences:[]}) {
-  const ids=new Map(),panes=['attention','progress','results','automatic','systems'].map(p=>Object.assign(new Element('section'),{dataset:{pane:p}})),buttons=panes.map(p=>Object.assign(new Element('button'),{dataset:{view:p.dataset.pane}}));
+  const ids=new Map(),panes=['priority','attention','progress','results','automatic','systems'].map(p=>Object.assign(new Element('section'),{dataset:{pane:p}})),buttons=panes.map(p=>Object.assign(new Element('button'),{dataset:{view:p.dataset.pane}}));
   const calls=[],opened=[];let fail=false;
   const c={generation:1,detailRequest:1,access:{connected:true},
     window:{location:{hash:'',pathname:'/monitor.html',search:'?work=abc'},history:{replaceState:(_a,_b,url)=>{calls.push({url});}}},
@@ -28,13 +29,13 @@ function client(data={preferences:[]}) {
     refresh:async()=>{},showDetail:async id=>opened.push(id),
     api:async(path,payload)=>{calls.push({path,payload});if(fail)throw Error('Connection interrupted');return data;}
   };
-  vm.createContext(c);vm.runInContext(fragment,c);
+  vm.createContext(c);vm.runInContext(taskFragment+fragment,c);
   return {c,ids,panes,buttons,calls,opened,setFail:v=>{fail=v;}};
 }
-test('separate views start with Attention and preserve the work link on navigation',()=>{
-  const t=client();t.c.selectView('attention',false);assert.equal(t.panes.find(p=>!p.hidden).dataset.pane,'attention');
+test('separate views default to the priority list and preserve the work link on navigation',()=>{
+  const t=client();t.c.selectView(undefined,false);assert.equal(t.panes.find(p=>!p.hidden).dataset.pane,'priority');
   t.c.selectView('progress');assert.deepEqual(t.panes.filter(p=>!p.hidden).map(p=>p.dataset.pane),['progress']);assert.equal(t.calls.at(-1).url,'/monitor.html?work=abc#progress');
-  t.c.selectView('unknown',false);assert.equal(t.panes.find(p=>!p.hidden).dataset.pane,'attention');
+  t.c.selectView('unknown',false);assert.equal(t.panes.find(p=>!p.hidden).dataset.pane,'priority');
 });
 test('results exclude accepted proposals and do not imply those were executed',()=>{
   const t=client();t.c.renderPriorityViews({work:{items:[{item:item('proposal','proposal','done')},{item:item('execution','code','done')},{item:item('active')}],items_truncated:false}});
@@ -72,10 +73,10 @@ test('stale preference replies cannot change a new session',async()=>{
 test('In progress displays execution states while excluding blocks, failures and completed work',()=>{
   const t=client();t.c.human=String;
   const rows=['queued','ready','leased','running','verifying','blocked','failed','done'].map(state=>({item:item(state,'code',state),spend:{runs:0}}));
-  t.c.snapshot={work:{items:rows,items_truncated:false}};
+  t.c.snapshot={work:{items:rows,items_truncated:false},priority_list:{entries:['ready','leased','queued','running','verifying'].map((item,i)=>({item,position:i+1}))}};
   t.c.$('search').value='';t.c.$('status').value='progress';
   const renderer=source.slice(source.indexOf('  function renderWork() {'),source.indexOf('  const progressStates ='));
   vm.runInContext(renderer,t.c);t.c.renderWork();
-  assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['leased','running','verifying','queued','ready']);
+  assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['ready','leased','queued','running','verifying']);
   t.c.$('status').value='running';t.c.renderWork();assert.deepEqual(all(t.c.$('workRows')).filter(n=>n.item).map(n=>n.item),['running']);
 });

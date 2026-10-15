@@ -566,10 +566,16 @@ time order and a round trip is exact.
 
 `priority` is the item's base priority. The scheduler derives effective urgency
 from unmet `blocks`/`waits_for` edges and parent gates on each pass: prerequisites
-inherit the highest priority of interested open work. The number of distinct
-waiters is the primary rank; inherited urgency, creation time and id break ties. It does not rewrite the base column;
+inherit the highest priority of interested open work. Inherited urgency is the
+primary rank; distinct waiter count, creation time and id break ties. Inheritance
+does not rewrite the base column;
 closed, expired, future-triggered and approval-held donors contribute nothing.
 Closing the last interested waiter removes its boost without a cleanup write.
+An explicit human reorder is different: the controller validates a complete,
+current order consistent with inherited urgency, then atomically writes descending base
+priorities through `WorkOp::SetPriority`, with expected-value checks and decision
+events. The existing column preserves the order across restart. Status, scope,
+budget and `updated_at` do not change; no ordering table or migration is needed.
 Failure-resolution `internal` items carry a `failure_fingerprint` artifact for
 stable reuse within the same repository; the title remains a legacy fallback.
 The `resolution_depth` artifact carries the bounded depth of diagnosis creation.

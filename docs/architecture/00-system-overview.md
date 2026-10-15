@@ -208,10 +208,19 @@ recurring/unknown failure diagnoses create or reuse prerequisites instead of
 filing independent background improvements. Original work waits for the
 prerequisite; its next attempt carries the completed prerequisite's evidence.
 The deterministic scheduler propagates priority through unmet ordering edges
-and parent gates. Distinct waiter count is the primary queue rank; inherited
-explicit urgency, age and id break ties. Base
-priorities, authorization, worker eligibility and resource locks remain separate
-gates. This adds no queue, persistence table or model-controlled status field.
+and parent gates. The authoritative priority list orders pending leaves by
+inherited explicit urgency, distinct waiter count, age and id. Both the monitor
+and dispatch use that order. Human reordering persists through existing base
+priorities, with revision checks and prerequisite-order validation. Dispatch
+skips ineligible entries while they remain visible in place. Authorization,
+worker eligibility and resource locks remain separate gates. This adds no queue,
+persistence table or model-controlled status field.
+
+The work manager presents each task's existing goal, completion criteria and
+current state together. The complete priority list carries bounded text previews;
+task details retain the full execution source and diagnostics. Presentation and
+task-writing guidance improve readability without creating another decision model
+or changing permissions, completion checks or dispatch order.
 
 ## The investigation kit (2026-10-13)
 
