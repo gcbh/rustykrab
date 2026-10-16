@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.1] - 2026-10-16
+
+- test(control): a failed git call shows what git said; scripted commits always change something (#717)
+
 - feat: bounded recovery. A work item's budget is cumulative over all its
   attempts, restarts and revivals; one whose budget is spent is not leased and
   asks its owner, whose answer grants one more allotment. Answers now resume

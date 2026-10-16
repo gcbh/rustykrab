@@ -621,10 +621,15 @@ pub(crate) mod tests {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
+        // git prints some refusals on stdout ("nothing to commit"), so a
+        // failure shows its status and both streams.
         assert!(
             out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "git {args:?} in {}: {}\nstdout: {}\nstderr: {}",
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
@@ -646,6 +651,39 @@ pub(crate) mod tests {
             ],
         );
         run_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A failed git call names what git said even when it said it on
+    /// stdout: an empty commit's refusal is not a blank error.
+    #[test]
+    fn a_failed_git_call_shows_its_stdout_and_status() {
+        let repo = Repo::new();
+        let failure = std::panic::catch_unwind(|| {
+            // An identity of its own, as `commit_all` has: without one, git
+            // on a host with no configured identity refuses before it looks
+            // for changes, and the refusal under test never happens.
+            run_git(
+                repo.path(),
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-q",
+                    "--no-gpg-sign",
+                    "-m",
+                    "empty",
+                ],
+            )
+        })
+        .unwrap_err();
+        let message = failure
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("nothing to commit"), "{message}");
+        assert!(message.contains("exit status"), "{message}");
     }
 
     fn workspace(repo: &Repo, root: &Path) -> Workspace {
