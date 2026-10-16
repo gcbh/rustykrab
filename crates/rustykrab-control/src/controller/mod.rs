@@ -68,6 +68,7 @@ mod brief;
 mod commit;
 mod credentials;
 mod discussion;
+mod dispatchability;
 mod filing;
 mod investigation;
 mod load;
@@ -731,6 +732,15 @@ impl ControlHandle for Controller {
     ) -> Result<crate::graph::PriorityList, Error> {
         let _loop = self.loop_lock.lock().await;
         self.reorder_priority_locked(revision, ordered, actor).await
+    }
+
+    /// The controller's own observation of foreground dispatch
+    /// (`dispatchability.rs`); unknown while the loop is busy, stale or
+    /// draining.
+    async fn foreground_dispatchability(
+        &self,
+    ) -> Result<Option<crate::handle::DispatchDemand>, Error> {
+        Controller::foreground_dispatchability(self).await
     }
 
     async fn queue_priorities(

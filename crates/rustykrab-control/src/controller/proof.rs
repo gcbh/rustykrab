@@ -59,11 +59,12 @@ use rustykrab_core::Error;
 use rustykrab_tools::work_backend::ToolState;
 use serde::{Deserialize, Serialize};
 
+pub(crate) use crate::capability_proof::registered_action;
 use crate::capability_proof::{
-    capability_proven, probe_inputs_digest, ExpectedOperation, Missing, OperationProbe,
-    ProbeRequest, RegisteredAction, OPERATION_PROBE,
+    capability_proven_in_generation, probe_inputs_digest, ExpectedOperation, Missing,
+    OperationProbe, ProbeRequest, RegisteredAction, OPERATION_PROBE,
 };
-use crate::errors::{GapKind, VerifierVerdict};
+use crate::errors::VerifierVerdict;
 use crate::graph::Snapshot;
 use crate::routing::{built_tool, CapabilityRef};
 use crate::worker::Worker;
@@ -88,30 +89,6 @@ const RECEIPT_GRACE: Duration = Duration::from_secs(1);
 
 /// Who verified a built tool's presence: the host's catalog.
 const BY_CATALOG: &str = "catalog";
-
-/// The registered probe for a capability need, if it has one: a host binary
-/// Codex's producer registered (`cargo`, `node`) is checked with
-/// `BinaryAvailable`; a RustyKrab tool with a registered read-only probe
-/// (`work_resources`) with `ToolCallable` and exactly its registered
-/// arguments. Anything else has no probe and stays availability only.
-///
-/// This mirrors the producer's registry in `rustykrab-agent`'s
-/// `capability_probe.rs`, which refuses (`Unobserved`) anything it does not
-/// register, so a mismatch fails closed.
-pub(crate) fn registered_action(need: &CapabilityRef) -> Option<RegisteredAction> {
-    match (need.gap, need.subject.as_str()) {
-        (GapKind::Tool | GapKind::Install, binary @ ("cargo" | "node")) => {
-            Some(RegisteredAction::BinaryAvailable {
-                binary: binary.to_string(),
-            })
-        }
-        (GapKind::Tool, tool @ "work_resources") => Some(RegisteredAction::ToolCallable {
-            tool: tool.to_string(),
-            args: serde_json::json!({}),
-        }),
-        _ => None,
-    }
-}
 
 /// A capability item's need and its registered probe, if both exist.
 fn registered_need(item: &WorkItem) -> Option<(CapabilityRef, RegisteredAction)> {
@@ -213,27 +190,6 @@ fn registered_needs(snap: &Snapshot, item: &str) -> Vec<(WorkItem, RegisteredAct
 /// Whether `item` waits on a capability whose need has a registered probe.
 pub(super) fn has_registered_need(snap: &Snapshot, item: &str) -> bool {
     !registered_needs(snap, item).is_empty()
-}
-
-/// The `operation_probe` rows of a capability item's evidence that can
-/// speak for `generation`: those bound to it, and any the controller could
-/// not read (which then fail the proof closed rather than vanish). The
-/// validator's latest-row rule applies among them, so a later failed or
-/// unobserved receipt for the same generation is never hidden behind an
-/// earlier success; receipts for another waiting item or another
-/// generation of this one do not compete.
-fn rows_for(evidence: &[Evidence], generation: &str) -> Vec<Evidence> {
-    evidence
-        .iter()
-        .filter(|e| e.kind == OPERATION_PROBE)
-        .filter(
-            |e| match serde_json::from_str::<OperationProbe>(&e.reference) {
-                Ok(p) => p.generation == generation,
-                Err(_) => true,
-            },
-        )
-        .cloned()
-        .collect()
 }
 
 /// Why a registered need is not proven, as a verifier verdict and a
@@ -477,9 +433,7 @@ impl Controller {
             })
             .await?;
 
-        let observed = self
-            .observe_all(worker.as_ref(), plans, cap, &generation)
-            .await;
+        let observed = self.observe_all(worker.as_ref(), plans, cap).await;
         // The probe's worktree goes whatever the probes found.
         if let Ok(Some(ws)) = workspace {
             discard(ws).await;
@@ -499,14 +453,12 @@ impl Controller {
         worker: Option<&Arc<dyn Worker>>,
         plans: Vec<Plan>,
         cap: &WorkItem,
-        generation: &str,
     ) -> Result<Option<Result<(), (VerifierVerdict, String)>>, Error> {
         let mut own = None;
         for plan in plans {
             let outcome = match (worker, plan.request) {
                 (Some(worker), Ok(request)) => {
-                    self.observe(worker, &plan.capability, &request, generation)
-                        .await?
+                    self.observe(worker, &plan.capability, &request).await?
                 }
                 (_, Err(why)) => Err((VerifierVerdict::Incomplete, why)),
                 (None, Ok(_)) => Err((VerifierVerdict::Incomplete, "has no executor".to_string())),
@@ -525,7 +477,6 @@ impl Controller {
         worker: &Arc<dyn Worker>,
         capability: &WorkItem,
         request: &ProbeRequest,
-        generation: &str,
     ) -> Result<Result<(), (VerifierVerdict, String)>, Error> {
         let observed = {
             let _slot = ProbeSlot::take(self, worker.name());
@@ -552,12 +503,9 @@ impl Controller {
                 at: self.clock.now(),
             })
             .await?;
-        let rows = rows_for(
-            &self.store.work_evidence_list(&capability.id).await?,
-            generation,
-        );
+        let rows = self.store.work_evidence_list(&capability.id).await?;
         Ok(
-            match capability_proven(capability, &rows, &request.expected) {
+            match capability_proven_in_generation(capability, &rows, &request.expected) {
                 Ok(_) => Ok(()),
                 Err(missing) => {
                     let (verdict, why) = unproven(&missing, Some(&probe));
@@ -594,11 +542,8 @@ impl Controller {
             {
                 return Ok(false);
             }
-            let rows = rows_for(
-                &self.store.work_evidence_list(&capability.id).await?,
-                &generation,
-            );
-            if capability_proven(&capability, &rows, &planned.expected).is_err() {
+            let rows = self.store.work_evidence_list(&capability.id).await?;
+            if capability_proven_in_generation(&capability, &rows, &planned.expected).is_err() {
                 return Ok(false);
             }
         }
@@ -680,6 +625,7 @@ async fn discard(ws: Workspace) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::GapKind;
 
     fn need(gap: GapKind, subject: &str) -> CapabilityRef {
         CapabilityRef {
