@@ -14,7 +14,11 @@
 //! - An answer ([`Controller::answer_locked`], from REST, the CLI or the
 //!   channel) settles the question, fires `on_answer` triggers, and resumes
 //!   the item (not the conversation): it returns to `queued` and its next
-//!   brief carries the answer ([`Controller::answers_for`]).
+//!   brief carries the answer ([`Controller::answers_for`]). An item the
+//!   ladder stopped on a spent budget or a failed verification resumes on
+//!   its owner's answer too, a spent budget with one more allotment, and
+//!   a no cancels it. Another open question or an approval hold still
+//!   holds it.
 //! - Standing judgment ([`Controller::judgment`]) is the active grants
 //!   folded over the configured baseline, cached until a grant changes.
 
@@ -40,6 +44,7 @@ use rustykrab_tools::work_backend::{AskOutcome, AskRequest, CapabilityAsk, Prove
 use super::batch::{has_open_plan_b, Batch};
 use super::filing::describe_rejection;
 use super::notice::{label, short, short_question, Cause};
+use super::spend::BUDGET_GRANT;
 use super::{Controller, Finished};
 
 /// The constraint that marks a `research` item the router filed: system
@@ -123,6 +128,24 @@ fn is_no(answer: &str) -> bool {
     ]
     .iter()
     .any(|w| a == *w || a.starts_with(&format!("{w} ")))
+}
+
+/// Whether `actor`'s answer may resume an item stopped on a failed
+/// verification: its owner (`user`, `user:<who>`), or a delegate deciding
+/// under standing judgment (`policy:<grant>`; only the router writes that
+/// actor, after a grant covered the question). Not a recorded default,
+/// research, the controller, or a worker.
+fn may_resume(actor: &str) -> bool {
+    is_owner(actor) || actor.starts_with("policy:")
+}
+
+/// Whether `actor`'s answer may grant a spent budget one more allotment, or
+/// cancel a stopped item: its owner only. No standing-judgment check
+/// delegates budget, so a delegate's answer, like a default's, neither
+/// replenishes a budget nor resumes it (resuming without a grant would only
+/// stop again at the guard).
+pub(super) fn is_owner(actor: &str) -> bool {
+    actor == "user" || actor.starts_with("user:")
 }
 
 /// Who answered, as the brief says it.
@@ -1330,8 +1353,12 @@ impl Controller {
         let still_open = related
             .iter()
             .any(|o| !answered_ids.contains(&o.id) && o.status == QuestionStatus::Open);
+        // An approval hold is independent of this question: the answer
+        // never releases it.
+        let held = b.snap.item(&q.item).is_some_and(|i| i.held_by.is_some());
+        let status = b.status(&q.item);
         let parked = matches!(
-            b.status(&q.item),
+            status,
             Some(Status::Blocked(
                 BlockedReason::NeedsDecision
                     | BlockedReason::NeedsConsent
@@ -1340,18 +1367,58 @@ impl Controller {
                     | BlockedReason::WorkerUnavailable
             ))
         );
-        if declined {
+        // A leaf the ladder stopped on a failed verification resumes on its
+        // owner's or a delegate's answer; one stopped on a spent budget only
+        // on its owner's, which grants one more allotment ([`BUDGET_GRANT`]).
+        // The owner's no cancels either, as a declined consent does.
+        let recovering = !b.snap.has_children(&q.item)
+            && matches!(
+                status,
+                Some(Status::Blocked(
+                    BlockedReason::BudgetExhausted | BlockedReason::VerificationFailed
+                ))
+            );
+        let authority = match status {
+            Some(Status::Blocked(BlockedReason::BudgetExhausted)) => is_owner(actor),
+            _ => may_resume(actor),
+        };
+        let refused = recovering && is_owner(actor) && is_no(&answer);
+        if declined || refused {
             let (touched, cancelled) =
                 b.cancel_tree(&q.item, actor, Some(format!("declined: {answer}")));
             changed.extend(touched);
             reply.cancelled = cancelled;
-        } else if parked && !still_open {
+        } else if parked && !still_open && !held {
             changed.extend(b.move_to(
                 &q.item,
                 Status::Queued,
                 actor,
                 format!("answered question {}", short_question(&q.id)),
             ));
+            reply.resumed.push(q.item.clone());
+        } else if recovering && authority && !still_open && !held {
+            let mut why = format!("answered question {}", short_question(&q.id));
+            if status == Some(Status::Blocked(BlockedReason::BudgetExhausted)) {
+                // One allotment per question, however often it is answered.
+                let granted = self
+                    .store
+                    .work_evidence_list(&q.item)
+                    .await?
+                    .iter()
+                    .any(|e| e.kind == BUDGET_GRANT && answered_ids.contains(&e.reference));
+                if !granted {
+                    b.evidence.push(rustykrab_core::work::Evidence {
+                        item: q.item.clone(),
+                        kind: BUDGET_GRANT.to_string(),
+                        reference: q.id.clone(),
+                        hash: None,
+                        verified_by: Some(actor.to_string()),
+                        at: now,
+                    });
+                }
+                why.push_str("; one more allotment of its budget granted");
+            }
+            changed.extend(b.move_to(&q.item, Status::Queued, actor, why));
             reply.resumed.push(q.item.clone());
         }
         b.settle(changed);

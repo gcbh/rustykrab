@@ -288,6 +288,20 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
                 |ctx| Box::pin(own_source_fix(ctx)),
             ),
         ),
+        (
+            Expected::Pass,
+            (
+                "control/bounded-recovery-repeated-failure-trips-the-breaker-once",
+                |ctx| Box::pin(breaker_trips_once(ctx)),
+            ),
+        ),
+        (
+            Expected::Pass,
+            (
+                "control/bounded-recovery-spent-budget-waits-for-its-owners-grant",
+                |ctx| Box::pin(budget_grant_resumes(ctx)),
+            ),
+        ),
     ]
 }
 
@@ -1633,7 +1647,7 @@ async fn s32(ctx: &Ctx) -> Result<()> {
 async fn s02(ctx: &Ctx) -> Result<()> {
     // Verify this adapter's Git claims independently of model routing.
     // Generic-pool coding and escalation are covered by scenario 17.
-    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let daemon = OwnDaemon::boot(ctx).await?;
     let ctx = &daemon.ctx;
     let tag = tag(2);
     let repo = FixtureRepo::create()?;
@@ -1783,7 +1797,7 @@ async fn s17(ctx: &Ctx) -> Result<()> {
 async fn s31(ctx: &Ctx) -> Result<()> {
     // Isolate the native adapter's private tracker contract. General routing
     // is exercised separately; the scripted model has no private Beads ledger.
-    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let daemon = OwnDaemon::boot(ctx).await?;
     let ctx = &daemon.ctx;
     let tag = tag(31);
     let repo = FixtureRepo::create()?;
@@ -1825,14 +1839,15 @@ async fn s31(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// A scripted daemon of its own, booted with `RUSTYKRAB_LOCAL_WORKER=off`,
-/// killed when the scenario ends however it ends.
-struct LocalWorkerOffDaemon {
+/// A scripted daemon of its own, killed when the scenario ends however it
+/// ends: with `RUSTYKRAB_LOCAL_WORKER=off` ([`OwnDaemon::boot`]), or with
+/// its local worker and a fresh store ([`OwnDaemon::boot_with`]).
+struct OwnDaemon {
     ctx: Ctx,
     _dir: tempfile::TempDir,
 }
 
-impl Drop for LocalWorkerOffDaemon {
+impl Drop for OwnDaemon {
     fn drop(&mut self) {
         if let Ok(mut daemon) = self.ctx.daemon.try_lock() {
             if let Some(mut child) = daemon.take() {
@@ -1843,10 +1858,15 @@ impl Drop for LocalWorkerOffDaemon {
     }
 }
 
-impl LocalWorkerOffDaemon {
-    async fn boot(shared: &Ctx) -> Result<LocalWorkerOffDaemon> {
+impl OwnDaemon {
+    async fn boot(shared: &Ctx) -> Result<OwnDaemon> {
+        OwnDaemon::boot_with(shared, &[("RUSTYKRAB_LOCAL_WORKER", "off")]).await
+    }
+
+    /// A daemon with `env` on top of the harness's own environment.
+    async fn boot_with(shared: &Ctx, env: &[(&str, &str)]) -> Result<OwnDaemon> {
         let dir = tempfile::Builder::new()
-            .prefix("rustykrab-e2e-local-off-")
+            .prefix("rustykrab-e2e-own-")
             .tempdir()?;
         let port = crate::pick_free_port()?;
         let base = format!("http://127.0.0.1:{port}");
@@ -1855,7 +1875,7 @@ impl LocalWorkerOffDaemon {
             dir.path(),
             port,
             &crate::Backend::Scripted(None),
-            &[("RUSTYKRAB_LOCAL_WORKER", "off")],
+            env,
         )?;
         if let Err(e) = crate::wait_for_health(&base, &shared.client, &mut child).await {
             let _ = child.kill();
@@ -1876,7 +1896,7 @@ impl LocalWorkerOffDaemon {
             daemon: std::sync::Arc::new(tokio::sync::Mutex::new(Some(child))),
             stand_ins: None,
         };
-        Ok(LocalWorkerOffDaemon { ctx, _dir: dir })
+        Ok(OwnDaemon { ctx, _dir: dir })
     }
 }
 
@@ -1886,7 +1906,7 @@ impl LocalWorkerOffDaemon {
 /// `GET /api/workers` lists no live local worker. It boots its own daemon,
 /// since the shared one's local worker is what the other scenarios run on.
 async fn local_worker_off(shared: &Ctx) -> Result<()> {
-    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let daemon = OwnDaemon::boot(shared).await?;
     let ctx = &daemon.ctx;
     let before = workers(ctx).await?;
     ensure!(
@@ -2105,7 +2125,7 @@ async fn wait_fix_item(ctx: &Ctx, failing: &str, not: Option<&str>) -> Result<St
 ///   first, what it concluded, the commit it landed and the run that
 ///   failed since, with whether that run's code had the fix in it.
 async fn investigation_kit(shared: &Ctx) -> Result<()> {
-    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let daemon = OwnDaemon::boot(shared).await?;
     let ctx = &daemon.ctx;
     let repo = FixtureRepo::create()?;
     let stand_in = ClaudeCodeStandIn::investigator()?;
@@ -2520,7 +2540,7 @@ fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
 /// the `workspace` and `commit` evidence rows a release slice will read, and
 /// that nothing moved the source's `main`.
 async fn own_source_fix(shared: &Ctx) -> Result<()> {
-    let daemon = LocalWorkerOffDaemon::boot(shared).await?;
+    let daemon = OwnDaemon::boot(shared).await?;
     let ctx = &daemon.ctx;
     let version = get(ctx, "/api/version").await?;
     let built = version["commit"]
@@ -2738,6 +2758,435 @@ async fn own_source_fix(shared: &Ctx) -> Result<()> {
     keep_evidence_file(
         "own-source-fix.investigator/working-directory.txt",
         &cap.join("working-directory.txt"),
+    )?;
+    Ok(())
+}
+
+// ── bounded recovery ─────────────────────────────────────────────────
+
+/// The evidence rows of `kind` an item's detail carries, in order.
+fn evidence_of(view: &Value, kind: &str) -> Vec<Value> {
+    evidence(view)
+        .into_iter()
+        .filter(|e| e["kind"] == kind)
+        .collect()
+}
+
+/// The `work_spend` rows of `id` with their totals, set against what its
+/// budget allows over `allotments` allotments, as text and as JSON.
+fn spend_report(ctx: &Ctx, id: &str, budget: &Value, allotments: u64) -> Result<(String, Value)> {
+    let conn = read_only(ctx)?;
+    let mut statement = conn.prepare(
+        "SELECT COALESCE(run, ''), worker, tokens, wall_ms, iterations, at
+           FROM work_spend WHERE item = ?1 ORDER BY at, rowid",
+    )?;
+    let rows: Vec<(String, String, i64, i64, i64, String)> = statement
+        .query_map([id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut text = format!(
+        "work_spend for item {id}\n{:<36}  {:<10}  {:>8}  {:>8}  {:>10}  at\n",
+        "run", "worker", "tokens", "wall_ms", "iterations"
+    );
+    let (mut tokens, mut wall_ms, mut iterations) = (0i64, 0i64, 0i64);
+    for (run, worker, t, w, i, at) in &rows {
+        text.push_str(&format!(
+            "{run:<36}  {worker:<10}  {t:>8}  {w:>8}  {i:>10}  {at}\n"
+        ));
+        tokens += t;
+        wall_ms += w;
+        iterations += i;
+    }
+    let allowed = |key: &str| budget[key].as_u64().unwrap_or(0) * allotments;
+    text.push_str(&format!(
+        "\ntotal: {} run(s), {iterations} iterations, {tokens} tokens, {wall_ms} ms wall\n\
+         budget: {} iterations, {} tokens, {} s wall per allotment; {allotments} allotment(s) \
+         allow {} iterations, {} tokens, {} s wall\n",
+        rows.len(),
+        budget["iterations"],
+        budget["tokens"],
+        budget["wall_seconds"],
+        allowed("iterations"),
+        allowed("tokens"),
+        allowed("wall_seconds"),
+    ));
+    let totals = json!({
+        "runs": rows.len(),
+        "iterations": iterations,
+        "tokens": tokens,
+        "wall_ms": wall_ms,
+        "budget": budget,
+        "allotments": allotments,
+    });
+    Ok((text, totals))
+}
+
+/// The `budget: N steps` line of every local worker run whose brief
+/// carries `marker`, oldest first: what each attempt was given.
+fn brief_budgets(ctx: &Ctx, marker: &str) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for conversation in conversations_mentioning(ctx, marker)? {
+        let text = strings(
+            ctx,
+            "SELECT data FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+            &conversation,
+        )?
+        .join("\n");
+        let steps = text.split("budget: ").skip(1).find_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            rest[digits.len()..]
+                .starts_with(" steps")
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+        });
+        if let Some(steps) = steps {
+            out.push(steps);
+        }
+    }
+    Ok(out)
+}
+
+/// Bounded recovery, the repeated-outcome circuit breaker, on a daemon of
+/// its own at the default `RUSTYKRAB_BREAKER_REPEATS` (3).
+///
+/// The incident's shape: on v6.5.6 one item ran at least 491 times and
+/// 8.7 hours against a one-hour budget, revived again and again with
+/// nothing changed and failing the same way each time. Here the reviver is
+/// the item's own repair policy (ten repairs, and no improvement rung of
+/// its own), and its worker fails every time with an error no classifier
+/// recognises:
+///
+/// - the first attempt and three repairs fail; the last three ran in the
+///   same attempt state with the same fingerprint, so the breaker trips:
+///   no fifth identical attempt, a `circuit_open` row naming the three
+///   runs, an `improve` rung that says so, and the item queued behind one
+///   investigation filed through the ladder's own prerequisite path;
+/// - the investigation lands a classifier rule that replays the failure,
+///   which is a new repair generation: the item's next attempt state
+///   differs, it resumes and reads the gauge;
+/// - five runs in all, within the item's one budget, one investigation.
+async fn breaker_trips_once(shared: &Ctx) -> Result<()> {
+    let daemon = OwnDaemon::boot_with(shared, &[]).await?;
+    let ctx = &daemon.ctx;
+    let tag = "[e2e-control bounded-recovery breaker]";
+    let budget = json!({
+        "iterations": 30, "tokens": 200_000, "wall_seconds": 600, "repairs": 10,
+        "rungs": {
+            "retries": 2, "repairs": 10, "worker_switches": 1, "acquisitions": 1,
+            "builds": 1, "requests": 1, "improvements": 0, "replans": 1,
+        },
+    });
+    let mut gauge = draft("personal", "Read the corrupted tide gauge", tag, W_GAUGE);
+    gauge["budget"] = budget.clone();
+    let x = file(ctx, gauge).await?;
+    let done = wait_status(ctx, &x, Status::Done).await?;
+
+    // ── the trip ──────────────────────────────────────────────────────
+    // The item's ladder as the detail returns it (`rungs` would also read
+    // each rung's event, so every rung twice).
+    let climbed: Vec<String> = field(&done, "ladder")
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["rung"].as_str().map(str::to_string))
+        .collect();
+    ensure!(
+        climbed == ["repair", "repair", "repair", "improve"],
+        "the ladder repaired three times, then the breaker filed the investigation: {climbed:?}"
+    );
+    let trail = event_trail(ctx, &x).await?;
+    let tripped = trail
+        .iter()
+        .filter(|e| e["kind"] == "rung")
+        .filter_map(|e| serde_json::from_str::<Value>(e["reason"].as_str()?).ok())
+        .find(|r| r["rung"] == "improve")
+        .ok_or_else(|| anyhow!("no improve rung"))?;
+    let outcome = tripped["outcome"].as_str().unwrap_or_default().to_string();
+    ensure!(
+        outcome.contains("circuit breaker tripped: 3 failed attempts in a row"),
+        "the improve rung says the breaker tripped: {outcome}"
+    );
+    let fingerprint = tripped["error"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    ensure!(
+        tripped["error"]["class"] == "unknown",
+        "the tripped failure is the worker's unrecognised one: {tripped}"
+    );
+
+    // ── what each attempt ran with ────────────────────────────────────
+    let runs: Vec<String> = evidence_of(&done, "run")
+        .iter()
+        .filter_map(|e| e["reference"].as_str().map(str::to_string))
+        .collect();
+    let states = evidence_of(&done, "attempt_state");
+    let hashes: Vec<&str> = states
+        .iter()
+        .map(|e| e["hash"].as_str().unwrap_or_default())
+        .collect();
+    ensure!(
+        runs.len() == 5 && hashes.len() == 5,
+        "five leases, each with its attempt state, well short of 491: {runs:?} {hashes:?}"
+    );
+    ensure!(
+        hashes[1] == hashes[2] && hashes[2] == hashes[3],
+        "the three repairs ran in one attempt state: {hashes:?}"
+    );
+    ensure!(
+        hashes[0] != hashes[1] && hashes[4] != hashes[3],
+        "the first attempt, and the one after the fix landed, are different states: {hashes:?}"
+    );
+    let open = evidence_of(&done, "circuit_open");
+    ensure!(open.len() == 1, "one circuit_open row: {open:?}");
+    let record: Value = serde_json::from_str(open[0]["reference"].as_str().unwrap_or_default())?;
+    ensure!(
+        record["runs"] == json!(runs[1..4]) && record["fingerprint"] == fingerprint.as_str(),
+        "circuit_open names the three runs and the fingerprint: {record}"
+    );
+    for run in &runs[1..4] {
+        ensure!(outcome.contains(run.as_str()), "the rung names run {run}");
+    }
+    ensure!(
+        evidence_of(&done, "attempt_failure").len() == 4,
+        "every judged failure is recorded with its state"
+    );
+
+    // ── one investigation, landed: a new repair generation ────────────
+    let fixes: Vec<Value> = list(ctx, "kind=internal&include_closed=true")
+        .await?
+        .into_iter()
+        .filter(|v| {
+            body(v)["artifact_refs"].as_array().is_some_and(|refs| {
+                refs.iter().any(|r| {
+                    r["kind"] == "failure_fingerprint" && r["value"] == fingerprint.as_str()
+                })
+            })
+        })
+        .collect();
+    ensure!(fixes.len() == 1, "exactly one investigation: {fixes:?}");
+    let fix = id(&fixes[0]);
+    ensure!(
+        outcome.starts_with(&format!("waiting on resolution item {fix}")),
+        "the item waited on that investigation: {outcome}"
+    );
+    let fixed = expect_status(ctx, &fix, Status::Done, "the investigation landed").await?;
+    ensure!(
+        evidence(&fixed)
+            .iter()
+            .any(|e| e["kind"] == "classifier_rule" && e["verified_by"] == "replay"),
+        "its classifier rule replayed the failure: {}",
+        evidence_text(&fixed)
+    );
+    let last_state: Value =
+        serde_json::from_str(states[4]["reference"].as_str().unwrap_or_default())?;
+    ensure!(
+        last_state["generation"]
+            .as_array()
+            .is_some_and(|g| g.iter().any(|r| r["item"] == fix.as_str())),
+        "the resumed attempt ran in the investigation's generation: {last_state}"
+    );
+
+    // ── spend: one budget, never refilled ─────────────────────────────
+    let (spend_text, totals) = spend_report(ctx, &x, &budget, 1)?;
+    ensure!(
+        totals["runs"] == 5
+            && totals["iterations"].as_i64().unwrap_or(i64::MAX) <= 30
+            && totals["tokens"].as_i64().unwrap_or(i64::MAX) <= 200_000
+            && totals["wall_ms"].as_i64().unwrap_or(i64::MAX) <= 600_000,
+        "five runs within the one budget: {totals}"
+    );
+    let given = brief_budgets(ctx, tag)?;
+    ensure!(
+        given.len() == 5 && given.windows(2).all(|w| w[1] < w[0]) && given[0] == 30,
+        "each attempt was briefed with what was left, not a fresh budget: {given:?}"
+    );
+
+    // ── the investigation record an operator reads ────────────────────
+    let printed = cli_stdout(ctx, &["work", "investigate", &fingerprint])?;
+    let as_json = cli_stdout(ctx, &["work", "investigate", &fingerprint, "--json"])?;
+    let investigated: Value = serde_json::from_str(&as_json)?;
+    ensure!(
+        investigated["fixes"][0]["item"]["id"] == fix.as_str()
+            && investigated["occurrences"][0]["item"]["id"] == x.as_str(),
+        "work investigate shows the item and its one investigation: {}",
+        excerpt(&as_json)
+    );
+
+    keep_evidence("breaker/item.events.txt", trail_text(&trail))?;
+    keep_evidence(
+        "breaker/item.events.json",
+        serde_json::to_string_pretty(&trail)?,
+    )?;
+    keep_evidence(
+        "breaker/item.attempt-state.json",
+        serde_json::to_string_pretty(&states)?,
+    )?;
+    keep_evidence(
+        "breaker/item.attempt-failure.json",
+        serde_json::to_string_pretty(&evidence_of(&done, "attempt_failure"))?,
+    )?;
+    keep_evidence(
+        "breaker/item.circuit-open.json",
+        serde_json::to_string_pretty(&open)?,
+    )?;
+    keep_evidence("breaker/item.spend.txt", &spend_text)?;
+    keep_evidence(
+        "breaker/item.brief-budgets.txt",
+        given
+            .iter()
+            .enumerate()
+            .map(|(i, steps)| format!("attempt {}: budget: {steps} steps\n", i + 1))
+            .collect::<String>(),
+    )?;
+    keep_evidence(
+        "breaker/investigation.events.txt",
+        trail_text(&event_trail(ctx, &fix).await?),
+    )?;
+    keep_evidence("breaker/work-investigate.txt", &printed)?;
+    keep_evidence("breaker/work-investigate.json", &as_json)?;
+    Ok(())
+}
+
+/// Bounded recovery, the cumulative budget and its grant, on a daemon of
+/// its own. An item whose budget holds two runs fails twice; its third run
+/// is never leased: the cumulative guard fails it `budget/iterations`
+/// before anything runs, and it parks `blocked(budget_exhausted)` with one
+/// question. Its owner's answer grants one more allotment (a `budget_grant`
+/// row naming the question) and resumes it, with that allotment as its
+/// brief; a second answer to the same question is refused and grants
+/// nothing.
+async fn budget_grant_resumes(shared: &Ctx) -> Result<()> {
+    let daemon = OwnDaemon::boot_with(shared, &[]).await?;
+    let ctx = &daemon.ctx;
+    let tag = "[e2e-control bounded-recovery budget]";
+    let budget = json!({ "iterations": 2, "tokens": 200_000, "wall_seconds": 600, "repairs": 2 });
+    let mut station = draft("personal", "Query the gauge station", tag, W_STATION);
+    station["budget"] = budget.clone();
+    let x = file(ctx, station).await?;
+    let spent = wait_status(ctx, &x, Status::Blocked(BlockedReason::BudgetExhausted)).await?;
+    let error: rustykrab_core::work::WorkError =
+        serde_json::from_value(field(&spent, "last_error").clone())?;
+    ensure!(
+        error.class == ErrorClass::Budget
+            && error.subclass.as_str() == "iterations"
+            && error.observed_by == "cumulative_budget_guard",
+        "the cumulative guard stopped it: {error:?}"
+    );
+    let leased = |view: &Value| events_of(view, EventKind::Lease).len();
+    let runs_before = leased(&spent);
+    tokio::time::sleep(QUIET).await;
+    let still = expect_status(
+        ctx,
+        &x,
+        Status::Blocked(BlockedReason::BudgetExhausted),
+        "a spent budget stays parked",
+    )
+    .await?;
+    ensure!(
+        leased(&still) == runs_before,
+        "nothing is leased on a spent budget"
+    );
+    let asked = questions_for(ctx, &x).await?;
+    ensure!(asked.len() == 1, "one question: {asked:?}");
+    let question = asked[0].clone();
+    ensure!(
+        question["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("budget is spent")),
+        "the question says the budget is spent: {question}"
+    );
+    let (before_text, before) = spend_report(ctx, &x, &budget, 1)?;
+    let spent_before = before["iterations"].as_u64().unwrap_or(0);
+
+    let qid = question["id"].as_str().unwrap_or_default().to_string();
+    let answer = post(
+        ctx,
+        &format!("{QUESTIONS}/{qid}/answer"),
+        json!({ "answer": ANSWER_STATION }),
+    )
+    .await?;
+    ensure!(
+        answer["resumed"] == json!([x]),
+        "the answer resumed the item: {answer}"
+    );
+    let again = expect(
+        ctx.post(
+            &format!("{QUESTIONS}/{qid}/answer"),
+            json!({ "answer": ANSWER_STATION }),
+        )
+        .await?,
+        &[409],
+        "a second answer to the same question",
+    )
+    .await?;
+    let done = wait_status(ctx, &x, Status::Done).await?;
+    let grants = evidence_of(&done, "budget_grant");
+    ensure!(
+        grants.len() == 1
+            && grants[0]["reference"] == qid.as_str()
+            && grants[0]["verified_by"]
+                .as_str()
+                .is_some_and(|by| by.starts_with("user")),
+        "one grant, naming the question and who answered: {grants:?}"
+    );
+    let given = brief_budgets(ctx, tag)?;
+    let (spend_text, totals) = spend_report(ctx, &x, &budget, 2)?;
+    ensure!(
+        totals["iterations"].as_i64().unwrap_or(i64::MAX) <= 4
+            && totals["runs"].as_u64() == Some(runs_before as u64 + 1),
+        "one more run, within two allotments: {totals}"
+    );
+    ensure!(
+        given.len() == runs_before + 1
+            && given.first() == Some(&2)
+            && given.last() == Some(&(4 - spent_before)),
+        "each run was briefed with what was left, the resumed one with two allotments less \
+         the {spent_before} iterations spent: {given:?}"
+    );
+    let trail = event_trail(ctx, &x).await?;
+    keep_evidence("budget/item.events.txt", trail_text(&trail))?;
+    keep_evidence(
+        "budget/item.events.json",
+        serde_json::to_string_pretty(&trail)?,
+    )?;
+    keep_evidence(
+        "budget/item.question.json",
+        serde_json::to_string_pretty(&question)?,
+    )?;
+    keep_evidence(
+        "budget/item.answer.json",
+        serde_json::to_string_pretty(&answer)?,
+    )?;
+    keep_evidence(
+        "budget/item.second-answer.json",
+        serde_json::to_string_pretty(&again)?,
+    )?;
+    keep_evidence(
+        "budget/item.budget-grant.json",
+        serde_json::to_string_pretty(&grants)?,
+    )?;
+    keep_evidence(
+        "budget/item.guard-error.json",
+        serde_json::to_string_pretty(field(&spent, "last_error"))?,
+    )?;
+    keep_evidence("budget/item.spend.before-grant.txt", &before_text)?;
+    keep_evidence("budget/item.spend.txt", &spend_text)?;
+    keep_evidence(
+        "budget/item.brief-budgets.txt",
+        given
+            .iter()
+            .enumerate()
+            .map(|(i, steps)| format!("attempt {}: budget: {steps} steps\n", i + 1))
+            .collect::<String>(),
     )?;
     Ok(())
 }
@@ -3036,7 +3485,8 @@ async fn s03(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Scenario 5: A worker stalls; the progress ledger triggers repair; the second
+/// Scenario 5: A worker stalls; the progress ledger triggers repair; its owner
+/// grants the spent budget one more allotment; the second
 /// attempt uses the first attempt's evidence.
 async fn s05(ctx: &Ctx) -> Result<()> {
     let tag = tag(5);
@@ -3057,6 +3507,25 @@ async fn s05(ctx: &Ctx) -> Result<()> {
     ensure!(
         trigger.contains("stall") || trigger.contains("progress"),
         "the repair was not triggered by the progress ledger: {trigger}"
+    );
+    // The stall ran to its run's cap, which is the whole of the item's
+    // remaining budget, so bounded recovery parks the repair on its owner:
+    // one question, and the answer grants the second attempt.
+    wait_status(ctx, &task, Status::Blocked(BlockedReason::BudgetExhausted)).await?;
+    let asked = questions_for(ctx, &task).await?;
+    let question = asked
+        .first()
+        .context("the spent budget asks the item's owner")?;
+    let qid = question["id"].as_str().unwrap_or_default();
+    let answer = post(
+        ctx,
+        &format!("{QUESTIONS}/{qid}/answer"),
+        json!({ "answer": "Yes, one more attempt." }),
+    )
+    .await?;
+    ensure!(
+        answer["resumed"] == json!([task]),
+        "the owner's answer resumed the stalled item: {answer}"
     );
     let deadline = Instant::now() + SETTLE;
     let attempts = loop {
@@ -3437,7 +3906,7 @@ fn ever_failed(view: &Value) -> bool {
 async fn s08(ctx: &Ctx) -> Result<()> {
     // The peer is the available executor in this fixture. Backend selectors
     // are retired and cannot force work away from another compatible resource.
-    let daemon = LocalWorkerOffDaemon::boot(ctx).await?;
+    let daemon = OwnDaemon::boot(ctx).await?;
     let ctx = &daemon.ctx;
     let tag = tag(8);
     let port = crate::pick_free_port()?;

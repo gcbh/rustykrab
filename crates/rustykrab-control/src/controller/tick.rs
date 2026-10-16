@@ -37,6 +37,7 @@ use super::filing::{
 use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, SWITCHED};
 use super::notice::{label, Cause};
 use super::questions::NewQuestion;
+use super::spend::{exhausted, CUMULATIVE_GUARD};
 use super::{Controller, Finished, Run, RunResult};
 
 /// Moves the ladder may make on one failure before it must surface: the
@@ -89,7 +90,7 @@ pub(super) fn covers(worker: &dyn Worker, item: &WorkItem) -> bool {
 }
 
 /// The blocked state a surfaced failure parks in (sections 7 and 8).
-fn surface_reason(error: &WorkError, why: SurfaceReason) -> BlockedReason {
+pub(super) fn surface_reason(error: &WorkError, why: SurfaceReason) -> BlockedReason {
     if why == SurfaceReason::PolicyStop {
         return BlockedReason::NeedsDecision;
     }
@@ -446,7 +447,12 @@ impl Controller {
                 },
             );
             b.revoke.push(id.clone());
-            changed.extend(self.climb(&mut b, &item, &worker, error).await?);
+            // A stall is a judged failure like any other: the breaker
+            // counts it before the ladder moves.
+            match self.judge_attempt(&mut b, &item, &error).await? {
+                Some(trip) => changed.extend(self.trip(&mut b, &item, &error, trip).await?),
+                None => changed.extend(self.climb(&mut b, &item, &worker, error).await?),
+            }
         }
 
         // A restart does not kill a run that lives outside this process
@@ -859,7 +865,7 @@ impl Controller {
                     .await;
             }
         }
-        for artifact in &result.artifacts {
+        for artifact in super::breaker::reported_artifacts(b, &item.id, worker, &result.artifacts) {
             // A landed rule is verified by the replay above, not by being
             // in the report; an adapter's command record is what checks
             // were verified against.
@@ -1191,7 +1197,7 @@ impl Controller {
                 worker_kind: Some(self.worker_kind(worker)),
             },
         );
-        for artifact in artifacts {
+        for artifact in super::breaker::reported_artifacts(b, &item.id, worker, artifacts) {
             b.evidence(&item.id, &artifact.kind, &artifact.value, None);
         }
         b.evidence.push(rustykrab_core::work::Evidence {
@@ -1230,7 +1236,67 @@ impl Controller {
         if let Some(verdict) = verdict_of(&error) {
             self.judged(b, item, worker, verdict).await?;
         }
+        // The same failure in the same state again: no identical attempt,
+        // one investigation (`breaker.rs`).
+        if let Some(trip) = self.judge_attempt(b, item, &error).await? {
+            return self.trip(b, item, &error, trip).await;
+        }
         self.climb(b, item, worker, error).await
+    }
+
+    /// The cumulative guard's stop (`spend.rs`): `item`, ready but with its
+    /// budget spent in `kind`, fails `budget/<kind>` observed by
+    /// [`CUMULATIVE_GUARD`], through the ladder like any failure, which
+    /// skips its own rungs for a spent budget and surfaces it as
+    /// `blocked(budget_exhausted)` with one question (a plan B or the
+    /// parent's re-plan first, inside a graph). Nothing is leased, nothing
+    /// runs and nothing is spent. Returns the transitions written.
+    async fn stop_spent(
+        &self,
+        item: &WorkItem,
+        kind: crate::errors::BudgetKind,
+        detail: String,
+    ) -> Result<usize, Error> {
+        let mut b = Batch::new(self.load().await?, self.clock.now());
+        let Some(item) = b
+            .snap
+            .item(&item.id)
+            .filter(|i| i.status == Status::Ready)
+            .cloned()
+        else {
+            return Ok(0);
+        };
+        let mut error = classify(
+            &FailureInput::BudgetExhausted {
+                budget: kind,
+                detail,
+            },
+            &Context {
+                tool: None,
+                worker_kind: None,
+            },
+        );
+        error.observed_by = CUMULATIVE_GUARD.to_string();
+        b.evidence.push(rustykrab_core::work::Evidence {
+            item: item.id.clone(),
+            kind: ERROR.to_string(),
+            reference: format!(
+                "{}/{}: {}",
+                error.class.as_str(),
+                error.subclass.as_str(),
+                error.detail
+            ),
+            hash: Some(error.fingerprint.clone()),
+            verified_by: Some(error.observed_by.clone()),
+            at: b.now,
+        });
+        tracing::info!(item = %item.id, detail = %error.detail, "cumulative budget spent: not leased");
+        let changed = self.climb(&mut b, &item, "controller", error).await?;
+        b.settle(changed);
+        Ok(self
+            .commit(b, &mut HashSet::new())
+            .await?
+            .map_or(0, |w| w.transitions))
     }
 
     /// A block or a question only the user can answer (section 7): the
@@ -1300,13 +1366,21 @@ impl Controller {
         excluded.insert(worker.to_string());
 
         // Recurrence counts items, not attempts: the same fingerprint on
-        // the same item counts once.
-        let first_here = !state.history.iter().any(|e| {
-            e.error
-                .as_ref()
-                .is_some_and(|x| x.fingerprint == error.fingerprint)
-        });
-        let seen = self.state().recurrence.count(&error.fingerprint) + u32::from(first_here);
+        // the same item counts once. The cumulative guard's own stop is
+        // not a recurring defect: each item spent its own budget, so it
+        // goes to the owner, never to an improvement item.
+        let guard = error.observed_by == CUMULATIVE_GUARD;
+        let first_here = !guard
+            && !state.history.iter().any(|e| {
+                e.error
+                    .as_ref()
+                    .is_some_and(|x| x.fingerprint == error.fingerprint)
+            });
+        let seen = if guard {
+            0
+        } else {
+            self.state().recurrence.count(&error.fingerprint) + u32::from(first_here)
+        };
         if first_here {
             b.observe.push(error.fingerprint.clone());
         }
@@ -1774,6 +1848,15 @@ impl Controller {
             {
                 continue;
             }
+            // The cumulative guard: what every earlier attempt spent is
+            // gone, however the item got back to ready. A spent budget is
+            // not leased; it fails `budget/*` and goes to the owner.
+            let allotments = self.allotments(&item.id).await?;
+            let (budget, spent) = self.cumulative_budget(&item, allotments);
+            if let Some((kind, detail)) = exhausted(&budget, &item.budget, allotments, spent) {
+                report.transitions += self.stop_spent(&item, kind, detail).await?;
+                continue;
+            }
             let events = self.store.work_events(&item.id).await?;
             let hist = history(&events);
             let mode = match item.kind {
@@ -1792,7 +1875,7 @@ impl Controller {
             } else {
                 Vec::new()
             };
-            let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist);
+            let mut brief = brief_for(&item, inputs.clone(), more, prior, &hist, budget);
             // Answers resume the item, not the conversation (section 7):
             // the next run's brief carries them as decisions.
             let root = snap
@@ -1833,6 +1916,14 @@ impl Controller {
                 }
             }
             brief.capability = mode;
+            // What this attempt runs with, right after its run row (same
+            // stamp, written after it): what the breaker compares failed
+            // attempts by.
+            let mut attempt = self
+                .attempt_state(&snap, &item, &brief, worker.as_ref(), &events)
+                .await?;
+            let leased_at = Utc::now();
+            attempt.at = leased_at;
             let mut lease_evidence = vec![
                 rustykrab_core::work::Evidence {
                     item: item.id.clone(),
@@ -1840,8 +1931,9 @@ impl Controller {
                     reference: run_id.clone(),
                     hash: None,
                     verified_by: None,
-                    at: Utc::now(),
+                    at: leased_at,
                 },
+                attempt,
                 // Which build of the daemon ran it: a fix only takes effect
                 // once it is built and deployed, and a later investigation
                 // has to tell a recurrence on an older build from a failed

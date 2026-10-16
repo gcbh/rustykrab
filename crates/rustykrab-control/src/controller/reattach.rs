@@ -86,7 +86,10 @@ impl Controller {
         } else {
             Vec::new()
         };
-        let mut brief = brief_for(item, lease.inputs.clone(), Vec::new(), prior, &hist);
+        // The run's own spend is recorded only when it ends, so what is
+        // left now is what the lease gave it.
+        let (budget, _) = self.cumulative_budget(item, self.allotments(&item.id).await?);
+        let mut brief = brief_for(item, lease.inputs.clone(), Vec::new(), prior, &hist, budget);
         brief.discussion = evidence
             .iter()
             .rev()

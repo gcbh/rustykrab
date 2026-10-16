@@ -623,8 +623,10 @@ a cancelled or lost run still points at its partial work.
 **Spend is one row per run.** `work_spend` records what each worker run
 spent (tokens across its model calls, wall time, iterations) when it ends
 or is stopped, whether or not its item is still live. A parent's remaining
-budget is its budget less what its subtree spent (section 4.2), and
-compaction writes the item's total into the archive's `cost`.
+budget is its budget less what its subtree spent (section 4.2), a leaf's is
+its budget, once per allotment, less what all its runs spent (each run is
+briefed with that remainder, and a leaf with too little left is not leased),
+and compaction writes the item's total into the archive's `cost`.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
@@ -639,7 +641,14 @@ daemon that ran the run, `hash` its run id; the work tables carry no
 failure on an older build from a failed fix), `investigation_bundle` (on a fix
 item: the path of the bundle the controller wrote for that run, `hash` the
 fingerprint), `resolution_outcome` (on an item released from a fix item that
-parked without landing: that item's id and the fact), and `classifier_rule` (a `<subclass>: <pattern>` row an
+parked without landing: that item's id and the fact), `attempt_state` (written
+right after `run` at lease time: `hash` a digest of what could change the
+attempt's outcome, `reference` the JSON it digests), `attempt_failure` (a
+judged failed attempt: its run, fingerprint and class as JSON, `hash` its
+attempt state), `circuit_open` (the repeated-outcome breaker tripped: the
+runs and the attempt state as JSON, `hash` the fingerprint), `budget_grant`
+(one more allotment of a leaf's budget: `reference` the question whose answer
+released it, `verified_by` who answered; each row adds one allotment), and `classifier_rule` (a `<subclass>: <pattern>` row an
 `internal` item landed, `verified_by = 'replay'` once the controller replayed
 the failure through it). The last is reloaded across items on start
 (`work_evidence_of_kind`), which is how a landed rule survives restarts and

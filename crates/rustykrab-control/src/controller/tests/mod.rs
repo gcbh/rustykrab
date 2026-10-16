@@ -5,6 +5,7 @@
 //! clock that moves one second per tick, and runs scripted [`Worker`]s that
 //! return canned [`ResultReport`]s per item title.
 
+mod bounds;
 mod checks;
 mod closeout;
 mod drain;

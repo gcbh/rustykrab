@@ -68,8 +68,16 @@ pub const DAEMON_BUILD: &str = "daemon_build";
 pub const INVESTIGATION_BUNDLE: &str = "investigation_bundle";
 
 /// What an `improve` rung's outcome starts with when the item was parked
-/// behind a fix item; the fix item's id follows.
+/// behind a fix item; the fix item's id follows, then, when the circuit
+/// breaker parked it, `; ` and why ([`resolution_item`] reads the id).
 pub const RESOLUTION_WAIT: &str = "waiting on resolution item ";
+
+/// The fix item an `improve` rung's outcome says its item waits on.
+pub fn resolution_item(outcome: &str) -> Option<&str> {
+    let rest = outcome.strip_prefix(RESOLUTION_WAIT)?;
+    let id = rest.split(';').next()?.trim();
+    (!id.is_empty()).then_some(id)
+}
 
 /// The artifact ref a fix item carries when the failure it investigates is
 /// in the daemon's own code: its value is the daemon's source repository,
@@ -919,10 +927,9 @@ pub async fn failure_history(
             if wanted_fp.as_deref().is_some_and(|w| Some(w) != about) {
                 continue;
             }
-            if let Some(fix) = rung.outcome.strip_prefix(RESOLUTION_WAIT) {
-                let fix = fix.trim().to_string();
-                if !fix.is_empty() && !fix_ids.contains(&fix) {
-                    fix_ids.push(fix);
+            if let Some(fix) = resolution_item(&rung.outcome) {
+                if !fix_ids.iter().any(|f| f == fix) {
+                    fix_ids.push(fix.to_string());
                 }
             }
         }

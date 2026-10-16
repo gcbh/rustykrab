@@ -1,0 +1,10 @@
+work_spend for item 62c403bb-8fbb-4705-af91-db77c5ed28c9
+run                                   worker        tokens   wall_ms  iterations  at
+587f7034-8134-4ee2-9353-cf0b9ba6d876  snapper            0         3           1  2026-10-14T21:23:08.818487000Z
+d6f7850d-675a-4d02-8659-e79432db20cc  snapper            0         3           1  2026-10-14T21:23:09.816697000Z
+8f85490c-80e7-4ced-9b03-2ed7d828cda3  snapper            0         5           1  2026-10-14T21:23:10.816493000Z
+722a9ae5-7584-4950-8d2c-c2b0b268857d  snapper            0         4           1  2026-10-14T21:23:11.818589000Z
+bf520b04-6fd2-476a-bf92-0789d4856e64  snapper            0         4           1  2026-10-14T21:23:13.818478000Z
+
+total: 5 run(s), 5 iterations, 0 tokens, 19 ms wall
+budget: 30 iterations, 200000 tokens, 600 s wall per allotment; 1 allotment(s) allow 30 iterations, 200000 tokens, 600 s wall

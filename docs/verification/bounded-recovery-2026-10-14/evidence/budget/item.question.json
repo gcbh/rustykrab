@@ -1,0 +1,22 @@
+{
+  "answer": null,
+  "answered_at": null,
+  "answered_by": null,
+  "asked_by": "controller",
+  "asked_class": null,
+  "class": "blocking_now",
+  "created_at": "2026-10-14T21:23:17.018887Z",
+  "decision": null,
+  "default_answer": null,
+  "delivered_via": "webchat",
+  "id": "28516066-f01d-44eb-96e8-81d71cbb73e0",
+  "item": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+  "kind": "decision",
+  "options": [],
+  "research_item": null,
+  "root": "ddb4a6c1-8ed0-4b6b-b751-a18a7be9a1b1",
+  "rule": "surfaced",
+  "status": "open",
+  "superseded_by": null,
+  "text": "Its budget is spent (budget/iterations): iterations budget spent: 2 of 2 iterations used over 2 run(s) (1 allotment(s) of 2, counted across every attempt); 0 left, under the 1 a run needs. Answer to grant one more allotment of its budget and resume it, or no to cancel it."
+}
