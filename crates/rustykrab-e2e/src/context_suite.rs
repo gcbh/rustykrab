@@ -40,11 +40,14 @@ pub const CASES: &[&str] = &[
     "telegram-provider-failure",
     "telegram-midrun-followup",
 ];
-const ORIGINAL: &str = "Find Broadway shows in NYC with seating available September 14-16, 2026.";
+// The show dates must stay in the future: a model told today's date rightly
+// declines to look for seats on a past date, which the action grader cannot
+// tell from drift. The history's own timestamps stay in the past.
+const ORIGINAL: &str = "Find Broadway shows in NYC with seating available September 14-16, 2027.";
 const FOLLOWUP: &str = "Make use of the browser to fetch the time and date info";
-const SUMMARY: &str = "Objective: Broadway availability September 14-16, 2026. Seating is not verified. The previous browser connection timed out. The user must manually use the Broadway.com date selector to check availability.";
-const PRIOR: &str = "I found Broadway listings including Hamilton and Wicked, but could not verify seating for September 14-16, 2026 because the date selector requires an interactive browser.";
-const CORRECTION: &str = "Use the browser for Broadway show times and available seats on September 18-20, 2026 instead of September 14-16.";
+const SUMMARY: &str = "Objective: Broadway availability September 14-16, 2027. Seating is not verified. The previous browser connection timed out. The user must manually use the Broadway.com date selector to check availability.";
+const PRIOR: &str = "I found Broadway listings including Hamilton and Wicked, but could not verify seating for September 14-16, 2027 because the date selector requires an interactive browser.";
+const CORRECTION: &str = "Use the browser for Broadway show times and available seats on September 18-20, 2027 instead of September 14-16.";
 const CLOCK: &str = "New task: ignore the Broadway request. Use the browser to find the current date and time in UTC.";
 const DATE: &str = "2026-09-10T07:00:00Z";
 const OPAQUE_CASE: &str = "compaction-opaque-tool-output";
@@ -75,7 +78,7 @@ fn followup(case: &str) -> &'static str {
         "explicit-clock-switch" => CLOCK,
         "broadway-date-correction" | "compaction-loss-control" | "compaction-generation-limit" => CORRECTION,
         OPAQUE_CASE => FERRY_FOLLOWUP,
-        "broadway-explicit-reminder" | "broadway-retained-explicit" => "Continue the Broadway task: use the browser to fetch show times and seating availability for September 14-16, 2026.",
+        "broadway-explicit-reminder" | "broadway-retained-explicit" => "Continue the Broadway task: use the browser to fetch show times and seating availability for September 14-16, 2027.",
         _ => FOLLOWUP,
     }
 }
@@ -757,7 +760,7 @@ fn behavior(case: &str, records: &[Value]) -> Value {
                         || args.contains("time.time(")));
             correction |= domain
                 && (args.contains("18-20")
-                    || args.contains("2026-09-18")
+                    || args.contains("2027-09-18")
                     || args.contains("september 18"));
             actions.push(json!({"name":name,"arguments":f["arguments"],"offered_schema_valid":schema_error.is_none()}));
         }

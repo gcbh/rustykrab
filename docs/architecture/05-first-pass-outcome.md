@@ -293,3 +293,20 @@ prints what each model resolves to, and the retired settings produce a startup
 warning instead of silently competing. This narrows OPINION §2 for providers
 (8 literal env reads to 3) without closing it. Hosted models keep
 `RUSTYKRAB_MAX_CONTEXT_TOKENS`.
+
+## Compaction state handoff (2026-10-15)
+
+The default compaction summarizer was handed the agent's own system prompt
+inside the history it summarized ("Complete the user's task… Keep going…").
+After #709 turned thinking off for summary calls, qwen3.8 at a 128K window
+answered the task instead of summarizing it in 8 of 16 summary calls, and the
+handoff then recorded the answer's guesses as fact ("Agent lacks browser
+automation capabilities"). The next action stayed on task in 2 of 6 trials.
+
+The summarizer now reads the history without the agent's system messages,
+under its own system message, with the instructions after a fenced history,
+and the default prompt asks for named state sections. A hill-climb over five
+candidates chose the sections; the evidence and the audited scoring are in
+`docs/verification/compaction-state-handoff-2026-10-15.md`. The retention is
+unchanged: first and latest user input verbatim.
+

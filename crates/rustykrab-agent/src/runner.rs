@@ -3438,9 +3438,10 @@ impl AgentRunner {
     }
 
     /// Single summarizer call over an arbitrary text input. Uses a
-    /// compaction-specific system prompt — it does *not* reuse the agent's
-    /// own system prompt, so the summarizer can focus on compression
-    /// without the agent's tool-using persona.
+    /// compaction-specific system prompt, never the agent's own; the
+    /// recursive path also leaves the agent's system messages out of the
+    /// rendered history, so the summarizer is never handed the agent's
+    /// instructions to follow.
     ///
     /// `max_output_tokens` is rendered into the system prompt as an
     /// explicit word budget. This is advisory (models don't always comply)
@@ -3453,29 +3454,29 @@ impl AgentRunner {
         partial: bool,
         max_output_tokens: usize,
     ) -> Result<String> {
-        let scope = if partial {
-            "a portion of a longer conversation (one of several chunks)"
-        } else {
-            "a conversation between a user and an agent"
-        };
         // Token → word conversion uses ~1.5 tokens/word as a conservative
         // estimate so the word budget leaves headroom under the token cap.
         let max_words = (max_output_tokens as f64 / 1.5).floor().max(128.0) as usize;
-        let system_prompt = if self.compaction.strategy == CompactionStrategy::Legacy {
-            format!(
-                "You are compressing {scope} so a downstream agent can continue the work \
-             without re-reading it. Preserve: concrete intermediate results (values, file \
-             paths, IDs, URLs), decisions, constraints and preferences, named entities, \
-             open questions, and the agent's current plan. Drop: pleasantries, superseded \
-             reasoning, and anything already resolved by later turns. Output terse bullet \
-             points only — no preamble, no meta-commentary. HARD LIMIT: keep the summary \
-             under {max_words} words — shorter is better. If you cannot fit everything, \
-             prioritise the most recent decisions and open work."
+        let strategy = self.compaction.strategy;
+        // The default handoff reads as a description of the session, not a
+        // turn in it: its own system message, the history fenced, and the
+        // instructions after it. With the history first, a provider can
+        // reuse it as a cached prefix across calls.
+        let (system_prompt, user_text) = if strategy == CompactionStrategy::Legacy {
+            (
+                crate::compaction::SUMMARIZER_SYSTEM.to_string(),
+                format!(
+                    "<history>\n{input}\n</history>\n\n{}",
+                    strategy.summary_prompt(max_words, partial)
+                ),
             )
         } else {
-            self.config
-                .compaction_strategy
-                .summary_prompt(max_words, partial)
+            (
+                self.config
+                    .compaction_strategy
+                    .summary_prompt(max_words, partial),
+                input.to_string(),
+            )
         };
         let messages = vec![
             Message {
@@ -3488,7 +3489,7 @@ impl AgentRunner {
             Message {
                 id: Uuid::new_v4(),
                 role: Role::User,
-                content: MessageContent::Text(input.to_string()),
+                content: MessageContent::Text(user_text),
                 created_at: Utc::now(),
                 agent_version: Message::version_stamp(),
             },
@@ -4050,9 +4051,13 @@ impl AgentRunner {
                 summary_cap_tokens,
                 "compaction: history exceeds single-call budget; using recursive path"
             );
+            // The agent's own system prompt is not session state, and a
+            // summarizer handed it ("complete the user's task") may act on
+            // it. Compaction keeps it in place regardless.
             let rendered: Vec<String> = conv
                 .messages
                 .iter()
+                .filter(|m| m.role != Role::System)
                 .map(Self::render_message_for_summary)
                 .collect();
             self.summarize_text_recursively(rendered, input_budget, summary_cap_tokens, 0)
@@ -5843,6 +5848,8 @@ mod compaction_tests {
         /// to carry the same tool block as an ordinary turn or the
         /// provider's cached prefix stops matching.
         tools_seen: Mutex<Vec<Vec<String>>>,
+        /// Every request's messages, in order.
+        requests: Mutex<Vec<Vec<Message>>>,
     }
 
     impl CountingProvider {
@@ -5852,6 +5859,7 @@ mod compaction_tests {
                 last_input_chars: Mutex::new(Vec::new()),
                 ctx_limit,
                 tools_seen: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -5869,6 +5877,7 @@ mod compaction_tests {
                 .lock()
                 .unwrap()
                 .push(tools.iter().map(|t| t.name.clone()).collect());
+            self.requests.lock().unwrap().push(messages.to_vec());
             let total_chars: usize = messages
                 .iter()
                 .map(|m| match &m.content {
@@ -6131,6 +6140,72 @@ mod compaction_tests {
         // Recursive path should have issued more than one provider call.
         let calls = *provider.call_count.lock().unwrap();
         assert!(calls >= 2, "recursive path expected, got {calls} call(s)");
+    }
+
+    /// The default summarizer describes the session rather than taking part
+    /// in it: its own system message, never the agent's, the agent's system
+    /// prompt left out of the history it reads, and the handoff sections
+    /// after the history. The compacted conversation keeps the agent's
+    /// system prompt in place.
+    #[tokio::test]
+    async fn the_summarizer_is_not_handed_the_agents_instructions() {
+        let provider = Arc::new(CountingProvider::new(Some(8_000)));
+        let runner = build_runner(Arc::clone(&provider));
+        let identity = "You are the agent. Complete the user's task.";
+        let mut messages = vec![Message {
+            id: Uuid::new_v4(),
+            role: Role::System,
+            content: MessageContent::Text(identity.into()),
+            created_at: Utc::now(),
+            agent_version: None,
+        }];
+        for i in 0..16 {
+            messages.push(Message {
+                id: Uuid::new_v4(),
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: MessageContent::Text(format!("turn {i} ").repeat(400)),
+                created_at: Utc::now(),
+                agent_version: None,
+            });
+        }
+        let mut conv = Conversation {
+            id: Uuid::new_v4(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            title: None,
+            summary: None,
+            detected_profile: None,
+            channel_source: None,
+            channel_id: None,
+            channel_thread_id: None,
+        };
+        runner
+            .compact_history(&mut conv, &[])
+            .await
+            .expect("compaction should succeed");
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert!(requests.len() >= 2, "the recursive path ran");
+        for request in &requests {
+            let text = |m: &Message| m.content.as_text().unwrap_or("").to_string();
+            assert_eq!(request[0].role, Role::System);
+            assert_eq!(text(&request[0]), crate::compaction::SUMMARIZER_SYSTEM);
+            let body = text(&request[1]);
+            assert!(
+                !body.contains(identity),
+                "the agent's prompt was summarized: {body}"
+            );
+            let history = body.find("</history>").expect("the history is fenced");
+            let sections = body.find("OBJECTIVE:").expect("the handoff sections");
+            assert!(history < sections, "the instructions follow the history");
+        }
+        assert_eq!(conv.messages[0].role, Role::System);
+        assert_eq!(conv.messages[0].content.as_text(), Some(identity));
     }
 
     /// The recall readers are declared once there is an archive to read.

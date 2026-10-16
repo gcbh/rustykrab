@@ -120,7 +120,7 @@ context_window = 131072
 | `output_tokens` | `4096` | A turn's output allowance (`num_predict`; `max_tokens` on an OpenAI-compatible local server) |
 | `keep_alive` | `30m` | How long the server keeps the model resident (Ollama duration syntax; `"server"` takes Ollama's default) |
 | `temperature`, `top_p`, `think` | each caller's | Unset keeps each caller's own: the chat agent samples at 0.1 and decides thinking per model, the local workers and the distiller sample at 0 without thinking |
-| `compaction_strategy` | `legacy` | `legacy`, `structured`, `structured-tail`, `structured-message-tail` or `extractive` |
+| `compaction_strategy` | `legacy` | `legacy` (an explicit state handoff: objective, latest instruction, constraints and preferences, candidates, findings, failed attempts, done, open, next step; first and latest user input kept verbatim), `structured`, `structured-tail`, `structured-message-tail` or `extractive` |
 | `compaction_threshold` | `0.85` | Fraction of the usable window at which compaction fires; `0` never compacts |
 | `compaction_summary_window` | unset | Serve compaction's summary calls at this larger window |
 | `late_tool_binding` | provider's | `append` or `rerender` |
