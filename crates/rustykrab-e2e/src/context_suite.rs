@@ -162,7 +162,7 @@ fn emulated_prompt_tokens(body: &Value) -> usize {
     tokens
 }
 
-fn fixture(case: &str) -> Vec<Value> {
+fn fixture(case: &str, window: Option<u32>) -> Vec<Value> {
     if case == "missing-history-control" {
         return vec![];
     }
@@ -177,7 +177,7 @@ fn fixture(case: &str) -> Vec<Value> {
     if noisy(case) {
         // Deliberately content-heavy tool history, not a copy of private incident data.
         // No clock hints: the negative control must not leak its expected answer.
-        for i in 0..10 {
+        for i in 0..noisy_fetches(window) {
             let id = format!("historical-fetch-{i}");
             messages.push(message(
                 "assistant",
@@ -793,6 +793,44 @@ fn read_messages(db: &Path, id: &str) -> Result<Vec<Value>> {
     rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
 }
 
+/// A trial daemon's window: the provider-trim control's deliberately small
+/// one, else `--context-window`, else the default.
+fn trial_window(case: &str, requested: Option<u32>) -> u32 {
+    if case == "provider-trim-control" {
+        rustykrab_agent::local_model::MIN_CONTEXT_WINDOW
+    } else {
+        requested.unwrap_or(DEFAULT_TRIAL_WINDOW)
+    }
+}
+
+/// A trial's `models.toml`: the window's own body (which caps output below a
+/// small window, since the daemon refuses an entry whose output fills it)
+/// plus the trial's compaction policy. The provider-trim control's history
+/// stays far over its 4K window and it never compacts, so the provider
+/// refuses it before dispatch.
+fn trial_models_toml(window: u32, strategy: &str, threshold: f64) -> String {
+    format!(
+        "{}compaction_strategy = \"{strategy}\"\ncompaction_threshold = {threshold}\n",
+        rustykrab_agent::LocalModels::toml_with_window(window)
+    )
+}
+
+/// The trial daemon's window when `--context-window` names none. The
+/// synthetic histories are sized to overflow it, so compaction runs.
+const DEFAULT_TRIAL_WINDOW: u32 = 65_536;
+
+/// Historical fetches in a noisy history. Ten (about 41K tokens) is the
+/// fixture CI and the default 64K window were written for. With an explicit
+/// `--context-window` the history grows to about 95% of that window, so
+/// compaction still fires: about 31 fetches at 128K.
+fn noisy_fetches(window: Option<u32>) -> usize {
+    const TOKENS_PER_FETCH: usize = 4_100;
+    match window {
+        Some(w) => (w as usize * 95 / 100).div_ceil(TOKENS_PER_FETCH).max(1),
+        None => 10,
+    }
+}
+
 fn context_compaction_strategy() -> Result<rustykrab_agent::CompactionStrategy> {
     match std::env::var("RUSTYKRAB_CONTEXT_COMPACTION_STRATEGY") {
         Ok(value) => Ok(serde_json::from_value(json!(value))?),
@@ -929,7 +967,14 @@ async fn trial(
         0.85
     };
     let compaction_strategy = context_compaction_strategy()?.name();
-    std::fs::write(dir.join("harness.toml"),format!("name=\"context-eval\"\nagent_name=\"RustyKrab\"\nmax_iterations=4\nsoft_iteration_warning=0\nmax_tool_retries=0\ncompaction_threshold_pct={threshold}\ncompaction_strategy=\"{compaction_strategy}\"\n"))?;
+    std::fs::write(dir.join("harness.toml"),"name=\"context-eval\"\nagent_name=\"RustyKrab\"\nmax_iterations=4\nsoft_iteration_warning=0\nmax_tool_retries=0\n")?;
+    // The model's window and compaction policy are its models.toml entry,
+    // as on a real daemon; a local model ignores harness.toml's budget.
+    let window = trial_window(case, args.context_window);
+    std::fs::write(
+        dir.join(rustykrab_agent::local_model::MODELS_FILE),
+        trial_models_toml(window, compaction_strategy, threshold),
+    )?;
     let port = pick_free_port()?;
     let base = format!("http://127.0.0.1:{port}");
     let stubs = stubs()?;
@@ -950,11 +995,7 @@ async fn trial(
         &Backend::Model {
             model: &args.model,
             ollama_url: &cap.base,
-            num_ctx: Some(if case == "provider-trim-control" {
-                4096
-            } else {
-                65536
-            }),
+            num_ctx: Some(window),
             active_tools: &["browser", "web_fetch", "web_search", "code_execution"],
             tool_stubs: &stubs,
             channel: if surface == Surface::Telegram {
@@ -977,7 +1018,7 @@ async fn trial(
         .build()?;
     let db = dir.join("db/store.db");
     let started = Instant::now();
-    let initial = fixture(case);
+    let initial = fixture(case, args.context_window);
     let mut id = String::new();
     let result: Result<()> = async {
         wait_for_health(
@@ -1304,6 +1345,8 @@ pub async fn run(bin: &str, args: &Args) -> Result<bool> {
     let version = CommandVersion::read(bin)?;
     let mut metadata = json!({"mode":args.mode,"binary_version":version,"history":"synthetic, no private production export",
         "compaction_strategy":context_compaction_strategy()?.name(),
+        "context_window":args.context_window.unwrap_or(DEFAULT_TRIAL_WINDOW),
+        "noisy_history_fetches":noisy_fetches(args.context_window),
         "browser_first_response_ready":browser_ready_fixture(),
         "binary_sha256":format!("{:x}",Sha256::digest(std::fs::read(bin)?)),
         "fixture_and_grader_sha256":format!("{:x}",Sha256::digest(include_str!("context_suite.rs"))),
@@ -1402,6 +1445,44 @@ impl CommandVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every case's trial config is one the daemon would load: a trial whose
+    /// daemon refuses its models.toml never starts, and its contract goes
+    /// unexercised.
+    #[test]
+    fn every_trial_models_toml_loads_at_every_window() {
+        for case in CASES {
+            for requested in [
+                None,
+                Some(rustykrab_agent::local_model::MIN_CONTEXT_WINDOW),
+                Some(8_192),
+                Some(32_768),
+                Some(131_072),
+                Some(rustykrab_agent::local_model::MAX_CONTEXT_WINDOW),
+            ] {
+                for strategy in ["legacy", "structured-message-tail"] {
+                    for threshold in [0.0, 0.01, 0.85] {
+                        let window = trial_window(case, requested);
+                        let body = trial_models_toml(window, strategy, threshold);
+                        let model = rustykrab_agent::LocalModels::from_toml(&body)
+                            .unwrap_or_else(|e| panic!("{case} at {window}: {e}\n{body}"))
+                            .for_model("any");
+                        assert_eq!(model.context_window, window, "{case}");
+                    }
+                }
+            }
+        }
+        // The trim control's window is the smallest the daemon accepts, and
+        // its output cap leaves room for input.
+        let trim = rustykrab_agent::LocalModels::from_toml(&trial_models_toml(
+            trial_window("provider-trim-control", Some(131_072)),
+            "legacy",
+            0.0,
+        ))
+        .unwrap()
+        .for_model("any");
+        assert_eq!((trim.context_window, trim.output_tokens), (4_096, 1_024));
+    }
     #[test]
     fn availability_audit_detects_phantom_active_tools_and_missing_reports() {
         let first = json!({"wire_request":{"stream":true,"tools":[]},"response":{"tool_calls":[{"function":{"name":"tools_load"}}]}});

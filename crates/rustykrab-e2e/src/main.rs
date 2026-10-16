@@ -1222,9 +1222,11 @@ pub enum Backend<'a> {
     Model {
         model: &'a str,
         ollama_url: &'a str,
-        /// Context window for the provider. `None` leaves the daemon's
-        /// default; the compaction scenarios lower it, because that is
-        /// what `effective_context_limit()` actually reads.
+        /// The model's window, written as `context_window` into the trial's
+        /// `models.toml` (the one place a local model's window is set), so
+        /// it sizes both the requests' `num_ctx` and the compaction budget.
+        /// `None` takes the built-in default. A suite that needs more of
+        /// the model's configuration writes `models.toml` itself first.
         num_ctx: Option<u32>,
         /// Extra environment for this daemon, applied last so a case can
         /// override anything the harness sets by default.
@@ -1249,26 +1251,6 @@ fn spawn_daemon(
     stand_ins: Option<&surface::StandIns>,
 ) -> Result<Child> {
     spawn_daemon_with(bin, data_dir, port, &Backend::Scripted(stand_ins))
-}
-
-/// The budget the daemon picks for Ollama when nothing overrides it
-/// (`resolve_max_context_tokens`). A scenario asking for less than this is
-/// shrinking the window on purpose.
-const OLLAMA_DEFAULT_CONTEXT_BUDGET: usize = 32_000;
-
-/// Read `max_context_tokens` back out of the `harness.toml` a scenario
-/// wrote, if it set one.
-fn harness_context_budget(data_dir: &std::path::Path) -> Option<usize> {
-    let toml = std::fs::read_to_string(data_dir.join("harness.toml")).ok()?;
-    toml.lines()
-        .find_map(|line| line.trim().strip_prefix("max_context_tokens"))
-        .and_then(|rest| {
-            rest.trim()
-                .strip_prefix('=')
-                .map(str::trim)
-                .map(str::to_string)
-        })
-        .and_then(|v| v.parse().ok())
 }
 
 fn spawn_daemon_with(
@@ -1394,31 +1376,17 @@ fn spawn_daemon_env(
                 // scenario's iteration cap and retry budget depend on how
                 // its prompt happens to read. (From #532.)
                 .env("RUSTYKRAB_HARNESS_ROUTER", "off");
-            if let Some(n) = num_ctx {
-                command.env("RUSTYKRAB_NUM_CTX", n.to_string());
-            }
-
-            // `max_context_tokens` from `harness.toml` is overwritten at
-            // startup by a provider-derived default (32k for Ollama), so a
-            // scenario that shrinks the window to force compaction never
-            // gets it. `RUSTYKRAB_MAX_CONTEXT_TOKENS` is the documented
-            // override that survives; carry the profile's value through it
-            // so the toml stays the single source of truth.
-            // Only when the scenario is deliberately shrinking the window.
-            // The ordinary profiles set a budget far above Ollama's own
-            // default, and pinning `num_ctx` that high would allocate a KV
-            // cache to match for every scenario.
-            if let Some(budget) =
-                harness_context_budget(data_dir).filter(|&b| b < OLLAMA_DEFAULT_CONTEXT_BUDGET)
-            {
-                command.env("RUSTYKRAB_MAX_CONTEXT_TOKENS", budget.to_string());
-                // The runner sizes the compaction threshold off the
-                // *provider's* reported window in preference to the
-                // profile's budget, so leaving Ollama at its default 64k
-                // puts the trigger ~55k out of reach and compaction never
-                // fires however small the profile says the window is.
-                // Shrink the provider window to match.
-                command.env("RUSTYKRAB_NUM_CTX", budget.to_string());
+            // The model's window and harness live in the trial's
+            // models.toml, as they do for a real daemon; nothing about the
+            // window is passed through the environment.
+            let models = data_dir.join(rustykrab_agent::local_model::MODELS_FILE);
+            if !models.exists() {
+                std::fs::write(
+                    &models,
+                    rustykrab_agent::LocalModels::toml_with_window(
+                        num_ctx.unwrap_or(rustykrab_agent::local_model::DEFAULT_CONTEXT_WINDOW),
+                    ),
+                )?;
             }
 
             // An empty spec means "leave the registry alone" — the
@@ -1688,6 +1656,10 @@ FLAGS:
                                 than paying for them twice
     --reps N                    Repetitions per model scenario (default: 3)
     --case SUBSTRING            Only scenarios whose id contains SUBSTRING
+    --context-window TOKENS     The model's window for context/context-model
+                                trials (written into each trial's models.toml;
+                                default 65536). The noisy cases' history grows
+                                to about 95% of it, so compaction still fires
     --quick                     Skip scenarios tagged slow
     --model TAG                 Ollama model for --mode model (default: gemma4:26b)
     --ollama-url URL            Ollama base URL (default: http://localhost:11434)
@@ -1737,6 +1709,9 @@ struct Args {
     model: String,
     ollama_url: String,
     ctx_list: Vec<u32>,
+    /// The model's window for context/context-model trials, written into
+    /// each trial's models.toml. `None` keeps the suite's 64K fixture.
+    context_window: Option<u32>,
     list: bool,
 }
 
@@ -1757,6 +1732,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         ollama_url: std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string()),
         ctx_list: vec![4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144],
+        context_window: None,
         list: false,
     };
     let value = |i: usize, name: &str| -> std::result::Result<String, String> {
@@ -1806,6 +1782,20 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
             }
             "--case" => {
                 args.case_filter = Some(value(i, "--case")?);
+                i += 1;
+            }
+            "--context-window" => {
+                let v = value(i, "--context-window")?;
+                let window: u32 = v
+                    .parse()
+                    .map_err(|_| format!("--context-window: not a number of tokens: {v}"))?;
+                if !(rustykrab_agent::local_model::MIN_CONTEXT_WINDOW
+                    ..=rustykrab_agent::local_model::MAX_CONTEXT_WINDOW)
+                    .contains(&window)
+                {
+                    return Err(format!("--context-window: {window} is out of range"));
+                }
+                args.context_window = Some(window);
                 i += 1;
             }
             "--trial-timeout" => {

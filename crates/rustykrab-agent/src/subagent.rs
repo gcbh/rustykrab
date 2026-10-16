@@ -27,16 +27,31 @@ use crate::harness::HarnessProfile;
 use crate::runner::AgentRunner;
 use crate::sandbox::Sandbox;
 
-/// The harness profile an [`AgentDefinition`] names; an unknown name gets
-/// the default. Shared with [`crate::LocalWorker`], which runs a definition
-/// the same way for the controller.
-pub(crate) fn profile_for(def: &AgentDefinition) -> HarnessProfile {
-    match def.profile.as_str() {
+/// The harness profile an [`AgentDefinition`] names, sized to the local
+/// model `provider` runs (`models.toml`): its window, compaction policy and
+/// late tool binding. An unknown name gets the default profile; a hosted
+/// provider keeps the profile's own budget. Shared with
+/// [`crate::LocalWorker`], which runs a definition the same way for the
+/// controller.
+pub(crate) fn profile_for(def: &AgentDefinition, provider: &dyn ModelProvider) -> HarnessProfile {
+    profile_from(def, provider, &crate::local_model::installed())
+}
+
+fn profile_from(
+    def: &AgentDefinition,
+    provider: &dyn ModelProvider,
+    models: &crate::LocalModels,
+) -> HarnessProfile {
+    let mut profile = match def.profile.as_str() {
         "coding" => HarnessProfile::coding(),
         "research" => HarnessProfile::research(),
         "creative" => HarnessProfile::creative(),
         _ => HarnessProfile::default(),
+    };
+    if let Some(tag) = provider.local_model_tag() {
+        models.for_model(tag).apply_to(&mut profile);
     }
+    profile
 }
 
 /// Runs sub-agents against an [`AgentRegistry`] using a fresh
@@ -175,7 +190,7 @@ impl SessionManager for SubagentRunner {
             .await
             .map_err(|_| Error::Internal("subagent semaphore closed".into()))?;
 
-        let profile = profile_for(&def);
+        let profile = profile_for(&def, self.provider.as_ref());
 
         let caps = self.derive_capabilities(def.allowed_tools.as_deref());
         let conv_id = Uuid::new_v4();
@@ -472,5 +487,52 @@ mod tests {
         assert!(runner.get_session_status("x").await.is_err());
         assert!(runner.send_to_session("x", "y").await.is_err());
         assert!(runner.get_session_history("x").await.is_err());
+    }
+
+    /// A local tag the scripted provider reports, so `profile_from` finds the
+    /// model's entry as it would for Ollama.
+    struct LocalTagged(&'static str);
+
+    #[async_trait]
+    impl ModelProvider for LocalTagged {
+        fn name(&self) -> &str {
+            "local"
+        }
+
+        async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
+            unreachable!("profile_from never calls the model")
+        }
+
+        fn local_model_tag(&self) -> Option<&str> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn a_worker_runs_its_local_model_entry_over_the_definition_preset() {
+        let models = crate::LocalModels::from_toml(
+            "[models.\"qwen3.8:27b-mlx\"]\ncontext_window = 49152\ncompaction_strategy = \"structured-message-tail\"\ncompaction_threshold = 0.7\n",
+        )
+        .unwrap();
+        let def = AgentDefinition {
+            profile: "coding".into(),
+            ..AgentDefinition::default()
+        };
+        let preset = HarnessProfile::coding();
+
+        let local = profile_from(&def, &LocalTagged("qwen3.8:27b-mlx"), &models);
+        assert_eq!(local.max_context_tokens, 49_152);
+        assert_eq!(local.compaction_context_ceiling, 49_152);
+        assert_eq!(
+            local.compaction_strategy,
+            crate::CompactionStrategy::StructuredMessageTail
+        );
+        assert_eq!(local.compaction_threshold_pct, 0.7);
+        // The loop is still the preset's to choose.
+        assert_eq!(local.max_iterations, preset.max_iterations);
+
+        let hosted = profile_from(&def, &ScriptedProvider::new(Vec::new()), &models);
+        assert_eq!(hosted.max_context_tokens, preset.max_context_tokens);
+        assert_eq!(hosted.compaction_strategy, preset.compaction_strategy);
     }
 }

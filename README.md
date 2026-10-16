@@ -92,6 +92,59 @@ inference on separate hardware — see [Delegating to a peer node](#delegating-t
 below to also delegate whole *agent tasks*, not just inference, to that
 machine.
 
+#### Local models (`models.toml`)
+
+Everything that is a property of a local model rather than of the harness is
+set in one operator-owned file, `<data dir>/models.toml`, keyed by the model's
+tag. The chat agent, the memory distiller, the local workers, sub-agents and
+the evaluation harness all read a model's settings from it, so a window is
+named once:
+
+```toml
+# Applies to every local model without an entry of its own.
+[default]
+context_window = 32768
+
+# Names only what differs from [default].
+[models."qwen3.8:27b-mlx"]
+context_window = 32768
+compaction_strategy = "structured-message-tail"
+
+[models."gemma4:26b"]
+context_window = 131072
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `context_window` | `131072` | The window in tokens: the `num_ctx` on every request, the compaction budget and its ceiling (4096 to 262144) |
+| `output_tokens` | `4096` | A turn's output allowance (`num_predict`; `max_tokens` on an OpenAI-compatible local server) |
+| `keep_alive` | `30m` | How long the server keeps the model resident (Ollama duration syntax; `"server"` takes Ollama's default) |
+| `temperature`, `top_p`, `think` | each caller's | Unset keeps each caller's own: the chat agent samples at 0.1 and decides thinking per model, the local workers and the distiller sample at 0 without thinking |
+| `compaction_strategy` | `legacy` | `legacy`, `structured`, `structured-tail`, `structured-message-tail` or `extractive` |
+| `compaction_threshold` | `0.85` | Fraction of the usable window at which compaction fires; `0` never compacts |
+| `compaction_summary_window` | unset | Serve compaction's summary calls at this larger window |
+| `late_tool_binding` | provider's | `append` or `rerender` |
+
+A missing file is the built-in defaults; a malformed or out-of-range one stops
+the daemon with the file and table named. `rustykrab-cli models` prints what
+each entry, the chat model and the local workers' model resolve to.
+
+The window has a memory cost that depends on the model's attention, so choose
+it from measurement rather than from what the model advertises, and measure at
+a fresh load. Ollama's MLX runner keeps a prefix cache that grows over a run
+to about 30 GiB for qwen3.8:27b whatever the window (2026-10-15, 36 GB Mac:
+29–30 GiB held at 32k), so `/api/ps` after a long run overstates what the
+window costs. qwen3.8:27b caches 64 KB per token in its 16 full-attention
+layers, about 2 GiB at 32k and 8.6 GiB at 128k, over 17 GiB of weights.
+
+These settings replace `RUSTYKRAB_NUM_CTX`, `OLLAMA_NUM_CTX`,
+`RUSTYKRAB_COMPACTION_CONTEXT_CEILING`, `RUSTYKRAB_COMPACTION_EXPAND_CTX`,
+`OLLAMA_KEEP_ALIVE` and the local workers' `context_tokens`, none of which is
+read any more. For a local model they also replace
+`RUSTYKRAB_MAX_CONTEXT_TOKENS` and `harness.toml`'s `max_context_tokens`,
+`compaction_*` keys, which still size a hosted model. The daemon names any of
+these still set at startup.
+
 #### Tuning the Ollama server for KV-cache reuse
 
 An agent loop re-sends the whole conversation on every iteration, so almost
@@ -104,7 +157,8 @@ a little every turn — but three settings on the server side matter just as
 much:
 
 ```bash
-# Must be >= RUSTYKRAB_NUM_CTX, or the server silently truncates prompts.
+# Must be >= every local model's context_window in models.toml, or the
+# server silently truncates prompts.
 export OLLAMA_CONTEXT_LENGTH=131072
 
 # One slot keeps a single conversation pinned to a single warm cache.
@@ -119,7 +173,7 @@ export OLLAMA_FLASH_ATTENTION=1
 export OLLAMA_KV_CACHE_TYPE=q8_0
 ```
 
-Keep `OLLAMA_CONTEXT_LENGTH` and `RUSTYKRAB_NUM_CTX` in sync. If the server
+Keep `OLLAMA_CONTEXT_LENGTH` and the model's `context_window` in sync. If the server
 window is the smaller of the two, RustyKrab's own trimming budget is too
 generous and the server truncates from the front of the prompt — which moves
 the truncation point every turn and throws away the cached prefix each time.
@@ -143,7 +197,7 @@ Two consequences worth knowing:
   trimming just drops the oldest turns. RustyKrab derives both budgets from
   the same figure to keep that order. If you see the "history trimming will
   pre-empt compaction" warning, the loaded tool schemas have grown large
-  enough to invert it — raise `RUSTYKRAB_NUM_CTX` or load fewer tools.
+  enough to invert it — raise the model's `context_window` or load fewer tools.
 
 - **Compaction is configured once per model.** When an agent is built,
   `CompactionConfig::for_model` resolves the threshold, the summary's size
@@ -154,17 +208,14 @@ Two consequences worth knowing:
   compaction keeps the recent turns verbatim and archives the rest for
   `recall_*` instead of ending the run.
 
-- **Going above ~64k takes two settings, not one.** `RUSTYKRAB_NUM_CTX` sizes
-  the window; `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` caps the budget the agent
-  loop will actually grow into, and defaults to 131,072. Raise only the first
-  and compaction still fires at ~56k — the extra window goes unused. RustyKrab
-  logs a warning when the ceiling is clipping the window, but the pairing is
-  easy to miss:
+- **One number sets a local model's window.** A model's `context_window` in
+  `models.toml` (see [Local models](#local-models-modelstoml)) is the `num_ctx`
+  every request pins, the compaction budget and its ceiling, so they cannot
+  disagree. To run a model at 128k:
 
-  ```bash
-  export RUSTYKRAB_NUM_CTX=131072
-  export OLLAMA_CONTEXT_LENGTH=131072
-  export RUSTYKRAB_COMPACTION_CONTEXT_CEILING=131072
+  ```toml
+  [models."gemma4:26b"]
+  context_window = 131072
   ```
 
   The default is deliberately below what a long-context model advertises.
@@ -209,17 +260,17 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_TIMEZONE` | host zone, else `UTC` | IANA zone name (e.g. `America/Los_Angeles`) that human-entered schedules are interpreted in. Cron expressions and offset-less one-shot timestamps passed to the `cron` tool are read as wall-clock times here; everything is still *stored* in UTC. Each job records the zone it was created with, so changing this does not move existing jobs. Use an IANA name, not a fixed offset like `UTC-8` — only the named zone tracks daylight saving |
 | `RUSTYKRAB_WORK_MANAGER` | `0` | `1`, `true` or `on` makes interactive turns manage work through assignment, resources, schedules and questions. Direct shell/write/message tools are withheld from these turns. Also enables durable cron work items. See [work-manager operation](docs/work-manager.md) |
 | `RUSTYKRAB_BRIEFING_VAULT` | — | Absolute operator-owned directory for private dated Markdown briefings. Overrides Obsidian REST only for briefing note actions. Saved notes are readable through authenticated monitoring and `/api/briefings`; writes stay in the scoped host integration tool |
-| `RUSTYKRAB_LOCAL_RESOURCES` | — | Absolute path to operator-owned JSON with model, loopback url, context_tokens and repositories. Registers preferred local coding/integration resources while keeping the configured CLI workers. |
+| `RUSTYKRAB_LOCAL_RESOURCES` | — | Absolute path to operator-owned JSON with model, loopback url and repositories (the model's window is its `context_window` in `models.toml`; a `context_tokens` key is ignored with a warning). Registers preferred local coding/integration resources while keeping the configured CLI workers. |
 | `RUSTYKRAB_INTEGRATION_WORKER` | `0` | Opt in to the restricted `integrations` worker. Uses the manager's `claude-cli` with its verified Max login; optional local resources add an Ollama integration worker with the same restrictions. Shares each provider's model slot, exposes read-only Gmail/calendar and web research plus dated Daily Briefings notes, and requires host-observed tool execution. See [instance consolidation](docs/instance-consolidation.md) |
 | `RUSTYKRAB_SERVICE_RESOURCES` | unset | Absolute path to operator-owned JSON registering local launchd services for cached monitoring and tracked ensure-running/restart actions. Health URLs must be loopback on another explicit port; binary/plist paths must exist. No services are registered by default |
 | `RUSTYKRAB_CRON_WORK_ITEMS` | `0` | `1` fires each scheduled job as a work item using its persisted runtime/tool/resource requirements. Native CLI workers receive the scheduled instructions; local workers retain the job conversation and SKILL.md path. Manager mode enables this automatically instead of as a task-queue conversation. The run ends with `result_report`, whose summary is the message delivered. Off by default while the local-model suites have not measured that path; the e2e daemon turns it on |
-| `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` (cloud) / `32000` (ollama) | Context budget used to compute the compaction threshold. Default is provider-aware: 128k for cloud providers (Anthropic) and 32k for local Ollama, where prompt evaluation on consumer GPUs times out long before a 128k window fills. Set to override the default for either provider |
-| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | `131072` | Hard upper bound on the context window used to compute the compaction threshold. Keeps compaction firing at a sane size even when the backing model advertises a much larger window. Read once at startup into the harness profile's `compaction_context_ceiling` |
+| `RUSTYKRAB_MAX_CONTEXT_TOKENS` | `128000` | Context budget for a **hosted** model (Anthropic, Claude CLI, a remote OpenAI-compatible endpoint). A local model's budget is its `context_window` in `models.toml`; this does not apply to it |
+| `RUSTYKRAB_COMPACTION_CONTEXT_CEILING` | — | **Retired.** A local model's ceiling is its `context_window` in `models.toml`. Ignored with a startup warning |
 | `OLLAMA_MODEL` | `gemma4:26b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `RUSTYKRAB_NUM_CTX` | `131072` | Context window pinned on every Ollama request. Takes precedence over `OLLAMA_NUM_CTX`. Clamped down to the model's native context length when that is smaller. The whole window is allocated as KV cache when the model loads, so lower this (or enable KV quantization, below) if the model won't fit in VRAM. Set to `server` to omit the field and let the server's `OLLAMA_CONTEXT_LENGTH` decide — this disables client-side trimming, since the client then cannot know what the server allocated |
-| `OLLAMA_NUM_CTX` | — | Legacy alias for `RUSTYKRAB_NUM_CTX`. Used only when `RUSTYKRAB_NUM_CTX` is unset |
-| `OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model and its KV cache resident after a request (Ollama duration syntax; `-1` for forever). Ollama's own default is 5 minutes, short enough that a sporadically-used gateway reloads the model on most messages. Set to `server` to omit the field |
+| `RUSTYKRAB_NUM_CTX` | — | **Retired.** Set the model's `context_window` in `models.toml`. Ignored with a startup warning |
+| `OLLAMA_NUM_CTX` | — | **Retired.** Set the model's `context_window` in `models.toml`. Ignored with a startup warning |
+| `OLLAMA_KEEP_ALIVE` | — | **Retired.** Set the model's `keep_alive` in `models.toml`. Ignored with a startup warning |
 | `OLLAMA_THINK` | `auto` | Whether to request thinking mode: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say). Ollama returns a 400 for `think` against models that don't support it |
 | `OLLAMA_VISION` | `auto` | Whether the model accepts image input: `true`, `false`, or `auto` to ask Ollama what the model supports (falling back to the model tag if it doesn't say) |
 | `OLLAMA_TIMEOUT_SECS` | `900` | HTTP request timeout for Ollama in seconds |
@@ -313,7 +364,7 @@ All configuration is via environment variables. No plaintext config files.
 | `RUSTYKRAB_APNS_ENVIRONMENT` | `sandbox` | APNs host for push notifications: `production` (or `prod`) sends to `api.push.apple.com`; anything else uses the sandbox |
 | `RUSTYKRAB_WORKSPACE` | current directory | Base directory the file tools are confined to |
 | `RUSTYKRAB_SSRF_ALLOW_HOSTS` | unset | Comma-separated host names exempt from the web tools' private-address block. Exact, case-insensitive, no wildcards. The evaluation harness forwards it to the daemons it boots |
-| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | unset | A positive integer runs every summarization call at that context window; anything else leaves compaction at the everyday window. Each switch costs a KV-cache resize on local servers. Read once at startup into the harness profile's `compaction_expand_ctx` |
+| `RUSTYKRAB_COMPACTION_EXPAND_CTX` | — | **Retired.** Set the model's `compaction_summary_window` in `models.toml`. Ignored with a startup warning |
 | `RUSTYKRAB_BROWSER_ISOLATED_ROOT` | unset | Directory the browser tool isolates its profiles under, instead of redirecting `HOME`. The evaluation harness sets it per boot |
 | `RUSTYKRAB_BROWSER_BORROW_SYSTEM_PROFILE` | off | `1` symlinks the account's active system-Chrome profile into RustyKrab's user-data directory to reuse its sessions. Unsafe while that Chrome is running |
 | `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT` | unset | Root for browser downloads, one subdirectory per profile. Unset, downloads stay under the profile's user-data directory |

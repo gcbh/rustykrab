@@ -156,14 +156,14 @@ Could each crate be lifted into a different program?
 | Crate | Reusable? | Blocker |
 |---|---|---|
 | `core` | **Yes** | None. Clean contract crate, no internal deps |
-| `providers` | **Yes** | 8 literal-key env reads (`OLLAMA_NUM_CTX`, `ANTHROPIC_CONTEXT_LENGTH`, …) override explicit config |
+| `providers` | **Yes** | 3 literal-key env reads (`OLLAMA_TIMEOUT_SECS`, `ANTHROPIC_CONTEXT_LENGTH`, a live-test model) plus the `OLLAMA_VISION`/`OLLAMA_THINK` capability overrides; the request window and keep-alive are now the caller's |
 | `memory` | **Yes** | Zero env reads, own storage trait, own config struct. The most portable crate here |
 | `skills` | **Yes** | Near-standalone |
 | `store` | **Mostly** | 3 literal-key env reads; single-connection design is an embedding constraint |
 | `channels` | **Mostly** | Concrete types, no unifying trait, so the consumer inherits the coupling |
 | `dream` | **Yes** | Reads through OutcomeSource and evaluation traits; store-backed adapters depend on store/control/core |
 | `tools` | **No** | 30 literal-key env reads; direct `rustykrab_store` coupling in 12 files |
-| `agent` | **Partly** | 5 literal-key env reads, including compaction tuning; depends on tools for agent-tool registration |
+| `agent` | **Partly** | 1 literal-key env read (`PATH` for an external worker); local model settings arrive as `models.toml` from the composition root; depends on tools for agent-tool registration |
 | `runtime` | **Yes** | 0 env reads, no axum. Distillation/lifecycle tests exist; direct assembly coverage remains limited |
 | `gateway` | **Mostly** | Transport and composition handles; AppState has 15 fields after control/evaluation/delegation wiring |
 | `cli` | N/A | Composition root by definition |
@@ -182,9 +182,9 @@ counts 56:
 | Crate | Reads | Examples |
 |---|---|---|
 | `tools` | 30 | `BROWSER_HEADLESS`, `CHROME_CDP_URL`, `RUSTYKRAB_BROWSER_DOWNLOAD_ROOT`, `X_API_BEARER_TOKEN`, `RUSTYKRAB_MCP_SERVERS`, `RUSTYKRAB_NODES` |
-| `providers` | 8 | `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`, `ANTHROPIC_CONTEXT_LENGTH` |
+| `providers` | 3 | `OLLAMA_TIMEOUT_SECS`, `ANTHROPIC_CONTEXT_LENGTH` (was 8; `OLLAMA_NUM_CTX`, `RUSTYKRAB_NUM_CTX` and `OLLAMA_KEEP_ALIVE` retired 2026-10-15) |
 | `gateway` | 5 | `RUSTYKRAB_ALLOWED_ORIGINS`, `RUSTYKRAB_PUBLIC_URL` |
-| `agent` | 5 | `RUSTYKRAB_COMPACTION_*` |
+| `agent` | 1 | `PATH` (the `RUSTYKRAB_COMPACTION_*` reads moved to the daemon earlier; the last two retired 2026-10-15) |
 | `store` | 3 | `RUSTYKRAB_MASTER_KEY`, `RUSTYKRAB_DISABLE_KEYCHAIN` |
 | `channels` | 1 | `TELEGRAM_API_BASE` |
 | `skills` | 1 | literal prompt-path lookup; dynamic skill requirements are excluded |

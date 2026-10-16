@@ -65,6 +65,10 @@ impl ModelProvider for MeteredProvider {
         self.inner.name()
     }
 
+    fn local_model_tag(&self) -> Option<&str> {
+        self.inner.local_model_tag()
+    }
+
     async fn check_model(&self) -> ModelCheck {
         self.inner.check_model().await
     }
