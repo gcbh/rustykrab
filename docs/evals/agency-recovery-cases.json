@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-10-14",
+  "source_base": "5bc3309ed4cda88695c65be7ce09db6cabfe723f",
+  "purpose": "Reusable recovery specifications from observed failure patterns; these are not completed test results or permission grants.",
+  "cases": [
+    {
+      "id": "skill-exists-operation-fails",
+      "execution_status": "specified_not_run",
+      "setup": "A capability recipe is installed and catalog-visible, but the affected executor cannot perform the original controller operation.",
+      "pass_conditions": ["Instruction availability and operation success have distinct proof", "The repair is not claimed effective before the original operation succeeds with representative executor access", "The missing host implementation has one actionable repair owner"],
+      "fail_conditions": ["Skill presence alone releases repeated attempts as successful recovery"]
+    },
+    {
+      "id": "stale-done-prerequisite",
+      "execution_status": "specified_not_run",
+      "setup": "A new failure parks behind an old completed capability; an independent owner consent hold remains open.",
+      "pass_conditions": ["Old completion cannot repeatedly wake the new failure", "A new verified recovery generation permits at most one resumption", "The independent consent hold remains intact across restart"],
+      "fail_conditions": ["Every sweep requeues the failure", "Unrelated owner consent is treated as answered"]
+    },
+    {
+      "id": "cumulative-leaf-budget",
+      "execution_status": "specified_not_run",
+      "setup": "Several individually short attempts consume one leaf item's token, iteration or wall budget; restart the controller between attempts.",
+      "pass_conditions": ["The next lease uses durable cumulative remaining spend", "An exhausted item gets no further execution lease", "Unchanged repeated failure triggers diagnosis instead of replenishing its budget"],
+      "fail_conditions": ["Each attempt receives a fresh full item budget", "Restart forgets charged spend"]
+    },
+    {
+      "id": "shared-integration-conflict",
+      "execution_status": "specified_not_run",
+      "setup": "Many work items inherit the same pair of verified commits that conflict in one file.",
+      "pass_conditions": ["One technical integration repair owns the common cause and affected items", "Resolution is tested and recorded at a new verified base", "Affected handoffs resume while independent owner decisions remain held"],
+      "fail_conditions": ["The same conflict becomes a separate owner direction question for every item", "Unverified conflict resolution is accepted"]
+    },
+    {
+      "id": "artifact-access-feasibility",
+      "execution_status": "specified_not_run",
+      "setup": "Healthy executors exist but none covers the task's required artifact inputs or output.",
+      "pass_conditions": ["The wait identifies exact missing access before a lease", "An authorized coherent grant is durable and applied to the actual executor", "The executor reads its inputs and writes the required output without recurring scope prompts"],
+      "fail_conditions": ["Healthy worker count is presented as runnable capacity", "An access repair itself has no feasible executor"]
+    },
+    {
+      "id": "planning-constraint-provenance",
+      "execution_status": "specified_not_run",
+      "setup": "An authorized implementation task follows a planning step with a planning-only constraint; successive attempts use different worktree paths.",
+      "pass_conditions": ["Planning-step constraints do not silently forbid the implementation step", "Current owner scope remains enforced", "Equivalent runtime scope requests share one operational identity"],
+      "fail_conditions": ["Implementation repeatedly stops because it inherited plan-only text", "Path changes generate duplicate unanswered permission questions"]
+    },
+    {
+      "id": "analysis-during-stalled-backlog",
+      "execution_status": "specified_not_run",
+      "setup": "Queued rows have unfinished dependencies and a ready row has no covering executor; no useful work is in flight.",
+      "pass_conditions": ["Bounded incident analysis can run and receives wait reasons, failure history and spend", "Review freshness and defer reasons are visible", "Useful foreground work retains its execution capacity"],
+      "fail_conditions": ["Mere queue presence indefinitely suppresses all diagnosis", "A failed or skipped review is represented as healthy"]
+    },
+    {
+      "id": "repair-present-and-effective",
+      "execution_status": "specified_not_run",
+      "setup": "A fix is committed in an isolated branch; compare a failing run on the old daemon with one containing the promoted fix.",
+      "pass_conditions": ["Landed, deployed and successful-original-operation evidence remain distinct", "Only recurrence on a build/configuration containing the fix counts against its effectiveness", "Promotion records a regression check, affected-work result and reversal path"],
+      "fail_conditions": ["A commit alone is reported as restored live service", "An old-build recurrence is attributed to the new fix"]
+    },
+    {
+      "id": "provider-neutral-successor",
+      "execution_status": "specified_not_run",
+      "setup": "A local executor yields an unfinished goal to a fresh native Claude or Codex runtime after a restart.",
+      "pass_conditions": ["The successor receives current owner intent, acceptance, decisions and remaining budget", "Verified code and failed-attempt evidence have separate provenance", "Relevant details can be retrieved without inlining the full accumulated history"],
+      "fail_conditions": ["The successor requires another provider's private conversation state", "Unverified partial code is represented as a verified continuation base"]
+    },
+    {
+      "id": "original-goal-versus-repair-activity",
+      "execution_status": "specified_not_run",
+      "setup": "Several capability or repair records complete while the original owner goals remain blocked; no post-change outcome is available.",
+      "pass_conditions": ["Original-goal completion and repair completion are measured separately", "Open stalled goals remain visible in the population", "Dreaming reports absent outcome measurements and rejects fabricated citations"],
+      "fail_conditions": ["Repair counts or model grades are used as proof of improved original-work throughput", "Missing outcomes become a positive improvement rate"]
+    }
+  ]
+}

@@ -1,5 +1,16 @@
 # Opinion: Correctness and Sensibility
 
+## Operational agency review — 2026-10-14
+
+The [dated execution review](../verification/agent-agency-review-2026-10-14.md)
+re-derives recovery failures against running `5bc3309`: at least 491 attempts
+on one item, 35 handoffs sharing one conflict, and zero measured dreaming
+outcomes. Source inspection also locates a review gate that treats queued work
+as runnable demand, and review inputs without per-run failure/spend/coverage
+evidence. These are new operational findings, not resolutions of the historical
+structural findings below. Their priority is original-work recovery under the
+[owner's agency direction](08-agent-agency-and-self-correction.md).
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

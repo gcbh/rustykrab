@@ -406,3 +406,13 @@ grants give native subscription resources bounded host-file output tools while
 retaining per-account capacity and authentication. Sweep recovery releases only
 receipt-proven controller failure waits on stopped prerequisites, leaving
 ordinary dependencies and consent intact.
+
+## Useful agency and self-correction direction (base 619d476, 2026-10-14)
+
+[The owner direction](08-agent-agency-and-self-correction.md) is shared through
+AGENTS.md/CLAUDE.md and a committed, bounded project-dreaming observation.
+Generation and fresh meta-review use an explicit original-work recovery lens.
+The existing controller, work ledger, read-only review jobs and evidence gates
+retain their responsibilities. This adds no crate, persistence schema, authority
+grant or execution queue. The [operational review](../verification/agent-agency-review-2026-10-14.md)
+records where running recovery still differs from the design.

@@ -20,6 +20,7 @@ of the code holds; the judgement is one reviewer's opinion at one point in time.
 | [`05-first-pass-outcome.md`](05-first-pass-outcome.md) | Which first-pass findings were acted on, and which were wrong |
 | [`06-release-pipeline.md`](06-release-pipeline.md) | Merge-triggered versioning, stack ownership, reproducibility, build, signing, and publication |
 | [`07-browser-use-parity.md`](07-browser-use-parity.md) | Rust browser execution parity with browser-use, verification evidence, and deliberate discontinuities |
+| [`08-agent-agency-and-self-correction.md`](08-agent-agency-and-self-correction.md) | Owner direction for useful agency, sufficient context and measured recovery; requirements distinguished from current execution |
 
 Per-component detail lives next to the code, one file per crate:
 

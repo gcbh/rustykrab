@@ -2,6 +2,16 @@
 
 Security-first, modular AI agent gateway written in Rust. Supports Telegram, Signal, and WebChat channels.
 
+## Owner direction: useful agency and self-correction
+
+Read [the agency and self-correction design](docs/architecture/08-agent-agency-and-self-correction.md)
+before changing execution, context, scheduling, permissions, UI, dreaming or
+evaluation. Simplify routine work within delegated scope and supply the evidence
+needed to act correctly. Evaluate repairs by whether original work resumes on
+the actual executor/build, and retain failed hypotheses and regression cases.
+The design records intended behavior; it does not claim all requirements are
+built or grant new permissions.
+
 ## Pre-commit checks
 
 Run these before every commit. CI enforces them on PRs to `main`.
