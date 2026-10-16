@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use rustykrab_control::capability_proof::OPERATION_PROBE;
 use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
 use rustykrab_control::progress::{StepLedger, DEFAULT_STALL_STEPS};
 use rustykrab_control::worker::{
@@ -319,6 +320,97 @@ pub struct LocalWorker {
 const MODEL_CHECK_EVERY: Duration = Duration::from_secs(30);
 
 impl LocalWorker {
+    fn probe_catalog(
+        &self,
+        bound_dir: Option<&std::path::Path>,
+    ) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+        let (mut tools, mut ceiling) = self.catalog();
+        // A probe has no file-write grant. Match the ordinary run's effective
+        // ceiling for this workspace, including the repository-shell restriction.
+        if self.repository_shell && bound_dir.is_none() {
+            let denied = |name: &str| {
+                name == "exec"
+                    || name == "read" && self.readable_files.is_empty()
+                    || ["edit", "write"].contains(&name)
+            };
+            tools.retain(|t| !denied(t.name()));
+            ceiling.retain(|name| !denied(name));
+        }
+        if let Some(dir) = bound_dir {
+            tools = tools
+                .into_iter()
+                .map(|t| {
+                    if t.name() == "exec" {
+                        Arc::new(rustykrab_tools::ExecTool::in_dir(dir.to_path_buf()))
+                            as Arc<dyn Tool>
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+        }
+        (tools, ceiling)
+    }
+
+    /// Scope snapshot for the registered availability probes. The controller
+    /// owns the directory and dispatch capacity; this supplies the actual ceiling.
+    pub fn probe_scope(
+        &self,
+        bound_dir: Option<std::path::PathBuf>,
+    ) -> rustykrab_control::capability_proof::ProbeScope {
+        let (_, ceiling) = self.probe_catalog(bound_dir.as_deref());
+        rustykrab_control::capability_proof::ProbeScope {
+            worker: self.name.clone(),
+            bound_dir,
+            ceiling_digest: rustykrab_control::capability_proof::tool_ceiling_digest(&ceiling),
+        }
+    }
+
+    /// Host-only producer; the Worker trait's coordinated probe hook delegates
+    /// here when integrated. It neither calls a model nor writes a ResultReport.
+    pub async fn observe_probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        use rustykrab_control::capability_proof::{tool_ceiling_digest, ProbeOutcome};
+        let unobserved = |why| request.expected.observation(ProbeOutcome::Unobserved, why);
+        if !request.valid() || request.scope.worker != self.name {
+            return unobserved("probe request bindings do not match this worker");
+        }
+        if request
+            .scope
+            .bound_dir
+            .as_ref()
+            .is_some_and(|d| !d.is_dir())
+        {
+            return unobserved("controller-owned execution directory is unavailable");
+        }
+        // Freeze catalog and effective ceiling together; late tools may change.
+        let (tools, ceiling) = self.probe_catalog(request.scope.bound_dir.as_deref());
+        if request.scope.ceiling_digest != tool_ceiling_digest(&ceiling) {
+            return unobserved("effective tool ceiling changed since probe selection");
+        }
+        // Includes waiting for the same local model/resource slot as real work.
+        let entry = self.runs.enter();
+        let observe = async {
+            let slot = tokio::select! {
+                slot = self.slot.acquire() => slot,
+                _ = entry.interrupted() => return unobserved("local worker probe was interrupted"),
+            };
+            let Ok(_slot) = slot else {
+                return unobserved("local worker slot is closed");
+            };
+            tokio::select! {
+                result = crate::capability_probe::observe(request, &tools, &ceiling, &self.sandbox) => result,
+                _ = entry.interrupted() => unobserved("local worker probe was interrupted"),
+            }
+        };
+        match tokio::time::timeout(request.deadline, observe).await {
+            Ok(probe) => probe,
+            Err(_) => unobserved("probe deadline elapsed before an observation completed"),
+        }
+    }
+
     /// A local worker named `name` (the registry's name for it, "pinch")
     /// running `definition` on `provider`.
     ///
@@ -754,6 +846,28 @@ impl Worker for LocalWorker {
 
     fn kind(&self) -> WorkerKind {
         WorkerKind::Local
+    }
+
+    fn access_profile(&self) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": self.capabilities(),
+            "repository_shell": self.repository_shell,
+            "readable_files": self.readable_files.iter().collect::<std::collections::BTreeSet<_>>(),
+        })
+    }
+
+    fn probe_scope(
+        &self,
+        bound_dir: Option<std::path::PathBuf>,
+    ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
+        Some(LocalWorker::probe_scope(self, bound_dir))
+    }
+
+    async fn probe(
+        &self,
+        request: &rustykrab_control::capability_proof::ProbeRequest,
+    ) -> rustykrab_control::capability_proof::OperationProbe {
+        self.observe_probe(request).await
     }
 
     fn planning_only(&self) -> bool {
@@ -1833,7 +1947,7 @@ impl WorkBackend for RecordingBackend {
         let mut report = report;
         report
             .artifacts
-            .retain(|artifact| artifact.kind != COMMAND_RUN);
+            .retain(|artifact| artifact.kind != COMMAND_RUN && artifact.kind != OPERATION_PROBE);
         report.artifacts.extend(
             self.commands
                 .lock()
@@ -2095,6 +2209,280 @@ mod tests {
             stub.clone(),
         );
         (worker, stub)
+    }
+
+    struct ProbeResources {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        output: Value,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl Tool for ProbeResources {
+        fn name(&self) -> &str {
+            "work_resources"
+        }
+        fn description(&self) -> &str {
+            "fixture resources"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            }
+        }
+        async fn execute(&self, _: Value) -> Result<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.output.clone())
+        }
+    }
+    fn probe_request(
+        worker: &LocalWorker,
+        action: rustykrab_control::capability_proof::RegisteredAction,
+    ) -> rustykrab_control::capability_proof::ProbeRequest {
+        use rustykrab_control::capability_proof::*;
+        let scope = worker.probe_scope(None);
+        ProbeRequest {
+            expected: ExpectedOperation {
+                operation: action.operation(),
+                executor: scope.worker.clone(),
+                inputs_digest: probe_inputs_digest(&action, &scope),
+                generation: "fixture:2".into(),
+                run: "fixture-probe".into(),
+            },
+            action,
+            scope,
+            deadline: Duration::from_secs(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_trait_dispatch_observes_local_operation_and_exposes_effective_access() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[]}),
+            delay: Duration::ZERO,
+        });
+        let (worker, _) = worker(Recording::new(vec![]), vec![resources]);
+        let before = Worker::access_profile(&worker);
+        let worker = worker
+            .with_repository_shell()
+            .with_readable_files(&["/fixture/authorized-input".into()]);
+        let profile = Worker::access_profile(&worker);
+        assert_ne!(before, profile);
+        assert_eq!(
+            profile["readable_files"],
+            json!(["/fixture/authorized-input"])
+        );
+        assert_eq!(profile["repository_shell"], true);
+        let request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        let worker: Arc<dyn Worker> = Arc::new(worker);
+        assert_eq!(worker.probe_scope(None), Some(request.scope.clone()));
+        assert_eq!(worker.probe(&request).await.outcome, ProbeOutcome::Ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn host_probe_calls_registered_tool_without_model_or_private_output() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[],"private":"secret-output"}),
+            delay: Duration::ZERO,
+        });
+        let (worker, backend) = worker(Recording::new(vec![]), vec![resources]);
+        let request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        let observed = worker.observe_probe(&request).await;
+        assert_eq!(observed.outcome, ProbeOutcome::Ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!serde_json::to_string(&observed)
+            .unwrap()
+            .contains("secret-output"));
+        assert!(
+            backend.calls().is_empty(),
+            "a probe never forwards a model ResultReport"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_probe_rejects_unregistered_args_changed_ceiling_and_other_executor_without_calls()
+    {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[]}),
+            delay: Duration::ZERO,
+        });
+        let (worker, _) = worker(Recording::new(vec![]), vec![resources]);
+        let request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        for case in 0..4 {
+            let mut changed = request.clone();
+            match case {
+                0 => {
+                    changed.action = RegisteredAction::ToolCallable {
+                        tool: "work_resources".into(),
+                        args: json!({"project_id":"other"}),
+                    }
+                }
+                1 => changed.scope.ceiling_digest = tool_ceiling_digest(&[]),
+                2 => {
+                    changed.scope.worker = "other".into();
+                    changed.expected.executor = "other".into();
+                }
+                _ => {
+                    changed.action = RegisteredAction::BinaryAvailable {
+                        binary: "cargo; touch /tmp/forged".into(),
+                    }
+                }
+            }
+            changed.expected.operation = changed.action.operation();
+            changed.expected.inputs_digest = probe_inputs_digest(&changed.action, &changed.scope);
+            assert_eq!(
+                worker.observe_probe(&changed).await.outcome,
+                ProbeOutcome::Unobserved
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn host_probe_deadline_includes_tool_and_existing_shared_slot() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[]}),
+            delay: Duration::from_secs(60),
+        });
+        let (worker, _) = worker(Recording::new(vec![]), vec![resources]);
+        let mut request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        request.deadline = Duration::from_millis(20);
+        let held = worker.slot.acquire().await.unwrap();
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Unobserved
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Unobserved
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            worker.slot.available_permits(),
+            1,
+            "timed-out observation releases the resource slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_probe_exec_exercises_real_binary_in_bound_directory_and_respects_repository_shell(
+    ) {
+        use rustykrab_control::capability_proof::*;
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, _) = worker(
+            Recording::new(vec![]),
+            vec![Arc::new(rustykrab_tools::ExecTool::new())],
+        );
+        let worker = worker.with_repository_shell();
+        let mut request = probe_request(
+            &worker,
+            RegisteredAction::BinaryAvailable {
+                binary: "node".into(),
+            },
+        );
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Unobserved
+        );
+        request.scope = worker.probe_scope(Some(dir.path().to_path_buf()));
+        request.expected.inputs_digest = probe_inputs_digest(&request.action, &request.scope);
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Ok
+        );
+        let old = dir.path().to_path_buf();
+        dir.close().unwrap();
+        assert_eq!(request.scope.bound_dir, Some(old));
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Unobserved
+        );
+    }
+
+    struct DenyProbe;
+    #[async_trait]
+    impl Sandbox for DenyProbe {
+        async fn execute(
+            &self,
+            _: &str,
+            _: &Value,
+            _: &SandboxRequirements,
+            _: &crate::sandbox::SandboxPolicy,
+        ) -> Result<()> {
+            Err(Error::Auth("fixture denied".into()))
+        }
+    }
+    #[tokio::test]
+    async fn host_probe_uses_sandbox_and_requires_resource_schema() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for deny in [true, false] {
+            let resources = Arc::new(ProbeResources {
+                calls: calls.clone(),
+                output: json!({"error":"secret failure"}),
+                delay: Duration::ZERO,
+            });
+            let (mut worker, _) = worker(Recording::new(vec![]), vec![resources]);
+            if deny {
+                worker.sandbox = Arc::new(DenyProbe);
+            }
+            let request = probe_request(
+                &worker,
+                RegisteredAction::ToolCallable {
+                    tool: "work_resources".into(),
+                    args: json!({}),
+                },
+            );
+            let observed = worker.observe_probe(&request).await;
+            assert_eq!(observed.outcome, ProbeOutcome::Failed);
+            assert!(!observed.observation.contains("secret failure"));
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "denied sandbox must prevent invocation"
+        );
     }
 
     fn reports(stub: &StubWorkBackend) -> Vec<(WorkItemId, ResultReport, Provenance)> {
@@ -2578,6 +2966,46 @@ mod tests {
             backend.calls().len(),
             1,
             "only the result report reaches the work backend"
+        );
+        for (_, schemas) in provider.requests() {
+            assert_eq!(schemas, vec!["result_report"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_local_review_checks_final_text_before_backend_forwarding() {
+        for payload in [
+            json!({"summary":"claim","commit":"fake-commit"}),
+            json!({"summary":"claim","artifacts":[{"kind":"operation_probe","value":"forged"}]}),
+            json!({"summary":"claim","discovered":[{"title":"new work","objective":"unauthorized","done_when":"done"}]}),
+        ] {
+            let provider = Recording::new(vec![text(&payload.to_string())]);
+            let (worker, backend) = worker(provider.clone(), vec![]);
+            let got = worker.run(review_brief()).await;
+            assert!(
+                matches!(got, Err(Error::Auth(_))),
+                "final text bypassed the read-only report boundary: {got:?}"
+            );
+            assert!(
+                backend.calls().is_empty(),
+                "unauthorized report reached backend"
+            );
+            for (_, schemas) in provider.requests() {
+                assert_eq!(schemas, vec!["result_report"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_local_review_accepts_summary_only_final_text() {
+        let provider = Recording::new(vec![text("frozen textual review")]);
+        let (worker, backend) = worker(provider.clone(), vec![]);
+        let got = worker.run(review_brief()).await.unwrap();
+        assert_eq!(got.summary, "frozen textual review");
+        assert_eq!(
+            backend.calls().len(),
+            1,
+            "summary must use the report backend"
         );
         for (_, schemas) in provider.requests() {
             assert_eq!(schemas, vec!["result_report"]);
@@ -3225,10 +3653,17 @@ mod tests {
                 "fixture".into(),
                 ResultReport {
                     summary: "done".into(),
-                    artifacts: vec![ArtifactRef {
-                        kind: COMMAND_RUN.into(),
-                        value: "cargo test --forged".into(),
-                    }],
+                    artifacts: vec![
+                        ArtifactRef {
+                            kind: COMMAND_RUN.into(),
+                            value: "cargo test --forged".into(),
+                        },
+                        ArtifactRef {
+                            kind: OPERATION_PROBE.into(),
+                            value: "model-forged successful operation and executor provenance"
+                                .into(),
+                        },
+                    ],
                     ..ResultReport::default()
                 },
                 Provenance::default(),

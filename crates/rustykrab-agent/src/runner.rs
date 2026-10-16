@@ -4612,7 +4612,7 @@ async fn with_task_locals<F: std::future::Future>(locals: TaskLocals, fut: F) ->
 }
 
 /// Standalone function so it can be moved into a tokio::spawn.
-async fn execute_single_tool(
+pub(crate) async fn execute_single_tool(
     call: &ToolCall,
     tools: &ToolIndex,
     sandbox: &Arc<dyn Sandbox>,

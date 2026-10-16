@@ -188,6 +188,18 @@ pub trait Worker: Send + Sync {
     fn runtime_status(&self) -> Option<serde_json::Value> {
         None
     }
+    /// What this worker's runs are allowed to do, as a stable value: the
+    /// settings that change an agent's authority (its tool ceiling or its
+    /// allowed and denied tool lists, permission mode, repositories,
+    /// delegated files and extra directories, model). The controller hashes
+    /// it into each attempt's identity (`attempt_state`), so an access
+    /// repair is a change the repeated-outcome breaker sees. Never a secret
+    /// value or an environment value, and nothing that differs run to run
+    /// (a run id, a temporary path, a process). Default: the advertised
+    /// [`Worker::capabilities`].
+    fn access_profile(&self) -> serde_json::Value {
+        serde_json::to_value(self.capabilities()).unwrap_or_default()
+    }
     /// Run one brief to its typed result. The controller verifies the result
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;
@@ -241,6 +253,40 @@ pub trait Worker: Send + Sync {
     /// recently, returns `false` and its row is left alone). Default: never.
     async fn refresh(&self) -> bool {
         false
+    }
+
+    /// The scope a registered probe on this worker runs in, for the run
+    /// directory `bound_dir` the controller chose: the worker's name, that
+    /// directory and a digest of its effective tool ceiling there
+    /// ([`crate::capability_proof::ProbeScope`]). The controller binds an
+    /// expected operation to it before asking for a probe. Default: `None`,
+    /// a worker that cannot run registered probes.
+    fn probe_scope(
+        &self,
+        _bound_dir: Option<std::path::PathBuf>,
+    ) -> Option<crate::capability_proof::ProbeScope> {
+        None
+    }
+
+    /// Perform `request`'s registered action itself, never through a model,
+    /// within the execution boundary its runs get, and report what the host
+    /// observed ([`crate::capability_proof::OperationProbe`]). The
+    /// controller stores that as `operation_probe` evidence and judges it
+    /// with [`crate::capability_proof::capability_proven`]. It runs within
+    /// the worker's own capacity; it is not a second scheduler. Default:
+    /// `Unobserved`, which never proves anything.
+    async fn probe(
+        &self,
+        request: &crate::capability_proof::ProbeRequest,
+    ) -> crate::capability_proof::OperationProbe {
+        request.expected.observation(
+            crate::capability_proof::ProbeOutcome::Unobserved,
+            format!(
+                "{} cannot observe {}",
+                self.name(),
+                request.action.operation()
+            ),
+        )
     }
 }
 
@@ -596,6 +642,78 @@ mod discussion_excerpt_tests {
         assert!(
             rendered.len() <= 8192,
             "framing belongs inside the limit too"
+        );
+    }
+
+    /// A worker that says nothing about probes: the trait's defaults.
+    struct Silent;
+
+    #[async_trait]
+    impl Worker for Silent {
+        fn name(&self) -> &str {
+            "silent"
+        }
+        fn kind(&self) -> WorkerKind {
+            WorkerKind::Local
+        }
+        fn capabilities(&self) -> WorkerCapabilities {
+            WorkerCapabilities {
+                tools: vec!["exec".into()],
+                ..WorkerCapabilities::default()
+            }
+        }
+        async fn run(&self, _brief: Brief) -> Result<ResultReport, Error> {
+            Err(Error::Internal("not run".into()))
+        }
+    }
+
+    /// By default a worker has no probe scope, observes no probe, and its
+    /// access profile is what it advertises: nothing a default can be
+    /// mistaken for proof.
+    #[tokio::test]
+    async fn a_worker_without_probes_observes_nothing() {
+        use crate::capability_proof::{
+            ExpectedOperation, ProbeOutcome, ProbeRequest, ProbeScope, RegisteredAction,
+        };
+        let w = Silent;
+        assert!(w.probe_scope(None).is_none());
+        assert_eq!(
+            w.access_profile(),
+            serde_json::to_value(w.capabilities()).unwrap()
+        );
+        let expected = ExpectedOperation {
+            operation: "binary.available/node".into(),
+            executor: "silent".into(),
+            inputs_digest: "0".repeat(64),
+            generation: "item:1".into(),
+            run: "probe-run".into(),
+        };
+        let request = ProbeRequest {
+            expected: expected.clone(),
+            action: RegisteredAction::BinaryAvailable {
+                binary: "node".into(),
+            },
+            scope: ProbeScope {
+                worker: "silent".into(),
+                bound_dir: None,
+                ceiling_digest: "0".repeat(64),
+            },
+            deadline: std::time::Duration::from_secs(5),
+        };
+        let probe = w.probe(&request).await;
+        assert_eq!(probe.outcome, ProbeOutcome::Unobserved);
+        assert_eq!(
+            (
+                probe.operation.as_str(),
+                probe.executor.as_str(),
+                probe.run.as_str()
+            ),
+            ("binary.available/node", "silent", "probe-run")
+        );
+        assert!(
+            probe.observation.contains("cannot observe"),
+            "{}",
+            probe.observation
         );
     }
 }

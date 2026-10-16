@@ -10,6 +10,8 @@
 //! - [`graph`]: pure functions over an in-memory snapshot of items and edges:
 //!   filing validation (section 14.1), readiness (4.1, 4.2), cascade (4.5),
 //!   roll-up (4.2), re-pointing (4.4) and aging candidates (4.6). No I/O.
+//! - [`capability_proof`]: pure validation of host-observed operations against
+//!   controller-selected bindings, without executing or resuming work.
 //! - [`errors`]: the error taxonomy and deterministic classifiers (section 9).
 //! - [`ladder`]: the resolution ladder as a pure state machine over an item's
 //!   rung history and budgets (sections 8 and 6.4).
@@ -46,6 +48,7 @@
 //! The shared data types live in `rustykrab_core::work`, so the store, the
 //! tools and the CLI agree on the vocabulary without depending on this crate.
 
+pub mod capability_proof;
 pub mod controller;
 pub mod errors;
 pub mod graph;
