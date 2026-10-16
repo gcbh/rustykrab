@@ -29,7 +29,11 @@ use rustykrab_dream::{
 use rustykrab_store::{Store, WorkFilter};
 use rustykrab_tools::work_backend::Provenance;
 use serde_json::json;
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 pub struct Config {
     pub projects: Vec<String>,
@@ -362,6 +366,7 @@ impl Dreaming {
         self.store.dream_review_save(&mut review).await
     }
     async fn freeze(&self, project_id: &str) -> Result<ReviewInput, Error> {
+        let captured_at = Utc::now();
         let id = project_id.parse().map_err(err)?;
         let snapshot = self
             .store
@@ -447,37 +452,155 @@ impl Dreaming {
                 ..Default::default()
             })
             .await?;
-        let matching: Vec<_> = work
-            .into_iter()
-            .filter(|w| {
-                w.artifact_refs
-                    .iter()
-                    .any(|a| a.kind == PROJECT_REF && a.value == project_id)
-            })
-            .collect();
+        let edges = self.store.work_edges_all_open().await?;
+        let snap = rustykrab_control::graph::Snapshot::new(work, edges);
+        let mut matching = project_members(&snap, project_id);
+        // Old waiting work needs visibility before completed history. A fresh
+        // comment or lease is not proof of useful progress on the owner's goal.
+        matching.sort_by_key(|w| (w.status.is_closed(), w.updated_at, &w.id));
+        let mut supplied = 0;
+        let mut work_bytes = 0;
         for w in matching.iter().take(30) {
-            observations.push(ReviewEvidence{id:format!("work:{}",w.id),source:"controller work row; completion is not a general quality guarantee".into(),content:serde_json::to_string(&json!({"id":w.id,"kind":w.kind,"status":w.status,"objective":clip(&w.objective,1200),"done_when":w.done_when})).map_err(err)?});
+            let observation = ReviewEvidence{id:format!("work:{}",w.id),source:"controller work row; completion is not a general quality guarantee".into(),content:serde_json::to_string(&json!({"id":w.id,"kind":w.kind,"status":w.status,"objective":clip(&w.objective,1200),"done_when":clip(&w.done_when,1200)})).map_err(err)?};
+            let bytes = serde_json::to_vec(&observation).map_err(err)?.len();
+            if work_bytes + bytes > 20_000 {
+                break;
+            }
+            work_bytes += bytes;
+            supplied += 1;
+            observations.push(observation);
         }
-        if matching.len() > 30 {
-            omissions.push("Only 30 current project work rows supplied.".into());
+        if matching.len() > supplied {
+            omissions.push(format!("Only {supplied} of {} unarchived project work rows supplied as text; at most 30 rows/20 KB. Operational counts cover the complete scoped population.", matching.len()));
         }
+        omissions.push("Work objective/acceptance text is bounded to 1,200 UTF-8 bytes per field; project membership inherits the controller's ancestor binding rule.".into());
         observations.push(ReviewEvidence {
             id: "dreaming-operations".into(),
             source: "deterministic daemon observation".into(),
             content: serde_json::to_string(&self.view().await?.metrics).map_err(err)?,
         });
-        let input = ReviewInput {
+        let mut input = ReviewInput {
             project_id: project_id.into(),
             revision: snapshot.revision.id.to_string(),
             project,
             observations,
             omissions,
-            captured_at: Utc::now(),
+            captured_at,
         };
+        input
+            .observations
+            .push(self.operational_evidence(&snap, project_id).await?);
+        input.omissions.push("Operational counts include unarchived rows; archives are counted globally but not attributed to this project. Recent events/items/worker rows are bounded samples. Stored health and verifier labels do not prove current capacity, tool success or original-goal recovery. No raw transcripts, result text, runtime config, credential values or file grants are supplied.".into());
+        // Retain operational diagnosis and immutable owner direction before
+        // lower-priority textual work samples; never truncate JSON mid-record.
+        let mut removed = 0;
+        while serde_json::to_vec(&input).map_err(err)?.len() > 99_500 {
+            let Some(index) = input
+                .observations
+                .iter()
+                .rposition(|o| o.id.starts_with("work:"))
+            else {
+                break;
+            };
+            input.observations.remove(index);
+            removed += 1;
+        }
+        if removed > 0 {
+            input.omissions.push(format!("{removed} further textual work observations omitted to retain operational evidence within the total input bound."));
+        }
         if serde_json::to_vec(&input).map_err(err)?.len() > 100_000 {
             return Err(err("frozen project review exceeds 100 KB input bound"));
         }
         Ok(input)
+    }
+
+    async fn operational_evidence(
+        &self,
+        snap: &rustykrab_control::graph::Snapshot,
+        project_id: &str,
+    ) -> Result<ReviewEvidence, Error> {
+        let monitor = self.store.work_monitor_snapshot(500, 80).await?;
+        let members = project_members(snap, project_id);
+        let ids: BTreeSet<_> = members.iter().map(|w| w.id.as_str()).collect();
+        let mut states: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for w in &members {
+            *states.entry(w.status.name()).or_default() += 1;
+            *kinds.entry(w.kind.as_str()).or_default() += 1;
+        }
+        let oldest_open = members
+            .iter()
+            .filter(|w| !w.status.is_closed())
+            .map(|w| w.created_at)
+            .min();
+        let mut samples: Vec<_> = monitor
+            .items
+            .iter()
+            .filter(|m| ids.contains(m.item.id.as_str()))
+            .collect();
+        samples.sort_by_key(|m| (m.item.status.is_closed(), m.item.updated_at, &m.item.id));
+        let items: Vec<_> = samples.iter().take(12).map(|m| {
+            let dependencies: Vec<_> = snap.edges_held_by(&m.item.id).filter(|e|e.kind.is_ordering()).take(8).map(|e|json!({
+                "item":e.depends_on,"kind":e.kind,"status":snap.status(&e.depends_on),"hold_question":snap.item(&e.depends_on).and_then(|w|w.held_by.as_ref()),
+            })).collect();
+            json!({
+            "id":m.item.id,"kind":m.item.kind,"status":m.item.status,"parent":m.item.parent,
+            "hold_question":m.item.held_by,"status_origin":m.item.status_origin,
+            "created_at":m.item.created_at,"updated_at":m.item.updated_at,"closed_at":m.item.closed_at,
+            "last_worker":m.last_worker.as_deref().map(|s|clip(s,128)),"last_activity":m.last_activity,
+            "children":m.children,"original_budget":m.item.budget,"recorded_spend":m.spend,
+            "evidence_rows":m.evidence_count,"rows_with_verifier_label":m.verified_evidence_count,
+            "dependencies":dependencies,"dependency_count":snap.edges_held_by(&m.item.id).filter(|e|e.kind.is_ordering()).count(),
+            "required_tool_names_sample":m.item.required_tools.iter().take(8).map(|s|clip(s,128)).collect::<Vec<_>>(),"required_tool_count":m.item.required_tools.len(),
+        })}).collect();
+        let events: Vec<_> = monitor.events.iter().filter(|e| ids.contains(e.event.item.as_str()))
+            .filter(|e| e.event.kind != rustykrab_core::work::EventKind::Comment)
+            .rev().take(12).map(|e| {
+                let failure = rustykrab_control::ladder::rung_event(&e.event).and_then(|r|r.error).map(|error|json!({
+                    "class":error.class,"subclass":error.subclass,"fingerprint":clip(&error.fingerprint,128)
+                }));
+                json!({"cursor":e.cursor,"item":e.event.item,"at":e.event.at,"kind":e.event.kind,"from":e.event.from,"to":e.event.to,"failure":failure})
+            }).collect();
+        let workers = self.store.workers().list().await?;
+        let worker_rows: Vec<_> = workers.iter().take(12).map(|w| {
+            let tools = w.capabilities.get("tools").and_then(serde_json::Value::as_array);
+            let names: Vec<_> = tools.into_iter().flatten().filter_map(serde_json::Value::as_str).take(16).map(|s|clip(s,128)).collect();
+            json!({"name":clip(&w.name,128),"kind":clip(&w.kind,64),"recorded_healthy":w.health=="healthy","last_seen":w.last_seen,"updated_at":w.updated_at,"tool_names_sample":names,"tool_name_count":tools.map(Vec::len),"cost_tier":w.cost_tier})
+        }).collect();
+        let build = crate::build_info();
+        let mut body = json!({
+            "schema":"incident-input-v1","captured_at":monitor.captured_at,
+            "daemon_build":{"version":build.version,"commit":build.commit,"build_date":build.build_date},"controller":self.control.loop_status(),
+            "global":{"unarchived_rows":monitor.total_live,"archived_rows":monitor.total_archived,"statuses":monitor.counts,"blocked_reasons":monitor.blocked_reasons,"active_by_worker":monitor.active_by_worker,"pending_questions":monitor.pending_questions,"pending_notices":monitor.pending_notices},
+            "project":{"unarchived_rows":members.len(),"statuses":states,"kinds":kinds,"oldest_open_created_at":oldest_open},
+            "sampling":{"monitor_item_limit":500,"monitor_items_truncated":monitor.items_truncated,"monitor_event_limit":80,"latest_event_cursor":monitor.event_cursor,"matching_monitor_rows":samples.len(),"worker_rows":workers.len()},
+            "items":items,"recent_events":events,"workers":worker_rows,
+            "limits":["Separate read transactions; capture times identify observations, not an atomic cross-store snapshot.","Raw failure details and historical traces are omitted. A missing failure in this event window is not a successful operation.","Recorded spend is completed/observed-run accounting; zero tokens can mean unavailable accounting. Original budget is not remaining budget.","Kind/status counts include repairs and parents. They are not original-goal throughput or proof of improvement.","Stored health/tool names are advertisements, not live dispatchability or proof of access. Sampled tool omissions do not establish absence."]
+        });
+        loop {
+            body["sampling"]["supplied_items"] =
+                json!(body["items"].as_array().map_or(0, Vec::len));
+            body["sampling"]["supplied_events"] =
+                json!(body["recent_events"].as_array().map_or(0, Vec::len));
+            body["sampling"]["supplied_workers"] =
+                json!(body["workers"].as_array().map_or(0, Vec::len));
+            if serde_json::to_vec(&body).map_err(err)?.len() <= 12_000 {
+                break;
+            }
+            let mut removed = false;
+            for key in ["items", "recent_events", "workers"] {
+                if let Some(rows) = body[key].as_array_mut() {
+                    if rows.pop().is_some() {
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+            if !removed {
+                return Err(err("operational aggregate exceeds bounded review input"));
+            }
+        }
+        Ok(ReviewEvidence { id:"controller-operations".into(),source:"bounded deterministic controller/store observations; metadata labels are not functional proof".into(),content:serde_json::to_string(&body).map_err(err)? })
     }
     async fn queue(&self, r: &ProjectReview, role: &str, prompt: String) -> Result<String, Error> {
         let marker = format!("{}:{role}", r.id);
@@ -666,16 +789,17 @@ impl Dreaming {
                 ..Default::default()
             })
             .await?;
-        if work.iter().any(|w| {
-            w.updated_at > r.input.captured_at
-                && w.artifact_refs
-                    .iter()
-                    .any(|a| a.kind == PROJECT_REF && a.value == r.input.project_id)
-                && !w
-                    .artifact_refs
-                    .iter()
-                    .any(|a| a.kind == "dream_project_review" && a.value == r.id)
-        }) {
+        let snap = rustykrab_control::graph::Snapshot::new(work, vec![]);
+        if project_members(&snap, &r.input.project_id)
+            .into_iter()
+            .any(|w| {
+                w.updated_at > r.input.captured_at
+                    && !w
+                        .artifact_refs
+                        .iter()
+                        .any(|a| a.kind == "dream_project_review" && a.value == r.id)
+            })
+        {
             return Err(err(
                 "project work changed during review; review fresh evidence",
             ));
@@ -801,6 +925,25 @@ async fn git(repo: &str, args: &[&str]) -> Result<String, Error> {
         return Err(err("repository observation unavailable or oversized"));
     }
     String::from_utf8(output.stdout).map_err(err)
+}
+
+fn project_members<'a>(
+    snap: &'a rustykrab_control::graph::Snapshot,
+    project_id: &str,
+) -> Vec<&'a rustykrab_core::work::WorkItem> {
+    snap.items()
+        .iter()
+        .filter(|item| {
+            let ancestors = snap.ancestors(&item.id);
+            rustykrab_control::handoff::binding(
+                std::iter::once(*item).chain(ancestors.iter().filter_map(|id| snap.item(id))),
+            )
+            .ok()
+            .flatten()
+            .as_deref()
+                == Some(project_id)
+        })
+        .collect()
 }
 
 // User-held work waits for a decision, not for a free runtime. It must not
@@ -1039,6 +1182,268 @@ mod tests {
             .any(|o| o == &format!("{AGENCY_PATH} truncated at 8000 bytes")));
         assert!(serde_json::to_vec(&bounded).unwrap().len() <= 100_000);
     }
+    async fn project_fixture_work(
+        store: &Store,
+        control: &Controller,
+        project_id: &str,
+    ) -> rustykrab_core::work::WorkItem {
+        let outcome = control
+            .file_draft(
+                WorkItemDraft {
+                    title: "Operational fixture".into(),
+                    objective: "Complete original fixture work".into(),
+                    done_when: "A useful result exists".into(),
+                    artifact_refs: vec![ArtifactRef {
+                        kind: PROJECT_REF.into(),
+                        value: project_id.into(),
+                    }],
+                    ..Default::default()
+                },
+                Provenance {
+                    conversation_id: None,
+                    filed_by_item: None,
+                    actor: "user".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let PlanOutcome::Accepted(a) = outcome else {
+            panic!("fixture filing refused")
+        };
+        store.work_get(&a.root).await.unwrap().unwrap()
+    }
+    fn operations(input: &ReviewInput) -> serde_json::Value {
+        serde_json::from_str(
+            &input
+                .observations
+                .iter()
+                .find(|o| o.id == "controller-operations")
+                .unwrap()
+                .content,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn frozen_operational_input_inherits_project_scope_and_records_spend_without_private_traces(
+    ) {
+        use rustykrab_core::work::{
+            ErrorClass, ErrorSubclass, EventKind, Evidence, Rung, RungEvent, WorkError, WorkEvent,
+        };
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let project = &dream.config.projects[0];
+        let root = project_fixture_work(&store, &control, project).await;
+        let mut child = root.clone();
+        child.id = "fixture-child".into();
+        child.parent = Some(root.id.clone());
+        child.artifact_refs.clear();
+        child.status = Status::Blocked(BlockedReason::NeedsTool);
+        child.held_by = Some("independent-owner-question".into());
+        let edge = rustykrab_core::work::Edge {
+            item: child.id.clone(),
+            depends_on: root.id.clone(),
+            kind: rustykrab_core::work::EdgeKind::Blocks,
+        };
+        store
+            .work_insert_graph(
+                std::slice::from_ref(&child),
+                std::slice::from_ref(&edge),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .work_spend_record(rustykrab_store::RunSpend {
+                item: child.id.clone(),
+                run: Some("fixture-run".into()),
+                worker: "fixture-worker".into(),
+                tokens: 321,
+                wall_ms: 2000,
+                iterations: 3,
+                at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let at = Utc::now();
+        let rung = RungEvent {
+            rung: Rung::Build,
+            at,
+            error: Some(WorkError {
+                class: ErrorClass::CapabilityGap,
+                subclass: ErrorSubclass::ToolGap,
+                fingerprint: "fixture-fingerprint".into(),
+                detail: "PRIVATE-RAW-FAILURE".into(),
+                artifact_refs: vec![],
+                observed_by: "fixture.host".into(),
+            }),
+            outcome: "PRIVATE-RAW-OUTCOME".into(),
+        };
+        store
+            .work_event_append(&WorkEvent {
+                item: child.id.clone(),
+                at,
+                kind: EventKind::Rung,
+                from: None,
+                to: None,
+                actor: "controller".into(),
+                reason: Some(rustykrab_control::ladder::encode_rung_event(&rung)),
+                upstream: None,
+                origin: None,
+                evidence_ref: None,
+            })
+            .await
+            .unwrap();
+        store
+            .work_evidence_add(Evidence {
+                item: child.id.clone(),
+                kind: "run_log".into(),
+                reference: "PRIVATE-RAW-TRANSCRIPT".into(),
+                hash: None,
+                verified_by: Some("worker:fixture".into()),
+                at,
+            })
+            .await
+            .unwrap();
+        let frozen = dream.freeze(project).await.unwrap();
+        let data = operations(&frozen);
+        assert_eq!(data["project"]["unarchived_rows"], 2);
+        let row = data["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == child.id)
+            .unwrap();
+        assert_eq!(row["dependencies"][0]["item"], root.id);
+        assert_eq!(
+            row["dependencies"][0]["status"],
+            serde_json::to_value(root.status).unwrap()
+        );
+        assert_eq!(row["dependency_count"], 1);
+        assert_eq!(row["recorded_spend"]["runs"], 1);
+        assert_eq!(row["recorded_spend"]["tokens"], 321);
+        assert_eq!(row["hold_question"], "independent-owner-question");
+        assert!(data["recent_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["failure"]["fingerprint"] == "fixture-fingerprint"));
+        assert!(frozen
+            .observations
+            .iter()
+            .any(|o| o.id == format!("work:{}", child.id)));
+        let serialized = serde_json::to_string(&frozen).unwrap();
+        assert!(!serialized.contains("PRIVATE-RAW"));
+        store
+            .work_spend_record(rustykrab_store::RunSpend {
+                item: child.id.clone(),
+                run: Some("fixture-run-2".into()),
+                worker: "fixture-worker".into(),
+                tokens: 100,
+                wall_ms: 1000,
+                iterations: 1,
+                at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            operations(&frozen)["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["id"] == child.id)
+                .unwrap()["recorded_spend"]["tokens"],
+            321
+        );
+        assert_eq!(
+            operations(&dream.freeze(project).await.unwrap())["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["id"] == child.id)
+                .unwrap()["recorded_spend"]["tokens"],
+            421
+        );
+        assert_eq!(
+            store.work_get(&child.id).await.unwrap().unwrap().held_by,
+            child.held_by
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_populations_survive_sampling_and_bound_oversized_acceptance_text() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let project = &dream.config.projects[0];
+        let seed = project_fixture_work(&store, &control, project).await;
+        let rows: Vec<_> = (0..39)
+            .map(|n| {
+                let mut w = seed.clone();
+                w.id = format!("sample-{n:02}");
+                w.objective = "€".repeat(3000);
+                w.done_when = "€".repeat(3000);
+                w
+            })
+            .collect();
+        store.work_insert_graph(&rows, &[], None).await.unwrap();
+        let frozen = dream.freeze(project).await.unwrap();
+        let data = operations(&frozen);
+        assert_eq!(data["project"]["unarchived_rows"], 40);
+        assert!(data["items"].as_array().unwrap().len() <= 12);
+        assert!(
+            frozen
+                .observations
+                .iter()
+                .filter(|o| o.id.starts_with("work:"))
+                .count()
+                < 30
+        );
+        assert!(frozen
+            .omissions
+            .iter()
+            .any(|o| o.contains("of 40 unarchived project work")));
+        let observation = frozen
+            .observations
+            .iter()
+            .find(|o| o.id == "controller-operations")
+            .unwrap();
+        assert!(observation.content.len() <= 12_000);
+        assert!(serde_json::to_vec(&frozen).unwrap().len() <= 100_000);
+    }
+
+    #[tokio::test]
+    async fn operational_scope_excludes_conflicting_ancestor_binding_and_keeps_unknowns_explicit() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let project = &dream.config.projects[0];
+        let root = project_fixture_work(&store, &control, project).await;
+        let mut child = root.clone();
+        child.id = "conflicting-project-child".into();
+        child.parent = Some(root.id.clone());
+        child.artifact_refs = vec![ArtifactRef {
+            kind: PROJECT_REF.into(),
+            value: uuid::Uuid::new_v4().to_string(),
+        }];
+        store
+            .work_insert_graph(std::slice::from_ref(&child), &[], None)
+            .await
+            .unwrap();
+        let frozen = dream.freeze(project).await.unwrap();
+        let data = operations(&frozen);
+        assert_eq!(data["project"]["unarchived_rows"], 1);
+        assert_eq!(
+            data["sampling"]["supplied_workers"], 0,
+            "fixed test registry has no durable worker advertisement"
+        );
+        assert!(data["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("not live dispatchability")));
+        assert!(!data["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == child.id));
+    }
+
     #[tokio::test]
     async fn held_legacy_work_does_not_silence_dreaming_but_ready_work_does() {
         let (_dir, store, control, dream, _lock) = setup(false).await;
