@@ -1,0 +1,16 @@
+2026-10-14T22:41:04.889073Z  transition -> ready  [controller]  ready
+2026-10-14T22:41:04.891094Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T22:41:04.891473Z  transition -> running  [worker:snapper]  run started
+2026-10-14T22:41:05.889285Z  run  [worker:snapper]  run ended: 2 iterations, 0 completion reminders, 0 tokens, 6 ms
+2026-10-14T22:41:05.889626Z  comment  [worker:snapper]  Agent reported: Installed node.
+2026-10-14T22:41:05.889626Z  rung  [controller]  rung repair: repair with the failure evidence
+2026-10-14T22:41:06.223405Z  transition -> verifying  [controller]  checking the result report
+2026-10-14T22:41:06.223405Z  transition -> blocked(verification_failed)  [controller]  verification failed on snapper: claim_mismatch: the tool `node` is not proven for "Run the node stand-in [e2e-control capability-proof]" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered operation executed; observed postcondition failed
+2026-10-14T22:41:06.223405Z  transition -> queued  [controller]  repair
+2026-10-14T22:41:06.223405Z  transition -> ready  [controller]  ready
+2026-10-14T22:41:06.225952Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T22:41:06.226325Z  transition -> running  [worker:snapper]  run started
+2026-10-14T22:41:06.887311Z  run  [worker:snapper]  run ended: 3 iterations, 0 completion reminders, 0 tokens, 71 ms
+2026-10-14T22:41:06.887644Z  comment  [worker:snapper]  Agent reported: e2e-control node stand-in repaired: it answers its version on the worker's exec path
+2026-10-14T22:41:06.903366Z  transition -> verifying  [controller]  checking the result report
+2026-10-14T22:41:06.903366Z  transition -> done  [controller]  verified on snapper (operation proven: binary.available/node): 1 artifact(s); e2e-control node stand-in repaired: it answers its version on the worker's exec path

@@ -1,0 +1,15 @@
+2026-10-14T22:41:03.351660Z  transition -> ready  [controller]  ready
+2026-10-14T22:41:03.889708Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T22:41:03.890109Z  transition -> running  [worker:snapper]  run started
+2026-10-14T22:41:04.888076Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+2026-10-14T22:41:04.888376Z  comment  [worker:snapper]  Agent reported: node does not answer here.
+2026-10-14T22:41:04.888376Z  rung  [controller]  rung build: filed capability item 3345f8ed-e85c-4707-9a80-b973239b495a
+2026-10-14T22:41:04.889073Z  transition -> blocked(needs_tool)  [controller]  waiting on a capability: tool node
+2026-10-14T22:41:07.889166Z  transition -> queued  [controller]  capability landed and its operation was proven on its executor
+2026-10-14T22:41:07.889166Z  transition -> ready  [controller]  ready
+2026-10-14T22:41:07.891398Z  lease -> leased  [worker:snapper]  ttl 1800s
+2026-10-14T22:41:07.893903Z  transition -> running  [worker:snapper]  run started
+2026-10-14T22:41:08.889063Z  run  [worker:snapper]  run ended: 1 iterations, 0 completion reminders, 0 tokens, 4 ms
+2026-10-14T22:41:08.889391Z  comment  [worker:snapper]  Agent reported: Ran the node stand-in.
+2026-10-14T22:41:08.889925Z  transition -> verifying  [controller]  checking the result report
+2026-10-14T22:41:08.889925Z  transition -> done  [controller]  verified on snapper: 1 artifact(s); Ran the node stand-in.

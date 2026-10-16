@@ -1,0 +1,240 @@
+[
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:04.889073Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:04.891094Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:04.891473Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:05.889285Z",
+    "evidence_ref": "2bdc01e0-d409-48c4-bf51-23d8af394ed7",
+    "from": null,
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 2 iterations, 0 completion reminders, 0 tokens, 6 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:05.889626Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: Installed node.",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:05.889626Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "rung",
+    "origin": null,
+    "reason": "{\"rung\":\"repair\",\"at\":\"2026-10-14T22:41:05.887909Z\",\"error\":{\"class\":\"verification\",\"subclass\":\"claim_mismatch\",\"fingerprint\":\"454ddb437dc534f3\",\"detail\":\"claim_mismatch: the tool `node` is not proven for \\\"Run the node stand-in [e2e-control capability-proof]\\\" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered operation executed; observed postcondition failed\",\"artifact_refs\":[],\"observed_by\":\"verifier\"},\"outcome\":\"repair with the failure evidence\"}",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.223405Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "checking the result report",
+    "to": {
+      "status": "verifying"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.223405Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "verifying"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "verification failed on snapper: claim_mismatch: the tool `node` is not proven for \"Run the node stand-in [e2e-control capability-proof]\" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered operation executed; observed postcondition failed",
+    "to": {
+      "reason": "verification_failed",
+      "status": "blocked"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.223405Z",
+    "evidence_ref": null,
+    "from": {
+      "reason": "verification_failed",
+      "status": "blocked"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "repair",
+    "to": {
+      "status": "queued"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.223405Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "queued"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "ready",
+    "to": {
+      "status": "ready"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:06.225952Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "ready"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "lease",
+    "origin": null,
+    "reason": "ttl 1800s",
+    "to": {
+      "status": "leased"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:06.226325Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "leased"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "run started",
+    "to": {
+      "status": "running"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:06.887311Z",
+    "evidence_ref": "510050ab-1790-4a1b-b272-874445078763",
+    "from": null,
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "run",
+    "origin": null,
+    "reason": "run ended: 3 iterations, 0 completion reminders, 0 tokens, 71 ms",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "worker:snapper",
+    "at": "2026-10-14T22:41:06.887644Z",
+    "evidence_ref": null,
+    "from": null,
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "comment",
+    "origin": null,
+    "reason": "Agent reported: e2e-control node stand-in repaired: it answers its version on the worker's exec path",
+    "to": null,
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.903366Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "running"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "checking the result report",
+    "to": {
+      "status": "verifying"
+    },
+    "upstream": null
+  },
+  {
+    "actor": "controller",
+    "at": "2026-10-14T22:41:06.903366Z",
+    "evidence_ref": null,
+    "from": {
+      "status": "verifying"
+    },
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "transition",
+    "origin": null,
+    "reason": "verified on snapper (operation proven: binary.available/node): 1 artifact(s); e2e-control node stand-in repaired: it answers its version on the worker's exec path",
+    "to": {
+      "status": "done"
+    },
+    "upstream": null
+  }
+]

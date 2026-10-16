@@ -16,13 +16,13 @@ use rustykrab_tools::work_backend::{ToolState, WorkRunContext, WORK_RUN_CONTEXT}
 
 use crate::errors::{
     apply_learned, classify, fingerprint, gap_of, Context, FailureInput, GapKind, LearnedRule,
-    VerifierVerdict, CLASSIFIER_RULE,
+    PolicyStop, VerifierVerdict, CLASSIFIER_RULE,
 };
 use crate::graph::{self, Effects};
 use crate::handle::TickReport;
 use crate::investigate::{fix_fingerprint, RESOLUTION_WAIT};
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
-use crate::routing::{built_tool, work_class, Judged, Verdict};
+use crate::routing::{work_class, Judged, Verdict};
 use crate::worker::{run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
 use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
@@ -34,8 +34,9 @@ use super::commit::Written;
 use super::filing::{
     parked_on_landed_capability, parked_reason, unneeded_capabilities, waiting_on_mcp,
 };
-use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, SWITCHED};
+use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, ROUTED_FOR, SWITCHED};
 use super::notice::{label, Cause};
+use super::proof::CapabilityVerdict;
 use super::questions::NewQuestion;
 use super::spend::{exhausted, CUMULATIVE_GUARD};
 use super::{Controller, Finished, Run, RunResult};
@@ -44,10 +45,10 @@ use super::{Controller, Finished, Run, RunResult};
 /// rejected-prerequisite and skipped-switch rungs continue the climb.
 const MAX_CLIMB: usize = 16;
 
-/// Who verified a claim: git for a commit and its paths, the host's
-/// catalog for a built tool, the adapter's command record for a check.
+/// Who verified a claim: git for a commit and its paths, the adapter's
+/// command record for a check (the host's catalog for a built tool is
+/// `proof.rs`'s).
 const BY_GIT: &str = "git";
-const BY_CATALOG: &str = "catalog";
 
 /// One evidence row a verified claim adds: kind, reference, verifier.
 type Proof = (String, String, Option<String>);
@@ -133,6 +134,38 @@ fn normalise_reported(error: &WorkError, kind: WorkerKind) -> WorkError {
         out.observed_by = "worker_report".to_string();
     }
     out
+}
+
+/// Who stops a read-only review's report that carries more than a review
+/// may: a typed `policy/scope` failure observed by this guard.
+pub(super) const READ_ONLY_GUARD: &str = "read_only_guard";
+
+/// Whether `item` is a read-only review job: an artifact ref
+/// `read_only_review=true` (`rustykrab_core::dream_review::REVIEW_ONLY`),
+/// as dreaming files its project-review jobs.
+pub(super) fn read_only_review(item: &WorkItem) -> bool {
+    item.artifact_refs
+        .iter()
+        .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
+}
+
+/// The fields of a read-only review's report that carry authority a review
+/// does not have: follow-up work, questions, artifacts (a classifier rule
+/// among them), a commit, changed paths, checks it says ran, or a block.
+/// Its summary, known limits and error are what a review reports.
+pub(super) fn review_overreach(result: &rustykrab_core::work::ResultReport) -> Vec<&'static str> {
+    [
+        ("discovered", !result.discovered.is_empty()),
+        ("questions", !result.questions.is_empty()),
+        ("artifacts", !result.artifacts.is_empty()),
+        ("commit", result.commit.is_some()),
+        ("changed_paths", !result.changed_paths.is_empty()),
+        ("checks_run", !result.checks_run.is_empty()),
+        ("blocked", result.blocked.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, set)| set.then_some(field))
+    .collect()
 }
 
 /// A claimed check as the verifier compares it: lower case, whitespace
@@ -517,9 +550,18 @@ impl Controller {
         }
 
         // Capability items that landed release what waited on them, and a
-        // configured MCP server releases what named it.
+        // configured MCP server releases what named it. A need with a
+        // registered probe releases only on proof for the item's current
+        // repair generation (`proof.rs`); one without is availability only.
         for id in parked_on_landed_capability(&b.snap) {
-            changed.extend(b.move_to(&id, Status::Queued, "controller", "capability landed"));
+            let reason = match self.revival_proven(&b.snap, &id).await? {
+                false => continue,
+                true if super::proof::has_registered_need(&b.snap, &id) => {
+                    "capability landed and its operation was proven on its executor"
+                }
+                true => "capability landed (availability only: no registered operation probe)",
+            };
+            changed.extend(b.move_to(&id, Status::Queued, "controller", reason));
         }
         for id in waiting_on_mcp(&b.snap, |s| self.catalog.mcp_server_configured(s)) {
             changed.extend(b.move_to(&id, Status::Queued, "controller", "MCP server configured"));
@@ -628,6 +670,15 @@ impl Controller {
                 // no longer the item's.
                 continue;
             }
+            // A capability's done claim is judged by probes on the worker
+            // that failed what waits on it; each takes one of that worker's
+            // slots, so the claim waits for a free one, as a lease would.
+            if let Ok(result) = &finished.outcome {
+                if self.probe_waits(&b.snap, &id, result).await? {
+                    self.state().finished.insert(id, finished);
+                    continue;
+                }
+            }
             self.reconcile_one(&mut b, &id, &finished).await?;
             let judged = std::mem::take(&mut b.judged);
             match self.commit(b, noticed).await {
@@ -706,7 +757,8 @@ impl Controller {
                 self.judge(b, &item, worker, result).await?
             }
         };
-        if let Ok(result) = &finished.outcome {
+        // A read-only review files nothing: its guard failed it above.
+        if let (Ok(result), false) = (&finished.outcome, read_only_review(&item)) {
             changed.extend(
                 self.file_discovered(b, &item, worker, &result.discovered)
                     .await,
@@ -740,6 +792,28 @@ impl Controller {
             tool: None,
             worker_kind: Some(kind),
         };
+        // A read-only review reports a summary, known limits or an error;
+        // a report that carries more is stopped before any of it is stored
+        // or acted on (whatever the worker type: its adapter's read-only
+        // flags stop host writes, not what the report claims).
+        if read_only_review(item) {
+            let overreach = review_overreach(result);
+            if !overreach.is_empty() {
+                let mut error = classify(
+                    &FailureInput::Policy {
+                        stop: PolicyStop::Scope,
+                        detail: format!(
+                            "a read-only review's report may carry only a summary, known limits \
+                             or an error; it carried {}",
+                            overreach.join(", ")
+                        ),
+                    },
+                    &ctx,
+                );
+                error.observed_by = READ_ONLY_GUARD.to_string();
+                return self.fail(b, item, worker, error, &[]).await;
+            }
+        }
         if let Some(error) = &result.error {
             let error = normalise_reported(error, kind);
             return self.fail(b, item, worker, error, &result.artifacts).await;
@@ -837,7 +911,7 @@ impl Controller {
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
         };
-        let proofs = match self.verify_claims(item, result).await? {
+        let mut proofs = match self.verify_claims(item, result).await? {
             Ok(proofs) => proofs,
             Err((verdict, why)) => {
                 let error = classify(
@@ -850,6 +924,31 @@ impl Controller {
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
         };
+        // A capability item: proven on the executor that needs it, or, with
+        // no registered probe, available (`proof.rs`). Catalog presence is
+        // never proof.
+        let mut proven = String::new();
+        if item.kind == WorkKind::Capability {
+            match self.judge_capability(&b.snap, item).await? {
+                CapabilityVerdict::Proven(operations) => {
+                    proven = format!(" (operation proven: {})", operations.join(", "));
+                }
+                CapabilityVerdict::AvailabilityOnly(rows) => {
+                    proofs.extend(rows);
+                    proven = " (availability only: no registered operation probe)".to_string();
+                }
+                CapabilityVerdict::Unproven(verdict, why) => {
+                    let error = classify(
+                        &FailureInput::Verifier {
+                            verdict,
+                            detail: why,
+                        },
+                        &ctx,
+                    );
+                    return self.fail(b, item, worker, error, &result.artifacts).await;
+                }
+            }
+        }
         // A fix item (the ladder's item for a recurring or unknown failure)
         // is done only when it landed something checked: a commit git
         // verified in its worktree, or a classifier rule that replayed. A
@@ -914,7 +1013,7 @@ impl Controller {
             Status::Done,
             "controller",
             format!(
-                "verified on {worker}: {} artifact(s); {}",
+                "verified on {worker}{proven}: {} artifact(s); {}",
                 result.artifacts.len(),
                 first_line(&result.summary)
             ),
@@ -983,8 +1082,10 @@ impl Controller {
     ///   commit or paths with no workspace to check them against claims
     ///   beyond the evidence;
     /// - every check it names, against the commands its adapter recorded
-    ///   the agent running ([`COMMAND_RUN`]), where any were recorded;
-    /// - a capability build of a tool: that the host now has the tool.
+    ///   the agent running ([`COMMAND_RUN`]), where any were recorded.
+    ///
+    /// A capability item's claim is judged after these, by
+    /// [`Controller::judge_capability`] (`proof.rs`).
     async fn verify_claims(
         &self,
         item: &WorkItem,
@@ -1072,24 +1173,6 @@ impl Controller {
                     )));
                 }
                 proofs.push(("check_run".into(), check.clone(), Some(COMMAND_RUN.into())));
-            }
-        }
-        // A capability build of a tool (its facet mode `build`, its need a
-        // tool): the host must now have the tool.
-        if item.kind == WorkKind::Capability {
-            let mode = self.capability_mode(&item.id).await?;
-            if let Some(tool) = built_tool(mode, &item.artifact_refs) {
-                self.catalog.refresh();
-                if self.catalog.tool_state(&tool) == ToolState::Unknown {
-                    return Ok(Err((
-                        VerifierVerdict::ClaimMismatch,
-                        format!(
-                            "the result says the tool is built, but the host has no tool named \
-                             `{tool}`"
-                        ),
-                    )));
-                }
-                proofs.push(("tool".into(), tool, Some(BY_CATALOG.into())));
             }
         }
         Ok(Ok(proofs))
@@ -1400,6 +1483,24 @@ impl Controller {
             }
             _ => None,
         };
+        // A native coding agent (Claude Code, Codex) cannot host a RustyKrab
+        // tool: a capability item for it could only close on the catalog's
+        // word, and its probe could never be observed there, so completing
+        // it would revive the item to ask again (the 491-run loop). The item
+        // goes to a worker whose tool ceiling has the tool instead, or
+        // surfaces once.
+        if let (Some(g), Some(true)) = (&gap, tool_exists) {
+            if g.kind == GapKind::Tool
+                && matches!(
+                    self.worker_kind(worker),
+                    WorkerKind::ClaudeCode | WorkerKind::Codex
+                )
+            {
+                return self
+                    .route_for_tool(b, item, worker, &error, &g.subject, &mut state, &excluded)
+                    .await;
+            }
+        }
         // A failed verification escalates: the switch rung looks above the
         // failing worker's tier, not beside it (sections 5 and 8).
         let floor = (error.class == ErrorClass::Verification)
@@ -1786,6 +1887,67 @@ impl Controller {
         );
     }
 
+    /// Route `item`, which native coding agent `worker` could not run for
+    /// want of the RustyKrab tool `tool`, to a worker whose tool ceiling has
+    /// it: a worker switch whose outcome names the tool ([`ROUTED_FOR`]),
+    /// so the next lease requires it. No capability item is filed. When no
+    /// registered worker could take it with the tool, the item surfaces
+    /// once with a question instead.
+    #[allow(clippy::too_many_arguments)]
+    async fn route_for_tool(
+        &self,
+        b: &mut Batch,
+        item: &WorkItem,
+        worker: &str,
+        error: &WorkError,
+        tool: &str,
+        state: &mut LadderState,
+        excluded: &HashSet<String>,
+    ) -> Result<Vec<WorkItemId>, Error> {
+        let has_tool =
+            |w: &dyn Worker| w.capabilities().tools.iter().any(|t| t == tool || t == "*");
+        let routable = self.registry.workers().iter().any(|w| {
+            w.name() != worker
+                && !excluded.contains(w.name())
+                && covers(w.as_ref(), item)
+                && has_tool(w.as_ref())
+        });
+        let id = item.id.clone();
+        if routable {
+            self.rung(
+                b,
+                &id,
+                state,
+                Rung::SwitchWorker,
+                error,
+                format!("{SWITCHED}{worker}{ROUTED_FOR}`{tool}`"),
+            );
+            return Ok(b.move_to(
+                &id,
+                Status::Queued,
+                "controller",
+                format!(
+                    "routed: {worker} runs natively and cannot host the RustyKrab tool `{tool}`"
+                ),
+            ));
+        }
+        let ask = format!(
+            "{} needs the RustyKrab tool `{tool}`, which {worker} runs natively and cannot host, \
+             and no other registered worker has it in its tool ceiling. Add a worker that has \
+             it, or change what the item needs.",
+            label(item)
+        );
+        self.rung(b, &id, state, Rung::Surface, error, ask.clone());
+        let reason = BlockedReason::NeedsDecision;
+        let changed = b.move_to(&id, Status::Blocked(reason), "controller", ask.clone());
+        self.record_question(
+            b,
+            NewQuestion::open(&id, QuestionKind::for_blocked(reason), ask, "no_route"),
+        )
+        .await?;
+        Ok(changed)
+    }
+
     /// Whether a healthy worker other than `excluded`, and above `floor`'s
     /// cost tier when one is set, could take `item`.
     pub(super) fn has_alternative(
@@ -1858,13 +2020,12 @@ impl Controller {
                 continue;
             }
             let events = self.store.work_events(&item.id).await?;
-            let hist = history(&events);
+            let hist = self.activatable(history(&events));
             let mode = match item.kind {
                 WorkKind::Capability => self.capability_mode(&item.id).await?,
                 _ => None,
             };
-            let Some(worker) = self.pick(&item, &hist.excluded, hist.floor, &load, &models, &busy)
-            else {
+            let Some(worker) = self.pick(&item, &hist, &load, &models, &busy) else {
                 // No eligible/free resource: keep the ready item queued.
                 // No attempt has started, so spend no failure/retry budget.
                 continue;
@@ -2065,14 +2226,20 @@ impl Controller {
         Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)))
     }
 
-    /// Live runs per worker, and the models local runs occupy.
-    fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
+    /// Live runs and capability probes per worker, and the models local
+    /// runs and probes occupy.
+    pub(super) fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
         let state = self.state();
         let mut load: HashMap<String, usize> = HashMap::new();
         let mut models: HashSet<String> = HashSet::new();
-        for run in state.runs.values() {
-            *load.entry(run.worker.clone()).or_default() += 1;
-            if let Some(w) = self.worker(&run.worker) {
+        let busy = state
+            .runs
+            .values()
+            .map(|run| (&run.worker, 1))
+            .chain(state.probing.iter().map(|(w, n)| (w, *n)));
+        for (worker, n) in busy {
+            *load.entry(worker.clone()).or_default() += n;
+            if let Some(w) = self.worker(worker) {
                 if self.config.serialise_local && w.kind() == WorkerKind::Local {
                     models.extend(w.capabilities().models);
                 }
@@ -2081,18 +2248,33 @@ impl Controller {
         (load, models)
     }
 
+    /// Whether `worker` could take one more run or probe now: under its
+    /// capacity, and for a serialised local worker its model free (12.1).
+    pub(super) fn has_free_slot(&self, worker: &dyn Worker) -> bool {
+        let (load, models) = self.load_by_worker();
+        load.get(worker.name()).copied().unwrap_or(0) < self.capacity(worker)
+            && !(self.config.serialise_local
+                && worker.kind() == WorkerKind::Local
+                && worker
+                    .capabilities()
+                    .models
+                    .iter()
+                    .any(|model| models.contains(model) || self.activity.busy(model)))
+    }
+
     /// Pick the cheapest compatible resource with available capacity. A
-    /// verified execution failure may impose a tier floor; task labels and
-    /// historical class records never constrain eligibility.
-    fn pick(
+    /// verified execution failure may impose a tier floor, and an item
+    /// routed for a tool needs a worker with that tool in its ceiling; task
+    /// labels and historical class records never constrain eligibility.
+    pub(super) fn pick(
         &self,
         item: &WorkItem,
-        excluded: &HashSet<String>,
-        floor: Option<u32>,
+        hist: &super::load::History,
         load: &HashMap<String, usize>,
         models: &HashSet<String>,
         busy: &[(Vec<String>, Option<String>)],
     ) -> Option<Arc<dyn Worker>> {
+        let (excluded, floor) = (&hist.excluded, hist.floor);
         let workers = self.registry.workers();
         workers
             .iter()
@@ -2101,6 +2283,10 @@ impl Controller {
                 self.dispatch_available(w.as_ref())
                     && !excluded.contains(w.name())
                     && covers(w.as_ref(), item)
+                    && hist
+                        .requires
+                        .iter()
+                        .all(|t| w.capabilities().tools.iter().any(|x| x == t || x == "*"))
                     && !busy.iter().any(|(resources, isolated)| {
                         let own = (self.config.worktree_root.is_some() && w.isolates_worktree())
                             .then(|| {

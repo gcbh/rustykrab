@@ -19,6 +19,7 @@ use rustykrab_core::Error;
 
 use crate::graph::Snapshot;
 use crate::worker::Brief;
+use rustykrab_tools::work_backend::ToolState;
 
 use super::load::{last_error, History};
 use super::Controller;
@@ -181,6 +182,19 @@ impl Controller {
             summary,
             error,
         })
+    }
+}
+
+impl Controller {
+    /// The item's history with only the activations the host can make: a
+    /// tool a capability rung named is activated up front when the host's
+    /// catalog has it (a built skill, a loaded tool). A host binary such as
+    /// `node` is not a RustyKrab tool, and requiring it would stop a local
+    /// run before it starts; once proven, the run uses it through `exec`.
+    pub(super) fn activatable(&self, mut hist: History) -> History {
+        hist.activate
+            .retain(|tool| self.catalog.tool_state(tool) != ToolState::Unknown);
+        hist
     }
 }
 

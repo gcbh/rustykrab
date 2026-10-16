@@ -1,0 +1,26 @@
+failure 454ddb437dc534f3  verification/claim_mismatch  1 item(s), 1 run(s)
+  first seen 2026-10-14 22:41:05Z, last seen 2026-10-14 22:41:05Z
+  claim_mismatch: the tool `node` is not proven for "Run the node stand-in [e2e-control capability-proof]" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered operation executed; observed postcondition failed
+
+item #3345f8ed  capability  done  "Build tool: node"
+  id 3345f8ed-e85c-4707-9a80-b973239b495a
+  run 2bdc01e0-d409-48c4-bf51-23d8af394ed7  snapper  2026-10-14 22:41:04Z -> 2026-10-14 22:41:05Z  HIT
+    judged blocked(verification_failed)
+    run ended: 2 iterations, 0 completion reminders, 0 tokens, 6 ms
+    daemon build 6.5.7+35ab449
+    rung repair verification/claim_mismatch [454ddb437dc534f3]: repair with the failure evidence
+    attempt_state: {"objective":"Build the tool `node` that #a7788ebf needs, so it can run again.","done_when":"The tool `node` is available to workers and #a7788ebf can use it.","constraints":[],"decisions":[],"inputs":[],"more_inputs":[],"base":null,"worker...
+    path: e2e-control/node-install.log
+    error: verification/claim_mismatch: claim_mismatch: the tool `node` is not proven for "Run the node stand-in [e2e-control capability-proof]" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered op...
+    attempt_failure: {"run":"2bdc01e0-d409-48c4-bf51-23d8af394ed7","fingerprint":"454ddb437dc534f3","error":"verification/claim_mismatch","counted":true}
+    operation_probe: {"operation":"binary.available/node","executor":"snapper","inputs_digest":"9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a","generation":"a7788ebf-0630-42dc-979c-8aa6a774c03b:1","run":"probe-f4cf2df8-cc0a-4c0e-a2a9-40207016...
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-vhli0F/run-logs/2bdc01e0-d409-48c4-bf51-23d8af394ed7.jsonl
+  run 510050ab-1790-4a1b-b272-874445078763  snapper  2026-10-14 22:41:06Z -> 2026-10-14 22:41:06Z
+    judged done
+    run ended: 3 iterations, 0 completion reminders, 0 tokens, 71 ms
+    daemon build 6.5.7+35ab449
+    attempt_state: {"objective":"Build the tool `node` that #a7788ebf needs, so it can run again.","done_when":"The tool `node` is available to workers and #a7788ebf can use it.","constraints":[],"decisions":[],"inputs":[],"more_inputs":[],"base":null,"worker...
+    command_run: python3 -c "import os, sys; p = os.path.join(sys.argv[1], 'e2e-bin', 'node'); open(p, 'w').write('#!/bin/sh\necho v24.0.0\n'); os.chmod(p, 0o755)" '/var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-vhli0F'
+    summary: e2e-control node stand-in repaired: it answers its version on the worker's exec path
+    operation_probe: {"operation":"binary.available/node","executor":"snapper","inputs_digest":"9eb8ef20488f5dcacbedbc0e25013706c8b73c3e78f6d5a409dd049203b3df5a","generation":"a7788ebf-0630-42dc-979c-8aa6a774c03b:2","run":"probe-74960b97-cdbf-4cf4-a9b5-8af4f336...
+    session log /var/folders/3l/v7wzqbpd6jj369c8cjmt47n00000gn/T/rustykrab-e2e-own-vhli0F/run-logs/510050ab-1790-4a1b-b272-874445078763.jsonl

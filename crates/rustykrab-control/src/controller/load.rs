@@ -33,6 +33,11 @@ pub(super) const SWITCHED: &str = "switched from ";
 /// every worker at or below that tier (sections 5 and 8).
 pub(super) const ESCALATING_ABOVE: &str = "; escalating above tier ";
 
+/// What a switch away from a native coding agent that lacks a RustyKrab
+/// tool adds to its outcome, followed by the tool: the next lease goes only
+/// to a worker whose tool ceiling has it (`tick.rs`'s `route_for_tool`).
+pub(super) const ROUTED_FOR: &str = "; routed to a worker whose tool ceiling has ";
+
 /// The reason an approval writes on each item it releases: the audit
 /// record of the answer. The approval also clears `held_by`; the marker is
 /// still read so a hold an older build released (leaving `held_by` set)
@@ -74,6 +79,10 @@ pub(super) struct History {
     /// Set once a failed verification escalated the item: leases go only
     /// to workers above this cost tier.
     pub floor: Option<u32>,
+    /// Tools the next lease's worker must have in its tool ceiling: the
+    /// item was routed away from a native coding agent that cannot host
+    /// them ([`ROUTED_FOR`]).
+    pub requires: Vec<String>,
 }
 
 pub(super) fn history(events: &[WorkEvent]) -> History {
@@ -104,6 +113,15 @@ pub(super) fn history(events: &[WorkEvent]) -> History {
                         .and_then(|(_, n)| n.trim().parse::<u32>().ok());
                     if let Some(tier) = tier {
                         out.floor = Some(out.floor.map_or(tier, |f| f.max(tier)));
+                    }
+                    if let Some((_, tool)) = rung.outcome.split_once(ROUTED_FOR) {
+                        let tool = tool.trim().trim_matches('`').to_string();
+                        if !tool.is_empty() && !out.requires.contains(&tool) {
+                            out.requires.push(tool.clone());
+                        }
+                        if !tool.is_empty() && !out.activate.contains(&tool) {
+                            out.activate.push(tool);
+                        }
                     }
                 }
                 if matches!(rung.rung, Rung::Acquire | Rung::Build) {

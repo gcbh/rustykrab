@@ -80,7 +80,7 @@ impl Controller {
         // The brief as the lease gave it: the inputs recorded on the lease,
         // the history as it stood. The worker has the run already; the brief
         // is what it would resubmit if its node had lost the task.
-        let hist = history(&self.store.work_events(&item.id).await?);
+        let hist = self.activatable(history(&self.store.work_events(&item.id).await?));
         let prior = if hist.repair.is_some() {
             evidence.clone()
         } else {

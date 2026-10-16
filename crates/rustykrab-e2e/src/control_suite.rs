@@ -302,6 +302,13 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
                 |ctx| Box::pin(budget_grant_resumes(ctx)),
             ),
         ),
+        (
+            Expected::Pass,
+            (
+                "control/capability-proof-a-build-counts-once-its-operation-works-on-the-executor",
+                |ctx| Box::pin(capability_proof(ctx)),
+            ),
+        ),
     ]
 }
 
@@ -1863,19 +1870,26 @@ impl OwnDaemon {
         OwnDaemon::boot_with(shared, &[("RUSTYKRAB_LOCAL_WORKER", "off")]).await
     }
 
-    /// A daemon with `env` on top of the harness's own environment.
+    /// A daemon with `env` on top of the harness's own environment. A
+    /// value may name the daemon's data directory as `__E2E_DATA_DIR__`.
     async fn boot_with(shared: &Ctx, env: &[(&str, &str)]) -> Result<OwnDaemon> {
         let dir = tempfile::Builder::new()
             .prefix("rustykrab-e2e-own-")
             .tempdir()?;
         let port = crate::pick_free_port()?;
         let base = format!("http://127.0.0.1:{port}");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let bound: Vec<(&str, String)> = env
+            .iter()
+            .map(|(k, v)| (*k, v.replace("__E2E_DATA_DIR__", &data_dir)))
+            .collect();
+        let env: Vec<(&str, &str)> = bound.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut child = crate::spawn_daemon_env(
             &shared.bin,
             dir.path(),
             port,
             &crate::Backend::Scripted(None),
-            env,
+            &env,
         )?;
         if let Err(e) = crate::wait_for_health(&base, &shared.client, &mut child).await {
             let _ = child.kill();
@@ -4348,6 +4362,270 @@ async fn s27(ctx: &Ctx) -> Result<()> {
         "the hand edit survived the next projection: {}",
         restored["title"]
     );
+    Ok(())
+}
+
+// ── functional capability proof ──────────────────────────────────────
+
+/// Write the `node` the daemon's exec path finds first.
+fn node_stand_in(bin: &std::path::Path, body: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin)?;
+    let path = bin.join("node");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// Functional capability proof on a scripted daemon of its own, with its
+/// local worker performing the probe through its own exec boundary. The
+/// daemon's exec path finds a `node` first that answers, with exit 0, no
+/// version: a binary that is there and does not work.
+///
+/// - The item reports `node` missing, parks `blocked(needs_tool)` and the
+///   ladder files `Build tool: node`.
+/// - The build first tries to report a passing `operation_probe` and a
+///   `repair_generation` of its own, which the worker's report tool
+///   refuses, then claims done without repairing anything. The controller
+///   writes generation 1 on the waiting item, asks the local worker (the
+///   executor that failed it) to run `node --version`, and the receipt says
+///   the postcondition failed: the build is not done, its verification
+///   fails, nothing forged is stored, and the item stays parked.
+/// - The build's repair replaces the stand-in with one that answers its
+///   version: generation 2, a passing receipt, the build closes `done` with
+///   its operation proven, and only then does the item resume and finish.
+async fn capability_proof(shared: &Ctx) -> Result<()> {
+    let path = format!(
+        "__E2E_DATA_DIR__/e2e-bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let daemon = OwnDaemon::boot_with(shared, &[("PATH", &path)]).await?;
+    let ctx = &daemon.ctx;
+    let bin = ctx.data_dir.join("e2e-bin");
+    node_stand_in(&bin, "echo 'node stand-in: broken, no version'")?;
+    let before = std::fs::read_to_string(bin.join("node"))?;
+    let tag = "[e2e-control capability-proof]";
+    let x = file(ctx, draft("personal", "Run the node stand-in", tag, W_NODE)).await?;
+    wait_status(ctx, &x, Status::Blocked(BlockedReason::NeedsTool)).await?;
+    let build = wait_listed(ctx, "kind=capability", "the build of node", |v| {
+        title(v) == "Build tool: node"
+    })
+    .await?;
+    let build = id(&build);
+    let built = match wait_status(ctx, &build, Status::Done).await {
+        Ok(view) => view,
+        Err(e) => {
+            let trail = trail_text(&event_trail(ctx, &build).await?);
+            keep_evidence_file(
+                "capability-proof/failed.daemon.log",
+                &ctx.data_dir.join("daemon.log"),
+            )?;
+            for log in evidence_of(&item(ctx, &build).await?, "run_log") {
+                if let Some(path) = log["reference"].as_str() {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    keep_evidence_file(
+                        &format!("capability-proof/failed.{name}"),
+                        std::path::Path::new(path),
+                    )?;
+                }
+            }
+            return Err(e.context(format!("the build's trail:\n{trail}")));
+        }
+    };
+    let finished = wait_status(ctx, &x, Status::Done).await?;
+    let after = std::fs::read_to_string(bin.join("node"))?;
+    ensure!(
+        after.contains(NODE_VERSION),
+        "the repair replaced the stand-in: {after}"
+    );
+
+    // ── the receipts: one failed, one passing, both the host's ────────
+    let executor =
+        worker_of(&finished).ok_or_else(|| anyhow!("the waiting item names no worker"))?;
+    let receipts = evidence_of(&built, "operation_probe");
+    ensure!(
+        receipts.len() == 2,
+        "two host receipts on the build, nothing a report forged: {}",
+        evidence_text(&built)
+    );
+    let probes: Vec<Value> = receipts
+        .iter()
+        .map(|e| serde_json::from_str(e["reference"].as_str().unwrap_or_default()))
+        .collect::<std::result::Result<_, _>>()?;
+    for (row, probe) in receipts.iter().zip(&probes) {
+        ensure!(
+            row["verified_by"] == format!("executor:{executor}").as_str()
+                && probe["executor"] == executor.as_str()
+                && probe["operation"] == "binary.available/node"
+                && row["hash"] == probe["inputs_digest"],
+            "a receipt from the executor, bound to its inputs: {row}"
+        );
+    }
+    ensure!(
+        probes[0]["outcome"] == "failed" && probes[1]["outcome"] == "ok",
+        "the first probe failed, the repaired one passed: {probes:?}"
+    );
+    ensure!(
+        probes[0]["generation"] == format!("{x}:1").as_str()
+            && probes[1]["generation"] == format!("{x}:2").as_str(),
+        "each probe is bound to its own generation of the waiting item: {probes:?}"
+    );
+
+    // ── the generations: on the waiting item, naming the probes ───────
+    let waiting = item(ctx, &x).await?;
+    let generations = evidence_of(&waiting, "repair_generation");
+    ensure!(
+        generations.len() == 2,
+        "two repair generations: {}",
+        evidence_text(&waiting)
+    );
+    for (n, (row, probe)) in generations.iter().zip(&probes).enumerate() {
+        let record: Value = serde_json::from_str(row["reference"].as_str().unwrap_or_default())?;
+        let planned = &record["probes"][0]["expected"];
+        ensure!(
+            record["n"] == n as u64 + 1
+                && record["cause"] == "capability"
+                && record["source_item"] == build.as_str()
+                && row["verified_by"] == "controller"
+                && [
+                    "operation",
+                    "executor",
+                    "inputs_digest",
+                    "generation",
+                    "run"
+                ]
+                .iter()
+                .all(|k| planned[*k] == probe[*k]),
+            "generation {} records the probe it was judged by: {record} {probe}",
+            n + 1
+        );
+    }
+
+    // ── the build: not done on its word, done on its proof ────────────
+    let build_trail = event_trail(ctx, &build).await?;
+    let unproven = build_trail.iter().find(|e| {
+        moved_to(e) == Some(Status::Blocked(BlockedReason::VerificationFailed))
+            && e["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("the operation probe failed"))
+    });
+    ensure!(
+        unproven.is_some(),
+        "the unrepaired build failed verification on its probe: {}",
+        trail_text(&build_trail)
+    );
+    let closed = build_trail
+        .iter()
+        .find(|e| moved_to(e) == Some(Status::Done))
+        .ok_or_else(|| anyhow!("the build never closed"))?;
+    ensure!(
+        closed["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("operation proven: binary.available/node")),
+        "the build closed on its proof: {closed}"
+    );
+    // ── the forged receipt: refused at the worker's own report tool ────
+    let first_log = evidence_of(&built, "run_log")
+        .first()
+        .and_then(|e| e["reference"].as_str().map(std::path::PathBuf::from))
+        .ok_or_else(|| anyhow!("the build's first run left no session log"))?;
+    let first_session = std::fs::read_to_string(&first_log)?;
+    ensure!(
+        first_session.contains("`operation_probe` is not one of")
+            && first_session.contains("`repair_generation` is not one of"),
+        "the worker's report tool refused the forged kinds: {}",
+        excerpt(&first_session)
+    );
+    ensure!(
+        evidence_of(&built, "repair_generation").is_empty()
+            && !evidence(&built)
+                .iter()
+                .any(|e| e["kind"] == "operation_probe"
+                    && e["verified_by"] != json!(format!("executor:{executor}"))),
+        "nothing forged is on the build: {}",
+        evidence_text(&built)
+    );
+
+    // ── the waiting item: resumed only on the proof ───────────────────
+    let trail = event_trail(ctx, &x).await?;
+    let leases = trail.iter().filter(|e| e["kind"] == "lease").count();
+    ensure!(
+        leases == 2,
+        "the item ran twice, before and after: {leases}"
+    );
+    let revived = trail
+        .iter()
+        .find(|e| {
+            e["reason"].as_str()
+                == Some("capability landed and its operation was proven on its executor")
+        })
+        .ok_or_else(|| anyhow!("the item was not released on the proof"))?;
+    let at = |e: &Value| time(&e["at"]).ok_or_else(|| anyhow!("an event without a time: {e}"));
+    ensure!(
+        at(revived)? >= at(closed)?,
+        "released only after the build was proven"
+    );
+    let second_lease = trail
+        .iter()
+        .filter(|e| e["kind"] == "lease")
+        .nth(1)
+        .ok_or_else(|| anyhow!("no second lease"))?;
+    ensure!(
+        at(second_lease)? >= at(closed)?,
+        "no run between the failed probe and the proof"
+    );
+
+    // ── the failed verification, as an operator investigates it ───────
+    let errors = evidence_of(&built, "error");
+    let fingerprint = errors
+        .iter()
+        .find(|e| {
+            e["reference"]
+                .as_str()
+                .is_some_and(|r| r.contains("the operation probe failed"))
+        })
+        .and_then(|e| e["hash"].as_str())
+        .ok_or_else(|| anyhow!("no error row for the failed probe"))?
+        .to_string();
+    let printed = cli_stdout(ctx, &["work", "investigate", &fingerprint])?;
+    ensure!(
+        printed.contains(&build),
+        "work investigate names the build: {}",
+        excerpt(&printed)
+    );
+
+    keep_evidence("capability-proof/node-stand-in.before.sh", &before)?;
+    keep_evidence("capability-proof/node-stand-in.after.sh", &after)?;
+    keep_evidence("capability-proof/waiting.events.txt", trail_text(&trail))?;
+    keep_evidence(
+        "capability-proof/waiting.events.json",
+        serde_json::to_string_pretty(&trail)?,
+    )?;
+    keep_evidence(
+        "capability-proof/build.events.txt",
+        trail_text(&build_trail),
+    )?;
+    keep_evidence(
+        "capability-proof/build.events.json",
+        serde_json::to_string_pretty(&build_trail)?,
+    )?;
+    keep_evidence(
+        "capability-proof/build.operation-probe.json",
+        serde_json::to_string_pretty(&receipts)?,
+    )?;
+    keep_evidence(
+        "capability-proof/waiting.repair-generation.json",
+        serde_json::to_string_pretty(&generations)?,
+    )?;
+    keep_evidence(
+        "capability-proof/build.errors.json",
+        serde_json::to_string_pretty(&errors)?,
+    )?;
+    keep_evidence("capability-proof/work-investigate.txt", &printed)?;
+    keep_evidence("capability-proof/build.run-1.session.jsonl", &first_session)?;
     Ok(())
 }
 

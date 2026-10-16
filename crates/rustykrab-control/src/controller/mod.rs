@@ -14,14 +14,18 @@
 //!    leases past their TTL either stall (a live run: the ladder climbs) or
 //!    return to `ready` (no run: a restart); on the first tick every other
 //!    active leaf this process is not running returns to `ready`;
-//!    items parked on a capability item that is now `done` are released;
-//!    then readiness (time triggers), roll-ups and parent verification are
-//!    settled.
+//!    items parked on a capability item that is now `done` are released
+//!    (for a need with a registered probe, only once it has `Proof` for the
+//!    item's current repair generation: `proof.rs`); then readiness (time
+//!    triggers), roll-ups and parent verification are settled.
 //! 2. **Reconcile** (step 5 and section 5): each finished run is verified
 //!    (repository-scoped work and Git claims against git), its evidence attached and its typed
 //!    transition, cascade, `discovered` filings and ladder rungs written in
 //!    one transaction; the producing worker's routing record is written
-//!    after it. A run the host ended on its way down
+//!    after it. A capability item for a need with a registered probe is
+//!    `done` only when the worker that failed the item waiting on it
+//!    performs the operation and the host observes it work (`proof.rs`);
+//!    its done claim waits for that worker's free slot, as a lease would. A run the host ended on its way down
 //!    ([`crate::worker::RunFailure::Interrupted`]) is no failure: its item
 //!    returns to `ready` with a `resume` event and its lease released, no
 //!    rung climbed and no repair counted.
@@ -50,7 +54,9 @@
 //! `load.rs` reads the store back (the snapshot, rung histories, a
 //! firing's conversation); `spend.rs` records what runs spend and gives
 //! parents their remaining budgets and leaves their cumulative one;
-//! `breaker.rs` is the repeated-outcome circuit breaker; `reattach.rs` keeps a run that
+//! `breaker.rs` is the repeated-outcome circuit breaker; `proof.rs` asks the
+//! failing worker to probe a capability's operation and gates its `done` and
+//! the revival behind it on the proof; `reattach.rs` keeps a run that
 //! outlived a restart (a peer's task) on its lease;
 //! `brief.rs` builds a run's inputs and brief; `filing.rs` is every filing
 //! path and the user's approve, reject and cancel; `tick.rs` is the loop;
@@ -70,6 +76,7 @@ mod planning;
 mod preferences;
 mod priority;
 mod project_context;
+mod proof;
 mod questions;
 mod queue_waits;
 mod reattach;
@@ -363,6 +370,10 @@ pub struct ControllerConfig {
     /// on one investigation of the failure. Zero turns the breaker off.
     /// The daemon reads `RUSTYKRAB_BREAKER_REPEATS`.
     pub breaker_repeats: u32,
+    /// How long a capability probe may take (`proof.rs`): the deadline of
+    /// the [`crate::capability_proof::ProbeRequest`] the controller sends,
+    /// capped at 30 seconds.
+    pub probe_deadline: Duration,
 }
 
 /// [`ControllerConfig::breaker_repeats`] unless configured.
@@ -401,6 +412,7 @@ impl Default for ControllerConfig {
             daemon_log_dir: None,
             build: None,
             breaker_repeats: DEFAULT_BREAKER_REPEATS,
+            probe_deadline: proof::PROBE_DEADLINE_CAP,
         }
     }
 }
@@ -442,6 +454,9 @@ struct Finished {
 struct State {
     runs: HashMap<WorkItemId, Run>,
     finished: HashMap<WorkItemId, Finished>,
+    /// Capability probes in flight per worker (`proof.rs`): each holds one
+    /// of its worker's slots, as a run does.
+    probing: HashMap<String, usize>,
     /// Brief provider outage backoff; work remains ready and spends no rung.
     availability_backoff: HashMap<String, DateTime<Utc>>,
     recurrence: Recurrence,
@@ -528,6 +543,7 @@ impl Controller {
             state: Mutex::new(State {
                 runs: HashMap::new(),
                 finished: HashMap::new(),
+                probing: HashMap::new(),
                 availability_backoff: HashMap::new(),
                 recurrence,
                 resumed: false,

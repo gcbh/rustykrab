@@ -1,0 +1,10 @@
+[
+  {
+    "at": "2026-10-14T22:41:05.887909Z",
+    "hash": "454ddb437dc534f3",
+    "item": "3345f8ed-e85c-4707-9a80-b973239b495a",
+    "kind": "error",
+    "reference": "verification/claim_mismatch: claim_mismatch: the tool `node` is not proven for \"Run the node stand-in [e2e-control capability-proof]\" (#a7788ebf): binary.available/node on snapper: the operation probe failed; the receipt says: registered operation executed; observed postcondition failed",
+    "verified_by": "verifier"
+  }
+]
