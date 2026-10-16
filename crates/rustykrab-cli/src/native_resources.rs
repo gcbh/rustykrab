@@ -116,6 +116,10 @@ impl NativeWorker {
     }
 }
 #[async_trait]
+/// `probe_scope` and `probe` keep the trait's defaults (no scope,
+/// `Unobserved`) on purpose: a run goes to the native CLI or to the host half
+/// per brief, and a probe through the host half would not attest the native
+/// CLI's boundary. Binding a probe to the path a run would take is open work.
 impl Worker for NativeWorker {
     fn name(&self) -> &str {
         self.native.name()
