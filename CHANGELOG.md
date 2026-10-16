@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- feat: compaction writes an explicit state handoff. The default summarizer
+  records the objective with its exact values, the latest instruction,
+  constraints and preferences, candidates and their status, findings, failed
+  attempts as observations, what is done and open, and the next step. It gets
+  its own system message and no longer reads the agent's own instructions,
+  which a local model would act on instead of summarizing. On qwen at 128K the
+  next action stayed on task in 5 of 6 trials of this build (6 of 6 in the
+  prompt hill-climb), up from 2 of 6.
+
 ## [6.6.1] - 2026-10-16
 
+- feat: configure each local model once, in models.toml (#718)
+- feat: share agency and recovery direction with development and dreaming (#694)
+- feat: freeze operational review evidence and enforce local read-only jobs (#696)
+- feat: verify capability claims with trusted local probes (#695)
+- feat(control): bound recovery with cumulative budgets, owner-only grants and a repeated-outcome breaker (#697)
+- feat(control): prove a capability's operation before it closes or revives what waits on it (#698)
+- feat(control): observe foreground dispatchability, and one probe registry (#699)
+- fix(cli): production local workers run their capability probes (#700)
+- test(control): wait for runs that are still working before a test calls its scenario settled (#716)
 - test(control): a failed git call shows what git said; scripted commits always change something (#717)
 
 - feat: bounded recovery. A work item's budget is cumulative over all its
