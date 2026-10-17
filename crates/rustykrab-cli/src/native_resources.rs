@@ -19,6 +19,8 @@ pub(crate) struct HostTools {
     pub backend: Arc<dyn WorkBackend>,
     pub transcripts: Arc<dyn RunTranscripts>,
     pub integrations: bool,
+    /// Loopback ports the host half's shell may not reach: the daemon's own.
+    pub private_ports: Vec<u16>,
 }
 
 pub(crate) struct NativeWorker {
@@ -97,6 +99,7 @@ impl NativeWorker {
         // The host half's runs leave session logs where the native half's
         // do, so either is opened from the same evidence.
         .with_private_paths(vec![config.data_dir.clone()])
+        .with_private_ports(tools.private_ports.clone())
         .with_run_logs(
             config
                 .data_dir
@@ -250,6 +253,7 @@ mod tests {
                     backend: Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
                     transcripts: Arc::new(Discard),
                     integrations: true,
+                    private_ports: Vec::new(),
                 },
             )
             .unwrap();
@@ -290,6 +294,7 @@ mod tests {
                     backend: Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
                     transcripts: Arc::new(Discard),
                     integrations: false,
+                    private_ports: Vec::new(),
                 },
             )
             .unwrap();
@@ -361,6 +366,7 @@ mod tests {
                 backend: Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
                 transcripts: Arc::new(Discard),
                 integrations: false,
+                private_ports: Vec::new(),
             },
         )
         .unwrap()
