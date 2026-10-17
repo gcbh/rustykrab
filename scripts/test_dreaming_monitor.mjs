@@ -107,7 +107,7 @@ test('older and future daemon responses remain unknown rather than implying capa
 test('daily limits, due state and in-progress reviews stay distinct from permission to start', () => {
   const t = dashboard();
   for (const [decision, expected] of [
-    ['daily_limit', /three-cycle limit for the last 24 hours/],
+    ['daily_limit', /review-cycle limit for the last 24 hours/],
     ['no_due_project', /No enabled project is due/],
     ['review_in_progress', /review cycle is already in progress/],
     ['idle_review', /An idle project review may start/],
@@ -119,6 +119,54 @@ test('daily limits, due state and in-progress reviews stay distinct from permiss
   }
   t.render({ ...view(observed('disabled')), enabled: false });
   assert.equal(t.$('dreamNow').disabled, true);
+});
+
+test('the server owns current admission wording and the numeric cycle limit', () => {
+  const t = dashboard();
+  t.render({ ...view(observed('daily_limit')), daily_review_limit: 7,
+    admission_allows_review: false,
+    admission_explanation: 'Server policy: seven cycles used; <inspect receipt>' });
+  assert.match(t.text(), /Last decision: Review deferred: Server policy: seven cycles used; <inspect receipt>/);
+  assert.match(t.text(), /Review-cycle limit per 24 hours: 7/);
+  assert.doesNotMatch(t.text(), /three-cycle|review-cycle limit for the last 24 hours has been reached/);
+  assert.equal(t.$('dreamNow').disabled, false);
+  t.render({ ...view({ decision: 'future_policy' }), daily_review_limit: 9,
+    admission_allows_review: true,
+    admission_explanation: 'A future server supplied this decision' });
+  assert.match(t.text(), /Last decision: Review available: A future server supplied this decision/);
+  assert.match(t.text(), /Review-cycle limit per 24 hours: 9/);
+});
+
+test('server availability stays explicit and unknown verdicts are not inferred from a reason or decision', () => {
+  const t = dashboard();
+  const snapshot = { ...view(observed('idle_review')), admission_explanation: 'a server-owned reason' };
+  for (const missing of [undefined, null, 0, 1, 'true', 'false', {}]) {
+    t.render({ ...snapshot, admission_allows_review: missing });
+    assert.match(t.text(), /Last decision: Review availability not reported: a server-owned reason/);
+    assert.doesNotMatch(t.text(), /Review available:|Review deferred:/);
+  }
+  t.render({ ...snapshot, admission_allows_review: false });
+  assert.match(t.text(), /Last decision: Review deferred: a server-owned reason/);
+  t.render({ ...snapshot, admission_allows_review: true });
+  assert.match(t.text(), /Last decision: Review available: a server-owned reason/);
+  assert.doesNotMatch(t.text(), /review is running|permission granted/i);
+});
+
+test('missing, malformed and orphaned display observations use legacy or unknown values', () => {
+  const t = dashboard();
+  for (const invalid of [undefined, null, '', '  ', 0, {}]) {
+    t.render({ ...view(observed('daily_limit')), admission_explanation: invalid,
+      daily_review_limit: invalid });
+    assert.match(t.text(), /Last decision: Review deferred: the review-cycle limit/);
+    assert.match(t.text(), /Review-cycle limit per 24 hours: not observed/);
+  }
+  for (const limit of [-1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1, '3']) {
+    t.render({ ...view(observed('daily_limit')), daily_review_limit: limit });
+    assert.match(t.text(), /Review-cycle limit per 24 hours: not observed/);
+  }
+  t.render({ ...view(undefined), admission_explanation: 'stale orphaned explanation' });
+  assert.doesNotMatch(t.text(), /stale orphaned explanation/);
+  assert.match(t.text(), /Review availability has not been reported/);
 });
 
 test('latest project-review receipts are separate from general expectation and outcome passes', () => {
@@ -137,10 +185,13 @@ test('latest project-review receipts are separate from general expectation and o
 
 test('refresh and disconnect-like missing snapshots remove previous admission evidence', () => {
   const t = dashboard();
-  t.render(view({ ...observed('incident_review'), waiting: { marker_from_old_snapshot: 80 } }));
+  t.render({ ...view({ ...observed('incident_review'), waiting: { marker_from_old_snapshot: 80 } }),
+    admission_explanation: 'old server explanation', daily_review_limit: 7 });
   assert.match(t.text(), /marker from old snapshot/);
+  assert.match(t.text(), /old server explanation/);
   t.render(view(undefined));
-  assert.doesNotMatch(t.text(), /marker from old snapshot|bounded incident review/);
+  assert.doesNotMatch(t.text(), /marker from old snapshot|bounded incident review|old server explanation|per 24 hours: 7/);
+  assert.match(t.text(), /Review-cycle limit per 24 hours: not observed/);
   t.render(null);
   assert.equal(t.text(), '');
   assert.equal(t.$('dreamNow').disabled, true);

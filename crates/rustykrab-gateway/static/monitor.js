@@ -150,16 +150,19 @@
       demand_stale: 'Review deferred: work demand is stale or ahead of the server clock.',
       foreground_active: 'Review deferred: foreground work is active.',
       foreground_runnable: 'Review deferred: foreground work can be dispatched.',
-      daily_limit: 'Review deferred: the three-cycle limit for the last 24 hours has been reached.',
+      daily_limit: 'Review deferred: the review-cycle limit for the last 24 hours has been reached.',
       no_due_project: 'No enabled project is due for review.',
       review_in_progress: 'A project review cycle is already in progress.',
       idle_review: 'An idle project review may start.',
       incident_review: 'A waiting-only backlog permits a bounded incident review.'
     };
     const a = d.admission;
-    const description = Object.hasOwn(descriptions, a?.decision) ? descriptions[a.decision] : 'Review availability has not been reported by this build.';
+    const serverExplanation = typeof a?.decision === 'string' && typeof d.admission_explanation === 'string' ? d.admission_explanation.trim() : '';
+    const availability = d.admission_allows_review === true ? 'Review available: ' : d.admission_allows_review === false ? 'Review deferred: ' : 'Review availability not reported: ';
+    const description = serverExplanation ? availability + serverExplanation : (Object.hasOwn(descriptions, a?.decision) ? descriptions[a.decision] : 'Review availability has not been reported by this build.');
     const count = value => Number.isSafeInteger(value) && value >= 0 ? num(value) : 'not observed';
     $('dreamMetrics').append(node('h3', 'Review availability'), node('p', 'Last decision: ' + description));
+    $('dreamMetrics').append(node('p', 'Review-cycle limit per 24 hours: ' + (Number.isSafeInteger(d.daily_review_limit) && d.daily_review_limit > 0 ? num(d.daily_review_limit) : 'not observed'), 'note'));
     if (a) {
       $('dreamMetrics').append(node('p', 'Decision check: ' + age(a.checked_at) + ' · Work-demand observation: ' + age(a.observed_at), 'note'));
       $('dreamMetrics').append(node('p', 'Active foreground runs: ' + count(a.active_foreground_runs) + ' · Runnable foreground tasks: ' + count(a.dispatchable_foreground_leaves)));

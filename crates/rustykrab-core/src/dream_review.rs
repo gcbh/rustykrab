@@ -6,6 +6,8 @@ use serde_json::Value;
 
 pub const REVIEW_ONLY: &str = "read_only_review";
 pub const RUBRIC: &str = "dreaming-v1";
+/// Maximum project-review cycles created in the rolling last 24 hours.
+pub const PROJECT_REVIEW_DAILY_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewEvidence {
@@ -191,8 +193,8 @@ pub enum ReviewAdmissionDecision {
     IncidentReview,
 }
 impl ReviewAdmissionDecision {
-    pub fn explanation(self) -> &'static str {
-        match self {
+    pub fn explanation(self) -> String {
+        let explanation = match self {
             Self::Disabled => "no projects are enabled for review",
             Self::ControllerUnavailable => {
                 "the work manager is stopping, failing, or waiting for exclusive control"
@@ -205,12 +207,17 @@ impl ReviewAdmissionDecision {
             }
             Self::ForegroundActive => "foreground work is active",
             Self::ForegroundRunnable => "foreground work can be dispatched",
-            Self::DailyLimit => "the three-cycle limit for the last 24 hours has been reached",
+            Self::DailyLimit => {
+                return format!(
+                    "the {PROJECT_REVIEW_DAILY_LIMIT}-cycle limit for the last 24 hours has been reached"
+                );
+            }
             Self::NoDueProject => "no enabled project is due for review",
             Self::ReviewInProgress => "a project review cycle is already in progress",
             Self::IdleReview => "current demand permits an idle project review",
             Self::IncidentReview => "a waiting-only backlog permits a bounded incident review",
-        }
+        };
+        explanation.into()
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -246,6 +253,15 @@ pub struct DreamingView {
     /// Missing in an older view means unobserved, not idle or healthy.
     #[serde(default)]
     pub admission: Option<ReviewAdmission>,
+    /// Display text for this view's final admission decision; not authority.
+    #[serde(default)]
+    pub admission_explanation: Option<String>,
+    /// Availability at this decision's check, not a reservation or permission.
+    #[serde(default)]
+    pub admission_allows_review: Option<bool>,
+    /// None on older servers; clients must not assume a numeric limit.
+    #[serde(default)]
+    pub daily_review_limit: Option<usize>,
     #[serde(default)]
     pub last_project_review_completed_at: Option<DateTime<Utc>>,
     #[serde(default)]
