@@ -104,10 +104,23 @@ fn normalise_word(word: &str) -> String {
         "<url>".to_string()
     } else if is_path(core) {
         "<path>".to_string()
+    } else if is_short_git_revision_range(core) {
+        "<id>..<id>".to_string()
     } else {
         replace_ids(core)
     };
     format!("{lead}{replaced}{trail}")
+}
+
+/// The verifier prints a pair of twelve-character short Git revisions.
+/// Recognise the pair before treating its runs as ordinary numbers or words:
+/// valid revisions may contain only digits or only hexadecimal letters.
+fn is_short_git_revision_range(word: &str) -> bool {
+    word.split_once("..").is_some_and(|(base, head)| {
+        [base, head]
+            .into_iter()
+            .all(|rev| rev.len() == 12 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
+    })
 }
 
 fn is_path(word: &str) -> bool {
@@ -282,6 +295,60 @@ mod tests {
             "can't open input/output for <path>"
         );
         assert_eq!(normalise("  "), "");
+    }
+
+    #[test]
+    fn short_git_revision_ranges_ignore_the_spelling_of_each_revision() {
+        let revisions = ["f941d808b499", "462412909355", "abcdefabcdef"];
+        let expected = fp(
+            ErrorSubclass::CheckFailed,
+            "diff of f941d808b499..f941d808b499: paths disagree",
+        );
+        for base in revisions {
+            for head in revisions {
+                assert_eq!(
+                    normalise(&format!("diff of {base}..{head}: paths disagree")),
+                    "diff of <id>..<id>: paths disagree"
+                );
+                assert_eq!(
+                    fp(
+                        ErrorSubclass::CheckFailed,
+                        &format!("diff of {base}..{head}: paths disagree"),
+                    ),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            normalise("diff of (ABCDEFABCDEF..462412909355): paths disagree"),
+            "diff of (<id>..<id>): paths disagree"
+        );
+    }
+
+    #[test]
+    fn short_git_revision_ranges_do_not_reclassify_other_words_or_paths() {
+        assert_eq!(normalise("attempt 462412909355"), "attempt <n>");
+        assert_eq!(normalise("a range 12..34"), "a range <n>..<n>");
+        assert_eq!(normalise("word abcdefabcdef"), "word abcdefabcdef");
+        assert_eq!(
+            normalise("range 12345678901..23456789012"),
+            "range <n>..<n>"
+        );
+        assert_eq!(
+            normalise("range 1234567890123..2345678901234"),
+            "range <n>..<n>"
+        );
+        assert_eq!(
+            normalise("range abcdefabcdef...abcdefabcdef"),
+            "range abcdefabcdef...abcdefabcdef"
+        );
+        assert_eq!(normalise("/tmp/abcdefabcdef..462412909355"), "<path>");
+        assert_eq!(
+            normalise("https://host/abcdefabcdef..462412909355"),
+            "<url>"
+        );
+        assert_eq!(normalise("`abcdefabcdef..462412909355`"), "<str>");
+        assert_eq!(normalise("🦀 12..34"), "🦀 <n>..<n>");
     }
 
     #[test]
