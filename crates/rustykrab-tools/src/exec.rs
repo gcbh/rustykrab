@@ -318,6 +318,23 @@ impl Default for ExecTool {
     }
 }
 
+/// Rustup's shims find the installed toolchains here, independently of the
+/// command's isolated HOME. Resolve relative host configuration before binding
+/// the command to a different worktree. Cargo configuration/credentials and
+/// other ambient environment variables are deliberately not forwarded.
+fn rustup_home() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".rustup"))
+        })?;
+    if home.is_absolute() {
+        Some(home)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(home))
+    }
+}
+
 fn truncate_output(s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
         // Use floor_char_boundary to avoid panicking when the truncation
@@ -640,7 +657,13 @@ impl Tool for ExecTool {
             .env_clear()
             .env("PATH", &path)
             .env("HOME", "/tmp/rustykrab-home")
-            .env("LANG", "C.UTF-8");
+            .env("LANG", "C.UTF-8")
+            // Use installed toolchains; an ordinary Cargo invocation must not
+            // implicitly download into the operator's shared Rustup store.
+            .env("RUSTUP_AUTO_INSTALL", "0");
+        if let Some(home) = rustup_home() {
+            process.env("RUSTUP_HOME", home);
+        }
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
         }
@@ -673,6 +696,169 @@ impl Tool for ExecTool {
             "stdout": stdout,
             "stderr": stderr,
         }))
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod environment_tests {
+    use super::ExecTool;
+    use rustykrab_core::Tool;
+    use serde_json::json;
+    use std::path::Path;
+
+    // Separate processes give each case a private environment; tests never
+    // mutate the workspace test process's environment or operator files.
+    fn fixture(explicit: Option<&str>) {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = root.path().join("daemon");
+        let worker = root.path().join("worker");
+        let host_home = root.path().join("host-home");
+        for dir in [&daemon, &worker, &host_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let explicit = explicit.map(|p| {
+            if p == "absolute" {
+                root.path().join("custom-rustup")
+            } else {
+                p.into()
+            }
+        });
+        let expected = match &explicit {
+            Some(p) if p.is_absolute() => p.clone(),
+            Some(p) => daemon.join(p),
+            None => host_home.join(".rustup"),
+        };
+        std::fs::create_dir_all(&expected).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--ignored",
+                "--exact",
+                "exec::environment_tests::child_exec_environment",
+                "--nocapture",
+            ])
+            .current_dir(&daemon)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &host_home)
+            .env("RK_EXEC_EXPECT_RUSTUP_HOME", &expected)
+            .env("RK_EXEC_WORKER_DIR", &worker)
+            .env("CARGO_HOME", root.path().join("credential-canary"))
+            .env("CARGO_REGISTRIES_CRATES_IO_TOKEN", "fixture-only-token")
+            .env("RUSTUP_AUTO_INSTALL", "1")
+            .env("ANTHROPIC_API_KEY", "fixture-only-key")
+            .env("RK_EXEC_PARENT_SECRET", "fixture-only-secret");
+        if let Some(explicit) = explicit {
+            child.env("RUSTUP_HOME", explicit);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "private environment fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn rustup_default_location_survives_an_isolated_command_home() {
+        fixture(None);
+    }
+
+    #[test]
+    fn explicit_rustup_location_takes_precedence_over_host_home() {
+        fixture(Some("absolute"));
+    }
+
+    #[test]
+    fn relative_rustup_location_is_bound_before_changing_worktree() {
+        fixture(Some("relative-rustup"));
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture; parents provide the isolated environment"]
+    fn child_exec_environment() {
+        let expected = std::env::var_os("RK_EXEC_EXPECT_RUSTUP_HOME")
+            .expect("parent must supply the expected installation path");
+        let worker = std::env::var_os("RK_EXEC_WORKER_DIR");
+        let tool = worker.as_ref().map_or_else(ExecTool::new, ExecTool::in_dir);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let out = tool.execute(json!({"command":"env"})).await.unwrap();
+                assert_eq!(out["exit_code"], 0);
+                let vars: std::collections::BTreeMap<_, _> = out["stdout"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .collect();
+                assert_eq!(vars.get("HOME"), Some(&"/tmp/rustykrab-home"));
+                assert_eq!(vars.get("RUSTUP_AUTO_INSTALL"), Some(&"0"));
+                let home = vars.get("RUSTUP_HOME").expect("Rustup location is missing");
+                assert_eq!(
+                    Path::new(home).canonicalize().unwrap(),
+                    Path::new(&expected).canonicalize().unwrap()
+                );
+                for key in [
+                    "CARGO_HOME",
+                    "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "RK_EXEC_PARENT_SECRET",
+                    "RK_EXEC_EXPECT_RUSTUP_HOME",
+                    "RK_EXEC_WORKER_DIR",
+                ] {
+                    assert!(!vars.contains_key(key), "parent variable leaked: {key}");
+                }
+                let pwd = tool.execute(json!({"command":"pwd"})).await.unwrap();
+                assert_eq!(pwd["exit_code"], 0);
+                if let Some(worker) = worker {
+                    assert_eq!(
+                        Path::new(pwd["stdout"].as_str().unwrap().trim())
+                            .canonicalize()
+                            .unwrap(),
+                        Path::new(&worker).canonicalize().unwrap()
+                    );
+                }
+                // An explicit opt-in verification run uses the real installed
+                // Cargo through this same Tool boundary; portable fixtures do
+                // not require their host to have installed Rust with Rustup.
+                if std::env::var_os("RK_EXEC_VERIFY_REAL_CARGO").is_some() {
+                    let cargo = tool
+                        .execute(json!({"command":"cargo --version"}))
+                        .await
+                        .unwrap();
+                    assert_eq!(cargo["exit_code"], 0, "{cargo}");
+                    assert!(cargo["stdout"].as_str().unwrap().starts_with("cargo "));
+                    let check = tool
+                        .execute(json!({"command":"cargo check --offline"}))
+                        .await
+                        .unwrap();
+                    assert_eq!(check["exit_code"], 0, "{check}");
+                    println!(
+                        "REAL_EXEC_RECEIPT {}",
+                        json!({"cargo_version":cargo,"offline_check":check,
+                            "isolated_home":vars.get("HOME"),
+                            "rustup_location_forwarded":true,
+                            "rustup_auto_install":vars.get("RUSTUP_AUTO_INSTALL"),
+                            "cargo_home_or_credentials_forwarded":false})
+                    );
+                }
+                if std::env::var_os("RK_EXEC_VERIFY_MISSING_CARGO").is_some() {
+                    for command in ["cargo --version", "cargo +stable --version"] {
+                        let cargo = tool.execute(json!({"command":command})).await.unwrap();
+                        assert_ne!(cargo["exit_code"], 0, "{cargo}");
+                        assert!(cargo["stderr"].as_str().unwrap().contains("not installed"));
+                        println!(
+                            "MISSING_EXEC_RECEIPT {}",
+                            json!({"command":command,"result":cargo})
+                        );
+                    }
+                }
+            });
     }
 }
 
