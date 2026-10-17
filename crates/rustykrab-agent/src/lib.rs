@@ -7,6 +7,7 @@ pub mod harness;
 pub mod local_model;
 pub mod local_worker;
 mod metered;
+mod native_observation;
 pub mod peer_worker;
 pub mod recall_tools;
 pub mod rlm;

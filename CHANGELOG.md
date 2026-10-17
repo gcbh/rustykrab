@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.3] - 2026-10-17
+
+- Retain native command outcomes for investigations (#708)
+
 ## [6.6.2] - 2026-10-16
 
 - feat(agent): compaction writes an explicit state handoff (#719)

@@ -41,8 +41,8 @@
 //! reads the whole disk, and its `--add-dir` grants write access.
 //!
 //! **What it returns.** The contract JSON is taken from the agent's final
-//! message ([`parse_contract`]). The adapter adds what it saw itself: every
-//! shell command the agent ran, as `command_run` artifacts (a model-written
+//! message ([`parse_contract`]). The adapter adds runtime command strings,
+//! including request-only formats, as `command_run` artifacts (a model-written
 //! `command_run` is dropped), which is the evidence the controller checks
 //! `checks_run` against. A run that ends without a contract is a typed
 //! [`RunFailure`]: the timeout `budget/wall`, a failed process
@@ -569,7 +569,7 @@ pub struct ExternalWorker {
 struct Transcript {
     /// The agent's final message, if it got that far.
     final_message: Option<String>,
-    /// Shell commands it ran, in order.
+    /// Command strings in runtime events, including request-only formats.
     commands: Vec<String>,
     usage: RunUsage,
     /// Set when the agent's own result says it stopped on an error.
@@ -658,7 +658,13 @@ impl ExternalWorker {
     /// the run reported or not, so a later run can investigate a failure
     /// from what happened instead of from a one-line error. Best effort: a
     /// log that cannot be written is logged and the run goes on.
-    fn append_log(&self, run: &str, invocation: &str, output: &std::process::Output) {
+    fn append_log(
+        &self,
+        run: &str,
+        invocation: &str,
+        output: &std::process::Output,
+        capture_complete: bool,
+    ) {
         let root = self.logs_root();
         let path = root.join(format!("{}.jsonl", file_id(run)));
         let written = (|| -> std::io::Result<()> {
@@ -672,9 +678,12 @@ impl ExternalWorker {
                 options.mode(0o600);
             }
             let mut file = options.open(&path)?;
+            let invocation_id = uuid::Uuid::new_v4().to_string();
             let marker = serde_json::json!({
                 "type": "rustykrab.invocation",
                 "invocation": invocation,
+                "invocation_id": invocation_id,
+                "capture_complete": capture_complete,
                 "run": run,
                 "worker": self.name,
                 "kind": self.config.kind.as_str(),
@@ -694,6 +703,19 @@ impl ExternalWorker {
                 });
                 writeln!(file, "{line}")?;
             }
+            // Diagnostic summary of THIS owned capture, including failed or
+            // partial invocations. No model artifact or saved log is ingested.
+            // The log is mutable investigation material, never operation proof.
+            let summary = serde_json::json!({
+                "type": "rustykrab.native_observations",
+                "worker": self.name,
+                "run": run,
+                "invocation": invocation,
+                "invocation_id": invocation_id,
+                "kind": self.config.kind.as_str(),
+                "observed": crate::native_observation::observe(self.config.kind, &output.stdout, capture_complete),
+            });
+            writeln!(file, "{summary}")?;
             Ok(())
         })();
         match written {
@@ -735,10 +757,8 @@ impl ExternalWorker {
     }
 
     /// Read what the agent printed into the result contract, or the typed
-    /// reason there is none; record what it spent and the commands it ran,
-    /// adding to what an earlier invocation of the same run recorded when
-    /// `resumed`. Also returns the session to resume when a Claude Code run
-    /// stopped at its turn cap and printed one.
+    /// reason there is none; record this invocation's usage and command
+    /// observations independently of whether it returns a valid contract.
     fn read_output(
         &self,
         brief: &Brief,
@@ -1340,14 +1360,14 @@ impl Worker for ExternalWorker {
         let (executed, partial, interrupted) = self.execute(cmd, limit).await;
         let outcome = match executed {
             Ok(output) => {
-                self.append_log(&run_id, "start", &output);
+                self.append_log(&run_id, "start", &output, true);
                 self.read_output(&brief, &run_id, &output, &last)
             }
             // Ended by its wall limit: record what it had spent, and keep
             // the timeout as the outcome.
             Err(e) => {
                 if let Some(partial) = &partial {
-                    self.append_log(&run_id, "start", partial);
+                    self.append_log(&run_id, "start", partial, false);
                     let _ = self.read_output(&brief, &run_id, partial, &last);
                 }
                 Err(e)
@@ -1499,7 +1519,7 @@ pub(crate) fn file_id(id: &str) -> String {
 // ── reading what the agent printed ────────────────────────────────────────
 
 /// Claude Code's `stream-json`: one JSON event per line. Tool uses of
-/// `Bash` are the commands it ran; the last `result` event is the envelope
+/// `Bash` record requests, not completion; the last `result` is the envelope
 /// with the final message, the turn count and the cost. A run ended before
 /// that envelope (daemon shutdown) keeps what its assistant turns reported:
 /// one turn per distinct message, and that message's usage.
@@ -1586,15 +1606,15 @@ fn claude_tokens(usage: &Value) -> u64 {
     .sum()
 }
 
-/// `codex exec --json`: one JSON event per line. Command executions are the
-/// commands it ran; agent messages are its text, the last one its final
+/// `codex exec --json`: one JSON event per line. Command events record command
+/// strings (legacy begin events are requests); agent messages supply the final
 /// message (the `--output-last-message` file wins when it is written).
 /// Reads both the `item.*` event shape and the older `msg` one.
 /// Codex displays a shell argv as a quoted command string. Decode only an
 /// exact `<known shell> -c/-lc <one command>` invocation, never arbitrary
 /// strings or compound wrappers. Preserve the command argument byte-for-byte:
 /// its quoting and heredocs are the check evidence, not display escapes.
-fn codex_command(value: &Value) -> Option<String> {
+pub(super) fn codex_command(value: &Value) -> Option<String> {
     let (display, argv) = match value {
         Value::String(display) => (display.clone(), shlex::split(display)),
         Value::Array(parts) => {
@@ -2613,6 +2633,13 @@ wait
         );
         let e = classify(&run_failure_input(&err), &Context::default());
         assert_eq!(e.subclass, ErrorSubclass::Wall);
+        let text = std::fs::read_to_string(worker.run_log("run-1").unwrap()).unwrap();
+        let partial = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .rfind(|v| v["type"] == "rustykrab.native_observations")
+            .unwrap();
+        assert_eq!(partial["observed"]["capture_incomplete"], true);
 
         // Two turns, msg-1 counted once: 125 + 230 tokens.
         let usage = worker.usage("run-1").expect("a timed-out run has usage");
@@ -2712,6 +2739,87 @@ wait
         assert!(!args.lines().any(|l| l == "--max-turns"), "{args}");
         assert!(!args.lines().any(|l| l == "--resume"), "{args}");
         assert!(!args.contains("rounds of"), "{args}");
+    }
+
+    /// Each single CLI invocation leaves a fresh diagnostic envelope, even
+    /// when a later run reuses the same run label. The log is not proof.
+    #[tokio::test]
+    async fn every_run_leaves_its_session_log() {
+        let f = Fixture::new();
+        let worker = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent(
+                "logged-claude",
+                r#"#!/bin/sh
+echo '{"type":"result","subtype":"success","num_turns":1,"result":"{\"summary\":\"fixture log\"}"}'
+"#,
+            ),
+        );
+        assert_eq!(worker.run_log("run-1"), None);
+        for _ in 0..2 {
+            worker.run(brief(None)).await.unwrap();
+        }
+        let log = worker.run_log("run-1").expect("each invocation left a log");
+        assert_eq!(log, f.data.path().join(RUN_LOGS_DIR).join("run-1.jsonl"));
+        let text = std::fs::read_to_string(&log).unwrap();
+        let events: Vec<Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let markers: Vec<_> = events
+            .iter()
+            .filter(|v| v["type"] == "rustykrab.invocation")
+            .collect();
+        let summaries: Vec<_> = events
+            .iter()
+            .filter(|v| v["type"] == "rustykrab.native_observations")
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(summaries.len(), 2);
+        assert_ne!(markers[0]["invocation_id"], markers[1]["invocation_id"]);
+        for (marker, summary) in markers.iter().zip(summaries) {
+            assert_eq!(marker["invocation"], "start");
+            assert_eq!(marker["capture_complete"], true);
+            assert_eq!(marker["run"], "run-1");
+            assert_eq!(marker["worker"], worker.name());
+            assert_eq!(marker["invocation_id"], summary["invocation_id"]);
+            assert_eq!(summary["observed"]["diagnostic_only"], true);
+            assert_eq!(summary["observed"]["schema_version"], 1);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(log).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_native_process_retains_structured_outcome_without_a_model_report() {
+        let f = Fixture::new();
+        let script = f.agent("observed-failure", r#"#!/bin/sh
+echo '{"type":"item.started","item":{"type":"command_execution","id":"check","command":"node --version"}}'
+echo '{"type":"item.completed","item":{"type":"command_execution","id":"check","command":"node --version","exit_code":7,"status":"failed","aggregated_output":"fixture missing node"}}'
+exit 9
+"#);
+        let worker = f.worker(WorkerKind::Codex, script);
+        assert!(worker.run(brief(None)).await.is_err());
+        let text = std::fs::read_to_string(worker.run_log("run-1").unwrap()).unwrap();
+        let summary = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["type"] == "rustykrab.native_observations")
+            .unwrap();
+        let record = &summary["observed"]["observations"][0];
+        assert_eq!(record["outcome"]["state"], "failed");
+        assert_eq!(record["exit_code"], 7);
+        assert_eq!(record["stdout"]["text"], "fixture missing node");
+        assert_eq!(summary["run"], "run-1");
+        assert_eq!(summary["worker"], worker.name());
+        assert_eq!(summary["observed"]["capture_incomplete"], false);
+        assert!(!text.contains("\"operation_probe\""));
     }
 
     /// The toolset is Claude Code's default working tools; a spec adds to
