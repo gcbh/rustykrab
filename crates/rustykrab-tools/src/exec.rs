@@ -55,6 +55,31 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "sort",
     "uniq",
     "diff",
+    // Text and data utilities: they read, compare or reshape what they are
+    // given, as sort and cut already do.
+    "paste",
+    "comm",
+    "join",
+    "column",
+    "nl",
+    "fold",
+    "rev",
+    "tac",
+    "seq",
+    "expr",
+    "bc",
+    "strings",
+    "hexdump",
+    "base64",
+    "shasum",
+    "sha256sum",
+    "md5",
+    "md5sum",
+    "cmp",
+    "jq",
+    "tree",
+    "realpath",
+    "zcat",
     "echo",
     "pwd",
     "whoami",
@@ -175,6 +200,9 @@ pub struct ExecTool {
     confinement: Option<Confinement>,
 }
 
+/// macOS's sandbox runner (Seatbelt).
+const SANDBOX: &str = "/usr/bin/sandbox-exec";
+
 impl ExecTool {
     pub fn new() -> Self {
         Self {
@@ -191,19 +219,30 @@ impl ExecTool {
         }
     }
 
-    /// `sh`, inside the sandbox when this instance is confined.
-    fn shell(&self) -> tokio::process::Command {
+    /// The directory and confinement a command runs under, when it runs in
+    /// the OS sandbox: a confined instance on a platform that has one.
+    fn sandbox(&self) -> Option<(&std::path::Path, &Confinement)> {
         let (Some(dir), Some(confinement)) = (&self.dir, &self.confinement) else {
-            return tokio::process::Command::new("sh");
+            return None;
         };
-        const SANDBOX: &str = "/usr/bin/sandbox-exec";
         if !cfg!(target_os = "macos") || !std::path::Path::new(SANDBOX).exists() {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
-                tracing::warn!("no OS sandbox on this platform; a worker's exec runs unconfined")
+                tracing::warn!(
+                    "no OS sandbox on this platform; a worker's exec runs unconfined, \
+                     checked against the allowlist"
+                )
             });
-            return tokio::process::Command::new("sh");
+            return None;
         }
+        Some((dir, confinement))
+    }
+
+    /// `sh`, inside the sandbox when this instance runs in one.
+    fn shell(&self) -> tokio::process::Command {
+        let Some((dir, confinement)) = self.sandbox() else {
+            return tokio::process::Command::new("sh");
+        };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
         sandboxed.arg("-p").arg(confinement.profile(dir)).arg("sh");
         sandboxed
@@ -216,7 +255,20 @@ impl ExecTool {
         if self.dir.is_some() {
             let mut all = Confinement::default_private();
             all.extend(private);
-            self.confinement = Some(Confinement { private: all });
+            self.confinement = Some(Confinement {
+                private: all,
+                ports: Confinement::default_private_ports(),
+            });
+        }
+        self
+    }
+
+    /// Also refuse the confined shell connections to these loopback ports
+    /// (the daemon's own gateway), on top of
+    /// [`Confinement::default_private_ports`].
+    pub fn deny_local_ports(mut self, ports: Vec<u16>) -> Self {
+        if let Some(confinement) = &mut self.confinement {
+            confinement.ports.extend(ports);
         }
         self
     }
@@ -231,13 +283,44 @@ impl ExecTool {
 /// Before this a worker's shell could write anywhere the daemon could and
 /// read its secrets; a run in the 2026-10-14 reminder eval searched the
 /// whole disk for a passphrase. Other platforms run unconfined, said once.
+///
+/// Inside the sandbox any program may run, as in Codex and Claude Code: the
+/// sandbox is the boundary, not a list of program names (python3, node and
+/// xargs run anything anyway). So it also closes what would let a command
+/// act outside it later or elsewhere: writes to the git directory's hooks
+/// and config (which git runs or reads outside the sandbox), connections to
+/// Docker's socket (host access), and connections to loopback `ports` (the
+/// daemon's API and the model server).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confinement {
     pub private: Vec<std::path::PathBuf>,
+    pub ports: Vec<u16>,
 }
 
 impl Confinement {
     /// The daemon user's credential stores.
+    /// Loopback ports a confined shell never reaches: Ollama's default.
+    pub fn default_private_ports() -> Vec<u16> {
+        vec![11434]
+    }
+
+    /// Docker's sockets, wherever the usual runtimes put them.
+    fn docker_sockets() -> Vec<std::path::PathBuf> {
+        let mut sockets = vec![std::path::PathBuf::from("/var/run/docker.sock")];
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            for rel in [
+                ".docker/run/docker.sock",
+                ".colima/default/docker.sock",
+                ".colima/docker.sock",
+                ".orbstack/run/docker.sock",
+                ".rd/docker.sock",
+            ] {
+                sockets.push(home.join(rel));
+            }
+        }
+        sockets
+    }
+
     pub fn default_private() -> Vec<std::path::PathBuf> {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return Vec::new();
@@ -272,9 +355,18 @@ impl Confinement {
                 .replace('"', "\\\"");
             format!("(subpath \"{s}\")")
         };
-        let mut own = vec![real(dir).unwrap_or_else(|| dir.to_path_buf())];
-        if let Some(common) = git_common_dir(dir) {
-            own.push(common);
+        let dir = real(dir).unwrap_or_else(|| dir.to_path_buf());
+        let mut own = vec![dir.clone()];
+        // The git directories whose hooks and config git runs or reads later,
+        // outside this sandbox: a repository's own `.git`, or the common one
+        // a linked worktree commits into.
+        let mut git_dirs = Vec::new();
+        if dir.join(".git").is_dir() {
+            git_dirs.push(dir.join(".git"));
+        }
+        if let Some(common) = git_common_dir(&dir) {
+            own.push(common.clone());
+            git_dirs.push(common);
         }
         let own: Vec<String> = own.iter().map(|p| quoted(p)).collect();
         let private: Vec<String> = self
@@ -292,6 +384,40 @@ impl Confinement {
         if !private.is_empty() {
             profile.push_str(&format!("(deny file-read* {})", private.join(" ")));
             profile.push_str(&format!("(allow file-read* {})", own.join(" ")));
+        }
+        // Later rules win, so these hold inside the writable git directory.
+        let git: Vec<String> = git_dirs
+            .iter()
+            .flat_map(|g| {
+                let literal = |p: std::path::PathBuf| {
+                    format!("(literal \"{}\")", p.to_string_lossy().replace('"', "\\\""))
+                };
+                [quoted(&g.join("hooks")), literal(g.join("config"))]
+            })
+            .collect();
+        if !git.is_empty() {
+            profile.push_str(&format!("(deny file-write* {})", git.join(" ")));
+        }
+        let sockets: Vec<String> = Self::docker_sockets()
+            .iter()
+            .filter_map(|p| real(p))
+            .map(|p| {
+                format!(
+                    "(remote unix-socket (path-literal \"{}\"))",
+                    p.to_string_lossy().replace('"', "\\\"")
+                )
+            })
+            .collect();
+        if !sockets.is_empty() {
+            profile.push_str(&format!("(deny network-outbound {})", sockets.join(" ")));
+        }
+        if !self.ports.is_empty() {
+            let ports: Vec<String> = self
+                .ports
+                .iter()
+                .map(|p| format!("(remote tcp \"localhost:{p}\")"))
+                .collect();
+            profile.push_str(&format!("(deny network-outbound {})", ports.join(" ")));
         }
         profile
     }
@@ -348,6 +474,333 @@ fn truncate_output(s: String) -> String {
     }
 }
 
+/// Refuse forced removal — `rm` with `-f` or `--force`, alone or in a flag
+/// group such as `-rf` — wherever a command runs it: in any segment, inside
+/// a substitution, behind a wrapper (`sudo`, `env`, `command`, `xargs` …)
+/// or after `find -exec`. Codex flags the same; an unattended run has no
+/// one to approve it, so it is refused with what to do instead. The sandbox
+/// still lets a command delete its worktree's uncommitted work and the
+/// repository's shared `.git`. An interpreter (`python3 -c`) can still
+/// delete; this catches the shell's way, which is the one models reach for.
+fn refuse_forced_removal(command: &str) -> std::result::Result<(), String> {
+    forced_removal_nested(command, 0)
+}
+
+fn forced_removal_nested(command: &str, depth: usize) -> std::result::Result<(), String> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return Err("command substitutions nest too deeply".into());
+    }
+    let (command, inner) = substitutions(command)?;
+    for body in &inner {
+        forced_removal_nested(body, depth + 1)?;
+    }
+    for segment in command_segments(&command)? {
+        if runs_forced_rm(segment) {
+            return Err(
+                "forced removal (rm -f, rm -rf, rm --force) is refused: remove the \
+                        files you mean without -f, or use git rm or git clean -n first"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Programs that run the command that follows them.
+const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "command", "exec", "nice", "nohup", "time", "timeout", "stdbuf", "xargs",
+];
+
+/// Whether a segment's command — past assignments, redirects, the shell's
+/// own words and wrappers, or in a `find -exec` — is `rm` with a force flag.
+fn runs_forced_rm(segment: &str) -> bool {
+    let unquote = |t: &str| t.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let tokens: Vec<String> = segment.split_whitespace().map(unquote).collect();
+    let forced = |args: &[String]| {
+        args.iter()
+            .take_while(|a| !matches!(a.as_str(), "--" | ";" | "\\;" | "+"))
+            .any(|a| {
+                a == "--force" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+            })
+    };
+    let mut i = 0;
+    let mut target_next = false;
+    let mut in_command = false;
+    while i < tokens.len() {
+        let token = tokens[i].trim_start_matches('(').trim_end_matches(')');
+        if std::mem::take(&mut target_next) {
+            i += 1;
+            continue;
+        }
+        if !in_command {
+            if let Some(needs_target) = redirect(token) {
+                target_next = needs_target;
+                i += 1;
+                continue;
+            }
+            if (token.contains('=') && !token.starts_with('=')) || SHELL_WORDS.contains(&token) {
+                i += 1;
+                continue;
+            }
+        }
+        let name = token.rsplit('/').next().unwrap_or(token);
+        if name == "rm" {
+            return forced(&tokens[i + 1..]);
+        }
+        if WRAPPERS.contains(&name) {
+            // The wrapper's own flags and settings come before its command.
+            in_command = true;
+            i += 1;
+            while i < tokens.len()
+                && (tokens[i].starts_with('-')
+                    || tokens[i].contains('=')
+                    || (matches!(name, "timeout" | "nice")
+                        && tokens[i].chars().next().is_some_and(|c| c.is_ascii_digit())))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if name == "find" {
+            return tokens[i + 1..].iter().enumerate().any(|(k, t)| {
+                matches!(t.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+                    && tokens
+                        .get(i + 2 + k)
+                        .is_some_and(|n| n.rsplit('/').next() == Some("rm"))
+                    && forced(&tokens[i + 3 + k..])
+            });
+        }
+        return false;
+    }
+    false
+}
+
+/// Split out the commands a line runs inside substitutions — `$(…)`,
+/// backticks, `<(…)` and `>(…)` — returning the line with each replaced by
+/// [`SUBSTITUTION`] and the commands found, so both can be checked.
+///
+/// The shell runs a substitution wherever it expands text: unquoted, inside
+/// double quotes, and in the body of a here-document whose delimiter is
+/// unquoted. Single quotes and a quoted delimiter's body are literal, so a
+/// `$(` there is text. `$((…))` is arithmetic and runs nothing, unless it
+/// holds a substitution, which is refused rather than parsed.
+fn substitutions(command: &str) -> std::result::Result<(String, Vec<String>), String> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut outer = String::with_capacity(command.len());
+    let mut inner = Vec::new();
+    let mut quote: Option<char> = None;
+    // Here-document delimiters opened on the current line, in order.
+    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i].1;
+        if quote == Some('\'') {
+            outer.push(c);
+            if c == '\'' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            outer.extend(chars[i..(i + 2).min(chars.len())].iter().map(|&(_, c)| c));
+            i += 2;
+            continue;
+        }
+        if quote == Some('"') {
+            if c == '"' {
+                quote = None;
+            } else if let Some(after) = expand_at(&chars, i, &mut outer, &mut inner)? {
+                i = after;
+                continue;
+            }
+            outer.push(c);
+            i += 1;
+            continue;
+        }
+        let next = chars.get(i + 1).map(|&(_, c)| c);
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '<' if next == Some('<') && chars.get(i + 2).map(|&(_, c)| c) != Some('<') => {
+                let (word, strip_tabs, quoted, after) = heredoc_delimiter(&chars, i + 2)?;
+                heredocs.push((word, strip_tabs, quoted));
+                outer.extend(chars[i..after].iter().map(|&(_, c)| c));
+                i = after;
+                continue;
+            }
+            '<' | '>' if next == Some('(') => {
+                let (body, after) = substitution_body(&chars, i + 2)?;
+                inner.push(body);
+                outer.push_str(SUBSTITUTION);
+                i = after;
+                continue;
+            }
+            '\n' if !heredocs.is_empty() => {
+                outer.push('\n');
+                i += 1;
+                for (word, strip_tabs, literal) in std::mem::take(&mut heredocs) {
+                    let (body_end, after) = heredoc_body(&chars, i, &word, strip_tabs);
+                    let body = &chars[i..body_end];
+                    if literal {
+                        outer.extend(body.iter().map(|&(_, c)| c));
+                    } else {
+                        // An unquoted body expands `$(…)` and backticks, as
+                        // double quotes do, but its quotes are text.
+                        let mut k = 0;
+                        while k < body.len() {
+                            if body[k].1 == '\\' {
+                                outer.extend(
+                                    body[k..(k + 2).min(body.len())].iter().map(|&(_, c)| c),
+                                );
+                                k += 2;
+                            } else if let Some(after) = expand_at(body, k, &mut outer, &mut inner)?
+                            {
+                                k = after;
+                            } else {
+                                outer.push(body[k].1);
+                                k += 1;
+                            }
+                        }
+                    }
+                    outer.extend(chars[body_end..after].iter().map(|&(_, c)| c));
+                    i = after;
+                }
+                continue;
+            }
+            _ => {
+                if let Some(after) = expand_at(&chars, i, &mut outer, &mut inner)? {
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        outer.push(c);
+        i += 1;
+    }
+    Ok((outer, inner))
+}
+
+/// Take the substitution or arithmetic that starts at `chars[i]`, if one
+/// does: push its command (if any) to `inner`, write what stands in for it
+/// to `outer`, and return the index after it.
+fn expand_at(
+    chars: &[(usize, char)],
+    i: usize,
+    outer: &mut String,
+    inner: &mut Vec<String>,
+) -> std::result::Result<Option<usize>, String> {
+    let at = |k: usize| chars.get(k).map(|&(_, c)| c);
+    match (at(i), at(i + 1), at(i + 2)) {
+        (Some('$'), Some('('), Some('(')) => {
+            let (body, after) = substitution_body(chars, i + 2)?;
+            if body.contains("$(") || body.contains('`') {
+                return Err("an arithmetic expansion holds a command substitution; \
+                            run that command on its own first"
+                    .into());
+            }
+            outer.extend(chars[i..after].iter().map(|&(_, c)| c));
+            Ok(Some(after))
+        }
+        (Some('$'), Some('('), _) => {
+            let (body, after) = substitution_body(chars, i + 2)?;
+            inner.push(body);
+            outer.push_str(SUBSTITUTION);
+            Ok(Some(after))
+        }
+        (Some('`'), _, _) => {
+            let mut body = String::new();
+            let mut k = i + 1;
+            loop {
+                match at(k) {
+                    None => return Err("command contains an unterminated backtick".into()),
+                    Some('`') => break,
+                    Some('\\') if matches!(at(k + 1), Some('`' | '\\' | '$')) => {
+                        body.extend(at(k + 1));
+                        k += 2;
+                    }
+                    Some(c) => {
+                        body.push(c);
+                        k += 1;
+                    }
+                }
+            }
+            inner.push(body);
+            outer.push_str(SUBSTITUTION);
+            Ok(Some(k + 1))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The text between an opening parenthesis (just before `chars[start]`)
+/// and its match, and the index after the match. Quoted parentheses do not
+/// count.
+fn substitution_body(
+    chars: &[(usize, char)],
+    start: usize,
+) -> std::result::Result<(String, usize), String> {
+    let mut depth = 1;
+    let mut quote: Option<char> = None;
+    let mut k = start;
+    while let Some(&(_, c)) = chars.get(k) {
+        match quote {
+            Some('\'') if c == '\'' => quote = None,
+            Some('\'') => {}
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => k += 1,
+                _ => {}
+            },
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => k += 1,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let body = chars[start..k].iter().map(|&(_, c)| c).collect();
+                        return Ok((body, k + 1));
+                    }
+                }
+                _ => {}
+            },
+        }
+        k += 1;
+    }
+    Err("command contains an unterminated substitution".into())
+}
+
+/// Where a here-document's body ends (the start of its delimiter line) and
+/// the index after the delimiter line, for a body starting at `chars[start]`.
+/// An unterminated body runs to the end.
+fn heredoc_body(
+    chars: &[(usize, char)],
+    start: usize,
+    word: &str,
+    strip_tabs: bool,
+) -> (usize, usize) {
+    let mut line_start = start;
+    while line_start < chars.len() {
+        let line_end = (line_start..chars.len())
+            .find(|&k| chars[k].1 == '\n')
+            .unwrap_or(chars.len());
+        let line: String = chars[line_start..line_end]
+            .iter()
+            .map(|&(_, c)| c)
+            .collect();
+        let line = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if line == word {
+            return (line_start, (line_end + 1).min(chars.len()));
+        }
+        line_start = line_end + 1;
+    }
+    (chars.len(), chars.len())
+}
+
 /// Split a shell command into the commands it runs, on the control
 /// operators and newlines that occur outside quotes.
 ///
@@ -399,7 +852,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                 '\\' => escaped = true,
                 '&' if matches!(prev, Some('>' | '<')) || next == Some('>') => {}
                 '<' if next == Some('<') && chars.get(i + 2).map(|&(_, c)| c) != Some('<') => {
-                    let (delimiter, strip_tabs, after) = heredoc_delimiter(&chars, i + 2)?;
+                    let (delimiter, strip_tabs, _, after) = heredoc_delimiter(&chars, i + 2)?;
                     heredocs.push((delimiter, strip_tabs));
                     i = after;
                     continue;
@@ -455,11 +908,12 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
 
 /// Read a here-document's delimiter word starting at `chars[at]` (just past
 /// `<<`): an optional `-` (strip leading tabs), optional blanks, then the
-/// word, bare or quoted. Returns the word, the tab flag, and the index after.
+/// word, bare or quoted. Returns the word, the tab flag, whether any of the
+/// word was quoted (which makes the body literal), and the index after.
 fn heredoc_delimiter(
     chars: &[(usize, char)],
     mut at: usize,
-) -> std::result::Result<(String, bool, usize), String> {
+) -> std::result::Result<(String, bool, bool, usize), String> {
     let strip_tabs = chars.get(at).is_some_and(|&(_, c)| c == '-');
     if strip_tabs {
         at += 1;
@@ -469,11 +923,15 @@ fn heredoc_delimiter(
     }
     let mut word = String::new();
     let mut quote: Option<char> = None;
+    let mut quoted = false;
     while let Some(&(_, c)) = chars.get(at) {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => word.push(c),
-            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                quoted = true;
+            }
             None if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
                 break
             }
@@ -487,7 +945,7 @@ fn heredoc_delimiter(
     if word.is_empty() {
         return Err("here-document has no delimiter".into());
     }
-    Ok((word, strip_tabs, at))
+    Ok((word, strip_tabs, quoted, at))
 }
 
 /// Validate that all commands in a potentially piped command are allowed.
@@ -495,27 +953,39 @@ fn heredoc_delimiter(
 /// The allowlist prevents arbitrary binary execution. Variable expansion,
 /// redirects, and other shell features are permitted since commands run
 /// via `sh -c` and the agent needs these for real-world tasks (e.g.
-/// `echo $HOME`, `python3 script.py > output.txt`).
+/// `echo $HOME`, `python3 script.py > output.txt`). A command or process
+/// substitution runs a command of its own, so that command is checked like
+/// any other (`x=$(git rev-parse HEAD)` passes, `echo $(bash -c ...)` does
+/// not).
 fn validate_command(command: &str) -> std::result::Result<(), String> {
     // Newlines separate commands, and each is checked below. A carriage
     // return separates nothing and has no use here.
     if command.contains('\r') {
         return Err("command contains carriage return characters".into());
     }
+    validate_nested(command, 0)
+}
 
-    // Block shell substitution patterns that bypass the allowlist.
-    // Since the command runs via `sh -c`, constructs like `$(cmd)`, `\`cmd\``,
-    // and `${var}` can execute arbitrary commands even if the outer command
-    // is in the allowlist (e.g. `echo $(rm -rf /)`).
-    if command.contains("$(") || command.contains('`') {
-        return Err(
-            "command contains shell substitution ($() or backticks) which is not allowed".into(),
-        );
+/// How deeply substitutions may nest before the check refuses the command.
+const MAX_SUBSTITUTION_DEPTH: usize = 8;
+
+/// What a checked substitution is replaced with, so the rest of its line
+/// can be checked. It is not a command: a substitution in command position
+/// would run whatever it printed, which no check can see.
+const SUBSTITUTION: &str = "__substitution__";
+
+fn validate_nested(command: &str, depth: usize) -> std::result::Result<(), String> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return Err("command substitutions nest too deeply".into());
+    }
+    let (command, inner) = substitutions(command)?;
+    for body in &inner {
+        validate_nested(body, depth + 1)?;
     }
 
     // Split on unquoted shell control operators and validate every command
     // segment. Empty segments account for the second byte in && and ||.
-    for segment in command_segments(command)? {
+    for segment in command_segments(&command)? {
         let segment = segment.trim();
         if segment.is_empty() || segment.starts_with('#') {
             continue;
@@ -544,6 +1014,13 @@ fn validate_command(command: &str) -> std::result::Result<(), String> {
             }
             if token == "for" {
                 break;
+            }
+            if token.contains(SUBSTITUTION) {
+                return Err(
+                    "a substitution cannot be the command to run: its output would \
+                            run unchecked; run the command directly"
+                        .into(),
+                );
             }
             let cmd_name = token.rsplit('/').next().unwrap_or(token);
             if ALLOWED_COMMANDS.contains(&cmd_name) {
@@ -587,7 +1064,13 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> &str {
-        if self.confinement.is_some() {
+        if self.sandbox().is_some() {
+            "Execute a shell command in your working directory and return its output. Any \
+             program may run, in a sandbox that refuses writes outside the working directory, \
+             its git directory and temporary space, writes to git hooks and config, reads of \
+             credential stores, and connections to Docker and RustyKrab's own services. Forced \
+             removal (rm -f, rm -rf) is refused: remove files without -f, or use git rm."
+        } else if self.confinement.is_some() {
             "Execute a shell command in your working directory and return its output. Commands \
              are validated against an allowlist. Writes outside the working directory and \
              temporary space, and reads of credential stores, are refused."
@@ -629,8 +1112,15 @@ impl Tool for ExecTool {
             rustykrab_core::Error::ToolExecution(ToolError::invalid_input("missing command"))
         })?;
 
-        // Validate command against allowlist
-        validate_command(command).map_err(|e| {
+        // In the sandbox, the sandbox is the boundary and any program runs;
+        // unsandboxed, the allowlist still decides. Forced removal is refused
+        // either way.
+        let checked = if self.sandbox().is_some() {
+            refuse_forced_removal(command)
+        } else {
+            validate_command(command).and_then(|()| refuse_forced_removal(command))
+        };
+        checked.map_err(|e| {
             rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
                 "command rejected: {e}"
             )))
@@ -863,6 +1353,52 @@ mod environment_tests {
 }
 
 #[cfg(test)]
+mod forced_removal_tests {
+    use super::refuse_forced_removal;
+
+    #[test]
+    fn forced_removal_is_refused_wherever_it_runs() {
+        for command in [
+            "rm -rf build",
+            "rm -f a.txt",
+            "rm --force a.txt",
+            "rm -fr build",
+            "rm -r -f build",
+            "/bin/rm -rf build",
+            "ls && rm -rf build",
+            "cd sub; rm -rf .",
+            "echo $(rm -rf build)",
+            "find . -name '*.o' | xargs rm -f",
+            "find . -name '*.o' -exec rm -f {} \\;",
+            "env FOO=1 rm -rf build",
+            "sudo rm -rf /",
+            "timeout 5 rm -rf build",
+            "nice -n 10 rm -rf build",
+            "if true; then rm -rf build; fi",
+        ] {
+            let error = refuse_forced_removal(command).unwrap_err();
+            assert!(error.contains("forced removal"), "{command}: {error}");
+        }
+    }
+
+    #[test]
+    fn plain_removal_and_mentions_of_rm_run() {
+        for command in [
+            "rm a.txt",
+            "rm -r build",
+            "rm -i a.txt",
+            "git rm -f old.txt",
+            "grep -n 'rm -rf' notes.md",
+            "echo rm -rf is refused",
+            "find . -name '*.pyc' -delete",
+            "python3 -c 'print(1)'",
+        ] {
+            refuse_forced_removal(command).unwrap_or_else(|e| panic!("{command}: {e}"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod validation_tests {
     use super::validate_command;
 
@@ -930,8 +1466,12 @@ mod validation_tests {
         // The command that reads the body is checked too.
         let error = validate_command("bash <<EOF\nls\nEOF").unwrap_err();
         assert!(error.contains("bash"));
-        // Substitution stays blocked, in a body as anywhere else.
+        // An unquoted body runs its substitutions, so they are checked; a
+        // quoted delimiter makes the body text.
         assert!(validate_command("cat <<EOF\n$(definitely-not-allowed)\nEOF").is_err());
+        assert!(validate_command("cat <<EOF\n`definitely-not-allowed`\nEOF").is_err());
+        validate_command("cat <<EOF\nhead is $(git rev-parse HEAD)\nEOF").unwrap();
+        validate_command("cat > f.sh <<'EOF'\necho $(definitely-not-allowed)\nEOF").unwrap();
         // A here-string is not a here-document.
         validate_command("grep x <<< 'x y'").unwrap();
     }
@@ -964,6 +1504,56 @@ mod validation_tests {
         assert!(error.contains("definitely-not-allowed"));
         let error = validate_command("2> err.log definitely-not-allowed").unwrap_err();
         assert!(error.contains("definitely-not-allowed"));
+    }
+
+    #[test]
+    fn substitutions_run_only_allowed_commands() {
+        validate_command("head=$(git rev-parse HEAD); echo $head").unwrap();
+        validate_command("echo \"today: $(date +%F)\"").unwrap();
+        validate_command("cd \"$(git rev-parse --show-toplevel)\" && ls").unwrap();
+        validate_command("echo `date`").unwrap();
+        validate_command("echo $(basename $(pwd))").unwrap();
+        validate_command("echo \"$(grep -c x \"$(ls | head -1)\")\"").unwrap();
+        validate_command("diff <(sort a.txt) <(sort b.txt)").unwrap();
+        validate_command("python3 gen.py | tee >(wc -l) > out.txt").unwrap();
+        validate_command("echo $((1 + 2 * 3))").unwrap();
+        // Single quotes are literal: nothing runs.
+        validate_command("grep -n '$(definitely-not-allowed)' notes.txt").unwrap();
+        validate_command("grep -n '`definitely-not-allowed`' notes.txt").unwrap();
+
+        for command in [
+            "echo $(definitely-not-allowed)",
+            "echo \"$(definitely-not-allowed)\"",
+            "echo `definitely-not-allowed`",
+            "echo $(ls; definitely-not-allowed)",
+            "echo $(echo $(definitely-not-allowed))",
+            "cat <(definitely-not-allowed)",
+            "ls | tee >(definitely-not-allowed)",
+        ] {
+            let error = validate_command(command).unwrap_err();
+            assert!(
+                error.contains("definitely-not-allowed"),
+                "{command}: {error}"
+            );
+        }
+        // What a substitution prints cannot be the command: no check sees it.
+        assert!(validate_command("$(which python3) run.py").is_err());
+        assert!(validate_command("\"$(which python3)\" run.py").is_err());
+        assert!(validate_command("echo $(( $(definitely-not-allowed) ))").is_err());
+        assert!(validate_command("echo $(ls").is_err());
+        assert!(validate_command("echo `ls").is_err());
+        let deep = format!("echo {}ls{}", "$(echo ".repeat(10), ")".repeat(10));
+        assert!(validate_command(&deep).is_err());
+    }
+
+    #[test]
+    fn text_and_data_utilities_are_allowed() {
+        validate_command("grep x log.txt | paste - - | column -t").unwrap();
+        validate_command("strings vault.bin | head").unwrap();
+        validate_command("jq '.items[] | .id' data.json | sort | uniq -c").unwrap();
+        validate_command("seq 1 5 | tac | nl").unwrap();
+        validate_command("comm -12 <(sort a) <(sort b)").unwrap();
+        validate_command("shasum -a 256 build.tar && cmp a.bin b.bin").unwrap();
     }
 
     #[test]
@@ -1145,6 +1735,101 @@ mod error_typing_tests {
         )
         .await;
         assert_eq!(code, 0, "{text}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sandboxed_shell_runs_any_program_but_forced_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        // `id` is not on the allowlist: unsandboxed it is refused.
+        assert!(ExecTool::in_dir(dir.path())
+            .execute(json!({ "command": "id -u" }))
+            .await
+            .is_err());
+        let tool = ExecTool::in_dir(dir.path()).confined(Vec::new());
+        let (code, text) = run_in(&tool, "id -u | paste - -").await;
+        assert_eq!(code, 0, "{text}");
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        let error = tool
+            .execute(json!({ "command": "rm -rf build" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("forced removal"), "{error}");
+        assert!(dir.path().join("build").exists());
+        assert_eq!(
+            run_in(&tool, "rmdir build && echo gone").await,
+            (0, "gone\n".into())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_touch_git_hooks_or_config() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@x.invalid"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&repo, &["worktree", "add", "-q", "../wt", "-b", "work"]);
+        let common = std::fs::canonicalize(repo.join(".git")).unwrap();
+        let tool = ExecTool::in_dir(root.path().join("wt")).confined(Vec::new());
+        let (code, text) = run_in(
+            &tool,
+            &format!(
+                "echo 'echo pwned' > '{}/hooks/post-commit'",
+                common.display()
+            ),
+        )
+        .await;
+        assert_ne!(code, 0, "wrote a hook: {text}");
+        assert!(!common.join("hooks/post-commit").exists());
+        let (code, text) = run_in(&tool, "git config core.pager 'sh -c id'").await;
+        assert_ne!(code, 0, "set git config: {text}");
+        // Committing, which writes objects, refs and the index, still works.
+        let (code, text) = run_in(
+            &tool,
+            "echo change > f.txt && git add f.txt && \
+             git -c user.name=t -c user.email=t@x.invalid commit -q --no-gpg-sign -m change",
+        )
+        .await;
+        assert_eq!(code, 0, "{text}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_reach_denied_local_ports() {
+        let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (denied_port, open_port) = (
+            denied.local_addr().unwrap().port(),
+            open.local_addr().unwrap().port(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ExecTool::in_dir(dir.path())
+            .confined(Vec::new())
+            .deny_local_ports(vec![denied_port]);
+        let connect = |port: u16| {
+            format!(
+                "python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}), 2); \
+                 print('connected')\""
+            )
+        };
+        let (code, text) = run_in(&tool, &connect(denied_port)).await;
+        assert_ne!(code, 0, "reached a denied port: {text}");
+        assert_eq!(
+            run_in(&tool, &connect(open_port)).await,
+            (0, "connected\n".into())
+        );
     }
 
     #[tokio::test]

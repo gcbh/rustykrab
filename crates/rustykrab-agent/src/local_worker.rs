@@ -305,6 +305,7 @@ pub struct LocalWorker {
     /// Paths a run's shell may not read, beside the credential stores
     /// `rustykrab_tools::Confinement` always keeps out of reach.
     private_paths: Vec<std::path::PathBuf>,
+    private_ports: Vec<u16>,
     readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
@@ -494,6 +495,7 @@ impl LocalWorker {
             repository_shell: false,
             result_report_reminder: None,
             private_paths: Vec::new(),
+            private_ports: Vec::new(),
             readable_files: Vec::new(),
             last_run: Mutex::new(None),
             spending: Mutex::new(HashMap::new()),
@@ -538,6 +540,13 @@ impl LocalWorker {
     /// its secrets file is.
     pub fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.private_paths.extend(paths);
+        self
+    }
+
+    /// Keep a run's shell from connecting to these loopback ports: the
+    /// daemon's own gateway, whose API it must not drive from inside a run.
+    pub fn with_private_ports(mut self, ports: Vec<u16>) -> Self {
+        self.private_ports.extend(ports);
         self
     }
 
@@ -1209,7 +1218,8 @@ impl LocalWorker {
                     match t.name() {
                         "exec" => Arc::new(
                             rustykrab_tools::ExecTool::in_dir(dir.clone())
-                                .confined(self.private_paths.clone()),
+                                .confined(self.private_paths.clone())
+                                .deny_local_ports(self.private_ports.clone()),
                         ) as Arc<dyn Tool>,
                         "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone()))
                             as Arc<dyn Tool>,

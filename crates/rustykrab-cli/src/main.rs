@@ -1547,11 +1547,23 @@ async fn main() -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    // Parsed before the workers are built: their shells may not reach the
+    // gateway's port.
+    let port: u16 = std::env::var("RUSTYKRAB_PORT")
+        .ok()
+        .map(|p| {
+            p.trim().parse().unwrap_or_else(|_| {
+                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(3000);
     fleet.share_host_tools(native_resources::HostTools {
         tools: tools.clone(),
         backend: deferred_work_backend.clone(),
         transcripts: scheduled_work::transcripts(&store, skill_registry.clone()),
         integrations: integrations::enabled(),
+        private_ports: vec![port],
     });
     // One KV slot per model (plan 12.1): the local worker and the runs of
     // a peer's briefs on this node (peers.rs) wait on the same one.
@@ -1575,6 +1587,7 @@ async fn main() -> anyhow::Result<()> {
             .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
             .with_run_logs(run_logs_dir.clone())
             .with_private_paths(vec![data_dir.clone()])
+            .with_private_ports(vec![port])
             .with_late_tools(fleet.skills.clone())
             .with_slot(model_slot.clone()),
         ))
@@ -1673,7 +1686,8 @@ async fn main() -> anyhow::Result<()> {
                             integrations::enabled(),
                         )?
                         .with_run_logs(run_logs_dir.clone())
-                        .with_private_paths(vec![data_dir.clone()]),
+                        .with_private_paths(vec![data_dir.clone()])
+                        .with_private_ports(vec![port]),
                     ) as Arc<dyn rustykrab_control::worker::Worker>
                 } else {
                     work_channel::planner_worker(
@@ -1708,7 +1722,8 @@ async fn main() -> anyhow::Result<()> {
                         true,
                     )?
                     .with_run_logs(run_logs_dir.clone())
-                    .with_private_paths(vec![data_dir.clone()]),
+                    .with_private_paths(vec![data_dir.clone()])
+                    .with_private_ports(vec![port]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 local_resources.as_ref().map(|_| 1),
@@ -1731,7 +1746,8 @@ async fn main() -> anyhow::Result<()> {
                         local_slot.clone(),
                     )
                     .with_run_logs(run_logs_dir.clone())
-                    .with_private_paths(vec![data_dir.clone()]),
+                    .with_private_paths(vec![data_dir.clone()])
+                    .with_private_ports(vec![port]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
                 Some(0),
@@ -1754,7 +1770,8 @@ async fn main() -> anyhow::Result<()> {
                             true,
                         )?
                         .with_run_logs(run_logs_dir.clone())
-                        .with_private_paths(vec![data_dir.clone()]),
+                        .with_private_paths(vec![data_dir.clone()])
+                        .with_private_ports(vec![port]),
                     ),
                     serde_json::json!({"role":"general-agent", "resource_slot":true}),
                     Some(0),
@@ -1764,15 +1781,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     deferred_work_backend.bind(controller.clone());
-    let port: u16 = std::env::var("RUSTYKRAB_PORT")
-        .ok()
-        .map(|p| {
-            p.trim().parse().unwrap_or_else(|_| {
-                eprintln!("ERROR: RUSTYKRAB_PORT must be a port number, got '{p}'");
-                std::process::exit(1);
-            })
-        })
-        .unwrap_or(3000);
     let overseer = overseer::Overseer::from_env(port)?;
     if !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty() {
         fleet
