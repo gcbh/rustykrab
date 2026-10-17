@@ -641,11 +641,11 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
             ],
         ),
         // 5: turns that add no evidence, past the progress ledger's notice
-        // and on to the run's iteration cap (the default budget's 25), where
-        // the stall is the failure.
+        // and on to the run's iteration cap (the default budget's 100),
+        // where the stall is the failure.
         script(
             W_STALL,
-            std::iter::repeat_n(call("todo_read", json!({})), 40).collect(),
+            std::iter::repeat_n(call("todo_read", json!({})), 110).collect(),
         ),
         // 17: a local worker that commits in its worktree, and one that
         // claims a commit that does not exist.

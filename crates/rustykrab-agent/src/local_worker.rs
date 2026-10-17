@@ -4106,7 +4106,7 @@ mod tests {
             "repair: an earlier attempt at this item failed\n",
             "  last_error: tool/timeout: carrier site timed out\n",
             "  prior_evidence: [path:notes/attempt-1.md]\n",
-            "budget: 25 steps\n",
+            "budget: 100 steps\n",
             "origin_conversation: conv-1\n",
         ] {
             assert!(r.contains(line), "missing {line:?} in:\n{r}");
