@@ -322,27 +322,33 @@ const MODEL_CHECK_EVERY: Duration = Duration::from_secs(30);
 impl LocalWorker {
     fn probe_catalog(
         &self,
-        bound_dir: Option<&std::path::Path>,
+        context: &rustykrab_control::capability_proof::ProbeContext,
     ) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+        if context.requirements.read_only_review {
+            return (Vec::new(), vec!["result_report".into()]);
+        }
         let (mut tools, mut ceiling) = self.catalog();
-        // A probe has no file-write grant. Match the ordinary run's effective
-        // ceiling for this workspace, including the repository-shell restriction.
-        if self.repository_shell && bound_dir.is_none() {
+        // Planning uses stable workspace identity, without allocating a directory
+        // on every tick. The producer below requires the actual directory.
+        if self.repository_shell && context.requirements.workspace.is_none() {
+            let has_files =
+                context.requirements.writable_resources.iter().any(|r| {
+                    r.starts_with("file:") && self.definition.writable_resources.contains(r)
+                });
             let denied = |name: &str| {
                 name == "exec"
-                    || name == "read" && self.readable_files.is_empty()
-                    || ["edit", "write"].contains(&name)
+                    || name == "read" && !has_files && self.readable_files.is_empty()
+                    || !has_files && ["edit", "write"].contains(&name)
             };
             tools.retain(|t| !denied(t.name()));
             ceiling.retain(|name| !denied(name));
         }
-        if let Some(dir) = bound_dir {
+        if let Some(dir) = &context.bound_dir {
             tools = tools
                 .into_iter()
                 .map(|t| {
                     if t.name() == "exec" {
-                        Arc::new(rustykrab_tools::ExecTool::in_dir(dir.to_path_buf()))
-                            as Arc<dyn Tool>
+                        Arc::new(rustykrab_tools::ExecTool::in_dir(dir.clone())) as Arc<dyn Tool>
                     } else {
                         t
                     }
@@ -352,17 +358,20 @@ impl LocalWorker {
         (tools, ceiling)
     }
 
-    /// Scope snapshot for the registered availability probes. The controller
-    /// owns the directory and dispatch capacity; this supplies the actual ceiling.
+    /// Stable effective scope; actual execution rechecks it and the directory.
     pub fn probe_scope(
         &self,
-        bound_dir: Option<std::path::PathBuf>,
+        context: &rustykrab_control::capability_proof::ProbeContext,
     ) -> rustykrab_control::capability_proof::ProbeScope {
-        let (_, ceiling) = self.probe_catalog(bound_dir.as_deref());
-        rustykrab_control::capability_proof::ProbeScope {
+        use rustykrab_control::capability_proof::{
+            binding_digest, tool_ceiling_digest, ExecutionPath, ProbeScope,
+        };
+        let (_, ceiling) = self.probe_catalog(context);
+        ProbeScope {
             worker: self.name.clone(),
-            bound_dir,
-            ceiling_digest: rustykrab_control::capability_proof::tool_ceiling_digest(&ceiling),
+            path: ExecutionPath::Local,
+            policy_digest: binding_digest(&Worker::access_profile(self)),
+            ceiling_digest: tool_ceiling_digest(&ceiling),
         }
     }
 
@@ -372,23 +381,52 @@ impl LocalWorker {
         &self,
         request: &rustykrab_control::capability_proof::ProbeRequest,
     ) -> rustykrab_control::capability_proof::OperationProbe {
-        use rustykrab_control::capability_proof::{tool_ceiling_digest, ProbeOutcome};
+        use rustykrab_control::capability_proof::ProbeOutcome;
         let unobserved = |why| request.expected.observation(ProbeOutcome::Unobserved, why);
-        if !request.valid() || request.scope.worker != self.name {
+        if !request.valid() || request.scope != self.probe_scope(&request.context) {
             return unobserved("probe request bindings do not match this worker");
         }
-        if request
-            .scope
-            .bound_dir
-            .as_ref()
-            .is_some_and(|d| !d.is_dir())
+        if request.context.requirements.workspace.is_some()
+            && request
+                .context
+                .bound_dir
+                .as_ref()
+                .is_none_or(|d| !d.is_dir())
         {
             return unobserved("controller-owned execution directory is unavailable");
         }
         // Freeze catalog and effective ceiling together; late tools may change.
-        let (tools, ceiling) = self.probe_catalog(request.scope.bound_dir.as_deref());
-        if request.scope.ceiling_digest != tool_ceiling_digest(&ceiling) {
-            return unobserved("effective tool ceiling changed since probe selection");
+        let (tools, ceiling) = self.probe_catalog(&request.context);
+        if request.scope.ceiling_digest
+            != rustykrab_control::capability_proof::tool_ceiling_digest(&ceiling)
+        {
+            return unobserved("effective tool ceiling changed while freezing the probe catalog");
+        }
+        if request
+            .context
+            .requirements
+            .required_tools
+            .iter()
+            .any(|t| !ceiling.contains(t))
+            || request
+                .context
+                .requirements
+                .required_mcp_servers
+                .iter()
+                .any(|server| {
+                    !ceiling
+                        .iter()
+                        .any(|t| mcp_server_of(t).is_some_and(|s| s.eq_ignore_ascii_case(server)))
+                })
+            || request
+                .context
+                .requirements
+                .writable_resources
+                .iter()
+                .filter(|r| r.starts_with("file:"))
+                .any(|r| !self.definition.writable_resources.contains(r))
+        {
+            return unobserved("effective requirements exceed this worker's execution boundary");
         }
         // Includes waiting for the same local model/resource slot as real work.
         let entry = self.runs.enter();
@@ -849,8 +887,16 @@ impl Worker for LocalWorker {
     }
 
     fn access_profile(&self) -> serde_json::Value {
+        let caps = self.capabilities();
         serde_json::json!({
-            "capabilities": self.capabilities(),
+            "capabilities": {
+                "models": rustykrab_control::capability_proof::sorted(&caps.models),
+                "tools": rustykrab_control::capability_proof::sorted(&caps.tools),
+                "mcp_servers": rustykrab_control::capability_proof::sorted(&caps.mcp_servers),
+                "repos": rustykrab_control::capability_proof::sorted(&caps.repos),
+                "writable_resources": rustykrab_control::capability_proof::sorted(&caps.writable_resources),
+                "machine": caps.machine,
+            },
             "repository_shell": self.repository_shell,
             "readable_files": self.readable_files.iter().collect::<std::collections::BTreeSet<_>>(),
         })
@@ -858,9 +904,9 @@ impl Worker for LocalWorker {
 
     fn probe_scope(
         &self,
-        bound_dir: Option<std::path::PathBuf>,
+        context: &rustykrab_control::capability_proof::ProbeContext,
     ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
-        Some(LocalWorker::probe_scope(self, bound_dir))
+        Some(LocalWorker::probe_scope(self, context))
     }
 
     async fn probe(
@@ -2242,17 +2288,29 @@ mod tests {
         action: rustykrab_control::capability_proof::RegisteredAction,
     ) -> rustykrab_control::capability_proof::ProbeRequest {
         use rustykrab_control::capability_proof::*;
-        let scope = worker.probe_scope(None);
+        let context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec![],
+                read_only_review: false,
+                workspace: None,
+            },
+            bound_dir: None,
+        };
+        let scope = worker.probe_scope(&context);
         ProbeRequest {
             expected: ExpectedOperation {
                 operation: action.operation(),
                 executor: scope.worker.clone(),
-                inputs_digest: probe_inputs_digest(&action, &scope),
+                inputs_digest: probe_inputs_digest(&action, &scope, &context),
                 generation: "fixture:2".into(),
                 run: "fixture-probe".into(),
             },
             action,
             scope,
+            context,
             deadline: Duration::from_secs(30),
         }
     }
@@ -2286,7 +2344,10 @@ mod tests {
             },
         );
         let worker: Arc<dyn Worker> = Arc::new(worker);
-        assert_eq!(worker.probe_scope(None), Some(request.scope.clone()));
+        assert_eq!(
+            worker.probe_scope(&request.context),
+            Some(request.scope.clone())
+        );
         assert_eq!(worker.probe(&request).await.outcome, ProbeOutcome::Ok);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2359,7 +2420,8 @@ mod tests {
                 }
             }
             changed.expected.operation = changed.action.operation();
-            changed.expected.inputs_digest = probe_inputs_digest(&changed.action, &changed.scope);
+            changed.expected.inputs_digest =
+                probe_inputs_digest(&changed.action, &changed.scope, &changed.context);
             assert_eq!(
                 worker.observe_probe(&changed).await.outcome,
                 ProbeOutcome::Unobserved
@@ -2425,15 +2487,21 @@ mod tests {
             worker.observe_probe(&request).await.outcome,
             ProbeOutcome::Unobserved
         );
-        request.scope = worker.probe_scope(Some(dir.path().to_path_buf()));
-        request.expected.inputs_digest = probe_inputs_digest(&request.action, &request.scope);
+        request.context.bound_dir = Some(dir.path().to_path_buf());
+        request.context.requirements.workspace = Some(WorkspaceIdentity {
+            repo: "/fixture".into(),
+            base: "base".into(),
+        });
+        request.scope = worker.probe_scope(&request.context);
+        request.expected.inputs_digest =
+            probe_inputs_digest(&request.action, &request.scope, &request.context);
         assert_eq!(
             worker.observe_probe(&request).await.outcome,
             ProbeOutcome::Ok
         );
         let old = dir.path().to_path_buf();
         dir.close().unwrap();
-        assert_eq!(request.scope.bound_dir, Some(old));
+        assert_eq!(request.context.bound_dir, Some(old));
         assert_eq!(
             worker.observe_probe(&request).await.outcome,
             ProbeOutcome::Unobserved
@@ -4080,5 +4148,33 @@ mod tests {
         let objective = r.lines().find(|l| l.starts_with("objective: ")).unwrap();
         assert_eq!(objective.chars().count(), "objective: ".len() + LINE_MAX);
         assert!(objective.ends_with("..."));
+    }
+    #[tokio::test]
+    async fn read_only_probe_context_never_executes_a_registered_resource_tool() {
+        use rustykrab_control::capability_proof::*;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = Arc::new(ProbeResources {
+            calls: calls.clone(),
+            output: json!({"workers":[]}),
+            delay: Duration::ZERO,
+        });
+        let (worker, _) = worker(Recording::new(vec![]), vec![resources]);
+        let mut request = probe_request(
+            &worker,
+            RegisteredAction::ToolCallable {
+                tool: "work_resources".into(),
+                args: json!({}),
+            },
+        );
+        request.context.requirements.read_only_review = true;
+        request.scope = worker.probe_scope(&request.context);
+        request.expected.inputs_digest =
+            probe_inputs_digest(&request.action, &request.scope, &request.context);
+        assert!(request.valid());
+        assert_eq!(
+            worker.observe_probe(&request).await.outcome,
+            ProbeOutcome::Unobserved
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

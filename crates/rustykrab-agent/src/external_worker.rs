@@ -1078,6 +1078,27 @@ impl Worker for ExternalWorker {
         self.config.kind
     }
 
+    fn access_profile(&self) -> Value {
+        use rustykrab_control::capability_proof::sorted;
+        serde_json::json!({
+            "kind": self.config.kind, "command": self.config.command,
+            "repos": sorted(&self.config.repos),
+            "writable_files": sorted(&self.config.writable_files),
+            "readable_files": sorted(&self.config.readable_files),
+            "model": self.config.model,
+            "allowed_tools": sorted(&allowed_list(&self.config.allowed_tools).split(',').map(str::to_string).collect::<Vec<_>>()),
+            "denied_tools": sorted(&self.config.denied_tools),
+            "builtin_denied_tools": CLAUDE_DENIED_TOOLS,
+            "permission_mode": self.config.permission_mode,
+            "environment_names": sorted(&self.config.env),
+            "claude_config_dir": self.config.claude_config_dir,
+            "codex_home": self.config.codex_home,
+            "require_max": self.config.require_max,
+            "require_chatgpt": self.config.require_chatgpt,
+            "skills_dir": self.config.skills_dir,
+        })
+    }
+
     async fn probe(
         &self,
         request: &rustykrab_control::capability_proof::ProbeRequest,
@@ -2067,9 +2088,21 @@ mod tests {
         let fixture = Fixture::new();
         for kind in [WorkerKind::ClaudeCode, WorkerKind::Codex] {
             let worker = fixture.worker(kind, PathBuf::from("/must-not-execute-probe"));
+            let context = ProbeContext {
+                requirements: EffectiveRequirements {
+                    kind: rustykrab_core::work::WorkKind::Task,
+                    required_tools: vec![],
+                    required_mcp_servers: vec![],
+                    writable_resources: vec![],
+                    read_only_review: false,
+                    workspace: None,
+                },
+                bound_dir: None,
+            };
             let scope = ProbeScope {
                 worker: "pinch".into(),
-                bound_dir: None,
+                path: ExecutionPath::Native,
+                policy_digest: tool_ceiling_digest(&[]),
                 ceiling_digest: tool_ceiling_digest(&[]),
             };
             let action = RegisteredAction::BinaryAvailable {
@@ -2079,16 +2112,17 @@ mod tests {
                 expected: ExpectedOperation {
                     operation: action.operation(),
                     executor: "pinch".into(),
-                    inputs_digest: probe_inputs_digest(&action, &scope),
+                    inputs_digest: probe_inputs_digest(&action, &scope, &context),
                     generation: "fixture:2".into(),
                     run: "probe-1".into(),
                 },
                 action,
                 scope,
+                context: context.clone(),
                 deadline: Duration::from_secs(30),
             };
             let worker: Arc<dyn Worker> = Arc::new(worker);
-            assert!(worker.probe_scope(None).is_none());
+            assert!(worker.probe_scope(&context).is_none());
             let probe = worker.probe(&request).await;
             assert_eq!(probe.outcome, ProbeOutcome::Unobserved);
             assert_eq!(probe.executor, "pinch");

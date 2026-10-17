@@ -587,7 +587,7 @@ impl Worker for IntegrationWorker {
     fn access_profile(&self) -> Value {
         serde_json::json!({
             "local": Worker::access_profile(&self.worker),
-            "resources": self.resources,
+            "resources": rustykrab_control::capability_proof::sorted(&self.resources),
             "model": self.model,
         })
     }
@@ -595,9 +595,12 @@ impl Worker for IntegrationWorker {
     /// ceiling, directory binding and sandbox as this wrapper's runs.
     fn probe_scope(
         &self,
-        bound_dir: Option<std::path::PathBuf>,
+        context: &rustykrab_control::capability_proof::ProbeContext,
     ) -> Option<rustykrab_control::capability_proof::ProbeScope> {
-        Worker::probe_scope(&self.worker, bound_dir)
+        let mut scope = Worker::probe_scope(&self.worker, context)?;
+        scope.policy_digest =
+            rustykrab_control::capability_proof::binding_digest(&self.access_profile());
+        Some(scope)
     }
     /// Probes take the same serial slot as runs, then go to the local
     /// worker, which performs the registered action itself. The wait for
@@ -627,7 +630,27 @@ impl Worker for IntegrationWorker {
             deadline: remaining,
             ..request.clone()
         };
-        Worker::probe(&self.worker, &request).await
+        if request.context.requirements.read_only_review
+            || request
+                .context
+                .requirements
+                .writable_resources
+                .iter()
+                .any(|r| !self.resources.contains(r))
+            || request
+                .context
+                .requirements
+                .required_tools
+                .iter()
+                .any(|t| t == "exec")
+                && request.context.requirements.workspace.is_none()
+        {
+            return request.expected.observation(
+                ProbeOutcome::Unobserved,
+                "effective requirements exceed this wrapper's execution boundary",
+            );
+        }
+        rustykrab_control::capability_proof::probe_through(self, &self.worker, &request).await
     }
     fn stop(&self, run: &str) {
         self.worker.stop(run)
@@ -1074,7 +1097,8 @@ mod tests {
     #[tokio::test]
     async fn a_probe_waits_for_the_serial_slot_only_until_its_deadline() {
         use rustykrab_control::capability_proof::{
-            probe_inputs_digest, ExpectedOperation, ProbeOutcome, ProbeRequest, RegisteredAction,
+            probe_inputs_digest, EffectiveRequirements, ExpectedOperation, ProbeContext,
+            ProbeOutcome, ProbeRequest, RegisteredAction,
         };
         use rustykrab_tools::work_backend::StubWorkBackend;
         let worker = IntegrationWorker::new_named(
@@ -1091,18 +1115,30 @@ mod tests {
             tool: "work_resources".into(),
             args: serde_json::json!({}),
         };
-        let scope = Worker::probe_scope(&worker, None)
+        let context = ProbeContext {
+            requirements: EffectiveRequirements {
+                kind: rustykrab_core::work::WorkKind::Task,
+                required_tools: vec![],
+                required_mcp_servers: vec![],
+                writable_resources: vec![],
+                read_only_review: false,
+                workspace: None,
+            },
+            bound_dir: None,
+        };
+        let scope = Worker::probe_scope(&worker, &context)
             .expect("the wrapper has its local worker's probe scope");
         let request = ProbeRequest {
             expected: ExpectedOperation {
                 operation: action.operation(),
                 executor: worker.name().to_string(),
-                inputs_digest: probe_inputs_digest(&action, &scope),
+                inputs_digest: probe_inputs_digest(&action, &scope, &context),
                 generation: "fixture:1".into(),
                 run: "probe-fixture".into(),
             },
             action,
             scope,
+            context,
             deadline: std::time::Duration::from_millis(200),
         };
         let _run = worker.serial.lock().await;

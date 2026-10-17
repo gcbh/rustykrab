@@ -15,8 +15,8 @@ use rustykrab_tools::work_backend::ToolState;
 
 use super::*;
 use crate::capability_proof::{
-    probe_inputs_digest, tool_ceiling_digest, ExpectedOperation, OperationProbe, ProbeOutcome,
-    ProbeRequest, ProbeScope, RegisteredAction,
+    probe_inputs_digest, tool_ceiling_digest, ExecutionPath, ExpectedOperation, OperationProbe,
+    ProbeContext, ProbeOutcome, ProbeRequest, ProbeScope, RegisteredAction,
 };
 use crate::controller::proof::{PlannedProbe, RepairGeneration};
 
@@ -37,6 +37,7 @@ pub(super) struct Prober {
     caps: WorkerCapabilities,
     /// Whether it offers a probe scope (a worker that cannot probe does not).
     scope: bool,
+    policy: std::sync::atomic::AtomicUsize,
     answers: Mutex<VecDeque<Answer>>,
     requests: Mutex<Vec<ProbeRequest>>,
     /// The store, to check at probe time that the generation the request is
@@ -61,6 +62,7 @@ impl Prober {
             kind: WorkerKind::Local,
             caps,
             scope: true,
+            policy: std::sync::atomic::AtomicUsize::new(0),
             answers: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             store: Mutex::new(None),
@@ -113,17 +115,25 @@ impl Worker for Prober {
         self.run.usage(run)
     }
 
-    fn probe_scope(&self, bound_dir: Option<PathBuf>) -> Option<ProbeScope> {
+    fn access_profile(&self) -> serde_json::Value {
+        serde_json::json!({"capabilities": self.caps, "policy": self.policy.load(std::sync::atomic::Ordering::SeqCst)})
+    }
+    fn probe_scope(&self, context: &ProbeContext) -> Option<ProbeScope> {
         self.scope.then(|| ProbeScope {
             worker: self.run.name.clone(),
-            bound_dir,
+            path: if context.requirements.uses_host() {
+                ExecutionPath::Host
+            } else {
+                ExecutionPath::Native
+            },
+            policy_digest: crate::capability_proof::binding_digest(&self.access_profile()),
             ceiling_digest: tool_ceiling_digest(&self.caps.tools),
         })
     }
 
     async fn probe(&self, request: &ProbeRequest) -> OperationProbe {
         self.requests.lock().unwrap().push(request.clone());
-        let dir = request.scope.bound_dir.clone();
+        let dir = request.context.bound_dir.clone();
         let exists = dir.as_ref().is_some_and(|d| d.is_dir());
         self.dirs.lock().unwrap().push((dir, exists));
         let store = self.store.lock().unwrap().clone();
@@ -290,7 +300,7 @@ async fn a_failed_probe_leaves_the_capability_unproven_and_its_waiter_parked_unt
     assert_eq!(first.expected.generation, format!("{w}:1"));
     assert_eq!(
         first.expected.inputs_digest,
-        probe_inputs_digest(&action, &first.scope)
+        probe_inputs_digest(&action, &first.scope, &first.context)
     );
     assert!(first.expected.run.starts_with("probe-"));
     assert!(first.deadline <= Duration::from_secs(30));
@@ -519,7 +529,7 @@ async fn a_model_reported_operation_probe_or_generation_is_ignored() {
 
 #[tokio::test]
 async fn revival_waits_for_proof_at_the_current_generation() {
-    let h = Harness::new(&[]);
+    let (h, pinch) = with_prober(StaticCatalog::default());
     let w = h.file_one(draft("w", NODE)).await;
     let c = h.file_one(draft("c", "Build tool: node")).await;
     let mut waiting = h.item(&w).await;
@@ -539,18 +549,42 @@ async fn revival_waits_for_proof_at_the_current_generation() {
     let snap = crate::graph::Snapshot::new(vec![waiting.clone(), cap.clone()], vec![edge]);
     let proven = || async { h.ctl.revival_proven(&snap, &w).await.unwrap() };
 
-    let scope = ProbeScope {
-        worker: "pinch".into(),
-        bound_dir: None,
-        ceiling_digest: tool_ceiling_digest(&["exec".to_string()]),
-    };
+    // A controller-owned lease names the intended executor; no active run
+    // is needed for this receipt-validation fixture.
+    h.store()
+        .work_event_append(&rustykrab_core::work::WorkEvent {
+            item: w.clone(),
+            kind: EventKind::Lease,
+            actor: "worker:pinch".into(),
+            from: None,
+            to: None,
+            reason: None,
+            evidence_ref: None,
+            origin: None,
+            upstream: None,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    let context = h
+        .ctl
+        .repair_context(&waiting, &h.events(&w).await)
+        .await
+        .unwrap();
+    let scope = pinch.probe_scope(&context).unwrap();
+    let binding = h
+        .ctl
+        .repair_binding(&snap, &w, &h.events(&w).await, &context)
+        .await
+        .unwrap();
+    let permission_digest = Some(h.ctl.access_digest(pinch.as_ref()).await);
     let action = RegisteredAction::BinaryAvailable {
         binary: "node".into(),
     };
     let expected = |n: u64, run: &str| ExpectedOperation {
         operation: action.operation(),
         executor: "pinch".into(),
-        inputs_digest: probe_inputs_digest(&action, &scope),
+        inputs_digest: probe_inputs_digest(&action, &scope, &context),
         generation: format!("{w}:{n}"),
         run: run.into(),
     };
@@ -562,7 +596,8 @@ async fn revival_waits_for_proof_at_the_current_generation() {
             n,
             cause: "capability".into(),
             source_item: c.clone(),
-            permission_digest: None,
+            permission_digest: permission_digest.clone(),
+            binding: Some(binding.clone()),
             probes: vec![PlannedProbe {
                 capability: c.clone(),
                 expected: expected(n, run),
@@ -586,7 +621,6 @@ async fn revival_waits_for_proof_at_the_current_generation() {
     };
     let add = |e: Evidence| async { h.store().work_evidence_add(e).await.unwrap() };
 
-    assert!(!proven().await, "no generation, no proof");
     add(generation(1, "probe-1")).await;
     assert!(!proven().await, "a generation without a receipt");
     h.clock.advance(TimeDelta::seconds(1));
@@ -948,4 +982,625 @@ async fn a_native_agent_without_a_rustykrab_tool_and_no_worker_with_it_surfaces_
     assert_eq!(asked.len(), 1, "{asked:#?}");
     assert!(asked[0].text.contains("`work_resources`"), "{asked:?}");
     assert!(asked[0].text.contains("codex"), "{asked:?}");
+}
+
+/// A completed capability and its parked original item, with one real
+/// controller lease event but no running future/slot. Receipt producer scripted;
+/// store, restart reconstruction, generation and both gates are production code.
+async fn revival_fixture() -> (Harness, Arc<Prober>, crate::graph::Snapshot, String) {
+    let (h, pinch) = with_prober(StaticCatalog::default());
+    let w = h.file_one(draft("w", NODE)).await;
+    let c = h.file_one(draft("c", "Build tool: node")).await;
+    let mut waiting = h.item(&w).await;
+    waiting.status = Status::Blocked(BlockedReason::NeedsTool);
+    waiting.held_by = Some("independent-owner-hold".into());
+    let mut cap = h.item(&c).await;
+    cap.kind = WorkKind::Capability;
+    cap.status = Status::Done;
+    cap.artifact_refs.push(ArtifactRef {
+        kind: "capability".into(),
+        value: "tool:node".into(),
+    });
+    h.store()
+        .work_event_append(&rustykrab_core::work::WorkEvent {
+            item: w.clone(),
+            kind: EventKind::Lease,
+            actor: "worker:pinch".into(),
+            from: None,
+            to: None,
+            reason: None,
+            evidence_ref: None,
+            origin: None,
+            upstream: None,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    let snap = crate::graph::Snapshot::new(
+        vec![waiting, cap],
+        vec![rustykrab_core::work::Edge {
+            item: w.clone(),
+            kind: EdgeKind::Blocks,
+            depends_on: c,
+        }],
+    );
+    (h, pinch, snap, w)
+}
+
+#[tokio::test]
+async fn revival_rebinds_same_path_policy_once_and_does_not_storm_on_unobserved_receipts() {
+    let (h, pinch, snap, w) = revival_fixture().await;
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(generations(&h, &w).await.len(), 1);
+    // A policy change with the same path/ceiling invalidates the old success.
+    pinch.policy.store(1, std::sync::atomic::Ordering::SeqCst);
+    h.ctl.state().probing.insert("pinch".into(), 1);
+    assert!(!h.ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(
+        generations(&h, &w).await.len(),
+        1,
+        "busy executor is not oversubscribed"
+    );
+    h.ctl.state().probing.remove("pinch");
+    pinch.answer(Answer::Outcome(ProbeOutcome::Unobserved));
+    assert!(!h.ctl.revival_proven(&snap, &w).await.unwrap());
+    assert!(!h.ctl.revival_proven(&snap, &w).await.unwrap());
+    let gens = generations(&h, &w).await;
+    assert_eq!(
+        gens.len(),
+        2,
+        "same context on later ticks creates no more generations"
+    );
+    assert_eq!(pinch.requests().len(), 2);
+    assert_eq!(
+        gens[0]
+            .binding
+            .as_ref()
+            .unwrap()
+            .scope
+            .as_ref()
+            .unwrap()
+            .path,
+        gens[1]
+            .binding
+            .as_ref()
+            .unwrap()
+            .scope
+            .as_ref()
+            .unwrap()
+            .path
+    );
+    assert_ne!(gens[0].binding, gens[1].binding);
+    assert_eq!(
+        snap.item(&w).unwrap().held_by.as_deref(),
+        Some("independent-owner-hold")
+    );
+    assert!(evidence(&h, &w, "budget_grant").await.is_empty());
+}
+
+#[tokio::test]
+async fn revival_rebinds_path_requirements_executor_and_legacy_after_restart() {
+    let (h, pinch, mut snap, w) = revival_fixture().await;
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    let mut item = snap.item(&w).unwrap().clone();
+    item.required_tools = vec!["work_resources".into()];
+    let cap = snap.items().iter().find(|i| i.id != w).unwrap().clone();
+    let edges = snap.edges_held_by(&w).cloned().collect();
+    snap = crate::graph::Snapshot::new(vec![item, cap], edges);
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(pinch.requests()[0].scope.path, ExecutionPath::Native);
+    assert_eq!(pinch.requests()[1].scope.path, ExecutionPath::Host);
+    // Reconstruct a controller over the same real store and a changed policy.
+    let ctl = Controller::new(
+        h.store().clone(),
+        vec![pinch.clone() as Arc<dyn Worker>],
+        h.config.clone(),
+    )
+    .with_clock(h.clock.clone())
+    .with_catalog(h.catalog.clone());
+    pinch.policy.store(2, std::sync::atomic::Ordering::SeqCst);
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(generations(&h, &w).await.len(), 3);
+    // Deserialize the legacy wire row (without binding), even with a prior
+    // success. It is not current proof; refresh once, then stay on that generation.
+    let mut legacy = serde_json::to_value(generations(&h, &w).await.last().unwrap()).unwrap();
+    legacy["n"] = serde_json::json!(4);
+    legacy.as_object_mut().unwrap().remove("binding");
+    h.store()
+        .work_evidence_add(Evidence {
+            item: w.clone(),
+            kind: "repair_generation".into(),
+            reference: legacy.to_string(),
+            hash: Some(format!("{w}:4")),
+            verified_by: Some("controller".into()),
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    pinch.answer(Answer::Outcome(ProbeOutcome::Unobserved));
+    assert!(!ctl.revival_proven(&snap, &w).await.unwrap());
+    assert!(!ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(generations(&h, &w).await.last().unwrap().n, 5);
+    h.store()
+        .work_event_append(&rustykrab_core::work::WorkEvent {
+            item: w.clone(),
+            kind: EventKind::Lease,
+            actor: "worker:removed-worker".into(),
+            from: None,
+            to: None,
+            reason: None,
+            evidence_ref: None,
+            origin: None,
+            upstream: None,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    assert!(!ctl.revival_proven(&snap, &w).await.unwrap());
+    assert!(!ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(
+        generations(&h, &w).await.last().unwrap().n,
+        6,
+        "an unavailable executor is recorded once, not on every tick"
+    );
+}
+
+#[test]
+fn recovery_requirements_share_post_activatable_tools_with_the_real_brief() {
+    let (h, _) = with_prober(StaticCatalog::default());
+    let mut catalog = StaticCatalog::default();
+    catalog
+        .tools
+        .insert("work_resources".into(), ToolState::Loaded);
+    let ctl = h.ctl.with_catalog(Arc::new(catalog));
+    let history = ctl.activatable(super::super::load::History {
+        activate: vec!["node".into(), "work_resources".into()],
+        ..Default::default()
+    });
+    let item: WorkItem = serde_json::from_value(serde_json::json!({
+        "id":"fixture", "kind":"task", "title":"fixture", "objective":"fixture", "done_when":"fixture",
+        "status":{"status":"ready"}, "created_at":"2026-10-15T00:00:00Z", "updated_at":"2026-10-15T00:00:00Z"
+    })).unwrap();
+    let brief =
+        super::super::brief::brief_for(&item, vec![], vec![], vec![], &history, item.budget);
+    let requirements = super::super::brief::effective_requirements(&item, &history);
+    assert_eq!(
+        requirements,
+        crate::capability_proof::EffectiveRequirements::from_brief(&brief)
+    );
+    assert_eq!(requirements.required_tools, vec!["work_resources"]);
+    assert!(requirements.uses_host());
+}
+
+#[tokio::test]
+async fn a_native_path_refusal_is_visible_once_per_generation_without_questions_or_retries() {
+    let (h, pinch, mut snap, w) = revival_fixture().await;
+    let mut item = snap.item(&w).unwrap().clone();
+    item.required_tools = vec!["work_resources".into()];
+    let cap = snap.items().iter().find(|i| i.id != w).unwrap().clone();
+    let edges: Vec<_> = snap.edges_held_by(&w).cloned().collect();
+    snap = crate::graph::Snapshot::new(vec![item.clone(), cap.clone()], edges.clone());
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    item.required_tools.clear();
+    snap = crate::graph::Snapshot::new(vec![item, cap], edges);
+    pinch.answer(Answer::Outcome(ProbeOutcome::Unobserved));
+    for _ in 0..3 {
+        assert!(!h.ctl.revival_proven(&snap, &w).await.unwrap());
+    }
+    let events = h.events(&w).await;
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning)
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].actor, "controller");
+    assert_eq!(
+        warnings[0].evidence_ref.as_deref(),
+        Some(format!("capability_revival_blocked:{w}:2").as_str())
+    );
+    let reason = warnings[0].reason.as_deref().unwrap();
+    assert!(
+        reason.contains("Native") && reason.contains("pinch") && reason.contains("unobserved"),
+        "{reason}"
+    );
+    assert_eq!(
+        pinch.requests().len(),
+        2,
+        "later checks neither re-probe nor duplicate warnings"
+    );
+    assert_eq!(generations(&h, &w).await.len(), 2);
+    assert_eq!(
+        snap.item(&w).unwrap().held_by.as_deref(),
+        Some("independent-owner-hold")
+    );
+    assert!(
+        events.iter().all(|e| e.kind != EventKind::Rung),
+        "no invented original-run ladder attempt"
+    );
+    assert!(evidence(&h, &w, "budget_grant").await.is_empty());
+}
+
+/// A real parked item and completed capability in SQLite, with no process
+/// executing the original. Host-owned fixture transitions establish the setup;
+/// actual ticks below allocate, persist, reconstruct and revive production work.
+async fn tick_revival_fixture(improvements: u32) -> (Harness, Arc<Prober>, String) {
+    let (h, pinch) = with_prober(StaticCatalog::default());
+    h.ctl.set_draining(true);
+    let mut w = draft("w", NODE);
+    w.budget = Some(Budget {
+        rungs: RungBudgets {
+            improvements,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let w = h.file_one(w).await;
+    h.store()
+        .work_transition(
+            &w,
+            None,
+            Status::Blocked(BlockedReason::NeedsTool),
+            "controller",
+            Some("waiting on node proof"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut cap = draft("cap", "Build tool: node");
+    cap.kind = Some(WorkKind::Capability);
+    cap.artifact_refs = vec![ArtifactRef {
+        kind: "capability".into(),
+        value: "tool:node".into(),
+    }];
+    let cap = h.file_one(cap).await;
+    h.store()
+        .work_transition(
+            &cap,
+            None,
+            Status::Done,
+            "controller",
+            Some("fixture capability landed"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    h.store()
+        .work_apply(vec![rustykrab_store::WorkOp::AddEdge(
+            rustykrab_core::work::Edge {
+                item: w.clone(),
+                kind: EdgeKind::Blocks,
+                depends_on: cap,
+            },
+        )])
+        .await
+        .unwrap();
+    h.store()
+        .work_event_append(&WorkEvent {
+            item: w.clone(),
+            kind: EventKind::Lease,
+            actor: "worker:pinch".into(),
+            from: None,
+            to: None,
+            reason: None,
+            evidence_ref: None,
+            origin: None,
+            upstream: None,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h
+        .ctl
+        .revival_proven(&h.ctl.load().await.unwrap(), &w)
+        .await
+        .unwrap());
+    pinch.policy.store(1, std::sync::atomic::Ordering::SeqCst);
+    pinch.answer(Answer::Outcome(ProbeOutcome::Unobserved));
+    (h, pinch, w)
+}
+
+#[tokio::test]
+async fn terminal_revival_allocates_one_owned_investigation_across_ticks_and_restart_then_reprobes_a_verified_repair(
+) {
+    let (h, pinch, w) = tick_revival_fixture(1).await;
+    h.tick().await;
+    let diagnoses = h.of_kind(WorkKind::Internal).await;
+    assert_eq!(diagnoses.len(), 1, "{:?}", h.events(&w).await);
+    let diagnosis = &diagnoses[0];
+    let fp = diagnosis
+        .artifact_refs
+        .iter()
+        .find(|r| r.kind == crate::investigate::FAILURE_FINGERPRINT)
+        .unwrap();
+    let history = crate::investigate::failure_history(h.store(), &fp.value, &Default::default())
+        .await
+        .unwrap()
+        .expect("the allocated investigator can retrieve the actual refusal by its fingerprint");
+    assert_eq!(history.occurrences.len(), 1);
+    let observed = evidence(&h, &w, "error").await;
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].verified_by.as_deref(),
+        Some("capability_revival")
+    );
+    assert!(
+        evidence(&h, &w, "attempt_failure").await.is_empty(),
+        "a probe is not an original execution"
+    );
+    assert_eq!(
+        h.status(&w).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    for _ in 0..3 {
+        h.tick().await;
+    }
+    assert_eq!(h.of_kind(WorkKind::Internal).await.len(), 1);
+    assert_eq!(pinch.requests().len(), 2);
+    let ctl = Controller::new(
+        h.store().clone(),
+        vec![pinch.clone() as Arc<dyn Worker>],
+        h.config.clone(),
+    )
+    .with_clock(h.clock.clone())
+    .with_catalog(h.catalog.clone());
+    ctl.set_draining(true);
+    for _ in 0..2 {
+        ControlHandle::tick(&ctl).await.unwrap();
+    }
+    assert_eq!(h.of_kind(WorkKind::Internal).await.len(), 1);
+    assert_eq!(
+        h.status(&w).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    assert_eq!(generations(&h, &w).await.len(), 2);
+    let actions: Vec<_> = h
+        .events(&w)
+        .await
+        .iter()
+        .filter_map(super::super::load::decode_rung)
+        .filter(|r| r.outcome.starts_with("capability revival action "))
+        .collect();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].rung, Rung::Improve);
+    assert!(!actions[0].outcome.contains(super::super::load::SWITCHED));
+    assert!(
+        crate::investigate::resolution_item(&actions[0].outcome).is_none(),
+        "generic resolution recovery must not requeue the original"
+    );
+    assert!(h
+        .store()
+        .questions_list(&Default::default())
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Merely claiming Done cannot refresh or release the original.
+    h.store()
+        .work_transition(
+            &diagnosis.id,
+            None,
+            Status::Done,
+            "controller",
+            Some("fixture landed claim"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    ControlHandle::tick(&ctl).await.unwrap();
+    assert_eq!(pinch.requests().len(), 2);
+    assert_eq!(
+        h.status(&w).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    // A fixture host-verifier receipt names an actual temporary Git commit.
+    let repo = crate::workspace::tests::Repo::new();
+    let commit = crate::workspace::tests::run_git(repo.path(), &["rev-parse", "HEAD"]);
+    h.store()
+        .work_evidence_add(Evidence {
+            item: diagnosis.id.clone(),
+            kind: "commit".into(),
+            reference: commit,
+            hash: None,
+            verified_by: Some("git".into()),
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    let mut b = super::super::batch::Batch::new(ctl.load().await.unwrap(), h.clock.now());
+    assert!(ctl
+        .recover_resolution_waiters(&mut b)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        b.status(&w),
+        Some(Status::Blocked(BlockedReason::NeedsTool))
+    );
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    ControlHandle::tick(&ctl).await.unwrap();
+    assert_eq!(
+        generations(&h, &w).await.len(),
+        3,
+        "one fresh proof after verified landing, same policy"
+    );
+    assert_eq!(pinch.requests().len(), 3);
+    assert!(matches!(h.status(&w).await, Status::Ready | Status::Queued));
+    assert!(
+        h.script.briefs_for(NODE).is_empty(),
+        "draining test never runs the original or invents spend"
+    );
+    assert!(evidence(&h, &w, "budget_grant").await.is_empty());
+}
+
+#[tokio::test]
+async fn exhausted_revival_diagnosis_notifies_once_without_a_question_or_proof_bypass() {
+    let (h, pinch, w) = tick_revival_fixture(0).await;
+    let first = h.tick().await;
+    assert!(
+        first.notices > 0,
+        "allocation failure is visible through the existing owner outbox"
+    );
+    assert!(h.of_kind(WorkKind::Internal).await.is_empty());
+    for _ in 0..3 {
+        assert_eq!(h.tick().await.notices, 0);
+    }
+    assert_eq!(
+        h.status(&w).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    assert_eq!(pinch.requests().len(), 2);
+    assert!(h
+        .store()
+        .questions_list(&Default::default())
+        .await
+        .unwrap()
+        .is_empty());
+    let ctl = Controller::new(
+        h.store().clone(),
+        vec![pinch.clone() as Arc<dyn Worker>],
+        h.config.clone(),
+    )
+    .with_clock(h.clock.clone())
+    .with_catalog(h.catalog.clone());
+    ctl.set_draining(true);
+    assert_eq!(ControlHandle::tick(&ctl).await.unwrap().notices, 0);
+    let actions: Vec<_> = h
+        .events(&w)
+        .await
+        .iter()
+        .filter_map(super::super::load::decode_rung)
+        .filter(|r| r.outcome.starts_with("capability revival action "))
+        .collect();
+    assert_eq!(actions.len(), 1);
+    assert!(actions[0].outcome.contains("no remaining Improve rung"));
+}
+
+#[tokio::test]
+async fn unrelated_landed_internal_work_cannot_mint_a_revival_generation() {
+    let (h, pinch, snap, w) = revival_fixture().await;
+    let mut unrelated = h
+        .item(&h.file_one(draft("other", "unrelated work")).await)
+        .await;
+    unrelated.kind = WorkKind::Internal;
+    unrelated.status = Status::Done;
+    h.store()
+        .work_evidence_add(Evidence {
+            item: unrelated.id.clone(),
+            kind: "commit".into(),
+            reference: "fixture-unrelated-commit".into(),
+            hash: None,
+            verified_by: Some("git".into()),
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    let mut items = snap.items().to_vec();
+    items.push(unrelated.clone());
+    let mut edges = snap.edges().to_vec();
+    edges.push(rustykrab_core::work::Edge {
+        item: w.clone(),
+        kind: EdgeKind::Blocks,
+        depends_on: unrelated.id,
+    });
+    let with_unrelated = crate::graph::Snapshot::new(items, edges);
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    assert!(h.ctl.revival_proven(&with_unrelated, &w).await.unwrap());
+    assert_eq!(generations(&h, &w).await.len(), 1);
+    assert_eq!(pinch.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn rejected_revival_investigation_notifies_once_and_never_creates_an_answer_bypass() {
+    let (h, pinch, w) = tick_revival_fixture(1).await;
+    let mut config = h.config.clone();
+    config.caps.max_depth = 0;
+    let ctl = Controller::new(
+        h.store().clone(),
+        vec![pinch.clone() as Arc<dyn Worker>],
+        config,
+    )
+    .with_clock(h.clock.clone())
+    .with_catalog(h.catalog.clone());
+    ctl.set_draining(true);
+    assert!(ControlHandle::tick(&ctl).await.unwrap().notices > 0);
+    assert_eq!(ControlHandle::tick(&ctl).await.unwrap().notices, 0);
+    assert!(h.of_kind(WorkKind::Internal).await.is_empty());
+    assert!(h
+        .store()
+        .questions_list(&Default::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        h.status(&w).await,
+        Status::Blocked(BlockedReason::NeedsTool)
+    );
+    let actions: Vec<_> = h
+        .events(&w)
+        .await
+        .iter()
+        .filter_map(super::super::load::decode_rung)
+        .filter(|r| r.outcome.starts_with("capability revival action "))
+        .collect();
+    assert_eq!(actions.len(), 1);
+    assert!(
+        actions[0].outcome.contains("depth limit"),
+        "{}",
+        actions[0].outcome
+    );
+}
+
+#[tokio::test]
+async fn a_new_daemon_build_requires_fresh_proof_without_claiming_the_repair_effective() {
+    let (h, pinch, snap, w) = revival_fixture().await;
+    pinch.answer(Answer::Outcome(ProbeOutcome::Ok));
+    assert!(h.ctl.revival_proven(&snap, &w).await.unwrap());
+    let mut config = h.config.clone();
+    config.build = Some(crate::investigate::BuildId {
+        commit: "feed1234".into(),
+        dirty: false,
+    });
+    let ctl = Controller::new(
+        h.store().clone(),
+        vec![pinch.clone() as Arc<dyn Worker>],
+        config,
+    )
+    .with_clock(h.clock.clone())
+    .with_catalog(h.catalog.clone());
+    pinch.answer(Answer::Outcome(ProbeOutcome::Unobserved));
+    assert!(
+        !ctl.revival_proven(&snap, &w).await.unwrap(),
+        "a build change is not passing proof"
+    );
+    assert!(!ctl.revival_proven(&snap, &w).await.unwrap());
+    assert_eq!(generations(&h, &w).await.len(), 2);
+    assert_eq!(
+        pinch.requests().len(),
+        2,
+        "same deployed identity does not generate on each tick"
+    );
+    assert_eq!(
+        pinch.requests()[0].scope,
+        pinch.requests()[1].scope,
+        "policy/path stayed the same"
+    );
+    assert!(generations(&h, &w).await[1]
+        .binding
+        .as_ref()
+        .unwrap()
+        .daemon_build
+        .contains("feed1234"));
 }

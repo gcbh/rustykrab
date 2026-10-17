@@ -211,12 +211,7 @@ pub(super) fn brief_for(
     history: &History,
     budget: Budget,
 ) -> Brief {
-    let mut required_tools = item.required_tools.clone();
-    for tool in &history.activate {
-        if !required_tools.contains(tool) {
-            required_tools.push(tool.clone());
-        }
-    }
+    let requirements = effective_requirements(item, history);
     Brief {
         item: item.id.clone(),
         kind: item.kind,
@@ -227,7 +222,7 @@ pub(super) fn brief_for(
         decisions_made: item.decisions_made.clone(),
         discussion: Vec::new(),
         artifact_refs: item.artifact_refs.clone(),
-        required_tools,
+        required_tools: requirements.required_tools,
         required_mcp_servers: item.required_mcp_servers.clone(),
         writable_resources: item.writable_resources.clone(),
         inputs,
@@ -242,4 +237,19 @@ pub(super) fn brief_for(
         project_context: None,
         investigation: None,
     }
+}
+
+/// Shared with recovery scope selection, after Controller::activatable filtered
+/// history. In particular a binary name never becomes a required host tool.
+pub(super) fn effective_requirements(
+    item: &WorkItem,
+    history: &History,
+) -> crate::capability_proof::EffectiveRequirements {
+    let mut requirements = crate::capability_proof::EffectiveRequirements::from_item(item);
+    for tool in &history.activate {
+        if !requirements.required_tools.contains(tool) {
+            requirements.required_tools.push(tool.clone());
+        }
+    }
+    requirements
 }
