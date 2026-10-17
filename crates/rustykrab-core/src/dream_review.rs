@@ -171,6 +171,67 @@ impl From<ProjectReview> for ReviewSummary {
         }
     }
 }
+/// Read-only admission evidence. These observations grant no authority and
+/// reserve no executor slot; the controller still leases and bounds each leaf.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAdmissionDecision {
+    Disabled,
+    ControllerUnavailable,
+    DemandUnknown,
+    DemandFailed,
+    DemandTimedOut,
+    DemandStale,
+    ForegroundActive,
+    ForegroundRunnable,
+    DailyLimit,
+    NoDueProject,
+    ReviewInProgress,
+    IdleReview,
+    IncidentReview,
+}
+impl ReviewAdmissionDecision {
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Disabled => "no projects are enabled for review",
+            Self::ControllerUnavailable => {
+                "the work manager is stopping, failing, or waiting for exclusive control"
+            }
+            Self::DemandUnknown => "the controller has no current demand observation",
+            Self::DemandFailed => "the controller could not read current work demand",
+            Self::DemandTimedOut => "the work demand observation exceeded its deadline",
+            Self::DemandStale => {
+                "the work demand observation is stale or ahead of the server clock"
+            }
+            Self::ForegroundActive => "foreground work is active",
+            Self::ForegroundRunnable => "foreground work can be dispatched",
+            Self::DailyLimit => "the three-cycle limit for the last 24 hours has been reached",
+            Self::NoDueProject => "no enabled project is due for review",
+            Self::ReviewInProgress => "a project review cycle is already in progress",
+            Self::IdleReview => "current demand permits an idle project review",
+            Self::IncidentReview => "a waiting-only backlog permits a bounded incident review",
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewAdmission {
+    pub checked_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub decision: ReviewAdmissionDecision,
+    /// None when there is no observation; unknown never fabricates zero demand.
+    pub active_foreground_runs: Option<usize>,
+    pub dispatchable_foreground_leaves: Option<usize>,
+    pub waiting: Option<std::collections::BTreeMap<String, usize>>,
+}
+impl ReviewAdmission {
+    pub fn allows_review(&self) -> bool {
+        matches!(
+            self.decision,
+            ReviewAdmissionDecision::IdleReview | ReviewAdmissionDecision::IncidentReview
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DreamingView {
     pub enabled: bool,
@@ -182,4 +243,11 @@ pub struct DreamingView {
     pub rubric: String,
     pub metrics: DreamMetaMetrics,
     pub reviews: Vec<ReviewSummary>,
+    /// Missing in an older view means unobserved, not idle or healthy.
+    #[serde(default)]
+    pub admission: Option<ReviewAdmission>,
+    #[serde(default)]
+    pub last_project_review_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_project_review_failed_at: Option<DateTime<Utc>>,
 }

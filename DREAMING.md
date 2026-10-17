@@ -693,3 +693,22 @@ evidence, duplicate implemented work and an unfalsifiable improvement. All
 three must be rejected on the relevant dimension before any recommendation
 is published. These calibration receipts measure basic rubric behavior; they
 do not validate real-world usefulness or remove shared-model bias.
+
+## Bounded diagnosis while work cannot run (2026-10-14)
+
+A queued row is not evidence that useful work can execute. Project reviews now
+consume a fresh observation from the existing controller matcher: active or
+dispatchable foreground yields priority; a waiting-only backlog can admit a due
+incident review. Missing, stale, future, failed or timed-out demand defers
+explicitly. Manual requests remain durable while waiting but do not override
+capacity or spending limits. The fresh meta-evaluator checks the same admission
+rule before its own job is filed.
+
+Inference still uses the existing low-priority report-only Research jobs, finite
+per-leaf budgets, cumulative controller guard/breaker, interval and three-cycle
+24-hour limit. No grant or independent owner hold is changed. Already running
+model calls remain bounded rather than immediately preempted. Admission permits
+enqueuing a review; it does not demonstrate an available analysis executor,
+model quality, a delivered repair or original-goal improvement. The monitor API
+exposes typed defer reasons, observation freshness and latest completed/failed
+project-review timestamps. UI rendering of the new fields is separate work.

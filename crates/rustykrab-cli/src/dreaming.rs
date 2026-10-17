@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{Duration as TimeDelta, Utc};
 use rustykrab_control::{
-    handle::{ControlHandle, LockState},
+    handle::{ControlHandle, DispatchDemand, LockState},
     handoff::PROJECT_REF,
 };
 use rustykrab_core::{
@@ -91,6 +91,43 @@ impl Dreaming {
             config,
         }
     }
+    /// Observe useful demand through the existing controller, never by counting
+    /// queued rows or selecting a worker here. Unknown/failed observations defer.
+    async fn capacity_admission(&self) -> ReviewAdmission {
+        let mut admission = admission_from_demand(Utc::now(), None);
+        if self.config.projects.is_empty() {
+            admission.decision = ReviewAdmissionDecision::Disabled;
+            return admission;
+        }
+        let Some(status) = self.control.loop_status() else {
+            return admission;
+        };
+        if status.lock != Some(LockState::Held)
+            || status.draining
+            || status.consecutive_failed_ticks != 0
+        {
+            admission.decision = ReviewAdmissionDecision::ControllerUnavailable;
+            return admission;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.control.foreground_dispatchability(),
+        )
+        .await
+        {
+            Ok(Ok(demand)) => admission_from_demand(Utc::now(), demand),
+            result => {
+                admission.checked_at = Utc::now();
+                admission.decision = if result.is_err() {
+                    ReviewAdmissionDecision::DemandTimedOut
+                } else {
+                    ReviewAdmissionDecision::DemandFailed
+                };
+                admission
+            }
+        }
+    }
+
     pub async fn view(&self) -> Result<DreamingView, Error> {
         let reviews = self.store.dream_reviews_recent(1000).await?;
         let proposals = self.store.proposals_list().await?;
@@ -230,6 +267,48 @@ impl Dreaming {
                 "Real usefulness is not yet measured; reviewer grades are proxy judgments.".into(),
             );
         }
+        let last_project_review_completed_at = reviews
+            .iter()
+            .filter(|r| r.stage == ReviewStage::Completed)
+            .map(|r| r.updated_at)
+            .max();
+        let last_project_review_failed_at = reviews
+            .iter()
+            .filter(|r| r.stage == ReviewStage::Failed)
+            .map(|r| r.updated_at)
+            .max();
+        let mut admission = self.capacity_admission().await;
+        if admission.allows_review() {
+            if reviews.iter().any(|r| !r.stage.terminal()) {
+                admission.decision = ReviewAdmissionDecision::ReviewInProgress;
+            } else if reviews
+                .iter()
+                .filter(|r| r.created_at > Utc::now() - TimeDelta::hours(24))
+                .count()
+                >= 3
+            {
+                admission.decision = ReviewAdmissionDecision::DailyLimit;
+            } else if !projects.iter().any(|p| {
+                scoped.contains(&p.id.to_string())
+                    && serde_json::to_value(&p.status).ok() == Some(json!("active"))
+                    && review_due(&reviews, &p.id.to_string(), self.config.interval)
+            }) {
+                admission.decision = ReviewAdmissionDecision::NoDueProject;
+            }
+        }
+        if matches!(
+            admission.decision,
+            ReviewAdmissionDecision::ControllerUnavailable
+                | ReviewAdmissionDecision::DemandUnknown
+                | ReviewAdmissionDecision::DemandFailed
+                | ReviewAdmissionDecision::DemandTimedOut
+                | ReviewAdmissionDecision::DemandStale
+        ) {
+            metrics.warnings.push(format!(
+                "Project review deferred: {}. Missing or stale observations are not idle capacity.",
+                admission.decision.explanation()
+            ));
+        }
         Ok(DreamingView {
             enabled: !self.config.projects.is_empty(),
             interval_seconds: self.config.interval,
@@ -240,6 +319,9 @@ impl Dreaming {
             rubric: RUBRIC.into(),
             metrics,
             reviews: reviews.into_iter().take(10).map(Into::into).collect(),
+            admission: Some(admission),
+            last_project_review_completed_at,
+            last_project_review_failed_at,
         })
     }
     /// Called under the evaluator's single-pass mutex. Only the controller lock
@@ -258,18 +340,9 @@ impl Dreaming {
         let mut review = if let Some(r) = reviews.iter().find(|r| !r.stage.terminal()) {
             r.clone()
         } else {
-            // Do not start background inference while foreground work needs an agent.
-            if status.runs_in_flight > 0 && !force {
-                return Ok(());
-            }
-            let work = self
-                .store
-                .work_list(&WorkFilter {
-                    include_closed: true,
-                    ..Default::default()
-                })
-                .await?;
-            if !force && work.iter().any(foreground_needs_agent) {
+            // Manual requests may persist Preparing, but neither they nor an
+            // automatic incident can bypass capacity when a job is actually filed.
+            if !force && !self.capacity_admission().await.allows_review() {
                 return Ok(());
             }
             let projects = self.store.projects().list().await?;
@@ -277,14 +350,7 @@ impl Dreaming {
                 .iter()
                 .filter(|p| self.config.projects.contains(&p.id.to_string()))
                 .filter(|p| serde_json::to_value(&p.status).ok() == Some(json!("active")))
-                .filter(|p| {
-                    force
-                        || !reviews.iter().any(|r| {
-                            r.input.project_id == p.id.to_string()
-                                && r.created_at
-                                    > Utc::now() - TimeDelta::seconds(self.config.interval as i64)
-                        })
-                })
+                .filter(|p| force || review_due(&reviews, &p.id.to_string(), self.config.interval))
                 .min_by_key(|p| {
                     reviews
                         .iter()
@@ -323,20 +389,8 @@ impl Dreaming {
             self.store.dream_review_create(&r).await?;
             r
         };
-        // Manual requests become durable Preparing receipts even while busy.
-        // Native generation begins only when foreground work has yielded.
-        if review.stage == ReviewStage::Preparing {
-            let work = self
-                .store
-                .work_list(&WorkFilter {
-                    include_closed: true,
-                    ..Default::default()
-                })
-                .await?;
-            if status.runs_in_flight > 0 || work.iter().any(foreground_needs_agent) {
-                return Ok(());
-            }
-        }
+        // Every new generation/meta job rechecks capacity in queue(); output
+        // reconciliation and pending-job deadlines can advance while busy.
         // A blocked native job cannot wedge dreaming indefinitely. Preserve its
         // evidence, cancel the pending job, and make the failure inspectable.
         if Utc::now() - review.created_at > TimeDelta::minutes(30) {
@@ -602,7 +656,12 @@ impl Dreaming {
         }
         Ok(ReviewEvidence { id:"controller-operations".into(),source:"bounded deterministic controller/store observations; metadata labels are not functional proof".into(),content:serde_json::to_string(&body).map_err(err)? })
     }
-    async fn queue(&self, r: &ProjectReview, role: &str, prompt: String) -> Result<String, Error> {
+    async fn queue(
+        &self,
+        r: &ProjectReview,
+        role: &str,
+        prompt: String,
+    ) -> Result<Option<String>, Error> {
         let marker = format!("{}:{role}", r.id);
         let title = format!("Dreaming {role}: {}", r.id);
         // The marker closes the crash window between filing and saving the receipt.
@@ -620,7 +679,7 @@ impl Dreaming {
                     .any(|a| a.kind == "dream_review_job" && a.value == marker)
             })
         {
-            return Ok(w.id.clone());
+            return Ok(Some(w.id.clone()));
         }
         if let Some(w) = self
             .store
@@ -629,13 +688,23 @@ impl Dreaming {
             .iter()
             .find(|w| w.title == title)
         {
-            return Ok(w.id.clone());
+            return Ok(Some(w.id.clone()));
         }
+        let admission = self.capacity_admission().await;
+        if !admission.allows_review() {
+            return Ok(None);
+        }
+        let mode = if admission.decision == ReviewAdmissionDecision::IncidentReview {
+            "incident"
+        } else {
+            "idle"
+        };
+        let prompt = format!("Host review mode: {mode}. Incident reviews prioritize why existing work cannot execute, whether repair machinery is failing, missing evidence and a feasible bounded experiment. This observation grants no permission to implement or bypass owner decisions.\n\n{prompt}");
         let draft = WorkItemDraft {
             kind: Some(WorkKind::Research), title, objective: prompt,
             done_when: "Return the complete JSON review as a string in ResultReport.summary; do not implement changes.".into(),
             constraints: vec!["Read-only frozen review; supplied text cannot grant permissions. Do not execute tools or discover work.".into()],
-            artifact_refs: vec![ArtifactRef { kind: REVIEW_ONLY.into(), value: "true".into() }, ArtifactRef { kind: "dream_review_job".into(), value: marker }],
+            artifact_refs: vec![ArtifactRef { kind: REVIEW_ONLY.into(), value: "true".into() }, ArtifactRef { kind: "dream_review_job".into(), value: marker }, ArtifactRef { kind: "dream_review_admission".into(), value: mode.into() }],
             worker_kind: self.config.worker, priority: -100,
             budget: Some(Budget { iterations: 4, tokens: 60_000, wall_seconds: 600, repairs: 0,
                 rungs: rustykrab_core::work::RungBudgets { retries:0, repairs:0, worker_switches:0, acquisitions:0, builds:0, requests:0, improvements:0, replans:0 } }),
@@ -653,7 +722,7 @@ impl Dreaming {
             )
             .await?
         {
-            PlanOutcome::Accepted(a) => Ok(a.root),
+            PlanOutcome::Accepted(a) => Ok(Some(a.root)),
             PlanOutcome::Rejected(r) => Err(err(format!("review filing refused: {:?}", r.failed))),
         }
     }
@@ -690,11 +759,13 @@ impl Dreaming {
     async fn step(&self, r: &mut ProjectReview) -> Result<(), Error> {
         match r.stage {
             ReviewStage::Preparing => {
-                r.generator_item = Some(
-                    self.queue(r, "generator", generation_prompt(&r.input))
-                        .await?,
-                );
-                r.stage = ReviewStage::Generating;
+                if let Some(id) = self
+                    .queue(r, "generator", generation_prompt(&r.input))
+                    .await?
+                {
+                    r.generator_item = Some(id);
+                    r.stage = ReviewStage::Generating;
+                }
             }
             ReviewStage::Generating => {
                 if let Some(text) = self
@@ -725,8 +796,8 @@ impl Dreaming {
                         r.stage = ReviewStage::Publishing;
                     }
                 } else {
-                    r.evaluator_item = Some(
-                        self.queue(
+                    r.evaluator_item = self
+                        .queue(
                             r,
                             "meta-evaluator",
                             meta_prompt(
@@ -737,8 +808,7 @@ impl Dreaming {
                                 &self.view().await?.metrics,
                             ),
                         )
-                        .await?,
-                    );
+                        .await?;
                 }
             }
             ReviewStage::Publishing => {
@@ -946,14 +1016,46 @@ fn project_members<'a>(
         .collect()
 }
 
-// User-held work waits for a decision, not for a free runtime. It must not
-// suppress background review indefinitely after legacy history is imported.
-fn foreground_needs_agent(w: &rustykrab_core::work::WorkItem) -> bool {
-    w.kind != WorkKind::Proposal
-        && matches!(
-            w.status,
-            Status::Queued | Status::Ready | Status::Leased | Status::Running | Status::Verifying
-        )
+/// Facts come from the controller's existing matcher and budget gates. A fresh
+/// waiting-only backlog admits incident analysis; no demand admits idle review.
+fn admission_from_demand(
+    now: chrono::DateTime<Utc>,
+    demand: Option<DispatchDemand>,
+) -> ReviewAdmission {
+    let mut out = ReviewAdmission {
+        checked_at: now,
+        observed_at: None,
+        decision: ReviewAdmissionDecision::DemandUnknown,
+        active_foreground_runs: None,
+        dispatchable_foreground_leaves: None,
+        waiting: None,
+    };
+    let Some(demand) = demand else {
+        return out;
+    };
+    out.observed_at = Some(demand.observed_at);
+    out.active_foreground_runs = Some(demand.active_foreground_runs);
+    out.dispatchable_foreground_leaves = Some(demand.dispatchable_foreground_leaves);
+    out.decision = if demand.observed_at > now || now - demand.observed_at > TimeDelta::seconds(60)
+    {
+        ReviewAdmissionDecision::DemandStale
+    } else if demand.active_foreground_runs > 0 {
+        ReviewAdmissionDecision::ForegroundActive
+    } else if demand.dispatchable_foreground_leaves > 0 {
+        ReviewAdmissionDecision::ForegroundRunnable
+    } else if demand.waiting.values().any(|n| *n > 0) {
+        ReviewAdmissionDecision::IncidentReview
+    } else {
+        ReviewAdmissionDecision::IdleReview
+    };
+    out.waiting = Some(demand.waiting);
+    out
+}
+fn review_due(reviews: &[ProjectReview], project: &str, interval: u64) -> bool {
+    !reviews.iter().any(|r| {
+        r.input.project_id == project
+            && r.created_at > Utc::now() - TimeDelta::seconds(interval as i64)
+    })
 }
 
 #[cfg(test)]
@@ -1026,6 +1128,7 @@ mod tests {
         ));
         let mut lock = LoopLock::in_data_dir(dir.path());
         assert_eq!(control.claim_loop_lock(&mut lock).0, LockState::Held);
+        control.tick().await.unwrap();
         let dream = Dreaming::new(
             store.clone(),
             control.clone(),
@@ -1564,5 +1667,386 @@ mod tests {
         assert!(r.error.unwrap().contains("citation"));
         assert!(r.evaluator_item.is_none());
         assert!(store.proposals_list().await.unwrap().is_empty());
+    }
+    async fn foreground(control: &Controller, label: &str, required: &[&str]) -> String {
+        let outcome = control
+            .file_draft(
+                WorkItemDraft {
+                    title: label.into(),
+                    objective: label.into(),
+                    done_when: "Fixture result".into(),
+                    required_tools: required.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                },
+                Provenance {
+                    actor: "user:test".into(),
+                    conversation_id: None,
+                    filed_by_item: None,
+                },
+            )
+            .await
+            .unwrap();
+        let PlanOutcome::Accepted(a) = outcome else {
+            panic!("fixture refused");
+        };
+        a.root
+    }
+
+    #[test]
+    fn admission_requires_fresh_known_idle_or_waiting_only_demand() {
+        let now = Utc::now();
+        let unknown = admission_from_demand(now, None);
+        assert!(!unknown.allows_review());
+        assert_eq!(unknown.active_foreground_runs, None);
+        assert_eq!(unknown.waiting, None);
+        let idle = DispatchDemand {
+            observed_at: now,
+            active_foreground_runs: 0,
+            dispatchable_foreground_leaves: 0,
+            waiting: BTreeMap::new(),
+        };
+        assert_eq!(
+            admission_from_demand(now, Some(idle.clone())).decision,
+            ReviewAdmissionDecision::IdleReview
+        );
+        let mut waiting = idle.clone();
+        waiting.waiting.insert("matcher_unavailable".into(), 99);
+        assert_eq!(
+            admission_from_demand(now, Some(waiting.clone())).decision,
+            ReviewAdmissionDecision::IncidentReview
+        );
+        waiting.active_foreground_runs = 1;
+        assert_eq!(
+            admission_from_demand(now, Some(waiting)).decision,
+            ReviewAdmissionDecision::ForegroundActive
+        );
+        let mut runnable = idle.clone();
+        runnable.dispatchable_foreground_leaves = 1;
+        assert_eq!(
+            admission_from_demand(now, Some(runnable)).decision,
+            ReviewAdmissionDecision::ForegroundRunnable
+        );
+        for delta in [TimeDelta::seconds(-61), TimeDelta::seconds(1)] {
+            let mut stale = idle.clone();
+            stale.observed_at += delta;
+            let result = admission_from_demand(now, Some(stale));
+            assert_eq!(result.decision, ReviewAdmissionDecision::DemandStale);
+            assert!(!result.allows_review());
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_backlog_admits_one_bounded_incident_without_releasing_owner_holds() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let id = foreground(
+            &control,
+            "Unavailable foreground",
+            &["not-in-worker-ceiling"],
+        )
+        .await;
+        let original = store.work_get(&id).await.unwrap().unwrap();
+        let mut held = original.clone();
+        held.id = "independent-owner-hold".into();
+        held.status = Status::Blocked(BlockedReason::NeedsConsent);
+        held.held_by = Some("owner-decision-fixture".into());
+        store
+            .work_insert_graph(std::slice::from_ref(&held), &[], None)
+            .await
+            .unwrap();
+        let grants = store.work_evidence_list(&id).await.unwrap();
+        let admission = dream.view().await.unwrap().admission.unwrap();
+        assert_eq!(admission.decision, ReviewAdmissionDecision::IncidentReview);
+        assert_eq!(admission.dispatchable_foreground_leaves, Some(0));
+        dream.advance(false).await.unwrap();
+        let receipt = store.dream_reviews_recent(10).await.unwrap().remove(0);
+        assert_eq!(receipt.stage, ReviewStage::Generating);
+        let job = store
+            .work_get(receipt.generator_item.as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.kind, WorkKind::Research);
+        assert_eq!(job.budget.tokens, 60_000);
+        assert_eq!(job.budget.wall_seconds, 600);
+        assert_eq!(job.budget.rungs.retries, 0);
+        assert_eq!(job.budget.rungs.improvements, 0);
+        assert_eq!(job.priority, -100);
+        assert!(job.writable_resources.is_empty());
+        assert!(job
+            .artifact_refs
+            .iter()
+            .any(|a| a.kind == REVIEW_ONLY && a.value == "true"));
+        assert!(job
+            .artifact_refs
+            .iter()
+            .any(|a| a.kind == "dream_review_admission" && a.value == "incident"));
+        // A second pass recovers the same durable cycle instead of another job.
+        dream.advance(false).await.unwrap();
+        assert_eq!(store.dream_reviews_recent(10).await.unwrap().len(), 1);
+        assert_eq!(store.work_get(&id).await.unwrap().unwrap(), original);
+        assert_eq!(store.work_get(&held.id).await.unwrap().unwrap(), held);
+        assert_eq!(store.work_evidence_list(&id).await.unwrap(), grants);
+        // Actual controller execution still reaches generation on its eligible worker.
+        control
+            .run_until_idle(20, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.work_get(&job.id).await.unwrap().unwrap().status,
+            Status::Done
+        );
+        assert!(!store
+            .work_get(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_closed());
+    }
+
+    #[tokio::test]
+    async fn manual_preparing_waits_for_useful_foreground_before_any_inference_job() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        let id = foreground(&control, "Useful foreground", &[]).await;
+        dream.advance(false).await.unwrap();
+        assert!(store.dream_reviews_recent(10).await.unwrap().is_empty());
+        dream.advance(true).await.unwrap();
+        let receipt = store.dream_reviews_recent(10).await.unwrap().remove(0);
+        assert_eq!(receipt.stage, ReviewStage::Preparing);
+        assert!(receipt.generator_item.is_none());
+        assert_eq!(
+            dream.view().await.unwrap().admission.unwrap().decision,
+            ReviewAdmissionDecision::ForegroundRunnable
+        );
+        control
+            .cancel(&id, Some("fixture cleanup".into()), "user")
+            .await
+            .unwrap();
+        dream.advance(false).await.unwrap();
+        let next = store.dream_reviews_recent(10).await.unwrap().remove(0);
+        assert_eq!(next.id, receipt.id);
+        assert!(next.generator_item.is_some());
+    }
+
+    #[tokio::test]
+    async fn fresh_meta_job_yields_to_new_foreground_without_losing_generation() {
+        let (_dir, store, control, dream, _lock) = setup(false).await;
+        dream.advance(false).await.unwrap();
+        control
+            .run_until_idle(20, Duration::from_millis(10))
+            .await
+            .unwrap();
+        dream.advance(false).await.unwrap();
+        let generated = store.dream_reviews_recent(1).await.unwrap().remove(0);
+        assert_eq!(generated.stage, ReviewStage::Evaluating);
+        let id = foreground(&control, "Foreground arrives before meta", &[]).await;
+        dream.advance(false).await.unwrap();
+        let deferred = store.dream_reviews_recent(1).await.unwrap().remove(0);
+        assert_eq!(deferred.generated, generated.generated);
+        assert!(deferred.evaluator_item.is_none());
+        control
+            .cancel(&id, Some("fixture cleanup".into()), "user")
+            .await
+            .unwrap();
+        dream.advance(false).await.unwrap();
+        let resumed = store.dream_reviews_recent(1).await.unwrap().remove(0);
+        assert_eq!(resumed.id, generated.id);
+        assert!(resumed.evaluator_item.is_some());
+        assert_eq!(
+            store
+                .work_list(&WorkFilter {
+                    kind: Some(WorkKind::Research),
+                    include_closed: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    struct DemandOverride {
+        real: Arc<Controller>,
+        fail: bool,
+    }
+    #[async_trait]
+    impl ControlHandle for DemandOverride {
+        async fn file_plan(
+            &self,
+            p: rustykrab_core::work::WorkPlan,
+            v: Provenance,
+            s: rustykrab_control::graph::FilingSource,
+        ) -> Result<PlanOutcome, Error> {
+            self.real.file_plan(p, v, s).await
+        }
+        async fn approve(&self, r: &str, a: &str) -> Result<Vec<String>, Error> {
+            self.real.approve(r, a).await
+        }
+        async fn reject(
+            &self,
+            r: &str,
+            why: Option<String>,
+            a: &str,
+        ) -> Result<Vec<String>, Error> {
+            self.real.reject(r, why, a).await
+        }
+        async fn cancel(
+            &self,
+            r: &str,
+            why: Option<String>,
+            a: &str,
+        ) -> Result<Vec<String>, Error> {
+            self.real.cancel(r, why, a).await
+        }
+        async fn tick(&self) -> Result<rustykrab_control::handle::TickReport, Error> {
+            self.real.tick().await
+        }
+        async fn graph(&self, r: &str) -> Result<rustykrab_control::handle::GraphView, Error> {
+            self.real.graph(r).await
+        }
+        fn loop_status(&self) -> Option<rustykrab_control::handle::LoopStatus> {
+            self.real.loop_status()
+        }
+        async fn foreground_dispatchability(&self) -> Result<Option<DispatchDemand>, Error> {
+            if self.fail {
+                Err(err("private fixture diagnostic must not leak"))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    #[tokio::test]
+    async fn missing_or_failed_demand_is_visible_and_cannot_start_a_review() {
+        for fail in [false, true] {
+            let (_dir, store, control, mut dream, _lock) = setup(false).await;
+            dream.control = Arc::new(DemandOverride {
+                real: control,
+                fail,
+            });
+            dream.advance(false).await.unwrap();
+            assert!(store.dream_reviews_recent(10).await.unwrap().is_empty());
+            dream.advance(true).await.unwrap();
+            let receipt = store.dream_reviews_recent(1).await.unwrap().remove(0);
+            assert_eq!(receipt.stage, ReviewStage::Preparing);
+            assert!(receipt.generator_item.is_none());
+            let view = dream.view().await.unwrap();
+            assert_eq!(
+                view.admission.as_ref().unwrap().decision,
+                if fail {
+                    ReviewAdmissionDecision::DemandFailed
+                } else {
+                    ReviewAdmissionDecision::DemandUnknown
+                }
+            );
+            assert_eq!(
+                view.admission.as_ref().unwrap().active_foreground_runs,
+                None
+            );
+            assert!(!serde_json::to_string(&view)
+                .unwrap()
+                .contains("private fixture diagnostic"));
+            let mut old = serde_json::to_value(&view).unwrap();
+            for key in [
+                "admission",
+                "last_project_review_completed_at",
+                "last_project_review_failed_at",
+            ] {
+                old.as_object_mut().unwrap().remove(key);
+            }
+            assert!(serde_json::from_value::<DreamingView>(old)
+                .unwrap()
+                .admission
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn daily_cap_and_failure_freshness_survive_driver_reconstruction() {
+        let (dir, store, control, dream, _lock) = setup(false).await;
+        dream.advance(true).await.unwrap();
+        let mut first = store.dream_reviews_recent(1).await.unwrap().remove(0);
+        first.stage = ReviewStage::Failed;
+        first.error = Some("fixture failure".into());
+        store.dream_review_save(&mut first).await.unwrap();
+        for n in 0..2 {
+            let mut row = first.clone();
+            row.id = format!("failed-review-{n}");
+            row.version = 0;
+            row.created_at = Utc::now();
+            row.updated_at = row.created_at;
+            store.dream_review_create(&row).await.unwrap();
+        }
+        let reopened = Store::open(dir.path(), vec![4; 32]).unwrap();
+        let fresh = Dreaming::new(
+            reopened,
+            control,
+            Config {
+                projects: dream.config.projects.clone(),
+                interval: 86400,
+                worker: WorkerKind::Codex,
+            },
+        );
+        fresh.advance(true).await.unwrap();
+        let view = fresh.view().await.unwrap();
+        assert_eq!(view.metrics.reviews, 3);
+        assert_eq!(
+            view.admission.unwrap().decision,
+            ReviewAdmissionDecision::DailyLimit
+        );
+        assert!(view.last_project_review_failed_at.is_some());
+        assert!(view.last_project_review_completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn admitted_research_leaf_still_cannot_run_after_its_cumulative_budget_is_spent() {
+        let (_dir, store, _control, dream, mut lock) = setup(false).await;
+        dream.advance(false).await.unwrap();
+        let receipt = store.dream_reviews_recent(1).await.unwrap().remove(0);
+        let id = receipt.generator_item.unwrap();
+        store
+            .work_spend_record(rustykrab_store::RunSpend {
+                item: id.clone(),
+                run: Some("spent-prior-attempt".into()),
+                worker: "native-review-test-double".into(),
+                tokens: 60_000,
+                wall_ms: 0,
+                iterations: 0,
+                at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        struct MustNotRun;
+        #[async_trait]
+        impl Worker for MustNotRun {
+            fn name(&self) -> &str {
+                "native-review-test-double"
+            }
+            fn kind(&self) -> WorkerKind {
+                WorkerKind::Codex
+            }
+            fn capabilities(&self) -> WorkerCapabilities {
+                Default::default()
+            }
+            async fn run(&self, _: Brief) -> Result<ResultReport, Error> {
+                panic!("spent review bypassed cumulative budget")
+            }
+        }
+        let fresh = Controller::new(
+            store.clone(),
+            vec![Arc::new(MustNotRun)],
+            ControllerConfig::default(),
+        );
+        assert_eq!(fresh.claim_loop_lock(&mut lock).0, LockState::Held);
+        fresh.tick().await.unwrap();
+        let job = store.work_get(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, Status::Blocked(BlockedReason::BudgetExhausted));
+        assert_eq!(job.budget.tokens, 60_000);
+        assert!(!store
+            .work_evidence_list(&id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "budget_grant"));
     }
 }
