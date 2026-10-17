@@ -497,7 +497,12 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Budget {
-            iterations: 25,
+            // A backstop against a run that loops, not the measure of a
+            // run's size: the wall clock bounds a run. At 25, half of the
+            // qwen3.8 long-context eval runs (2026-10-15/16) ended on the
+            // turn count, some after committing their work, and a run that
+            // ends on it files no report.
+            iterations: 100,
             tokens: 200_000,
             wall_seconds: 3_600,
             repairs: 2,

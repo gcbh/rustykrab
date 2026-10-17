@@ -1092,7 +1092,7 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
             "  edges      blocked by #42; discovered from #9; inputs from #42",
             "  archived   #9 Renew the passport  personal  done",
             "  needed by  #45 (blocks)",
-            "  budget     200k tokens, 25 iterations, 1h",
+            "  budget     200k tokens, 100 iterations, 1h",
             "  rungs      retry",
             "  history    3 events, 1 evidence",
         ] {
