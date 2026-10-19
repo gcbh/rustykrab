@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.4] - 2026-10-19
+
+- A work item's default turn budget is 100, not 25 (#725)
+
 ## [6.6.3] - 2026-10-17
 
 - Retain native command outcomes for investigations (#708)
