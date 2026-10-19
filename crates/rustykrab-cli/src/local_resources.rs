@@ -151,6 +151,11 @@ impl CodingWorker {
         self.worker = self.worker.with_private_paths(paths);
         self
     }
+    /// Keep the worker's shell off `ports` (`LocalWorker::with_private_ports`).
+    pub(crate) fn with_private_ports(mut self, ports: Vec<u16>) -> Self {
+        self.worker = self.worker.with_private_ports(ports);
+        self
+    }
 }
 #[async_trait]
 impl Worker for CodingWorker {
