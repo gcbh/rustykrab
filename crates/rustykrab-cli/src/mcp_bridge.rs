@@ -12,21 +12,25 @@
 //! - The grant is read from `RUSTYKRAB_MCP_GRANT` alone, never from argv,
 //!   which every process on the machine can read. The daemon is
 //!   `RUSTYKRAB_GATEWAY_URL` (the same default as the other client
-//!   subcommands) and must be a loopback address, and no proxy is used, so
-//!   the grant never leaves this machine.
+//!   subcommands) and must be a loopback address, and no proxy is used nor
+//!   redirect followed, so the grant never leaves this machine.
 //! - Nothing it writes contains the grant: its log lines on stderr (which
 //!   the agent keeps), the errors it answers with and the daemon's replies
 //!   all pass through [`Redactor`].
 //! - Tool calls go to the daemon one at a time, in the order they came: a
 //!   grant runs one call at a time, so calls an agent sends together are
-//!   served in turn rather than refused. Any other message goes at once,
-//!   so a `ping` is answered during a long call.
+//!   served in turn rather than refused, and one the agent cancels while
+//!   it waits is never sent. Any other message goes at once, so a `ping`
+//!   is answered during a long call.
+//! - A line that is not UTF-8 or not JSON is answered with a parse error;
+//!   the bridge reads on.
 //! - A request the daemon refused or could not be reached for is answered
 //!   with a JSON-RPC error; a notification that met one is dropped.
 //! - When the agent closes stdin, the bridge exits without waiting: no one
 //!   is left to read a reply, and the daemon records a call it abandoned
 //!   as ambiguous.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,10 +116,13 @@ impl Bridge {
         );
         // No overall timeout: the daemon clamps every call to the run's
         // deadline and the tool's own cap.
+        // Nothing but the daemon itself is sent the grant: no proxy, and no
+        // redirect followed elsewhere.
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             client,
@@ -147,28 +154,52 @@ impl Bridge {
                 Ok::<_, std::io::Error>(())
             }
         });
+        // The ids of calls the agent cancelled; one still queued is dropped
+        // unsent, as a cancelled request gets no reply.
+        let cancelled = Arc::new(Mutex::new(HashSet::<String>::new()));
         let (calls, mut queued) = mpsc::unbounded_channel::<Value>();
         let serial = tokio::spawn({
-            let (bridge, replies) = (bridge.clone(), replies.clone());
+            let (bridge, replies, cancelled) = (bridge.clone(), replies.clone(), cancelled.clone());
             async move {
                 while let Some(call) = queued.recv().await {
+                    let id = call["id"].to_string();
+                    if cancelled
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id)
+                    {
+                        continue;
+                    }
                     if let Some(reply) = bridge.forward(&call).await {
                         let _ = replies.send(reply);
                     }
                 }
             }
         });
-        let mut lines = BufReader::new(input).lines();
-        while let Some(line) = lines.next_line().await? {
-            let line = line.trim();
-            if line.is_empty() {
+        let mut input = BufReader::new(input);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if input.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            if line.trim_ascii().is_empty() {
                 continue;
             }
-            let Ok(message) = serde_json::from_str::<Value>(line) else {
+            // A line that is not UTF-8, or not JSON, is answered, not fatal.
+            let Ok(message) = serde_json::from_slice::<Value>(&line) else {
                 let _ = replies.send(error(Value::Null, PARSE_ERROR, "not a JSON-RPC message"));
                 continue;
             };
-            if message.get("method").and_then(Value::as_str) == Some("tools/call") {
+            let method = message.get("method").and_then(Value::as_str);
+            if method == Some("notifications/cancelled") {
+                let id = message["params"]["requestId"].to_string();
+                cancelled
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id);
+            }
+            if method == Some("tools/call") {
                 let _ = calls.send(message);
             } else {
                 let (bridge, replies) = (bridge.clone(), replies.clone());

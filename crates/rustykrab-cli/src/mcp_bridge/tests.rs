@@ -11,13 +11,16 @@ const GRANT: &str = "rkmcp_0123456789abcdef0123456789abcdef0123456789abcdef01234
 #[derive(Default)]
 struct Seen {
     headers: Mutex<Vec<Headers>>,
+    calls: AtomicUsize,
     calls_in_flight: AtomicUsize,
     most_calls_in_flight: AtomicUsize,
+    redirected: AtomicUsize,
 }
 
 /// A stand-in for the daemon's MCP route. `leak` is refused with a body
-/// that repeats the presented credential, `echo` answers with it, a
-/// `tools/call` takes a moment, a notification is accepted.
+/// that repeats the presented credential, `echo` answers with it,
+/// `redirect` points elsewhere, a `tools/call` takes a moment, a
+/// notification is accepted.
 async fn stand_in(
     State(seen): State<Arc<Seen>>,
     headers: Headers,
@@ -40,7 +43,9 @@ async fn stand_in(
             .into_response(),
         Some("echo") => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":{"credential":auth}}))
             .into_response(),
+        Some("redirect") => axum::response::Redirect::temporary("/elsewhere").into_response(),
         Some("tools/call") => {
+            seen.calls.fetch_add(1, Ordering::SeqCst);
             let now = seen.calls_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             seen.most_calls_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -55,6 +60,13 @@ async fn daemon() -> (Url, Arc<Seen>) {
     let seen = Arc::new(Seen::default());
     let app = axum::Router::new()
         .route(PATH, axum::routing::post(stand_in))
+        .route(
+            "/elsewhere",
+            axum::routing::post(|State(seen): State<Arc<Seen>>| async move {
+                seen.redirected.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }),
+        )
         .with_state(seen.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -102,10 +114,11 @@ impl Agent {
     }
 
     async fn send(&mut self, message: Value) {
-        self.input
-            .write_all(format!("{message}\n").as_bytes())
-            .await
-            .unwrap();
+        self.send_raw(format!("{message}\n").as_bytes()).await;
+    }
+
+    async fn send_raw(&mut self, bytes: &[u8]) {
+        self.input.write_all(bytes).await.unwrap();
     }
 
     async fn reply(&mut self) -> (String, Value) {
@@ -200,6 +213,65 @@ async fn tool_calls_reach_the_daemon_one_at_a_time_in_order() {
     assert_eq!(ids[0], "ping");
     assert_eq!(ids[1..], [json!(1), json!(2), json!(3)]);
     assert_eq!(seen.most_calls_in_flight.load(Ordering::SeqCst), 1);
+    agent.close().await;
+}
+
+#[tokio::test]
+async fn a_bad_line_is_answered_and_the_bridge_reads_on() {
+    let (base, _) = daemon().await;
+    let mut agent = Agent::start(&base, Captured::default());
+    // Not UTF-8, then not JSON: each answered, neither fatal.
+    for bad in [&b"\xff\xfe{}\n"[..], b"{not json\n"] {
+        agent.send_raw(bad).await;
+        let (_, refused) = agent.reply().await;
+        assert_eq!(refused["error"]["code"], PARSE_ERROR);
+        assert_eq!(refused["id"], Value::Null);
+    }
+    agent
+        .send(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .await;
+    assert_eq!(agent.reply().await.1["id"], 1);
+    agent.close().await;
+}
+
+#[tokio::test]
+async fn a_redirect_is_not_followed() {
+    let (base, seen) = daemon().await;
+    let mut agent = Agent::start(&base, Captured::default());
+    agent
+        .send(json!({"jsonrpc":"2.0","id":1,"method":"redirect"}))
+        .await;
+    let (line, refused) = agent.reply().await;
+    assert_eq!(refused["error"]["code"], SERVER_ERROR, "{line}");
+    assert!(line.contains("HTTP 307"), "{line}");
+    assert_eq!(seen.redirected.load(Ordering::SeqCst), 0);
+    agent.close().await;
+}
+
+#[tokio::test]
+async fn a_call_cancelled_while_queued_is_never_sent() {
+    let (base, seen) = daemon().await;
+    let mut agent = Agent::start(&base, Captured::default());
+    for id in 1..=3 {
+        agent
+            .send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"work_status"}}))
+            .await;
+    }
+    // Call 1 is at the daemon and 2 and 3 wait behind it; 3 is cancelled.
+    agent
+        .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}))
+        .await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(agent.reply().await.1["id"].clone());
+    }
+    assert_eq!(ids, [json!(1), json!(2)]);
+    // The next reply answers the next request, not the cancelled call.
+    agent
+        .send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
+        .await;
+    assert_eq!(agent.reply().await.1["id"], 4);
+    assert_eq!(seen.calls.load(Ordering::SeqCst), 2);
     agent.close().await;
 }
 
