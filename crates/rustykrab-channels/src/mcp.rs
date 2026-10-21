@@ -3,10 +3,6 @@
 //! Speaks JSON-RPC 2.0 to a child process's stdin/stdout. Designed to be
 //! transport-agnostic but currently implements the stdio transport used by
 //! most MCP servers (including hyperframes).
-//!
-//! Its wire types are also what the gateway's MCP route (`/api/mcp`)
-//! answers a native agent with, so an unset optional field is left out
-//! rather than sent as `null`, which MCP clients reject.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +19,6 @@ use tracing;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDef {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value,
@@ -34,11 +29,11 @@ pub struct McpToolDef {
 pub struct McpContent {
     #[serde(rename = "type")]
     pub content_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub data: Option<String>,
-    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mimeType", default)]
     pub mime_type: Option<String>,
 }
 
@@ -53,11 +48,11 @@ pub struct McpToolResult {
 /// Server capabilities returned during initialization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tools: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub resources: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub prompts: Option<Value>,
 }
 
@@ -68,11 +63,7 @@ pub struct InitializeResult {
     pub protocol_version: String,
     #[serde(default)]
     pub capabilities: ServerCapabilities,
-    #[serde(
-        default,
-        rename = "serverInfo",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "serverInfo")]
     pub server_info: Option<Value>,
 }
 

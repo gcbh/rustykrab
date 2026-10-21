@@ -2,43 +2,48 @@
 //! (`docs/plans/native-mcp-host-tools.md`, rollout step 1).
 //!
 //! A native run whose brief needs a host tool is minted a grant: a random
-//! bearer token bound to one work item, one run and one actor
-//! (`worker:<name>`), the tools the run may call, an expiry at the run's
-//! wall deadline and a call quota. The gateway's MCP route resolves the
-//! token here, and every call runs here, in the daemon, under
-//! `WORK_RUN_CONTEXT` bound to the grant's item and actor, so the scope
-//! comes from the grant, never from the agent's arguments, and credentials
-//! never leave the daemon.
+//! bearer token bound to one work item, the run's conversation and one
+//! actor (`worker:<name>`), the tools the run may call, an expiry at the
+//! run's wall deadline and a call quota. The gateway's MCP route resolves
+//! the token here, and every call runs here, in the daemon, under
+//! `WORK_RUN_CONTEXT` and `SESSION_TOOL_CONTEXT` bound to the grant as the
+//! host half binds them for a local run, so the scope comes from the grant,
+//! never from the agent's arguments, and credentials never leave the
+//! daemon.
 //!
 //! Each grant keeps its own record of what was called and how each call
 //! ended, so observation is isolated per grant, and with it per item, run
 //! and generation: a call is recorded only on the grant it was made on, a
 //! record is sealed when its grant is revoked (a late result is dropped,
-//! never carried into the next run's record), and a record attests only
-//! the run it was minted for.
+//! never carried into the next run's record), and only the grant itself
+//! attests a report, when its minter finishes it.
 //!
 //! Admission is atomic: the grant must be live (not revoked, not past its
-//! deadline), the tool granted (a read-only review's grant carries none),
-//! the quota unspent (every attempt counts, whichever connection made it),
-//! and no other call in flight. A retry id (the bridge's session and the
-//! JSON-RPC id) repeats its first call's answer, or is refused under a
-//! different call. A call runs until the grant's deadline or the tool's
-//! own cap, whichever is first. Revocation or expiry cancels what is in
-//! flight, but cannot undo what it already did, so that call is recorded
-//! as ambiguous rather than as done or not done.
+//! deadline) and its run not ended, the quota unspent (every attempt
+//! counts, whichever connection made it), the request id new (the bridge's
+//! session and the JSON-RPC id; a reused one is refused, never replayed),
+//! the tool granted (a read-only review's grant carries none), and no other
+//! call in flight. A call runs until the grant's deadline or the tool's own
+//! cap, whichever is first. Revocation or expiry cancels what is in flight,
+//! but cannot undo what it already did, so that call is recorded as
+//! ambiguous rather than as done or not done. A call that ends a worker run
+//! on the host half (a question that parked the item) ends this run too:
+//! no call is admitted after it, and the minter is told.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use rustykrab_core::active_tools::{ActiveToolsRegistry, SessionToolContext, SESSION_TOOL_CONTEXT};
+use rustykrab_core::capability::CapabilitySet;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::work::{ArtifactRef, ResultReport, WorkItemId};
-use rustykrab_core::{Error, Result, Tool};
+use rustykrab_core::Tool;
 use rustykrab_tools::work_backend::{WorkBackend, WorkRunContext, WORK_RUN_CONTEXT};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -54,9 +59,9 @@ pub const MCP_CALL: &str = "mcp_call";
 /// still has to keep it out.
 const TOKEN_PREFIX: &str = "rkmcp_";
 
-/// What a retry of a call that never finished is told.
-const UNKNOWN_EFFECT: &str =
-    "the call was cancelled before it finished; whether it took effect is unknown";
+/// What a call that ended the run tells the agent, beside its result.
+const RUN_ENDED: &str = "This run has ended: the item waits for the answer. Call no more tools; \
+                         write your final report now and stop.";
 
 /// The tools a native agent is granted first: `work_status`, `work_file`
 /// and the question tools, over `backend`. A native run reports with its
@@ -73,8 +78,8 @@ pub fn work_tools(backend: Arc<dyn WorkBackend>) -> Vec<Arc<dyn Tool>> {
 /// What a grant is minted with.
 pub struct GrantSpec {
     pub item: WorkItemId,
-    /// The controller's run id.
-    pub run: String,
+    /// The run's conversation, which the work tools file and route under.
+    pub conversation: Uuid,
     /// The event actor its calls are made as, `worker:<name>`.
     pub actor: String,
     /// A read-only review: the grant carries no tools, whatever `tools` says.
@@ -108,9 +113,9 @@ impl fmt::Debug for GrantToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallOutcome {
-    /// It ran and its result reports no error.
+    /// It ran and its result reports no error or refusal.
     Ok,
-    /// It ran and failed, or its result reports an error.
+    /// It ran and failed, or its result reports an error or a refusal.
     Failed,
     /// It was refused before running: outside the grant.
     Denied,
@@ -126,40 +131,16 @@ pub struct CallObservation {
     pub outcome: CallOutcome,
 }
 
-/// What a run did with its grant, returned when the grant is revoked.
+/// What a run did with its grant, returned when the grant is finished.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GrantRecord {
-    pub item: WorkItemId,
-    pub run: String,
-    pub generation: Uuid,
     /// When the bridge's `initialize` and `tools/list` had both reached the
     /// route. Reachability only: any holder of the grant could have sent
     /// them, so it never proves the agent made a call.
     pub bridge_connected: Option<DateTime<Utc>>,
+    /// The summary of the call that ended the run, if one did.
+    pub ended: Option<String>,
     pub calls: Vec<CallObservation>,
-}
-
-impl GrantRecord {
-    /// Attest `report`, the result of `run` on `item`: drop every
-    /// [`MCP_CALL`] artifact the agent wrote and add one per call this
-    /// grant observed. A record attests only the run it was minted for.
-    pub fn attest(&self, item: &str, run: &str, report: &mut ResultReport) -> Result<()> {
-        if self.item != item || self.run != run {
-            return Err(Error::Auth(
-                "an MCP grant's calls attest only the run it was minted for".into(),
-            ));
-        }
-        report
-            .artifacts
-            .retain(|artifact| artifact.kind != MCP_CALL);
-        for call in &self.calls {
-            report.artifacts.push(ArtifactRef {
-                kind: MCP_CALL.into(),
-                value: serde_json::to_string(call).expect("serializable observation"),
-            });
-        }
-        Ok(())
-    }
 }
 
 /// Why a request on a grant was not answered with a tool result.
@@ -168,16 +149,16 @@ pub enum CallError {
     /// No live grant has this token: never minted, revoked, or past its
     /// deadline.
     NotLive,
-    /// The tool is not one the grant carries.
+    /// The tool is not one the grant carries (a review's carries none).
     NotGranted,
-    /// The grant is a read-only review's, which carries no tools.
-    ReadOnly,
     /// The run has attempted as many calls as its quota allows.
     QuotaSpent,
     /// Another call on the grant is still in flight.
     Busy,
-    /// The retry id was first used for a different call.
-    ConflictingRetry,
+    /// The request id was already used in this session.
+    RepeatedId,
+    /// An earlier call ended the run.
+    Ended,
     /// The grant was revoked or expired while the call ran.
     Cancelled,
 }
@@ -187,12 +168,12 @@ impl fmt::Display for CallError {
         f.write_str(match self {
             Self::NotLive => "this run's RustyKrab grant is not live: it was revoked or expired",
             Self::NotGranted => "this tool is not granted to this run",
-            Self::ReadOnly => "a read-only review is granted no RustyKrab tools",
             Self::QuotaSpent => "this run has used all of its RustyKrab tool calls",
             Self::Busy => {
                 "another RustyKrab tool call of this run is still running; one runs at a time"
             }
-            Self::ConflictingRetry => "this request id was already used for a different call",
+            Self::RepeatedId => "this request id was already used; a call is sent once",
+            Self::Ended => RUN_ENDED,
             Self::Cancelled => {
                 "the run's grant was revoked or expired during the call; \
                  whether it took effect is unknown"
@@ -221,21 +202,30 @@ impl McpGrants {
             Uuid::new_v4().simple(),
             Uuid::new_v4().simple()
         ));
-        let (revoked, _) = watch::channel(false);
+        let tools = if spec.read_only {
+            Vec::new()
+        } else {
+            spec.tools
+        };
         let live = Arc::new(Live {
-            item: spec.item,
-            run: spec.run,
-            actor: spec.actor,
-            generation: Uuid::new_v4(),
-            read_only: spec.read_only,
-            tools: if spec.read_only {
-                Vec::new()
-            } else {
-                spec.tools
+            binding: WorkRunContext {
+                item: spec.item,
+                actor: spec.actor,
             },
+            // The run's conversation, and nothing a call could load or grow.
+            session: SessionToolContext {
+                conversation_id: spec.conversation,
+                capabilities: Arc::new(CapabilitySet::none()),
+                all_tools: Arc::new(tools.clone()),
+                active_tools: Arc::new(ActiveToolsRegistry::new()),
+                recall: Arc::default(),
+                todos: Arc::default(),
+            },
+            tools,
             deadline: spec.deadline,
             quota: spec.quota,
-            revoked,
+            revoked: watch::channel(false).0,
+            ended: watch::channel(None).0,
             state: Mutex::new(State::default()),
         });
         self.map().insert(token.0.clone(), live.clone());
@@ -269,34 +259,29 @@ impl McpGrants {
             .collect())
     }
 
-    /// Call `name` on the grant (`tools/call`). `retry` identifies the
-    /// request across retries of it. The outer error is a refusal or a
-    /// cancellation; the inner one is the tool's own failure.
+    /// Call `name` on the grant (`tools/call`) under request id `id`. The
+    /// outer error is a refusal or a cancellation; the inner one is a
+    /// failure the agent reads as the tool's result.
     pub async fn call(
         &self,
         token: &str,
-        retry: &str,
+        id: &str,
         name: &str,
         args: Value,
     ) -> std::result::Result<std::result::Result<Value, String>, CallError> {
         let live = self.live_grant(token)?;
-        let (tool, mut revoked) = match live.admit(retry, name, &args)? {
-            Admission::Answered(answer) => return Ok(answer),
-            Admission::Run(tool, revoked) => (tool, revoked),
-        };
+        let (tool, mut revoked) = live.admit(id, name)?;
         let call = InFlight {
             live: &live,
-            key: retry.to_string(),
             tool: name.to_string(),
             settled: false,
         };
         let cap = Duration::from_secs(tool_cap_secs(name, &tool.sandbox_requirements()));
         let until = live.deadline.min(Instant::now() + cap);
-        let binding = WorkRunContext {
-            item: live.item.clone(),
-            actor: live.actor.clone(),
-        };
-        let execute = WORK_RUN_CONTEXT.scope(binding, tool.execute(args));
+        let execute = SESSION_TOOL_CONTEXT.scope(
+            live.session.clone(),
+            WORK_RUN_CONTEXT.scope(live.binding.clone(), tool.execute(args)),
+        );
         let finished = tokio::select! {
             biased;
             _ = revoked.wait_for(|revoked| *revoked) => None,
@@ -314,8 +299,26 @@ impl McpGrants {
                 Err(CallError::Cancelled)
             };
         };
-        let answer = result.map_err(|e| e.to_string());
-        if call.settle(Some(answer.clone())) {
+        // One judgement of success, for the record and for the agent.
+        let mut ended = None;
+        let answer = match result {
+            Ok(mut value) => match rustykrab_tools::worker_run_end_summary(name, &value) {
+                Some(summary) => {
+                    value["next"] = json!(RUN_ENDED);
+                    ended = Some(summary);
+                    Ok(value)
+                }
+                None if succeeded(&value) => Ok(value),
+                None => Err(value.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let outcome = if answer.is_ok() {
+            CallOutcome::Ok
+        } else {
+            CallOutcome::Failed
+        };
+        if call.settle(outcome, ended) {
             Ok(answer)
         } else {
             // Revoked as it finished: the record was sealed without it.
@@ -349,9 +352,39 @@ impl McpGrant {
         &self.token
     }
 
-    /// Revoke the grant and return what its run did with it.
-    pub fn finish(self) -> GrantRecord {
-        self.revoke()
+    /// Resolves, with its summary, when a call ends the run (a question
+    /// that parked the item): the run's agent should be stopped then.
+    pub async fn ended(&self) -> String {
+        let mut ended = self.live.ended.subscribe();
+        let summary = match ended.wait_for(Option::is_some).await {
+            Ok(summary) => summary.clone(),
+            Err(_) => None,
+        };
+        match summary {
+            Some(summary) => summary,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Revoke the grant and return what its run did with it, attesting
+    /// `report`, the run's own result, when there is one: every
+    /// [`MCP_CALL`] artifact the agent wrote is replaced by one per call
+    /// this grant observed. Only the grant attests, so no other run's
+    /// record can.
+    pub fn finish(self, report: Option<&mut ResultReport>) -> GrantRecord {
+        let record = self.revoke();
+        if let Some(report) = report {
+            report
+                .artifacts
+                .retain(|artifact| artifact.kind != MCP_CALL);
+            report
+                .artifacts
+                .extend(record.calls.iter().map(|call| ArtifactRef {
+                    kind: MCP_CALL.into(),
+                    value: serde_json::to_string(call).expect("serializable observation"),
+                }));
+        }
+        record
     }
 
     fn revoke(&self) -> GrantRecord {
@@ -367,15 +400,14 @@ impl Drop for McpGrant {
 }
 
 struct Live {
-    item: WorkItemId,
-    run: String,
-    actor: String,
-    generation: Uuid,
-    read_only: bool,
+    binding: WorkRunContext,
+    session: SessionToolContext,
     tools: Vec<Arc<dyn Tool>>,
     deadline: Instant,
     quota: u32,
     revoked: watch::Sender<bool>,
+    /// The summary of the call that ended the run.
+    ended: watch::Sender<Option<String>>,
     state: Mutex<State>,
 }
 
@@ -383,26 +415,14 @@ struct Live {
 struct State {
     sealed: bool,
     attempts: u32,
-    /// The retry id and tool of the call in flight.
-    in_flight: Option<(String, String)>,
-    retries: HashMap<String, Retry>,
+    /// Every request id used.
+    ids: HashSet<String>,
+    /// The tool of the call in flight.
+    in_flight: Option<String>,
     calls: Vec<CallObservation>,
     initialized: bool,
     listed: bool,
     connected: Option<DateTime<Utc>>,
-}
-
-/// A call under one retry id, and its answer once it has one.
-struct Retry {
-    tool: String,
-    args: Value,
-    answer: Option<std::result::Result<Value, String>>,
-}
-
-enum Admission {
-    /// A retry of a call that already has its answer.
-    Answered(std::result::Result<Value, String>),
-    Run(Arc<dyn Tool>, watch::Receiver<bool>),
 }
 
 impl Live {
@@ -423,31 +443,28 @@ impl Live {
         }
         if state.initialized && state.listed && state.connected.is_none() && !state.sealed {
             state.connected = Some(Utc::now());
-            tracing::info!(item = %self.item, run = %self.run, "a native agent's MCP bridge connected");
+            tracing::info!(item = %self.binding.item, conversation = %self.session.conversation_id,
+                "a native agent's MCP bridge connected");
         }
     }
 
     fn admit(
         &self,
-        retry: &str,
+        id: &str,
         name: &str,
-        args: &Value,
-    ) -> std::result::Result<Admission, CallError> {
+    ) -> std::result::Result<(Arc<dyn Tool>, watch::Receiver<bool>), CallError> {
         let mut state = self.lock();
         if state.sealed || Instant::now() >= self.deadline {
             return Err(CallError::NotLive);
         }
-        if let Some(earlier) = state.retries.get(retry) {
-            if earlier.tool != name || earlier.args != *args {
-                return Err(CallError::ConflictingRetry);
-            }
-            return match &earlier.answer {
-                Some(answer) => Ok(Admission::Answered(answer.clone())),
-                None => Err(CallError::Busy),
-            };
+        if self.ended.borrow().is_some() {
+            return Err(CallError::Ended);
         }
         if state.attempts >= self.quota {
             return Err(CallError::QuotaSpent);
+        }
+        if !state.ids.insert(id.to_string()) {
+            return Err(CallError::RepeatedId);
         }
         state.attempts += 1;
         let Some(tool) = self
@@ -460,57 +477,30 @@ impl Live {
                 tool: name.chars().take(80).collect(),
                 outcome: CallOutcome::Denied,
             });
-            return Err(if self.read_only {
-                CallError::ReadOnly
-            } else {
-                CallError::NotGranted
-            });
+            return Err(CallError::NotGranted);
         };
         if state.in_flight.is_some() {
             return Err(CallError::Busy);
         }
-        state.in_flight = Some((retry.to_string(), name.to_string()));
-        state.retries.insert(
-            retry.to_string(),
-            Retry {
-                tool: name.to_string(),
-                args: args.clone(),
-                answer: None,
-            },
-        );
-        Ok(Admission::Run(tool.clone(), self.revoked.subscribe()))
+        state.in_flight = Some(name.to_string());
+        Ok((tool.clone(), self.revoked.subscribe()))
     }
 
-    /// Record how the call under `retry` ended (`None`: it did not), unless
-    /// the grant was sealed first. Says whether it was recorded.
-    fn settle(
-        &self,
-        retry: &str,
-        tool: &str,
-        answer: Option<std::result::Result<Value, String>>,
-    ) -> bool {
+    /// Record how the call in flight ended, and the run's end if it ended
+    /// it, unless the grant was sealed first. Says whether it was recorded.
+    fn settle(&self, tool: &str, outcome: CallOutcome, ended: Option<String>) -> bool {
         let mut state = self.lock();
-        if state
-            .in_flight
-            .as_ref()
-            .is_some_and(|(key, _)| key == retry)
-        {
-            state.in_flight = None;
-        }
+        state.in_flight = None;
         if state.sealed {
             return false;
         }
-        let outcome = match &answer {
-            None => CallOutcome::Ambiguous,
-            Some(Ok(value)) if succeeded(value) => CallOutcome::Ok,
-            Some(_) => CallOutcome::Failed,
-        };
         state.calls.push(CallObservation {
             tool: tool.to_string(),
             outcome,
         });
-        if let Some(earlier) = state.retries.get_mut(retry) {
-            earlier.answer = Some(answer.unwrap_or_else(|| Err(UNKNOWN_EFFECT.into())));
+        if let Some(summary) = ended {
+            tracing::info!(item = %self.binding.item, %summary, "a native agent's MCP call ended its run");
+            self.ended.send_replace(Some(summary));
         }
         true
     }
@@ -521,7 +511,7 @@ impl Live {
         let mut state = self.lock();
         if !state.sealed {
             state.sealed = true;
-            if let Some((_, tool)) = state.in_flight.take() {
+            if let Some(tool) = state.in_flight.take() {
                 state.calls.push(CallObservation {
                     tool,
                     outcome: CallOutcome::Ambiguous,
@@ -529,10 +519,8 @@ impl Live {
             }
         }
         let record = GrantRecord {
-            item: self.item.clone(),
-            run: self.run.clone(),
-            generation: self.generation,
             bridge_connected: state.connected,
+            ended: self.ended.borrow().clone(),
             calls: state.calls.clone(),
         };
         drop(state);
@@ -545,30 +533,32 @@ impl Live {
 /// timed out, or its request abandoned), it is recorded as ambiguous.
 struct InFlight<'a> {
     live: &'a Live,
-    key: String,
     tool: String,
     settled: bool,
 }
 
 impl InFlight<'_> {
-    fn settle(mut self, answer: Option<std::result::Result<Value, String>>) -> bool {
+    fn settle(mut self, outcome: CallOutcome, ended: Option<String>) -> bool {
         self.settled = true;
-        self.live.settle(&self.key, &self.tool, answer)
+        self.live.settle(&self.tool, outcome, ended)
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.live.settle(&self.key, &self.tool, None);
+            self.live.settle(&self.tool, CallOutcome::Ambiguous, None);
         }
     }
 }
 
-/// Whether a tool's result reports success, read the way the host half's
-/// integration observation reads it.
+/// Whether a tool's result reports success: no error (the host half's
+/// integration observation reads it the same way) and no refusal (the
+/// work tools refuse with `outcome: rejected`).
 fn succeeded(value: &Value) -> bool {
-    value.get("error").is_none_or(Value::is_null) && value["is_error"] != Value::Bool(true)
+    value.get("error").is_none_or(Value::is_null)
+        && value["is_error"] != Value::Bool(true)
+        && value["outcome"] != "rejected"
 }
 
 #[cfg(test)]
