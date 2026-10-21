@@ -1027,8 +1027,10 @@ impl OllamaProvider {
     /// Map an HTTP status code to a specific error variant (#186).
     fn map_status_error(status: reqwest::StatusCode, body: &str) -> Error {
         // Ollama answers 500 when it cannot parse the model's own output as a
-        // tool call. Typed, so the agent loop can tell the model rather than
-        // resend a request that would fail the same way.
+        // tool call (or, once a stream has started, streams the same body as
+        // a line; `chat_stream` classifies that here too). Typed, so the
+        // agent loop can tell the model rather than resend a request that
+        // would fail the same way.
         if status.as_u16() == 500
             && [
                 "XML syntax error",
@@ -1360,9 +1362,44 @@ impl ModelProvider for OllamaProvider {
                     continue;
                 }
 
-                let stream_chunk: OllamaStreamChunk = serde_json::from_str(line).map_err(|e| {
-                    Error::ModelProvider(format!("failed to parse Ollama stream chunk: {e}"))
-                })?;
+                let stream_chunk: OllamaStreamChunk = match serde_json::from_str(line) {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        let Ok(OllamaStreamError { error }) = serde_json::from_str(line) else {
+                            return Err(Error::ModelProvider(format!(
+                                "failed to parse Ollama stream chunk: {e}"
+                            )));
+                        };
+                        // Once a stream has started Ollama can no longer
+                        // answer with a status, so it reports a failure as a
+                        // line of its own and ends the stream. Before the
+                        // first chunk the same failure would have been a 500
+                        // with this body, and it is classified as one: a tool
+                        // call Ollama could not parse is the model's to fix,
+                        // a crashed runner stays a provider error. Unlike
+                        // that 500 it is not resent here: text may already
+                        // have streamed, and a second attempt would stream
+                        // its own after it.
+                        //
+                        // What arrived before the error is dropped with it.
+                        // The reply was cut off: as a finished turn its text
+                        // would stop mid-sentence, and the tool calls already
+                        // parsed would run without the one that broke. Text
+                        // already passed to `on_event` stays shown.
+                        tracing::warn!(
+                            model = %self.model,
+                            error = %error,
+                            chunks_received,
+                            accumulated_text_len = full_text.len(),
+                            tool_calls_dropped = tool_calls.len(),
+                            "Ollama reported an error mid-stream"
+                        );
+                        return Err(Self::map_status_error(
+                            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                            line,
+                        ));
+                    }
+                };
 
                 if let Some(ref content) = stream_chunk.message.content {
                     if !content.is_empty() {
@@ -1536,6 +1573,13 @@ struct OllamaStreamChunk {
     prompt_eval_count: Option<u32>,
     #[serde(default)]
     eval_count: Option<u32>,
+}
+
+/// The line Ollama streams in place of a chunk when a reply fails after the
+/// stream has started: `{"error": "..."}` and nothing else.
+#[derive(Deserialize)]
+struct OllamaStreamError {
+    error: String,
 }
 
 #[derive(Deserialize)]
