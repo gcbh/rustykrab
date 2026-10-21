@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.5] - 2026-10-21
+
+- fix(deps): take the patched rustls-webpki and webpki roots (#728)
+
 ## [6.6.4] - 2026-10-19
 
 - A work item's default turn budget is 100, not 25 (#725)
