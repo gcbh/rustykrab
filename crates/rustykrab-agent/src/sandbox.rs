@@ -35,6 +35,22 @@ pub fn tool_timeout_secs(tool_name: &str) -> Option<u64> {
     }
 }
 
+/// How long one call of a tool may run: its own timeout when it has one,
+/// else the network-aware default. The runner bounds a call with it, and
+/// so does a native agent's call over MCP (`mcp_grants`).
+pub fn tool_cap_secs(tool_name: &str, requirements: &SandboxRequirements) -> u64 {
+    if let Some(secs) = tool_timeout_secs(tool_name) {
+        secs
+    } else if requirements.needs_net_discovery {
+        // Raw-net-discovery tools (arp-scan, nmap) still get the full 300s.
+        300
+    } else if requirements.needs_net {
+        DEFAULT_NET_TOOL_TIMEOUT_SECS
+    } else {
+        SandboxPolicy::default().timeout_secs
+    }
+}
+
 /// Policy that controls what a sandboxed tool execution can do.
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {

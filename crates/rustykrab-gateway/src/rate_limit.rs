@@ -320,6 +320,16 @@ pub async fn rate_limit_middleware(
         return Ok(next.run(request).await);
     }
 
+    // A native run's live grant on its own route is not a guess either; its
+    // quota and its one call in flight are what bound it.
+    if path == crate::mcp_route::PATH
+        && bearer
+            .as_deref()
+            .is_some_and(|grant| state.mcp_grants.is_live(grant))
+    {
+        return Ok(next.run(request).await);
+    }
+
     let client_ip = extract_client_ip(&request, addr.ip());
 
     if !state.rate_limiter.check(client_ip) {

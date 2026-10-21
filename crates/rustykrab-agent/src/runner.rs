@@ -125,7 +125,7 @@ const DEFAULT_ACTIVE_TOOLS: &[&str] = &[
 ];
 
 use crate::compaction::{CompactionConfig, CompactionStrategy};
-use crate::sandbox::{tool_timeout_secs, Sandbox, SandboxPolicy, DEFAULT_NET_TOOL_TIMEOUT_SECS};
+use crate::sandbox::{tool_cap_secs, Sandbox, SandboxPolicy};
 use crate::trace::{ExecutionTracer, ToolTrace};
 
 /// Tool names whose output comes from external/untrusted sources (web pages,
@@ -4680,16 +4680,7 @@ pub(crate) async fn execute_single_tool(
     // Per-tool timeout takes precedence over the requirements-based default.
     // The blanket 300s was the root cause of the 15-min silences seen in
     // production: a single hung browser call would burn the full window.
-    // Raw-net-discovery tools (arp-scan, nmap) still get the full 300s.
-    let policy_timeout = if let Some(secs) = tool_timeout_secs(&call.name) {
-        secs
-    } else if requirements.needs_net_discovery {
-        300
-    } else if requirements.needs_net {
-        DEFAULT_NET_TOOL_TIMEOUT_SECS
-    } else {
-        SandboxPolicy::default().timeout_secs
-    };
+    let policy_timeout = tool_cap_secs(&call.name, &requirements);
 
     let policy = SandboxPolicy {
         allow_fs_read: capabilities.has(&Capability::FileRead),

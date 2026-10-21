@@ -28,5 +28,7 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time for the MCP grants' deadline and cap tests.
+tokio = { workspace = true, features = ["test-util"] }
 # The reminder eval example (examples/reminder_eval.rs) logs the runner to a file.
 tracing-subscriber.workspace = true

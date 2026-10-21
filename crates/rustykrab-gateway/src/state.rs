@@ -90,6 +90,10 @@ pub struct AppState {
     pub briefing_vault: Option<Arc<rustykrab_store::briefing_vault::BriefingVault>>,
     /// Host-cached registered infrastructure observations.
     pub resources: Option<Arc<dyn crate::resources::ResourceObserver>>,
+    /// The native runs' live grants, which `POST /api/mcp` resolves and
+    /// calls through. Empty until the composition root shares the store its
+    /// workers mint into: the route then refuses every token.
+    pub mcp_grants: Arc<rustykrab_agent::mcp_grants::McpGrants>,
 
     // --- Outbound channels, delivered to by the webhook routes ---
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -129,6 +133,7 @@ impl AppState {
             build: BuildInfo::default(),
             briefing_vault: None,
             resources: None,
+            mcp_grants: Arc::default(),
             telegram: None,
             signal: None,
             slack: None,
@@ -279,6 +284,13 @@ impl AppState {
     /// Report `build` from `GET /api/version`.
     pub fn with_build_info(mut self, build: BuildInfo) -> Self {
         self.build = build;
+        self
+    }
+
+    /// Resolve `POST /api/mcp`'s grants in `grants`, the store the native
+    /// workers mint into.
+    pub fn with_mcp_grants(mut self, grants: Arc<rustykrab_agent::mcp_grants::McpGrants>) -> Self {
+        self.mcp_grants = grants;
         self
     }
 

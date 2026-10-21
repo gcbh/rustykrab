@@ -6,6 +6,7 @@ mod file_scope;
 pub mod harness;
 pub mod local_model;
 pub mod local_worker;
+pub mod mcp_grants;
 mod metered;
 mod native_observation;
 pub mod peer_worker;
@@ -34,7 +35,7 @@ pub use runner::{
     LlmTriggerStrategy, OnMessageCallback, NOT_CALLABLE,
 };
 pub use sandbox::{
-    tool_timeout_secs, NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy,
+    tool_cap_secs, tool_timeout_secs, NoSandbox, ProcessSandbox, Sandbox, SandboxPolicy,
     DEFAULT_NET_TOOL_TIMEOUT_SECS,
 };
 pub use subagent::SubagentRunner;

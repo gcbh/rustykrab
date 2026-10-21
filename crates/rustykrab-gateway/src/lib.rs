@@ -3,6 +3,7 @@ mod briefing_routes;
 mod credential_page;
 pub mod evaluate_routes;
 pub mod logging;
+pub mod mcp_route;
 pub mod monitor_routes;
 pub mod origin;
 mod payment_page;
@@ -87,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .merge(worker_routes::routes())
         .merge(evaluate_routes::routes())
         .merge(question_routes::routes())
+        .merge(mcp_route::routes())
         .merge(telegram_webhook::telegram_routes())
         .merge(signal_webhook::signal_routes())
         .merge(credential_page::routes())
