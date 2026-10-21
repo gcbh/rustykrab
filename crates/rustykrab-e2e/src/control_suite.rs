@@ -38,7 +38,10 @@
 //! Claude Code stand-in executable from `fixture_repo.rs`; scenario 8 boots
 //! a second scripted daemon as the peer. The fleet scenarios outside the
 //! plan's numbering (`fleet_scenarios`) boot their own daemon when their
-//! premise is a daemon setting, such as `RUSTYKRAB_LOCAL_WORKER=off`.
+//! premise is a daemon setting, such as `RUSTYKRAB_LOCAL_WORKER=off`. The
+//! MCP bridge's (`control_suite/mcp.rs`) serves the gateway's router in
+//! process instead and starts the daemon binary's `mcp-bridge` itself,
+//! until the native worker mints the grants a booted daemon would hand it.
 //!
 //! # Wire assumptions
 //!
@@ -87,6 +90,7 @@
 //!   `delegated_tasks` columns `work_item_id`, `status` and `attempts`,
 //!   which scenario 8 reads from the peer's store.
 
+mod mcp;
 mod script;
 mod wire;
 
@@ -307,6 +311,13 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
             (
                 "control/capability-proof-a-build-counts-once-its-operation-works-on-the-executor",
                 |ctx| Box::pin(capability_proof(ctx)),
+            ),
+        ),
+        (
+            Expected::Pass,
+            (
+                "control/native-agent-calls-a-granted-host-tool-through-the-mcp-bridge",
+                |ctx| Box::pin(mcp::native_agent_through_the_bridge(ctx)),
             ),
         ),
     ]

@@ -4276,6 +4276,7 @@ dependencies = [
  "rusqlite",
  "rustykrab-agent",
  "rustykrab-core",
+ "rustykrab-gateway",
  "rustykrab-providers",
  "rustykrab-store",
  "rustykrab-tools",
