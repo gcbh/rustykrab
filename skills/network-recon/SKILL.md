@@ -201,7 +201,8 @@ ssh -o BatchMode=yes user@192.168.1.1 'cat /tmp/dnsmasq.leases'
 - CLI output is plain text. Parse structured fields (JSON, key=value) directly;
   for free-form output, extract the relevant lines with `grep`/`awk` via pipes
   in the same `exec` call rather than multiple round-trips.
-- `exec` truncates output at 100 KB — pre-filter with `head`, `grep -c`, or
+- `exec` returns at most 30 KB of output (head and tail; the whole output is
+  saved to a file the result names) — pre-filter with `head`, `grep -c`, or
   `wc -l` when a scan could produce more.
 - `exec` timeout defaults to 120 s, max 600 s. For full-port `nmap` scans set
   `timeout_secs` explicitly.
