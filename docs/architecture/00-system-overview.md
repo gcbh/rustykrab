@@ -426,3 +426,16 @@ The existing controller, work ledger, read-only review jobs and evidence gates
 retain their responsibilities. This adds no crate, persistence schema, authority
 grant or execution queue. The [operational review](../verification/agent-agency-review-2026-10-14.md)
 records where running recovery still differs from the design.
+
+## Answer submission and message state (base 9f717f7)
+
+Owner answers are acknowledged through a durable receipt on their existing
+question before the scheduling lock is acquired. The controller later commits
+answer, work effects and receipt completion together; transport receipt and work
+progress are separate observable facts. The discussion updates that same sent
+message, reconciles uncertain delivery and retries with a stable identity.
+Periodic project-handoff reconstruction is prepared outside the command lock,
+reuses project history within that preparation and applies only still-current
+results. Actual execution revalidates its own context before a lease. The
+existing work graph, question record and event ledger retain authority and
+durability; there is no additional scheduling queue or inference path.

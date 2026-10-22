@@ -626,3 +626,206 @@ async fn accumulated_project_history_does_not_overflow_a_small_execution_slice()
         context
     );
 }
+
+#[tokio::test]
+async fn background_handoff_preparation_uses_no_command_lock_and_stale_results_do_not_release_work()
+{
+    use crate::handle::ControlHandle;
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().to_owned()),
+            ..Default::default()
+        },
+        vec![],
+    );
+    let planning = project(&h, &repo).await;
+    let item = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "deferred",
+            Some(planning.project.id),
+        ))
+        .await;
+    h.ctl
+        .hold_context(
+            &h.store().work_get(&item).await.unwrap().unwrap(),
+            "historical context limit".into(),
+        )
+        .await
+        .unwrap();
+    let busy = h.ctl.loop_lock.lock().await;
+    let checked = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.ctl.prepare_handoff_rechecks(),
+    )
+    .await
+    .expect("history preparation must not acquire the command lock")
+    .unwrap();
+    drop(busy);
+    h.ctl
+        .comment(
+            &item,
+            "Owner direction changed during preparation",
+            "user:owner",
+        )
+        .await
+        .unwrap();
+    let waiting = h.ctl.waiting_questions().await.unwrap();
+    let mut batch = super::super::batch::Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    assert!(h
+        .ctl
+        .recover_project_context_holds(&mut batch, &waiting, checked)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    h.clock.advance(TimeDelta::seconds(31));
+    let fresh = h.ctl.prepare_handoff_rechecks().await.unwrap();
+    let mut batch = super::super::batch::Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    assert_eq!(
+        h.ctl
+            .recover_project_context_holds(&mut batch, &waiting, fresh)
+            .await
+            .unwrap(),
+        vec![item.clone()]
+    );
+    h.ctl.commit(batch, &mut Default::default()).await.unwrap();
+    assert_eq!(h.status(&item).await, Status::Queued);
+}
+
+#[tokio::test]
+async fn a_late_saved_answer_prevents_a_prepared_technical_recovery_from_committing() {
+    use crate::handle::ControlHandle;
+    use rustykrab_store::AnswerSubmissionStatus;
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().to_owned()),
+            ..Default::default()
+        },
+        vec![],
+    );
+    let planning = project(&h, &repo).await;
+    let item = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "late owner answer",
+            Some(planning.project.id),
+        ))
+        .await;
+    h.ctl
+        .hold_context(
+            &h.store().work_get(&item).await.unwrap().unwrap(),
+            "historical context limit".into(),
+        )
+        .await
+        .unwrap();
+    let checked = h.ctl.prepare_handoff_rechecks().await.unwrap();
+    let waiting = h.ctl.waiting_questions().await.unwrap();
+    let question = waiting.iter().find(|q| q.item == item).unwrap().id.clone();
+    let mut batch = super::super::batch::Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    assert_eq!(
+        h.ctl
+            .recover_project_context_holds(&mut batch, &waiting, checked)
+            .await
+            .unwrap(),
+        vec![item.clone()]
+    );
+    h.ctl
+        .submit_answer(
+            &question,
+            "Use the current project intent",
+            "user:owner",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        h.ctl.commit(batch, &mut Default::default()).await.is_err(),
+        "stale recovery must roll back atomically"
+    );
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    let pending = h.store().question_get(&question).await.unwrap().unwrap();
+    assert_eq!(
+        pending.status,
+        rustykrab_core::questions::QuestionStatus::Open
+    );
+    assert_eq!(
+        pending.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Pending
+    );
+    {
+        let _guard = h.ctl.loop_lock.lock().await;
+        h.ctl.apply_pending_answers_locked().await.unwrap();
+    }
+    let applied = h.store().question_get(&question).await.unwrap().unwrap();
+    assert_eq!(
+        applied.answer.as_deref(),
+        Some("Use the current project intent")
+    );
+    assert_eq!(
+        applied.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Applied
+    );
+    assert_eq!(h.status(&item).await, Status::Ready);
+}
+
+#[tokio::test]
+async fn cached_project_history_keeps_each_tasks_own_execution_slice() {
+    let repo = Repo::new();
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![]);
+    let planning = project(&h, &repo).await;
+    let first = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "first slice",
+            Some(planning.project.id),
+        ))
+        .await;
+    let next = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "second slice",
+            Some(planning.project.id),
+        ))
+        .await;
+    let snap = h.ctl.load().await.unwrap();
+    let mut cache = std::collections::BTreeMap::new();
+    let a = h
+        .ctl
+        .cached_project_context(&snap, snap.item(&first).unwrap(), &mut cache)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = h
+        .ctl
+        .cached_project_context(&snap, snap.item(&next).unwrap(), &mut cache)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.work, b.work);
+    assert!(a.execution_items.contains(&first));
+    assert!(!a.execution_items.contains(&next));
+    assert!(b.execution_items.contains(&next));
+    assert!(!b.execution_items.contains(&first));
+    assert_eq!(
+        Some(b),
+        h.ctl
+            .project_context(&snap, snap.item(&next).unwrap())
+            .await
+            .unwrap()
+    );
+}

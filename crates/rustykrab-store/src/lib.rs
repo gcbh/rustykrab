@@ -56,7 +56,8 @@ pub use pending_links::PendingLinks;
 pub use projects::{ApplyRevisionResult, ProjectStore};
 pub use proposals::{ProjectionRow, ProposalEvidence, ProposalRow};
 pub use questions::{
-    JudgmentRow, NoticeDraft, QuestionFilter, QuestionRow, QuestionWrite, WaitingNotice,
+    AnswerSubmission, AnswerSubmissionStatus, JudgmentRow, NoticeDraft, QuestionFilter,
+    QuestionRow, QuestionWrite, WaitingNotice,
 };
 pub use recall_archive::RecallArchiveStore;
 pub use secret::{SecretMeta, SecretStore, WriteAuthority};

@@ -817,13 +817,20 @@ impl ControlHandle for Controller {
     /// own lock so no caller needs a separate check that could race. `Held`,
     /// or no loop driving the controller (`None`), ticks.
     async fn tick(&self) -> Result<TickReport, Error> {
+        // Read/reconstruct expensive project history before taking the command
+        // lock; a concurrent answer must not wait behind that background work.
+        let handoffs = if self.state().lock == Some(LockState::Waiting) {
+            Ok(None)
+        } else {
+            self.prepare_handoff_rechecks().await
+        };
         let _loop = self.loop_lock.lock().await;
         if self.state().lock == Some(LockState::Waiting) {
             return Err(Error::LockWaiting(format!(
                 "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
             )));
         }
-        self.tick_locked().await
+        self.tick_locked(handoffs).await
     }
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {
@@ -875,6 +882,17 @@ impl ControlHandle for Controller {
     ) -> Result<AnswerReply, Error> {
         let _loop = self.loop_lock.lock().await;
         self.answer_locked(question, answer, actor).await
+    }
+
+    async fn submit_answer(
+        &self,
+        question: &str,
+        answer: &str,
+        actor: &str,
+        submission_id: Option<&str>,
+    ) -> Result<AnswerReply, Error> {
+        self.save_answer_submission(question, answer, actor, submission_id)
+            .await
     }
 
     async fn start_work(

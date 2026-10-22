@@ -81,6 +81,66 @@ pub(super) async fn post(ctx: &Ctx, path: &str, body: Value) -> Result<Value> {
     .await
 }
 
+/// Intake acknowledges storage; wait for the real daemon to apply that exact
+/// receipt before checking downstream work or running an evaluation.
+pub(super) async fn submit_answer(ctx: &Ctx, question: &str, words: &str) -> Result<Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = format!("{QUESTIONS}/{question}/answer");
+    let body = json!({"answer": words, "submission_id": id});
+    let accepted = expect(ctx.post(&path, body.clone()).await?, &[202], "save answer").await?;
+    ensure!(
+        accepted["question"]["answer_submission"]["id"] == id,
+        "wrong answer receipt: {accepted}"
+    );
+    ensure!(
+        accepted["question"]["answer_submission"]["status"] == "pending",
+        "intake did not return a pending receipt: {accepted}"
+    );
+    ensure!(
+        accepted["resumed"] == json!([]),
+        "intake claimed work effects: {accepted}"
+    );
+    let deadline = Instant::now() + SETTLE;
+    let applied = loop {
+        let row = get(ctx, &format!("{QUESTIONS}/{question}")).await?;
+        ensure!(
+            row["answer_submission"]["id"] == id,
+            "accepted answer identity changed: {row}"
+        );
+        ensure!(
+            row["answer_submission"]["status"] != "rejected",
+            "answer rejected: {row}"
+        );
+        if row["answer_submission"]["status"] == "applied" {
+            ensure!(
+                row["status"] == "answered",
+                "receipt applied without a settled question: {row}"
+            );
+            break row;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "answer still pending after {SETTLE:?}: {row}"
+        );
+        tokio::time::sleep(POLL).await;
+    };
+    let replayed = expect(
+        ctx.post(&path, body).await?,
+        &[200],
+        "replay applied answer",
+    )
+    .await?;
+    ensure!(
+        replayed["question"]["answer_submission"] == applied["answer_submission"],
+        "retry changed the receipt: {replayed}"
+    );
+    ensure!(
+        replayed["resumed"] == json!([]),
+        "retry repeated work effects: {replayed}"
+    );
+    Ok(json!({"accepted": accepted, "applied": applied, "replayed": replayed}))
+}
+
 // ── filings ──────────────────────────────────────────────────────────
 
 /// Any filing path: accepted whole or rejected whole, typed either way.

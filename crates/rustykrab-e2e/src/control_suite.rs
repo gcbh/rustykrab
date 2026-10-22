@@ -2419,12 +2419,7 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
 
     // ── answered, it lands a commit and is done ──────────────────────
     let question_id = question["id"].as_str().unwrap_or_default();
-    post(
-        ctx,
-        &format!("{QUESTIONS}/{question_id}/answer"),
-        json!({ "answer": INVESTIGATION_LAND_THE_FIX }),
-    )
-    .await?;
+    submit_answer(ctx, question_id, INVESTIGATION_LAND_THE_FIX).await?;
     let landed = wait_status(ctx, &fix, Status::Done).await?;
     let commit = evidence(&landed)
         .into_iter()
@@ -3133,15 +3128,10 @@ async fn budget_grant_resumes(shared: &Ctx) -> Result<()> {
     let spent_before = before["iterations"].as_u64().unwrap_or(0);
 
     let qid = question["id"].as_str().unwrap_or_default().to_string();
-    let answer = post(
-        ctx,
-        &format!("{QUESTIONS}/{qid}/answer"),
-        json!({ "answer": ANSWER_STATION }),
-    )
-    .await?;
+    let answer = submit_answer(ctx, &qid, ANSWER_STATION).await?;
     ensure!(
-        answer["resumed"] == json!([x]),
-        "the answer resumed the item: {answer}"
+        answer["applied"]["answer_submission"]["status"] == "applied",
+        "the saved answer was applied: {answer}"
     );
     let again = expect(
         ctx.post(
@@ -3481,12 +3471,7 @@ async fn s03(ctx: &Ctx) -> Result<()> {
     );
     wait_told(ctx, FLORIST_QUESTION).await?;
     let question_id = question["id"].as_str().unwrap_or_default();
-    post(
-        ctx,
-        &format!("{QUESTIONS}/{question_id}/answer"),
-        json!({ "answer": ANSWER_FLORIST }),
-    )
-    .await?;
+    submit_answer(ctx, question_id, ANSWER_FLORIST).await?;
     wait_status(ctx, &task, Status::Done).await?;
     let carried = conversations_mentioning(ctx, ANSWER_FLORIST)?;
     ensure!(
@@ -3542,15 +3527,10 @@ async fn s05(ctx: &Ctx) -> Result<()> {
         .first()
         .context("the spent budget asks the item's owner")?;
     let qid = question["id"].as_str().unwrap_or_default();
-    let answer = post(
-        ctx,
-        &format!("{QUESTIONS}/{qid}/answer"),
-        json!({ "answer": "Yes, one more attempt." }),
-    )
-    .await?;
+    let answer = submit_answer(ctx, qid, "Yes, one more attempt.").await?;
     ensure!(
-        answer["resumed"] == json!([task]),
-        "the owner's answer resumed the stalled item: {answer}"
+        answer["applied"]["answer_submission"]["status"] == "applied",
+        "the owner's saved answer was applied: {answer}"
     );
     let deadline = Instant::now() + SETTLE;
     let attempts = loop {
@@ -4194,12 +4174,7 @@ async fn s15(ctx: &Ctx) -> Result<()> {
     let question = wait_question(ctx, &task).await?;
     wait_told(ctx, "e2e-control check-in").await?;
     let question_id = question["id"].as_str().unwrap_or_default();
-    post(
-        ctx,
-        &format!("{QUESTIONS}/{question_id}/answer"),
-        json!({ "answer": "9am" }),
-    )
-    .await?;
+    submit_answer(ctx, question_id, "9am").await?;
     evaluate(ctx).await?;
     let flagged = proposals_mentioning(ctx, &task).await?;
     ensure!(

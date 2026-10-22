@@ -280,6 +280,20 @@ pub trait ControlHandle: Send + Sync {
         Err(unsupported("answering questions"))
     }
 
+    /// Durably accept owner direction without waiting for a scheduling pass.
+    /// The returned question carries its receipt; pending is not yet applied.
+    /// Handles without a durable intake retain their synchronous behavior.
+    async fn submit_answer(
+        &self,
+        question: &str,
+        answer: &str,
+        actor: &str,
+        submission_id: Option<&str>,
+    ) -> Result<AnswerReply, Error> {
+        let _ = submission_id;
+        self.answer(question, answer, actor).await
+    }
+
     /// Grant standing judgment in ordinary language; it is compiled to a
     /// checklist and in force from the next filing or question.
     /// Append an attributed comment for future execution without releasing holds.

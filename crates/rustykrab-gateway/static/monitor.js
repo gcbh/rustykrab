@@ -96,13 +96,17 @@
       if (!response.ok) throw new Error('Access rejected by the gateway (' + response.status + '). Open the monitor at your daemon address.');
       throw new Error('The daemon returned an unreadable response.');
     }
-    if (!response.ok) throw new Error(data.message || 'The daemon could not complete this request (' + response.status + ').');
+    if (!response.ok) {
+      const error = new Error(data.message || 'The daemon could not complete this request (' + response.status + ').');
+      error.status = response.status; throw error;
+    }
     return data;
   }
   function disconnect(message = '') {
     generation++; detailRequest++; pending = false;
     clearInterval(interval); interval = null;
     access.disconnect(); snapshot = null; lastQuestions = ''; discussionDrafts.clear();
+    answerAttempts.clear(); answerQuestions.clear(); answerPainters.clear();
     priorityMoving = false; priorityError = ''; $('priorityRows').replaceChildren(); $('priorityError').hidden = true;
     $('accessStatus').textContent = ''; $('accessMessage').textContent = access.message({disconnected: true});
     $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
@@ -566,6 +570,87 @@
     }); body.append(form);
   }
   const discussionDrafts = new Map();
+  const answerAttempts = new Map(), answerQuestions = new Map(), answerPainters = new Map(), answerChecking = new Set();
+  function answerMessageView(question, attempt, item) {
+    const receipt = attempt?.receipt || (question.answer_submission?.id === attempt?.id || !attempt ? question.answer_submission : null);
+    const state = receipt?.status || attempt?.state || 'none';
+    const messages = {
+      none: '', sending: 'Sending…', confirming: 'Checking whether your answer was saved…',
+      unconfirmed: 'Delivery is unconfirmed. Retry sends the same answer.',
+      pending: 'Saved. Waiting for the decision to be applied.',
+      applied: 'Decision applied.' + (item ? ' ' + taskState(item) + '.' : ''),
+      rejected: 'Could not apply this decision: ' + (receipt?.error || 'Review the current question before retrying.'),
+      failed: 'Could not save this answer: ' + (attempt?.error || 'Please try again.')
+    };
+    return {state, text: messages[state] || 'Checking the saved answer.'};
+  }
+  function observeAnswerQuestion(q) {
+    const previous = answerQuestions.get(q.id), old = previous?.answer_submission, next = q.answer_submission;
+    if (previous && (!['open','recorded','researching'].includes(previous.status) && ['open','recorded','researching'].includes(q.status)
+      || old?.id === next?.id && ['applied','rejected'].includes(old?.status) && next?.status === 'pending')) return previous;
+    answerQuestions.set(q.id, q); return q;
+  }
+  function paintAnswers() {
+    for (const [id, paint] of answerPainters) if (!paint()) answerPainters.delete(id);
+  }
+  function answerIdentity() {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return [hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-');
+  }
+  async function reconcileAnswer(id, g = generation) {
+    if (answerChecking.has(id)) return;
+    answerChecking.add(id);
+    try {
+      let q = await api('/api/questions/' + encodeURIComponent(id));
+      if (g !== generation) return;
+      q = observeAnswerQuestion(q);
+      const attempt = answerAttempts.get(id), receipt = q.answer_submission;
+      if (attempt) {
+        if (receipt?.id === attempt.id) {
+          attempt.receipt = receipt; attempt.state = receipt.status;
+        } else if (q.status !== 'open' && q.status !== 'recorded' && q.status !== 'researching') {
+          attempt.state = 'failed'; attempt.error = 'This question has already closed.' + (q.answer ? ' Recorded decision: ' + q.answer : ' Review its recorded decision.');
+        } else if (attempt.state !== 'failed') attempt.state = 'unconfirmed';
+      }
+    } catch (_) {
+      const attempt = answerAttempts.get(id);
+      if (g === generation && attempt?.state === 'confirming') attempt.state = 'unconfirmed';
+    } finally {
+      answerChecking.delete(id); if (g === generation) paintAnswers();
+    }
+  }
+  async function recordAnswer(question, text) {
+    const g = generation, previous = answerAttempts.get(question.id);
+    if (previous && ['sending','confirming','pending','applied'].includes(previous.state)) return;
+    const retry = previous?.state === 'unconfirmed';
+    const attempt = retry ? previous : {id:answerIdentity(), answer:text, submitted_at:new Date().toISOString()};
+    attempt.state = 'sending'; attempt.receipt = null; attempt.error = '';
+    answerAttempts.set(question.id, attempt); paintAnswers();
+    try {
+      const reply = await api('/api/questions/' + encodeURIComponent(question.id) + '/answer', {answer:attempt.answer, submission_id:attempt.id});
+      if (g !== generation) return;
+      reply.question = observeAnswerQuestion(reply.question);
+      attempt.receipt = reply.question.answer_submission;
+      if (attempt.receipt) attempt.id = attempt.receipt.id;
+      attempt.state = attempt.receipt?.status || 'applied';
+      discussionDrafts.delete('answer:' + question.id); lastQuestions = '';
+    } catch (error) {
+      if (g !== generation) return;
+      attempt.error = error.message;
+      attempt.state = error.status >= 400 && error.status < 500 && ![408,429].includes(error.status) ? 'failed' : 'confirming';
+      paintAnswers(); await reconcileAnswer(question.id, g);
+    } finally { if (g === generation) paintAnswers(); }
+  }
+  async function refreshAnswerMessages(g) {
+    const ids = new Set();
+    for (const [id, attempt] of answerAttempts) if (['pending','confirming','unconfirmed'].includes(attempt.state)) ids.add(id);
+    for (const id of answerPainters.keys()) if (answerQuestions.get(id)?.answer_submission?.status === 'pending') ids.add(id);
+    await Promise.all(Array.from(ids, id => reconcileAnswer(id, g)));
+    if (g === generation) paintAnswers();
+  }
   function questionsByWork(questions) {
     const groups = new Map();
     for (const q of questions) {
@@ -578,6 +663,7 @@
     try {
       const data = await api('/api/questions?status=open');
       if (requestGeneration !== generation) return;
+      for (const q of data.questions) observeAnswerQuestion(q);
       const groups = questionsByWork(data.questions);
       const card = $('stats').lastElementChild;
       const proposals = snapshot?.work.items.filter(r => r.item.kind === 'proposal' && !closed.has(status(r.item))).map(r => r.item.id) || [];
@@ -591,7 +677,8 @@
         const row = node('article', undefined, 'question');
         row.append(itemButton(id, item ? taskTitle(item) : 'Work ' + id.slice(0, 8)));
         if (item) appendTaskOverview(row, item, true);
-        row.append(node('p', questions.length + (questions.length === 1 ? ' pending decision' : ' pending decisions') + ' · ' + (item ? taskState(item) : 'Waiting for your direction'), 'note'));
+        const saved = questions.filter(q => q.answer_submission?.status === 'pending').length;
+        row.append(node('p', questions.length + (questions.length === 1 ? ' pending decision' : ' pending decisions') + (saved ? ' · ' + saved + ' saved, awaiting application' : '') + ' · ' + (item ? taskState(item) : 'Waiting for your direction'), 'note'));
         row.append(node('p', questions[0].text), node('small', 'Questions and replies stay in this work item’s discussion.'));
         $('questionRows').append(row);
       }
@@ -610,41 +697,79 @@
     refreshButton.addEventListener('click', () => showDetail(id)); section.append(refreshButton);
     const repeated = data.questions.filter(q => q.superseded_by).length;
     if (repeated) section.append(node('p', repeated + ' repeated requests consolidated; their history is retained.', 'note'));
-    const entries = data.comments.map(e => ({ at: e.at, author: e.actor, text: e.reason, type: 'comment' }));
+    answerPainters.clear();
+    const controls = new Map(), bubbles = new Map();
+    const entries = data.comments.map(e => ({ at:e.at, author:e.actor, text:e.reason, type:'comment' }));
     for (const e of data.activity || []) {
-      if (e.kind === 'transition' && e.to) entries.push({ at: e.at, author: e.actor, text: 'Work status: ' + human(typeof e.to === 'string' ? e.to : e.to.status), type: 'status' });
+      if (e.kind === 'transition' && e.to) entries.push({at:e.at, author:e.actor, text:'Work status: ' + human(typeof e.to === 'string' ? e.to : e.to.status), type:'status'});
     }
-    for (const q of data.questions) {
+    for (let q of data.questions) {
       if (q.superseded_by) continue;
-      entries.push({ at: q.created_at, author: q.asked_by, text: q.text, type: 'question', question: q });
-      if (q.answer) entries.push({ at: q.answered_at, author: q.answered_by, text: q.answer, type: 'answer' });
+      q = observeAnswerQuestion(q);
+      entries.push({at:q.created_at, author:q.asked_by, text:q.text, type:'question', question:q});
+      const receipt = q.answer_submission, attempt = answerAttempts.get(q.id);
+      if (receipt || attempt) entries.push({at:receipt?.submitted_at || attempt.submitted_at, author:receipt?.actor || 'user:you', text:attempt?.answer || receipt.answer, type:'answer', answerQuestion:q});
+      if (q.answer && receipt?.status !== 'applied') entries.push({at:q.answered_at, author:q.answered_by, text:q.answer, type:'answer'});
     }
     entries.sort((a,b) => new Date(a.at) - new Date(b.at));
     const timeline = node('div', undefined, 'discussion-timeline'); section.append(timeline);
     if (!entries.length) timeline.append(node('p', 'Start the discussion with direction or a comment.', 'note'));
+    const answerBubble = (q, row) => {
+      const message = node('p'), state = node('p', '', 'answer-message-status'), retry = node('button', 'Retry same answer');
+      state.setAttribute('role','status'); state.setAttribute('aria-live','polite'); retry.type = 'button'; retry.hidden = true;
+      retry.addEventListener('click', () => recordAnswer(q, answerAttempts.get(q.id)?.answer || ''));
+      row.classList.add('answer-message'); row.append(message,state,retry);
+      const bubble = {row,message,state,retry}; bubbles.set(q.id,bubble); return bubble;
+    };
     for (const entry of entries) {
       const row = node('article', undefined, 'discussion-entry');
-      row.append(node('small', (entry.author?.startsWith('user:') ? 'You' : entry.author?.startsWith('worker:') ? entry.author.slice(7) : entry.author === 'agent' ? 'Manager' : entry.author) + ' · ' + at(entry.at) + ' · ' + human(entry.type)), node('p', entry.text));
+      row.append(node('small', (entry.author?.startsWith('user:') ? 'You' : entry.author?.startsWith('worker:') ? entry.author.slice(7) : entry.author === 'agent' ? 'Manager' : entry.author) + ' · ' + at(entry.at) + ' · ' + human(entry.type)));
+      if (entry.answerQuestion) answerBubble(entry.answerQuestion,row); else row.append(node('p',entry.text));
       const q = entry.question;
       if (q?.status === 'open') {
         if (q.kind === 'approval' && body.dataset.startOptions === 'true') row.append(node('p', 'Choose Start once or automatic permission above to approve this work.', 'note'));
         else if (q.kind === 'credential') row.append(node('p', 'Provide credentials through the secure request linked in your notification.', 'note'));
         else {
-          if (q.options.length) row.append(node('p', q.options.map((o,i) => (i+1) + '. ' + o).join(' · '), 'note'));
-          const form = node('form'), input = node('textarea'), button = node('button', 'Record decision', 'primary'), error = node('p', '', 'note');
-          const key = 'answer:' + q.id; input.required = true; input.value = discussionDrafts.get(key) || ''; input.setAttribute('aria-label', 'Decision: ' + q.text);
-          input.placeholder = q.kind === 'approval' ? 'approve or reject' : q.kind === 'consent' ? 'yes or no' : 'Your decision'; input.addEventListener('input', () => discussionDrafts.set(key, input.value)); error.setAttribute('role', 'alert');
-          form.append(input, button); row.append(form, error);
+          if (q.options.length) row.append(node('p',q.options.map((o,i) => (i+1) + '. ' + o).join(' · '),'note'));
+          const form = node('form'), input = node('textarea'), button = node('button','Record decision','primary');
+          const key = 'answer:' + q.id; input.required = true; input.value = discussionDrafts.get(key) || q.answer_submission?.answer || ''; input.setAttribute('aria-label','Decision: ' + q.text);
+          input.placeholder = q.kind === 'approval' ? 'approve or reject' : q.kind === 'consent' ? 'yes or no' : 'Your decision'; input.addEventListener('input', () => discussionDrafts.set(key,input.value));
+          form.append(input,button); row.append(form); controls.set(q.id,{form,input,button});
           form.addEventListener('submit', async event => {
-            event.preventDefault(); button.disabled = true;
-            try { await api('/api/questions/' + encodeURIComponent(q.id) + '/answer', { answer: input.value }); if (g !== generation || request !== detailRequest) return; discussionDrafts.delete(key); lastQuestions = ''; await refresh(); await showDetail(id); }
-            catch (e) { if (g === generation && request === detailRequest) error.textContent = e.message; }
-            finally { button.disabled = false; }
+            event.preventDefault(); if (g !== generation || request !== detailRequest) return;
+            await recordAnswer(q,input.value); if (g === generation && request === detailRequest) await refresh();
           });
         }
-      } else if (q) row.append(node('small', human(q.status), 'note'));
+      } else if (q) row.append(node('small',human(q.status),'note'));
       timeline.append(row);
     }
+    for (const q of data.questions.filter(q => !q.superseded_by)) {
+      answerPainters.set(q.id, () => {
+        if (g !== generation || request !== detailRequest || !$('detail').open) return false;
+        const latest = answerQuestions.get(q.id) || q, attempt = answerAttempts.get(q.id), control = controls.get(q.id);
+        const item = snapshot?.work.items.find(r => r.item.id === id)?.item || snapshot?.priority_list?.entries.find(i => i.item === id);
+        const view = answerMessageView(latest,attempt,item);
+        const busy = ['sending','confirming','unconfirmed','pending','applied'].includes(view.state) || latest.answer_submission?.status === 'pending';
+        if (control) { control.form.hidden = busy || latest.status !== 'open'; control.button.disabled = busy; }
+        if (q.kind === 'approval') for (const button of body.querySelectorAll('.start-options button')) {
+          if (busy || latest.status !== 'open') { if (!button.disabled) button.dataset.answerWait = 'true'; button.disabled = true; }
+          else if (button.dataset.answerWait) { button.disabled = false; delete button.dataset.answerWait; }
+        }
+        if (view.state !== 'none') {
+          let bubble = bubbles.get(q.id);
+          if (!bubble) {
+            const row = node('article',undefined,'discussion-entry'); row.append(node('small','You · ' + at(attempt?.submitted_at) + ' · answer'));
+            bubble = answerBubble(q,row); timeline.append(row);
+          }
+          const text = attempt?.answer || latest.answer_submission?.answer || latest.answer || '';
+          if (bubble.message.textContent !== text) bubble.message.textContent = text;
+          bubble.row.dataset.state = view.state; if (bubble.state.textContent !== view.text) bubble.state.textContent = view.text;
+          bubble.retry.hidden = view.state !== 'unconfirmed'; bubble.retry.disabled = ['sending','confirming'].includes(view.state);
+        }
+        return true;
+      });
+    }
+    paintAnswers();
     if (data.total_comments > data.comments.length) {
       const older = node('button', 'Load earlier comments');
       older.addEventListener('click', async () => {
@@ -677,6 +802,7 @@
       if (observedPriority !== priorityVersion && snapshot) reply.priority_list = snapshot.priority_list;
       snapshot = reply; render(reply);
       await refreshQuestions(g);
+      await refreshAnswerMessages(g);
       if (currentView === 'automatic') await refreshPreferences(g);
     } catch (e) {
       if (g !== generation) return;

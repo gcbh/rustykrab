@@ -728,3 +728,29 @@ async fn when_no_investigation_can_be_filed_the_item_surfaces_once() {
     assert_eq!(h.script.briefs_for(GAUGE).len(), briefs, "and stays put");
     assert_eq!(questions_of(&h, &x).await.len(), 1);
 }
+
+#[tokio::test]
+async fn retrying_a_saved_budget_answer_never_grants_a_second_allotment() {
+    let h = Harness::new(&["pinch"]);
+    let item = spent(&h).await;
+    let q = open_question(&h, &item).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    h.ctl
+        .submit_answer(&q.id, "yes", "user:master", Some(&id))
+        .await
+        .unwrap();
+    {
+        let _guard = h.ctl.loop_lock.lock().await;
+        h.ctl.apply_pending_answers_locked().await.unwrap();
+    }
+    assert_eq!(evidence(&h, &item, "budget_grant").await.len(), 1);
+    h.ctl
+        .submit_answer(&q.id, "yes", "user:master", Some(&id))
+        .await
+        .unwrap();
+    {
+        let _guard = h.ctl.loop_lock.lock().await;
+        h.ctl.apply_pending_answers_locked().await.unwrap();
+    }
+    assert_eq!(evidence(&h, &item, "budget_grant").await.len(), 1);
+}

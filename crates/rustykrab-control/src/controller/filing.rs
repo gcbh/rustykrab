@@ -18,7 +18,7 @@ use rustykrab_core::work::{
     WorkerKind,
 };
 use rustykrab_core::Error;
-use rustykrab_store::{ArchivedItem, WorkOp, WorkPlanRow};
+use rustykrab_store::{ArchivedItem, QuestionWrite, WorkOp, WorkPlanRow};
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, StatusSelector, WorkStatusView, DEFAULT_ACTOR,
 };
@@ -1033,7 +1033,7 @@ impl Controller {
         root: &str,
         actor: &str,
     ) -> Result<Vec<WorkItemId>, Error> {
-        self.approve_with_preference_locked(root, actor, None, None)
+        self.approve_with_preference_locked(root, actor, None, None, None)
             .await
     }
 
@@ -1043,6 +1043,7 @@ impl Controller {
         actor: &str,
         preference: Option<rustykrab_store::JudgmentRow>,
         direction: Option<String>,
+        answer_submission: Option<(&str, &str)>,
     ) -> Result<Vec<WorkItemId>, Error> {
         let now = self.clock.now();
         let mut b = Batch::new(self.load().await?, now);
@@ -1090,6 +1091,14 @@ impl Controller {
             released.push(item.id);
         }
         b.settle(released.clone());
+        if let Some((question, submission)) = answer_submission {
+            b.ops.push(WorkOp::Question(QuestionWrite::AnswerProcessed {
+                id: question.to_string(),
+                submission: submission.to_string(),
+                error: None,
+                at: Utc::now(),
+            }));
+        }
         self.commit(b, &mut HashSet::new()).await?;
         Ok(released)
     }
@@ -1099,6 +1108,17 @@ impl Controller {
         root: &str,
         reason: Option<String>,
         actor: &str,
+    ) -> Result<Vec<WorkItemId>, Error> {
+        self.reject_with_submission_locked(root, reason, actor, None)
+            .await
+    }
+
+    pub(super) async fn reject_with_submission_locked(
+        &self,
+        root: &str,
+        reason: Option<String>,
+        actor: &str,
+        answer_submission: Option<(&str, &str)>,
     ) -> Result<Vec<WorkItemId>, Error> {
         let now = self.clock.now();
         let mut b = Batch::new(self.load().await?, now);
@@ -1121,6 +1141,14 @@ impl Controller {
             cancelled.push(item.id);
         }
         b.settle(changed);
+        if let Some((question, submission)) = answer_submission {
+            b.ops.push(WorkOp::Question(QuestionWrite::AnswerProcessed {
+                id: question.to_string(),
+                submission: submission.to_string(),
+                error: None,
+                at: Utc::now(),
+            }));
+        }
         self.commit(b, &mut HashSet::new()).await?;
         Ok(cancelled)
     }
