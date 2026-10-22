@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.6] - 2026-10-22
+
+- feat(cli): `rustykrab-cli mcp-bridge` hands a native agent its run's granted tools over stdio MCP (#730)
+
 ## [6.6.5] - 2026-10-21
 
 - fix(deps): take the patched rustls-webpki and webpki roots (#728)

@@ -12,6 +12,9 @@ rustykrab-core.workspace = true
 rustykrab-agent.workspace = true
 rustykrab-providers.workspace = true
 rustykrab-tools.workspace = true
+# The MCP bridge scenario serves the gateway's real router in process until
+# a booted daemon's native worker mints grants (control_suite/mcp.rs).
+rustykrab-gateway.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

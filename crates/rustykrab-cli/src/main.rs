@@ -10,6 +10,7 @@ mod evaluation;
 mod fleet;
 mod integrations;
 mod local_resources;
+mod mcp_bridge;
 mod models_cmd;
 mod monitor_cmd;
 mod native_resources;
@@ -606,6 +607,14 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
+    // A native agent's MCP server, started by the agent itself: stdout is
+    // its protocol, so it starts before any logging, and it touches no
+    // data directory.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("mcp-bridge") {
+        return mcp_bridge::run(&args[2..]).await;
+    }
+
     // --- Data directory ---
     // RUSTYKRAB_DATA_DIR overrides the OS default so tests and the E2E
     // harness can boot on a throwaway directory.
@@ -654,7 +663,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("rustykrab {}", version_string());
 
     // --- CLI subcommands ---
-    let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V") {
         println!("rustykrab {}", version_string());
         return Ok(());
@@ -701,7 +709,7 @@ async fn main() -> anyhow::Result<()> {
     // reporting the mistake.
     if let Some(unknown) = args.get(1).filter(|a| !a.starts_with('-')) {
         eprintln!("unknown subcommand '{unknown}'");
-        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, models, update, monitor, questions, answer, judgment, consolidate");
+        eprintln!("subcommands: skill, keychain, chat, dream, pair, work, workers, worker, models, update, monitor, questions, answer, judgment, consolidate, mcp-bridge");
         eprintln!("run with no arguments to start the daemon");
         std::process::exit(2);
     }
