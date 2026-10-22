@@ -604,13 +604,20 @@
     if (answerChecking.has(id)) return;
     answerChecking.add(id);
     try {
-      let q = await api('/api/questions/' + encodeURIComponent(id));
+      const attempt = answerAttempts.get(id);
+      let q = await api('/api/questions/' + encodeURIComponent(attempt?.question_id || id));
       if (g !== generation) return;
+      // An accepted original receipt stays on that row. An unacknowledged
+      // request may instead have reached the consolidated canonical question.
+      if (attempt && !q.answer_submission && q.superseded_by) {
+        q = await api('/api/questions/' + encodeURIComponent(q.superseded_by));
+        if (g !== generation) return;
+      }
       q = observeAnswerQuestion(q);
-      const attempt = answerAttempts.get(id), receipt = q.answer_submission;
+      const receipt = q.answer_submission;
       if (attempt) {
         if (receipt?.id === attempt.id) {
-          attempt.receipt = receipt; attempt.state = receipt.status;
+          attempt.question_id = q.id; attempt.receipt = receipt; attempt.state = receipt.status;
         } else if (q.status !== 'open' && q.status !== 'recorded' && q.status !== 'researching') {
           attempt.state = 'failed'; attempt.error = 'This question has already closed.' + (q.answer ? ' Recorded decision: ' + q.answer : ' Review its recorded decision.');
         } else if (attempt.state !== 'failed') attempt.state = 'unconfirmed';
@@ -633,6 +640,7 @@
       const reply = await api('/api/questions/' + encodeURIComponent(question.id) + '/answer', {answer:attempt.answer, submission_id:attempt.id});
       if (g !== generation) return;
       reply.question = observeAnswerQuestion(reply.question);
+      attempt.question_id = reply.question.id;
       attempt.receipt = reply.question.answer_submission;
       if (attempt.receipt) attempt.id = attempt.receipt.id;
       attempt.state = attempt.receipt?.status || 'applied';
@@ -699,15 +707,20 @@
     if (repeated) section.append(node('p', repeated + ' repeated requests consolidated; their history is retained.', 'note'));
     answerPainters.clear();
     const controls = new Map(), bubbles = new Map();
+    const visibleQuestion = q => {
+      const attempt = answerAttempts.get(q.id);
+      return !q.superseded_by || q.answer_submission || attempt && (!attempt.question_id || attempt.question_id === q.id);
+    };
     const entries = data.comments.map(e => ({ at:e.at, author:e.actor, text:e.reason, type:'comment' }));
     for (const e of data.activity || []) {
       if (e.kind === 'transition' && e.to) entries.push({at:e.at, author:e.actor, text:'Work status: ' + human(typeof e.to === 'string' ? e.to : e.to.status), type:'status'});
     }
     for (let q of data.questions) {
-      if (q.superseded_by) continue;
+      const attempt = answerAttempts.get(q.id);
+      if (!visibleQuestion(q)) continue;
       q = observeAnswerQuestion(q);
       entries.push({at:q.created_at, author:q.asked_by, text:q.text, type:'question', question:q});
-      const receipt = q.answer_submission, attempt = answerAttempts.get(q.id);
+      const receipt = q.answer_submission;
       if (receipt || attempt) entries.push({at:receipt?.submitted_at || attempt.submitted_at, author:receipt?.actor || 'user:you', text:attempt?.answer || receipt.answer, type:'answer', answerQuestion:q});
       if (q.answer && receipt?.status !== 'applied') entries.push({at:q.answered_at, author:q.answered_by, text:q.answer, type:'answer'});
     }
@@ -743,10 +756,10 @@
       } else if (q) row.append(node('small',human(q.status),'note'));
       timeline.append(row);
     }
-    for (const q of data.questions.filter(q => !q.superseded_by)) {
+    for (const q of data.questions.filter(visibleQuestion)) {
       answerPainters.set(q.id, () => {
         if (g !== generation || request !== detailRequest || !$('detail').open) return false;
-        const latest = answerQuestions.get(q.id) || q, attempt = answerAttempts.get(q.id), control = controls.get(q.id);
+        const attempt = answerAttempts.get(q.id), latest = answerQuestions.get(attempt?.question_id || q.id) || q, control = controls.get(q.id);
         const item = snapshot?.work.items.find(r => r.item.id === id)?.item || snapshot?.priority_list?.entries.find(i => i.item === id);
         const view = answerMessageView(latest,attempt,item);
         const busy = ['sending','confirming','unconfirmed','pending','applied'].includes(view.state) || latest.answer_submission?.status === 'pending';

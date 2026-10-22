@@ -600,7 +600,10 @@ acknowledgement it shows sending or unconfirmed delivery; a lost connection
 triggers a question read, and an explicit retry retains the same UUID and words.
 It never infers failure solely from a timeout. Acknowledged receipts show saved/
 waiting, applied with the current task state, or rejected with the retained
-reason. Pending and rejected receipts survive reload through question data.
+reason. Pending and rejected receipts survive reload through question data,
+including receipts on consolidated questions. Accepted original receipts stay
+bound to their question; redirected acknowledgements reconcile the canonical
+question without duplicating the sent message.
 Five-second observations reconcile pending messages without replacing the dialog
 or discarding a separate comment draft. Older reads cannot downgrade a completed
 receipt. Raw/model text continues to enter through textContent, and connection

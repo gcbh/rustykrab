@@ -162,3 +162,46 @@ test('an acknowledged duplicate adopts the server receipt identity for subsequen
   await c.c.recordAnswer(question(),'Use A');await c.c.refreshAnswerMessages(1);
   assert.equal(answerRows(c.body)[0].dataset.state,'applied');
 });
+
+test('reload retains a rejected answer on a consolidated question without a second decision editor',async()=>{
+  const old={...question('old'),status:'obsolete',superseded_by:'q1',answer_submission:receipt('rejected')};
+  const c=client({comments:[],activity:[],questions:[old,question()],total_comments:0});
+  await c.c.renderDiscussion('i1',c.body,1,1);
+  assert.equal(answerRows(c.body).length,1);
+  assert.equal(answerRows(c.body)[0].dataset.state,'rejected');
+  assert(all(answerRows(c.body)[0]).some(n=>String(n.textContent).includes('Work closed')));
+  assert.equal(all(c.body).filter(n=>n.tag==='textarea').length,2);
+});
+
+test('an acknowledged canonical answer keeps updating on the existing message',async()=>{
+  const data={comments:[],activity:[],questions:[question('old')],total_comments:0};
+  const c=client(data);await c.c.renderDiscussion('i1',c.body,1,1);
+  let canonical;
+  c.c.api=async(path,payload)=>{
+    if(payload){canonical={...question(),answer_submission:receipt('pending',payload.submission_id)};return{question:canonical};}
+    assert.equal(path,'/api/questions/q1');
+    return{...canonical,status:'answered',answer:'Use A',answer_submission:{...canonical.answer_submission,status:'applied'}};
+  };
+  await c.c.recordAnswer(question('old'),'Use A');const row=answerRows(c.body)[0];
+  await c.c.refreshAnswerMessages(1);assert.equal(row.dataset.state,'applied');assert.equal(answerRows(c.body)[0],row);
+  data.questions=[{...question('old'),status:'obsolete',superseded_by:'q1'},{...canonical,status:'answered',answer:'Use A',answer_submission:{...canonical.answer_submission,status:'applied'}}];
+  c.c.api=async()=>data;
+  const refreshed=new Element('body');await c.c.renderDiscussion('i1',refreshed,1,1);
+  assert.equal(answerRows(refreshed).length,1,'a refreshed canonical answer must not duplicate the old message');
+});
+
+test('a lost canonical acknowledgement follows consolidation while original accepted receipts stay put',async()=>{
+  for(const originalAccepted of [false,true]){
+    const c=client({comments:[],activity:[],questions:[question('old')],total_comments:0});
+    await c.c.renderDiscussion('i1',c.body,1,1);let id;const reads=[];
+    c.c.api=async(path,payload)=>{
+      if(payload){id=payload.submission_id;throw new Error('Acknowledgement lost');}
+      reads.push(path);
+      if(path==='/api/questions/old')return{...question('old'),status:'obsolete',superseded_by:'q1',...(originalAccepted?{answer_submission:receipt('rejected',id)}:{})};
+      return{...question(),answer_submission:receipt('pending',id)};
+    };
+    await c.c.recordAnswer(question('old'),'Use A');
+    assert.equal(answerRows(c.body)[0].dataset.state,originalAccepted?'rejected':'pending');
+    assert.deepEqual(reads,originalAccepted?['/api/questions/old']:['/api/questions/old','/api/questions/q1']);
+  }
+});
