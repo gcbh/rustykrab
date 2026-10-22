@@ -278,7 +278,9 @@ impl ExecTool {
 /// as Claude Code's own sandbox is): it writes only in its directory, the
 /// git directory a worktree commits into, and temporary space, and it reads
 /// everything but `private` (credential stores, the daemon's data, where
-/// its secrets file is), its own directory always excepted. Reads elsewhere
+/// its secrets file is), its own directory always excepted. Ancestors of
+/// the working and git directories expose metadata only for path resolution;
+/// their contents remain private. Reads elsewhere
 /// stay open, as tools need the system, their caches and the network.
 /// Before this a worker's shell could write anywhere the daemon could and
 /// read its secrets; a run in the 2026-10-14 reminder eval searched the
@@ -368,6 +370,20 @@ impl Confinement {
             own.push(common.clone());
             git_dirs.push(common);
         }
+        // Git resolves every directory component even when the worktree itself
+        // is readable. A private ancestor (the daemon's data directory) must
+        // expose its directory metadata, but not its entries or file contents.
+        let ancestors: std::collections::BTreeSet<String> = own
+            .iter()
+            .flat_map(|p| p.ancestors().skip(1))
+            .map(|p| {
+                let path = p
+                    .to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"");
+                format!("(literal \"{path}\")")
+            })
+            .collect();
         let own: Vec<String> = own.iter().map(|p| quoted(p)).collect();
         let private: Vec<String> = self
             .private
@@ -384,6 +400,12 @@ impl Confinement {
         if !private.is_empty() {
             profile.push_str(&format!("(deny file-read* {})", private.join(" ")));
             profile.push_str(&format!("(allow file-read* {})", own.join(" ")));
+            if !ancestors.is_empty() {
+                profile.push_str(&format!(
+                    "(allow file-read-metadata {})",
+                    ancestors.into_iter().collect::<Vec<_>>().join(" ")
+                ));
+            }
         }
         // Later rules win, so these hold inside the writable git directory.
         let git: Vec<String> = git_dirs
@@ -1707,6 +1729,82 @@ mod error_typing_tests {
         let (code, text) = run_in(&tool, "cat ../../../service.json").await;
         assert_ne!(code, 0);
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_worktree_can_resolve_its_cwd_inside_private_data() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = data.path().join("repos/source");
+        let work = data.path().join("worktrees/repair");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(work.parent().unwrap()).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@x.invalid",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                work.to_str().unwrap(),
+                "-b",
+                "repair",
+            ],
+        );
+        std::fs::write(
+            data.path().join("service.json"),
+            "protected-service-sentinel",
+        )
+        .unwrap();
+        let tool = ExecTool::in_dir(&work).confined(vec![data.path().to_path_buf()]);
+        let expected = std::fs::canonicalize(&work).unwrap();
+        assert_eq!(
+            run_in(&tool, "/bin/pwd -P").await,
+            (0, format!("{}\n", expected.display()))
+        );
+        assert_eq!(
+            run_in(&tool, &format!("cd '{}' && /bin/pwd -P", work.display())).await,
+            (0, format!("{}\n", expected.display()))
+        );
+        assert_eq!(
+            run_in(&tool, "git status --porcelain").await,
+            (0, String::new())
+        );
+        assert_eq!(
+            run_in(&tool, "git rev-parse --show-toplevel").await,
+            (0, format!("{}\n", expected.display()))
+        );
+        assert_eq!(run_in(&tool, "echo repaired > result.txt && git add result.txt && git -c user.name=t -c user.email=t@x.invalid commit -q --no-gpg-sign -m repair").await,
+                   (0, String::new()));
+        let (code, text) = run_in(&tool, "cat ../../service.json").await;
+        assert_ne!(code, 0, "private data became readable: {text}");
+        assert!(!text.contains("protected-service-sentinel"), "{text}");
+        assert_ne!(
+            run_in(&tool, "ls ../..").await.0,
+            0,
+            "private directory became listable"
+        );
     }
 
     #[cfg(target_os = "macos")]
