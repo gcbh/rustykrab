@@ -31,6 +31,13 @@ pub async fn require_auth(
         return Ok(next.run(request).await);
     }
 
+    // A native run's MCP grant authenticates the MCP route, and nothing
+    // else does: the route checks the grant itself (`mcp_route`), and an
+    // owner or device token presented there is refused, not accepted here.
+    if request.uri().path() == crate::mcp_route::PATH {
+        return Ok(next.run(request).await);
+    }
+
     // Static assets are public (the WebChat UI).
     if !request.uri().path().starts_with("/api/") && !request.uri().path().starts_with("/webhook/")
     {

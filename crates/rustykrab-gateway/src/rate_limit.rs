@@ -314,6 +314,17 @@ pub async fn rate_limit_middleware(
     // type is not Sync.
     let bearer = bearer_token(request.headers());
 
+    // A native run's live grant on its own route is not a guess either; its
+    // quota and its one call in flight are what bound it. Checked first: it
+    // is in memory, and a grant is never a device token worth a lookup.
+    if path == crate::mcp_route::PATH
+        && bearer
+            .as_deref()
+            .is_some_and(|grant| state.mcp_grants.is_live(grant))
+    {
+        return Ok(next.run(request).await);
+    }
+
     if crate::tailnet_auth::principal(&state, &request).is_some()
         || is_authenticated(&state, bearer.as_deref()).await
     {
@@ -335,7 +346,7 @@ pub async fn rate_limit_middleware(
 /// Returns `None` for anything that is not a non-empty `Bearer` value, so
 /// a malformed or empty header can never be mistaken for a credential and
 /// is rate-limited like any other anonymous request.
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

@@ -165,7 +165,7 @@ Could each crate be lifted into a different program?
 | `tools` | **No** | 30 literal-key env reads; direct `rustykrab_store` coupling in 12 files |
 | `agent` | **Partly** | 1 literal-key env read (`PATH` for an external worker); local model settings arrive as `models.toml` from the composition root; depends on tools for agent-tool registration |
 | `runtime` | **Yes** | 0 env reads, no axum. Distillation/lifecycle tests exist; direct assembly coverage remains limited |
-| `gateway` | **Mostly** | Transport and composition handles; AppState has 15 fields after control/evaluation/delegation wiring |
+| `gateway` | **Mostly** | Transport and composition handles; AppState has 19 fields after control/evaluation/delegation wiring and the MCP grants |
 | `cli` | N/A | Composition root by definition |
 
 Trait placement is resolved. Ambient configuration is not: `agent` and

@@ -37,3 +37,8 @@ hex.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# The MCP route's tests grant the real work tools over the recording backend.
+rustykrab-tools.workspace = true
+# Drive the real router with a connection from another machine, which a
+# loopback listener cannot produce.
+tower = { version = "0.5", features = ["util"] }
