@@ -3164,7 +3164,9 @@ impl AgentRunner {
     /// overhead charged per message by `rustykrab_core::token_estimate`.
     ///
     /// JSON payloads are sized with a counting writer (`json_len`) — the
-    /// serialized bytes are counted, never materialized.
+    /// serialized bytes are counted, never materialized. A tool result is
+    /// charged at the denser tool-output rate
+    /// (`rustykrab_core::estimate_tool_output_bytes`).
     fn estimate_message_tokens(msg: &Message) -> usize {
         let content_chars = match &msg.content {
             MessageContent::Text(t) => t.len(),
@@ -3173,7 +3175,9 @@ impl AgentRunner {
                 .iter()
                 .map(|tc| tc.name.len() + json_len(&tc.arguments))
                 .sum(),
-            MessageContent::ToolResult(tr) => json_len(&tr.output),
+            MessageContent::ToolResult(tr) => {
+                return rustykrab_core::estimate_tool_output_bytes(json_len(&tr.output));
+            }
             MessageContent::MultiPart(blocks) => blocks
                 .iter()
                 .map(|b| match b {
@@ -6268,6 +6272,27 @@ mod compaction_tests {
     }
 
     /// A history over half the window still fits one summary call with its
+    /// A tool result is charged at the tool-output rate: the 104 KB test
+    /// run of 2026-10-16 was 42,114 real tokens, and the prose rate's 29,802
+    /// let the request that carried it skip compaction and run Ollama out
+    /// of memory.
+    #[test]
+    fn a_tool_result_is_charged_at_the_tool_output_rate() {
+        let result = Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id: "c1".into(),
+                output: serde_json::json!({ "stdout": "x".repeat(104_000) }),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        );
+        let estimate = AgentRunner::estimate_message_tokens(&result);
+        assert!(estimate >= 52_000, "{estimate}");
+        let prose = Message::stamped(Role::User, MessageContent::Text("x".repeat(104_000)));
+        assert!(AgentRunner::estimate_message_tokens(&prose) < 30_000);
+    }
+
     /// allowance: one call over the cached prefix, not uncached chunks.
     #[tokio::test]
     async fn a_history_that_fits_one_summary_call_gets_one() {

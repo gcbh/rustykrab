@@ -35,9 +35,27 @@
 //! letting a provider report the budget for the tool set actually loaded.
 //! Until you have confirmed that path covers every provider in use, treat
 //! the two estimators as separate on purpose.
+//!
+//! # Tool output has its own divisor
+//!
+//! A tool result is the one large delta the runner sizes with this
+//! heuristic alone: it arrives after the last response's anchor and decides
+//! whether the next request compacts first. Command output, logs and code
+//! tokenize much denser than prose, so it is charged at
+//! [`TOOL_OUTPUT_BYTES_PER_TOKEN`]. Over-counting it only compacts a turn
+//! early, since the next response re-anchors; under-counting it let a 42K-token
+//! test run into a qwen3.8 request estimated at 29.8K, which ran Ollama out
+//! of GPU memory.
 
 /// Bytes per token.
 pub const BYTES_PER_TOKEN: f64 = 3.5;
+
+/// Bytes per token for a tool's output, serialized. Measured on qwen3.8
+/// (long-context eval, 2026-10-15 and 16): a `unittest -v` run tokenized at
+/// 2.48 bytes per token, logs at 1.9 to 2.3, Python source at about 3.0,
+/// where prose sits near [`BYTES_PER_TOKEN`]. Set at the dense end, because
+/// an under-count is the failure that costs a run.
+pub const TOOL_OUTPUT_BYTES_PER_TOKEN: f64 = 2.0;
 
 /// Framing overhead charged per message, for its role and delimiters.
 pub const MESSAGE_OVERHEAD_TOKENS: usize = 4;
@@ -54,6 +72,12 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 /// materializing them.
 pub fn estimate_bytes(bytes: usize) -> usize {
     (bytes as f64 / BYTES_PER_TOKEN).ceil() as usize
+}
+
+/// Estimated tokens for a tool result whose serialized output is `bytes`,
+/// including the per-message framing overhead.
+pub fn estimate_tool_output_bytes(bytes: usize) -> usize {
+    (bytes as f64 / TOOL_OUTPUT_BYTES_PER_TOKEN).ceil() as usize + MESSAGE_OVERHEAD_TOKENS
 }
 
 /// Estimated tokens for a message body of `bytes`, including the
@@ -89,6 +113,15 @@ mod tests {
             estimate_bytes(35) + MESSAGE_OVERHEAD_TOKENS
         );
         assert_eq!(estimate_message_bytes(0), MESSAGE_OVERHEAD_TOKENS);
+    }
+
+    #[test]
+    fn tool_output_is_charged_denser_than_prose() {
+        // The 2026-10-16 case: 104,309 bytes of test output were 42,114
+        // tokens; the prose divisor said 29,802.
+        let estimate = estimate_tool_output_bytes(104_309);
+        assert!(estimate >= 42_114, "{estimate}");
+        assert!(estimate > estimate_message_bytes(104_309));
     }
 
     /// The property the summary cap depends on: a string cut to

@@ -5,7 +5,13 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::timeout;
 
-const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100KB
+/// The most of a command's output that goes back to the model, stdout and
+/// stderr together: 30 KB, about what Claude Code's Bash tool keeps (30,000
+/// characters). It was 100 KB per stream; one `unittest -v` run then put
+/// 42K tokens into a qwen3.8 conversation in a single turn, and the next
+/// request ran Ollama out of GPU memory at about 104K tokens of context
+/// (long-context eval, 2026-10-16).
+const MAX_OUTPUT_BYTES: usize = 30 * 1024;
 
 /// A command's time limit when the call names none: long enough for a
 /// test suite or a build step, as feather-harness's 120 s default is.
@@ -461,17 +467,91 @@ fn rustup_home() -> Option<std::path::PathBuf> {
     }
 }
 
-fn truncate_output(s: String) -> String {
-    if s.len() > MAX_OUTPUT_BYTES {
-        // Use floor_char_boundary to avoid panicking when the truncation
-        // point falls within a multi-byte UTF-8 character.
-        let end = s.floor_char_boundary(MAX_OUTPUT_BYTES);
-        let mut truncated = s[..end].to_string();
-        truncated.push_str("\n... [truncated]");
-        truncated
-    } else {
-        s
+/// What of a command's stdout and stderr goes back to the model: both whole
+/// when together they fit [`MAX_OUTPUT_BYTES`], otherwise each stream's head
+/// and tail, the larger stream giving way first. A cut stream is written
+/// whole to a file under [`full_output_dir`] and its marker names the path,
+/// so the model can read or grep the rest with another command.
+fn bound_output(stdout: String, stderr: String) -> (String, String) {
+    let (out_len, err_len) = (stdout.len(), stderr.len());
+    if out_len + err_len <= MAX_OUTPUT_BYTES {
+        return (stdout, stderr);
     }
+    let half = MAX_OUTPUT_BYTES / 2;
+    let err_budget = if err_len <= half {
+        err_len
+    } else if out_len <= half {
+        MAX_OUTPUT_BYTES - out_len
+    } else {
+        half
+    };
+    let out_budget = MAX_OUTPUT_BYTES - err_budget;
+    (
+        head_and_tail(stdout, out_budget, "stdout"),
+        head_and_tail(stderr, err_budget, "stderr"),
+    )
+}
+
+/// `s` cut to its first and last `budget / 2` bytes around a marker that
+/// names the file holding all of it; `s` itself when it fits.
+fn head_and_tail(s: String, budget: usize, stream: &str) -> String {
+    if s.len() <= budget {
+        return s;
+    }
+    // Char boundaries, so a cut never splits a multi-byte UTF-8 character.
+    let head_end = s.floor_char_boundary(budget / 2);
+    let tail_start = s.ceil_char_boundary(s.len() - budget / 2);
+    let omitted = tail_start - head_end;
+    let saved = match save_full_output(&s, stream) {
+        Ok(path) => format!("the whole {stream} is in {}", path.display()),
+        Err(e) => format!("the whole {stream} could not be saved: {e}"),
+    };
+    format!(
+        "{}\n\n... [{omitted} bytes omitted; {saved}] ...\n\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
+/// Where cut output is kept: the daemon's temporary directory, which a
+/// sandboxed command may read and which the OS clears.
+fn full_output_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("rustykrab-exec-output")
+}
+
+/// How long a saved output is kept: long enough for any run that cut it.
+const FULL_OUTPUT_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn save_full_output(s: &str, stream: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = full_output_dir();
+    std::fs::create_dir_all(&dir)?;
+    // Each save prunes what earlier runs left, so the directory stays small
+    // without a sweeper of its own.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > FULL_OUTPUT_KEEP);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let path = dir.join(format!(
+        "{millis}-{}-{}.{stream}.txt",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, s)?;
+    Ok(path)
 }
 
 /// Refuse forced removal — `rm` with `-f` or `--force`, alone or in a flag
@@ -1177,8 +1257,10 @@ impl Tool for ExecTool {
                 rustykrab_core::Error::ToolExecution(ToolError::transient(e.to_string()))
             })?;
 
-        let stdout = truncate_output(String::from_utf8_lossy(&output.stdout).into_owned());
-        let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).into_owned());
+        let (stdout, stderr) = bound_output(
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        );
         let exit_code = output.status.code().unwrap_or(-1);
 
         Ok(json!({
@@ -1840,5 +1922,69 @@ mod error_typing_tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ToolErrorKind::Timeout);
+    }
+}
+
+#[cfg(test)]
+mod output_bound_tests {
+    use super::{bound_output, MAX_OUTPUT_BYTES};
+
+    /// The path a cut stream's marker names.
+    fn saved_path(cut: &str) -> std::path::PathBuf {
+        let start = cut.find(" is in ").expect("marker names a file") + " is in ".len();
+        let end = cut[start..].find(']').unwrap() + start;
+        cut[start..end].into()
+    }
+
+    #[test]
+    fn output_that_fits_comes_back_whole() {
+        let (out, err) = bound_output("a".repeat(20_000), "b".repeat(10_000));
+        assert_eq!(out, "a".repeat(20_000));
+        assert_eq!(err, "b".repeat(10_000));
+    }
+
+    #[test]
+    fn long_output_keeps_its_head_and_tail_and_saves_the_rest() {
+        // A test run's first failures are at the top and its summary at the
+        // bottom; both must survive the cut.
+        let mut out = String::from("FIRST FAILURE\n");
+        out.push_str(&"x".repeat(200_000));
+        out.push_str("\nRan 74 tests: FAILED (failures=1)");
+        let (cut, err) = bound_output(out.clone(), String::new());
+        assert!(err.is_empty());
+        assert!(cut.len() < MAX_OUTPUT_BYTES + 300, "{}", cut.len());
+        assert!(cut.starts_with("FIRST FAILURE"));
+        assert!(cut.ends_with("FAILED (failures=1)"));
+        assert!(cut.contains("bytes omitted"));
+        let path = saved_path(&cut);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), out);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn short_stderr_survives_long_stdout_whole() {
+        let (out, err) = bound_output("o".repeat(100_000), "error: E306 at line 18".into());
+        assert_eq!(err, "error: E306 at line 18");
+        assert!(out.len() + err.len() < MAX_OUTPUT_BYTES + 300);
+        let _ = std::fs::remove_file(saved_path(&out));
+    }
+
+    #[test]
+    fn two_long_streams_share_the_budget() {
+        let (out, err) = bound_output("o".repeat(80_000), "e".repeat(80_000));
+        assert!(out.contains("stdout is in") && err.contains("stderr is in"));
+        assert!(out.len() + err.len() < MAX_OUTPUT_BYTES + 600);
+        for cut in [out, err] {
+            let _ = std::fs::remove_file(saved_path(&cut));
+        }
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        // Four-byte characters put every cut point mid-character unless it
+        // moves to a boundary.
+        let (out, _) = bound_output("😀".repeat(20_000), String::new());
+        assert!(out.starts_with('😀') && out.ends_with('😀'));
+        let _ = std::fs::remove_file(saved_path(&out));
     }
 }

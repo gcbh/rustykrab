@@ -65,7 +65,8 @@ pub use session::Session;
 pub use timezone::Tz;
 pub use todo::{render_todos, TodoItem, TodoStatus, TodoStore};
 pub use token_estimate::{
-    estimate_bytes, estimate_message_bytes, estimate_text_tokens, max_bytes_for_tokens,
+    estimate_bytes, estimate_message_bytes, estimate_text_tokens, estimate_tool_output_bytes,
+    max_bytes_for_tokens,
 };
 pub use tool::{mcp_server_of, SandboxRequirements, Tool, MCP_TOOL_PREFIX};
 pub use tool_block::{ToolBlockObservation, ToolBlockTracker};
