@@ -707,7 +707,8 @@ question goes at once. `work_plans` records each accepted `work_plan` call for
 questions(id PK, item, root, kind, class, text, options JSON,
           default_answer, asked_class, rule, asked_by, status,
           delivered_via, answer, answered_by, answered_at,
-          research_item, decision JSON, created_at, superseded_by FK → questions.id)
+          research_item, decision JSON, created_at, superseded_by FK → questions.id,
+          answer_submission JSON nullable)
    INDEX idx_questions_item    (item, created_at)
    INDEX idx_questions_waiting (status, created_at)
          WHERE status IN ('open', 'recorded', 'researching')
@@ -734,6 +735,18 @@ record is what the evaluation of section 10 reads for avoidable escalations
 (Phase 6: a surfaced question whose answer equals `default_answer`, is a candidate).
 Unreadable values parse to the conservative case: an unknown class reads as
 `blocking_now`, an unknown status as `open`.
+
+`answer_submission` is an additive nullable receipt on this existing question,
+not another work queue. It records a submission UUID, normalized words, the
+server-derived actor and submission time, and `pending`, `applied` or `rejected`
+with completion time/error. Legacy rows remain NULL. Saving a pending receipt
+changes no question status, answer, permission, budget or work status. Exact
+identity/payload retries return the original receipt, conflicting reuse and a
+different pending answer are refused. The controller commits the actual answer,
+graph effects and `applied` receipt in one `work_apply` transaction. A refused
+application retains a `rejected` receipt plus a question event with the submitted
+words; retrying that still-open question creates a new identity. Pending receipts
+are recovered from the question after restart and processed by submission time.
 
 `judgment_policies` keeps standing judgment in the user's words (`text`),
 what it compiled to (`checks`, the controller's inspectable checklist), the

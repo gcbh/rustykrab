@@ -265,8 +265,23 @@ impl WorkCommands {
         if question.is_empty() || answer.trim().is_empty() {
             return "Usage: /answer <question> <your answer>".to_string();
         }
-        match self.control.answer(question, answer, &self.actor).await {
+        match self
+            .control
+            .submit_answer(question, answer, &self.actor, None)
+            .await
+        {
             Ok(reply) => {
+                if reply
+                    .question
+                    .answer_submission
+                    .as_ref()
+                    .is_some_and(|s| s.status == rustykrab_store::AnswerSubmissionStatus::Pending)
+                {
+                    return format!(
+                        "Answer saved for question {}. Waiting for it to be applied.",
+                        short(&reply.question.id)
+                    );
+                }
                 let mut text = format!(
                     "Answered question {}.",
                     reply.question.id.chars().take(8).collect::<String>()

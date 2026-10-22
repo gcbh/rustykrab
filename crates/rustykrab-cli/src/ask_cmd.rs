@@ -50,6 +50,18 @@ pub async fn run(data_dir: &Path, verb: &str, args: &[String]) -> anyhow::Result
                     json!({ "answer": answer.join(" ") }),
                 )
                 .await?;
+            if reply
+                .question
+                .answer_submission
+                .as_ref()
+                .is_some_and(|s| s.status == rustykrab_store::AnswerSubmissionStatus::Pending)
+            {
+                println!(
+                    "Answer saved for {}. Waiting for it to be applied.",
+                    short(&reply.question.id)
+                );
+                return Ok(());
+            }
             let mut line = format!(
                 "Answered {}: {}",
                 short(&reply.question.id),

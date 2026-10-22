@@ -11,8 +11,10 @@
 //!   waits on; a blocking-later one is recorded for the root's next message;
 //!   an obsolete one closes. A question the item already had answered is
 //!   the worker ignoring its answer: a failure for the ladder.
-//! - An answer ([`Controller::answer_locked`], from REST, the CLI or the
-//!   channel) settles the question, fires `on_answer` triggers, and resumes
+//! - REST and channel answer intake save durable receipts without the command
+//!   lock. A controller pass applies pending receipts through the same answer
+//!   path as synchronous control commands ([`Controller::answer_locked`]). It
+//!   settles the question, fires `on_answer` triggers, and resumes
 //!   the item (not the conversation): it returns to `queued` and its next
 //!   brief carries the answer ([`Controller::answers_for`]). An item the
 //!   ladder stopped on a spent budget or a failed verification resumes on
@@ -38,7 +40,10 @@ use rustykrab_core::work::{
     ResultReport, Rung, RungEvent, Status, WorkItem, WorkItemDraft, WorkItemId, WorkKind, WorkPlan,
 };
 use rustykrab_core::{Error, ToolError};
-use rustykrab_store::{JudgmentRow, QuestionFilter, QuestionRow, QuestionWrite, WorkOp};
+use rustykrab_store::{
+    AnswerSubmission, AnswerSubmissionStatus, JudgmentRow, QuestionFilter, QuestionRow,
+    QuestionWrite, WorkOp,
+};
 use rustykrab_tools::work_backend::{AskOutcome, AskRequest, CapabilityAsk, Provenance};
 
 use super::batch::{has_open_plan_b, Batch};
@@ -336,6 +341,7 @@ impl Controller {
         };
         let row = QuestionRow {
             superseded_by: None,
+            answer_submission: None,
             id: id.clone(),
             item: q.item.clone(),
             root,
@@ -1210,18 +1216,10 @@ impl Controller {
 
     // ── answers ───────────────────────────────────────────────────────
 
-    /// A question by its id or the first eight characters of it, among the
-    /// questions still waiting.
-    async fn resolve_question(&self, id: &str) -> Result<QuestionRow, Error> {
+    /// Find the addressed row before considering historical consolidation.
+    async fn lookup_question(&self, id: &str) -> Result<QuestionRow, Error> {
         let id = id.trim().trim_start_matches('#');
         if let Some(q) = self.store.question_get(id).await? {
-            if let Some(canonical) = q.superseded_by.as_deref() {
-                return self
-                    .store
-                    .question_get(canonical)
-                    .await?
-                    .ok_or_else(|| Error::NotFound(format!("question {canonical}")));
-            }
             return Ok(q);
         }
         let waiting = self
@@ -1235,21 +1233,24 @@ impl Controller {
             .filter(|q| !id.is_empty() && q.id.starts_with(id))
             .collect();
         match matches.len() {
-            1 => {
-                let q = matches.into_iter().next().expect("one match");
-                if let Some(canonical) = q.superseded_by.as_deref() {
-                    self.store
-                        .question_get(canonical)
-                        .await?
-                        .ok_or_else(|| Error::NotFound(format!("question {canonical}")))
-                } else {
-                    Ok(q)
-                }
-            }
+            1 => Ok(matches.into_iter().next().expect("one match")),
             0 => Err(Error::NotFound(format!("question {id}"))),
             _ => Err(invalid(format!(
                 "question {id} is ambiguous: give more of its id"
             ))),
+        }
+    }
+
+    /// Follow a historical question link to its canonical row.
+    async fn resolve_question(&self, id: &str) -> Result<QuestionRow, Error> {
+        let q = self.lookup_question(id).await?;
+        if let Some(canonical) = q.superseded_by.as_deref() {
+            self.store
+                .question_get(canonical)
+                .await?
+                .ok_or_else(|| Error::NotFound(format!("question {canonical}")))
+        } else {
+            Ok(q)
         }
     }
 
@@ -1263,13 +1264,161 @@ impl Controller {
         actor: &str,
     ) -> Result<AnswerReply, Error> {
         let q = self.resolve_question(question).await?;
+        let pending = q
+            .answer_submission
+            .as_ref()
+            .filter(|r| r.status == AnswerSubmissionStatus::Pending);
+        if pending
+            .is_some_and(|r| r.actor != actor || r.answer != resolve_option(answer, &q.options))
+        {
+            return Err(Error::AlreadyExists(
+                "a saved answer is already waiting to be applied to this question".into(),
+            ));
+        }
+        self.answer_with_submission_locked(
+            &q.id,
+            pending.map_or(answer, |r| r.answer.as_str()),
+            actor,
+            pending.map(|r| r.id.as_str()),
+        )
+        .await
+    }
+
+    pub(super) async fn save_answer_submission(
+        &self,
+        question: &str,
+        answer: &str,
+        actor: &str,
+        submission_id: Option<&str>,
+    ) -> Result<AnswerReply, Error> {
+        let addressed = self.lookup_question(question).await?;
+        // A lost acknowledgement must reconcile the accepted receipt, even if
+        // the original question was consolidated before the retry arrived.
+        let q = if addressed.answer_submission.is_some() {
+            addressed
+        } else {
+            self.resolve_question(&addressed.id).await?
+        };
+        let answer = resolve_option(answer, &q.options);
+        if answer.is_empty() {
+            return Err(invalid("an answer needs words"));
+        }
+        if q.kind == QuestionKind::Consent && !is_yes(&answer) && !is_no(&answer) {
+            return Err(invalid("a consent is answered yes or no"));
+        }
+        if q.kind == QuestionKind::Approval && !is_yes(&answer) && !is_no(&answer) {
+            return Err(invalid(
+                "a plan's approval is answered approve or reject [reason]",
+            ));
+        }
+        let id = match submission_id {
+            Some(id) => uuid::Uuid::parse_str(id)
+                .map_err(|_| invalid("answer submission_id must be a UUID"))?
+                .to_string(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        let question = self
+            .store
+            .question_submit_answer(
+                &q.id,
+                AnswerSubmission {
+                    id,
+                    answer,
+                    actor: actor.to_string(),
+                    submitted_at: Utc::now(),
+                    status: AnswerSubmissionStatus::Pending,
+                    completed_at: None,
+                    error: None,
+                },
+            )
+            .await?;
+        Ok(AnswerReply {
+            question,
+            resumed: Vec::new(),
+            released: Vec::new(),
+            cancelled: Vec::new(),
+        })
+    }
+
+    /// Receipts are durable; a cancelled HTTP request or daemon restart cannot
+    /// lose accepted direction. Effects and a successful receipt commit together.
+    pub(super) async fn apply_pending_answers_locked(&self) -> Result<(), Error> {
+        for q in self.store.questions_pending_answers().await? {
+            let Some(receipt) = q.answer_submission else {
+                continue;
+            };
+            let result = self
+                .answer_with_submission_locked(
+                    &q.id,
+                    &receipt.answer,
+                    &receipt.actor,
+                    Some(&receipt.id),
+                )
+                .await;
+            if let Err(error) = result {
+                if matches!(error, Error::Storage(_)) {
+                    return Err(error);
+                }
+                let mut b = Batch::new(self.load().await?, self.clock.now());
+                let message = error.to_string();
+                b.ops.push(WorkOp::Question(QuestionWrite::AnswerProcessed {
+                    id: q.id.clone(),
+                    submission: receipt.id.clone(),
+                    error: Some(message.clone()),
+                    at: Utc::now(),
+                }));
+                b.note(
+                    &q.item,
+                    EventKind::Question,
+                    &receipt.actor,
+                    format!(
+                        "Saved answer {} could not be applied: {message}. Submitted words: {}",
+                        receipt.id, receipt.answer
+                    ),
+                );
+                self.commit(b, &mut HashSet::new()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn answer_with_submission_locked(
+        &self,
+        question: &str,
+        answer: &str,
+        actor: &str,
+        submission: Option<&str>,
+    ) -> Result<AnswerReply, Error> {
+        let q = self.resolve_question(question).await?;
+        if submission.is_some() && q.id != question {
+            return Err(Error::AlreadyExists(
+                "the saved answer's question was superseded; review the current question".into(),
+            ));
+        }
         if !q.status.is_waiting() {
             return Err(Error::AlreadyExists(format!(
                 "question {} is already {}",
                 q.id, q.status
             )));
         }
-        let answer = resolve_option(answer, &q.options);
+        if submission.is_some()
+            && self
+                .store
+                .work_get(&q.item)
+                .await?
+                .is_none_or(|item| item.status.is_closed())
+        {
+            return Err(Error::AlreadyExists(
+                "the work closed before this saved answer could be applied".into(),
+            ));
+        }
+        // Receipt words were already resolved at intake. A numeric option
+        // label must not be interpreted a second time as an option index.
+        let answer = if submission.is_some() {
+            answer.to_string()
+        } else {
+            resolve_option(answer, &q.options)
+        };
         if answer.is_empty() {
             return Err(invalid("an answer needs words"));
         }
@@ -1281,13 +1430,28 @@ impl Controller {
         };
         if q.kind == QuestionKind::Approval {
             if is_yes(&answer) {
-                reply.released = self.approve_locked(&q.item, actor).await?;
+                reply.released = self
+                    .approve_with_preference_locked(
+                        &q.item,
+                        actor,
+                        None,
+                        None,
+                        submission.map(|id| (q.id.as_str(), id)),
+                    )
+                    .await?;
             } else if is_no(&answer) {
                 let why = answer
                     .split_once(' ')
                     .map(|(_, r)| r.trim().to_string())
                     .filter(|r| !r.is_empty());
-                reply.cancelled = self.reject_locked(&q.item, why, actor).await?;
+                reply.cancelled = self
+                    .reject_with_submission_locked(
+                        &q.item,
+                        why,
+                        actor,
+                        submission.map(|id| (q.id.as_str(), id)),
+                    )
+                    .await?;
             } else {
                 return Err(invalid(
                     "a plan's approval is answered approve or reject [reason]",
@@ -1422,6 +1586,14 @@ impl Controller {
             reply.resumed.push(q.item.clone());
         }
         b.settle(changed);
+        if let Some(submission) = submission {
+            b.ops.push(WorkOp::Question(QuestionWrite::AnswerProcessed {
+                id: q.id.clone(),
+                submission: submission.to_string(),
+                error: None,
+                at: Utc::now(),
+            }));
+        }
         self.commit(b, &mut HashSet::new()).await?;
         reply.question = self
             .store

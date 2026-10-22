@@ -104,6 +104,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), Error> {
         )
         .map_err(|e| Error::Storage(e.to_string()))?;
     }
+    if !columns.iter().any(|c| c == "answer_submission") {
+        conn.execute(
+            "ALTER TABLE questions ADD COLUMN answer_submission TEXT",
+            [],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    }
     let mut stmt = conn
         .prepare("PRAGMA table_info(work_outbox)")
         .map_err(|e| Error::Storage(e.to_string()))?;
@@ -141,6 +148,27 @@ fn json<T: Serialize>(value: &T) -> Result<String, WorkStoreError> {
 }
 
 // ── questions ──────────────────────────────────────────────────────────
+
+/// Receipt for an owner's answer. Saving it does not settle the question or
+/// release work; the controller applies it in its normal graph transaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerSubmission {
+    pub id: String,
+    pub answer: String,
+    pub actor: String,
+    pub submitted_at: DateTime<Utc>,
+    pub status: AnswerSubmissionStatus,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerSubmissionStatus {
+    Pending,
+    Applied,
+    Rejected,
+}
 
 /// One `questions` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -187,11 +215,13 @@ pub struct QuestionRow {
     /// Canonical unresolved question when this row was consolidated; no answer implied.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_submission: Option<AnswerSubmission>,
 }
 
 const QUESTION_COLUMNS: &str = "id, item, root, kind, class, text, options, default_answer, \
      asked_class, rule, asked_by, status, delivered_via, answer, answered_by, answered_at, \
-     research_item, decision, created_at, superseded_by";
+     research_item, decision, created_at, superseded_by, answer_submission";
 
 /// Map a `SELECT {QUESTION_COLUMNS}` row. Conservative: an unreadable kind
 /// reads as `decision`, an unreadable class as `blocking_now` and an
@@ -205,6 +235,7 @@ fn question_from_row(row: &Row) -> rusqlite::Result<QuestionRow> {
     let decision: Option<String> = row.get("decision")?;
     let answered_at: Option<String> = row.get("answered_at")?;
     let created_at: String = row.get("created_at")?;
+    let submission: Option<String> = row.get("answer_submission")?;
     Ok(QuestionRow {
         id: row.get("id")?,
         item: row.get("item")?,
@@ -226,6 +257,17 @@ fn question_from_row(row: &Row) -> rusqlite::Result<QuestionRow> {
         decision: decision.and_then(|raw| serde_json::from_str(&raw).ok()),
         created_at: parse_ts(&created_at).unwrap_or_default(),
         superseded_by: row.get("superseded_by")?,
+        answer_submission: submission
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        20,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -236,6 +278,13 @@ fn question_from_row(row: &Row) -> rusqlite::Result<QuestionRow> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuestionWrite {
     Insert(Box<QuestionRow>),
+    /// Complete only this receipt, in the same transaction as its effects.
+    AnswerProcessed {
+        id: String,
+        submission: String,
+        error: Option<String>,
+        at: DateTime<Utc>,
+    },
     /// Consolidate a waiting repetition into another question on the same item.
     Supersede {
         id: String,
@@ -290,7 +339,7 @@ pub(crate) fn insert_question(conn: &Connection, q: &QuestionRow) -> Result<(), 
     conn.execute(
         &format!(
             "INSERT INTO questions ({QUESTION_COLUMNS}) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
         ),
         params![
             q.id,
@@ -313,6 +362,7 @@ pub(crate) fn insert_question(conn: &Connection, q: &QuestionRow) -> Result<(), 
             q.decision.as_ref().map(json).transpose()?,
             ts(&q.created_at),
             q.superseded_by,
+            q.answer_submission.as_ref().map(json).transpose()?,
         ],
     )?;
     Ok(())
@@ -335,6 +385,41 @@ pub(crate) fn apply_question(
 ) -> Result<(), WorkStoreError> {
     match write {
         QuestionWrite::Insert(q) => insert_question(conn, q),
+        QuestionWrite::AnswerProcessed {
+            id,
+            submission,
+            error,
+            at,
+        } => {
+            let q = get_question(conn, id)?
+                .ok_or_else(|| WorkStoreError::NotFound(format!("question {id}")))?;
+            let mut receipt = q
+                .answer_submission
+                .filter(|r| r.id == *submission && r.status == AnswerSubmissionStatus::Pending)
+                .ok_or_else(|| {
+                    WorkStoreError::AlreadyExists("answer receipt has changed".into())
+                })?;
+            if error.is_none()
+                && (q.status != QuestionStatus::Answered
+                    || q.answered_by.as_deref() != Some(receipt.actor.as_str()))
+            {
+                return Err(WorkStoreError::AlreadyExists(
+                    "answer has not been applied by its submitter".into(),
+                ));
+            }
+            receipt.status = if error.is_some() {
+                AnswerSubmissionStatus::Rejected
+            } else {
+                AnswerSubmissionStatus::Applied
+            };
+            receipt.completed_at = Some(*at);
+            receipt.error = error.clone();
+            conn.execute(
+                "UPDATE questions SET answer_submission = ?2 WHERE id = ?1",
+                params![id, json(&receipt)?],
+            )?;
+            Ok(())
+        }
         QuestionWrite::Supersede { id, canonical, at } => {
             let q = get_question(conn, id)?
                 .ok_or_else(|| WorkStoreError::NotFound(format!("question {id}")))?;
@@ -367,6 +452,21 @@ pub(crate) fn apply_question(
                     "question {id} is already {}",
                     current.status
                 )));
+            }
+            // Intake bypasses the controller lock. A technical recovery built
+            // before an owner's submission must not obsolete that receipt and
+            // resume work using its stale observation. Refuse the whole graph
+            // transaction; the next pass applies the durable answer first.
+            if *status == QuestionStatus::Obsolete
+                && by.as_deref() == Some("controller")
+                && current
+                    .answer_submission
+                    .as_ref()
+                    .is_some_and(|r| r.status == AnswerSubmissionStatus::Pending)
+            {
+                return Err(WorkStoreError::AlreadyExists(
+                    "a saved answer arrived before technical recovery committed".into(),
+                ));
             }
             conn.execute(
                 "UPDATE questions SET status = ?2, answer = ?3, answered_by = ?4, \
@@ -595,6 +695,62 @@ impl Store {
             .await
     }
 
+    /// Save an answer receipt without waiting for the controller's graph lock.
+    /// A retry with the same identity and payload returns the original receipt;
+    /// a different pending answer cannot overwrite accepted owner direction.
+    pub async fn question_submit_answer(
+        &self,
+        id: &str,
+        submission: AnswerSubmission,
+    ) -> Result<QuestionRow, WorkStoreError> {
+        let id = id.to_string();
+        self.question_call(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut q = get_question(&tx, &id)?
+                .ok_or_else(|| WorkStoreError::NotFound(format!("question {id}")))?;
+            if let Some(existing) = &q.answer_submission {
+                let same_payload = existing.answer == submission.answer && existing.actor == submission.actor;
+                if existing.id == submission.id {
+                    if !same_payload {
+                        return Err(WorkStoreError::AlreadyExists("this answer identity was already used for different words or a different sender".into()));
+                    }
+                    return Ok(q);
+                }
+                if existing.status == AnswerSubmissionStatus::Pending {
+                    if same_payload { return Ok(q); }
+                    return Err(WorkStoreError::AlreadyExists("a saved answer is already waiting to be applied to this question".into()));
+                }
+            }
+            if !q.status.is_waiting() || q.superseded_by.is_some() {
+                return Err(WorkStoreError::AlreadyExists(format!("question {id} is already {}", q.status)));
+            }
+            if submission.status != AnswerSubmissionStatus::Pending {
+                return Err(WorkStoreError::AlreadyExists("a new answer receipt must be pending".into()));
+            }
+            tx.execute("UPDATE questions SET answer_submission = ?2 WHERE id = ?1", params![id, json(&submission)?])?;
+            tx.commit()?;
+            q.answer_submission = Some(submission);
+            Ok(q)
+        }).await
+    }
+
+    /// Unprocessed receipts remain on their question through a restart.
+    pub async fn questions_pending_answers(&self) -> Result<Vec<QuestionRow>, WorkStoreError> {
+        self.question_call(move |conn| {
+            let mut stmt = conn.prepare(&format!("SELECT {QUESTION_COLUMNS} FROM questions WHERE answer_submission IS NOT NULL ORDER BY created_at, id"))?;
+            let rows = stmt.query_map([], question_from_row)?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let q = row?;
+                if q.answer_submission.as_ref().is_some_and(|s| s.status == AnswerSubmissionStatus::Pending) {
+                    pending.push(q);
+                }
+            }
+            pending.sort_by_key(|q| q.answer_submission.as_ref().map(|s| (s.submitted_at, s.id.clone())));
+            Ok(pending)
+        }).await
+    }
+
     /// Questions matching `filter`, newest first.
     pub async fn questions_list(
         &self,
@@ -751,6 +907,7 @@ mod tests {
     fn question(id: &str, item: &str) -> QuestionRow {
         QuestionRow {
             superseded_by: None,
+            answer_submission: None,
             id: id.into(),
             item: item.into(),
             root: item.into(),
@@ -771,6 +928,119 @@ mod tests {
             decision: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_answer_receipt_survives_database_reopen_and_migrates_an_old_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), vec![7; 32]).unwrap();
+        s.question_write(QuestionWrite::Insert(Box::new(question("q1", "i1"))))
+            .await
+            .unwrap();
+        with_conn(&s.conn, |conn| {
+            conn.execute("ALTER TABLE questions DROP COLUMN answer_submission", [])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(s);
+        let s = Store::open(dir.path(), vec![7; 32]).unwrap();
+        let receipt = AnswerSubmission {
+            id: Uuid::new_v4().to_string(),
+            answer: "Petals".into(),
+            actor: "user:owner".into(),
+            submitted_at: Utc::now(),
+            status: AnswerSubmissionStatus::Pending,
+            completed_at: None,
+            error: None,
+        };
+        assert!(s
+            .question_get("q1")
+            .await
+            .unwrap()
+            .unwrap()
+            .answer_submission
+            .is_none());
+        let saved = s
+            .question_submit_answer("q1", receipt.clone())
+            .await
+            .unwrap();
+        drop(s);
+        let reopened = Store::open(dir.path(), vec![7; 32]).unwrap();
+        assert_eq!(reopened.question_get("q1").await.unwrap().unwrap(), saved);
+        assert_eq!(
+            reopened.questions_pending_answers().await.unwrap(),
+            vec![saved]
+        );
+        assert_eq!(
+            reopened
+                .question_submit_answer("q1", receipt)
+                .await
+                .unwrap()
+                .answer,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_receipt_completion_rolls_back_with_an_invalid_question_transaction() {
+        let s = store();
+        s.question_write(QuestionWrite::Insert(Box::new(question("q1", "i1"))))
+            .await
+            .unwrap();
+        let receipt = AnswerSubmission {
+            id: Uuid::new_v4().to_string(),
+            answer: "Petals".into(),
+            actor: "user:owner".into(),
+            submitted_at: Utc::now(),
+            status: AnswerSubmissionStatus::Pending,
+            completed_at: None,
+            error: None,
+        };
+        let pending = s
+            .question_submit_answer("q1", receipt.clone())
+            .await
+            .unwrap();
+        let settle = QuestionWrite::Settle {
+            id: "q1".into(),
+            status: QuestionStatus::Answered,
+            answer: Some("Petals".into()),
+            by: Some("user:owner".into()),
+            decision: None,
+            at: Utc::now(),
+        };
+        let processed = |id: String| QuestionWrite::AnswerProcessed {
+            id: "q1".into(),
+            submission: id,
+            error: None,
+            at: Utc::now(),
+        };
+        assert!(s
+            .work_apply(vec![
+                WorkOp::Question(settle.clone()),
+                WorkOp::Question(processed("wrong receipt".into()))
+            ])
+            .await
+            .is_err());
+        assert_eq!(s.question_get("q1").await.unwrap().unwrap(), pending);
+        s.work_apply(vec![
+            WorkOp::Question(settle),
+            WorkOp::Question(processed(receipt.id)),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            s.question_get("q1")
+                .await
+                .unwrap()
+                .unwrap()
+                .answer_submission
+                .unwrap()
+                .status,
+            AnswerSubmissionStatus::Applied
+        );
+        assert!(s.questions_pending_answers().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -958,6 +1228,7 @@ mod consolidation_tests {
             decision: None,
             created_at: now,
             superseded_by: None,
+            answer_submission: None,
         };
         for q in [
             row("canonical", "item"),

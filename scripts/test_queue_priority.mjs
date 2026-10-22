@@ -66,7 +66,7 @@ test('a monitor read started before a move cannot restore an older order',async(
   const response=new Promise(resolve=>{complete=resolve;});
   const {context}=priorityContext(()=>response);
   context.pending=false;context.access={connected:true};context.currentView='priority';
-  context.render=()=>{};context.refreshQuestions=async()=>{};
+  context.render=()=>{};context.refreshQuestions=async()=>{};context.refreshAnswerMessages=async()=>{};
   const refreshFragment=source.slice(source.indexOf('  async function refresh() {'),source.indexOf('  async function showDetail('));
   vm.runInContext(refreshFragment,context);
   const reading=context.refresh();

@@ -2,18 +2,18 @@
 //! router's and standing judgment's HTTP surface
 //! (`docs/plans/control-layer-and-worker-fleet.md`, sections 5, 7 and 14).
 //!
-//! Reads of questions come straight from the store; answering and granting
-//! go through the controller's [`ControlHandle`], so an answer resumes the
-//! item that asked (not a conversation) in the same transaction that
-//! settles the question. Each command carries the authenticated principal
-//! as its actor.
+//! Reads come straight from the store. Answer intake durably saves a receipt
+//! without waiting for the controller's command lock; the controller later
+//! applies the answer, its work effects, and receipt completion atomically.
+//! Each command carries the authenticated principal as its actor.
 //!
 //! - `GET /api/questions` lists questions oldest first (`item`, `root`,
 //!   `status`, `waiting=true` filter); `GET /api/questions/{id}` reads one.
-//! - `POST /api/questions/{id}/answer` with `{ "answer": "..." }` answers
-//!   one, by its id or the first eight characters of it. 409 when it is
-//!   already settled, 400 when the answer does not fit it (a consent takes
-//!   yes or no; a plan's approval takes approve or reject).
+//! - `POST /api/questions/{id}/answer` accepts `{ "answer": "...",
+//!   "submission_id": "optional UUID" }`, by full or eight-character question
+//!   id. 202 means saved and pending; a completed identical retry returns 200.
+//!   Reusing a receipt id with different words or actor conflicts (409).
+//!   Invalid consent/approval words or receipt ids return 400.
 //! - `GET /api/judgment` shows the grants in force and the rules they add up
 //!   to; `POST /api/judgment` with `{ "text": "...", "scope": "..." }`
 //!   grants standing judgment in ordinary language and answers with what it
@@ -207,6 +207,8 @@ async fn get_question(
 #[derive(Debug, Deserialize)]
 struct AnswerBody {
     answer: String,
+    #[serde(default)]
+    submission_id: Option<String>,
 }
 
 /// `POST /api/questions/{id}/answer`.
@@ -215,16 +217,31 @@ async fn answer(
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> Result<Json<AnswerReply>, ApiError> {
+) -> Result<(StatusCode, Json<AnswerReply>), ApiError> {
     let control = control(&state)?;
     let parsed: AnswerBody = body_json(&body, "answer")?;
     if parsed.answer.trim().is_empty() {
         return Err(ApiError::bad_request("an answer needs words"));
     }
     let reply = control
-        .answer(&id, &parsed.answer, &actor_of(principal))
+        .submit_answer(
+            &id,
+            &parsed.answer,
+            &actor_of(principal),
+            parsed.submission_id.as_deref(),
+        )
         .await?;
-    Ok(Json(reply))
+    let status = if reply
+        .question
+        .answer_submission
+        .as_ref()
+        .is_some_and(|s| s.status == rustykrab_store::AnswerSubmissionStatus::Pending)
+    {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(reply)))
 }
 
 /// `GET /api/judgment`.
@@ -417,6 +434,7 @@ mod tests {
             self.store
                 .question_write(QuestionWrite::Insert(Box::new(QuestionRow {
                     superseded_by: None,
+                    answer_submission: None,
                     id: question.clone(),
                     item: item.clone(),
                     root: item.clone(),
@@ -456,9 +474,19 @@ mod tests {
 
         let path = format!("/api/questions/{question}/answer");
         let (status, body) = h.post(&path, json!({ "answer": "1" })).await;
-        assert_eq!(status, Http::OK, "{body}");
-        assert_eq!(body["question"]["answer"], "Petals");
-        assert_eq!(body["resumed"][0], item.as_str());
+        assert_eq!(status, Http::ACCEPTED, "{body}");
+        assert!(body["question"]["answer"].is_null());
+        assert_eq!(body["question"]["answer_submission"]["answer"], "Petals");
+        assert_eq!(body["question"]["answer_submission"]["status"], "pending");
+        assert_eq!(
+            h.store.work_get(&item).await.unwrap().unwrap().status,
+            Status::Blocked(BlockedReason::NeedsDecision)
+        );
+        h.control.tick().await.unwrap();
+        let (status, applied) = h.get(&format!("/api/questions/{question}")).await;
+        assert_eq!(status, Http::OK);
+        assert_eq!(applied["answer"], "Petals");
+        assert_eq!(applied["answer_submission"]["status"], "applied");
         let resumed = h.store.work_get(&item).await.unwrap().unwrap().status;
         assert!(
             resumed == Status::Queued || resumed == Status::Ready,
@@ -474,6 +502,49 @@ mod tests {
             .post("/api/questions/nope/answer", json!({ "answer": "x" }))
             .await;
         assert_eq!(status, Http::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn answer_retries_keep_one_authenticated_receipt_before_and_after_application() {
+        let h = harness().await;
+        let (_, question) = h.parked().await;
+        let path = format!("/api/questions/{question}/answer");
+        let short_path = format!("/api/questions/{}/answer", &question[..8]);
+        let id = Uuid::new_v4().to_string();
+        let payload = json!({
+            "answer": "2", "submission_id": id,
+            "actor": "worker:spoof", "status": "applied"
+        });
+        let (status, saved) = h.post(&path, payload.clone()).await;
+        assert_eq!(status, Http::ACCEPTED, "{saved}");
+        let receipt = &saved["question"]["answer_submission"];
+        assert_eq!(receipt["id"], id);
+        assert_eq!(receipt["answer"], "Stems");
+        assert_eq!(receipt["status"], "pending");
+        assert_ne!(receipt["actor"], "worker:spoof");
+        assert!(receipt["actor"].as_str().unwrap().starts_with("user"));
+        let (status, replay) = h.post(&short_path, payload.clone()).await;
+        assert_eq!(status, Http::ACCEPTED);
+        assert_eq!(saved, replay, "retry preserves receipt and timestamp");
+        for conflict in [
+            json!({"answer": "1", "submission_id": id}),
+            json!({"answer": "1", "submission_id": Uuid::new_v4().to_string()}),
+        ] {
+            assert_eq!(h.post(&path, conflict).await.0, Http::CONFLICT);
+        }
+        assert_eq!(
+            h.post(&path, json!({"answer": "2", "submission_id": "invalid"}))
+                .await
+                .0,
+            Http::BAD_REQUEST
+        );
+        h.control.tick().await.unwrap();
+        let (_, applied) = h.get(&format!("/api/questions/{question}")).await;
+        assert_eq!(applied["answer_submission"]["status"], "applied");
+        let (status, replay) = h.post(&path, payload).await;
+        assert_eq!(status, Http::OK);
+        assert_eq!(replay["question"], applied);
+        assert_eq!(replay["resumed"], json!([]), "retry has no work effects");
     }
 
     #[tokio::test]

@@ -1,12 +1,12 @@
 //! Reconstruct context independently of a Claude/Codex session or its transcript.
 use std::collections::BTreeMap;
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use rustykrab_core::questions::QuestionKind;
 use rustykrab_core::questions::QuestionStatus;
 use rustykrab_core::work::{BlockedReason, Evidence, Status, WorkItem};
 use rustykrab_core::Error;
-use rustykrab_projects::{ProjectId, ProjectStatus};
+use rustykrab_projects::{ProjectId, ProjectSnapshot, ProjectStatus};
 use rustykrab_store::{QuestionRow, QuestionWrite, WorkOp};
 
 use super::batch::Batch;
@@ -19,6 +19,35 @@ use crate::handoff::{
 use crate::workspace::{Workspace, WORKSPACE_EVIDENCE};
 
 const CONTEXT_BYTES: usize = 128 * 1024;
+
+/// Expensive checks run outside the command lock. They are only hints for
+/// technical-hold recovery, never permission to lease or accept code.
+pub(super) struct HandoffChecks {
+    events: i64,
+    projects: BTreeMap<ProjectId, ProjectSnapshot>,
+    passed: Vec<String>,
+}
+
+fn technical(q: &QuestionRow) -> bool {
+    q.status == QuestionStatus::Open
+        && q.kind == QuestionKind::Decision
+        && q.rule == "project_context"
+        && q.asked_by == "controller"
+        && !q
+            .answer_submission
+            .as_ref()
+            .is_some_and(|s| s.status == rustykrab_store::AnswerSubmissionStatus::Pending)
+}
+
+fn eligible(snap: &Snapshot, item: &WorkItem, waiting: &[QuestionRow], worktrees: bool) -> bool {
+    item.status == Status::Blocked(BlockedReason::NeedsDecision)
+        && item.held_by.is_none()
+        && !snap.has_children(&item.id)
+        && !waiting
+            .iter()
+            .any(|q| q.item == item.id && q.status == QuestionStatus::Open && !technical(q))
+        && (Workspace::repo_of(&item.writable_resources).is_none() || worktrees)
+}
 
 impl Controller {
     pub(super) async fn project_id(
@@ -133,6 +162,18 @@ impl Controller {
             .into_iter()
             .filter(|q| ids.contains(q.item.as_str()))
             .collect();
+        let execution_items = Self::execution_items(snap, item);
+        let context = ProjectContext {
+            snapshot,
+            work,
+            base_sources: Vec::new(),
+            questions,
+            execution_items,
+        };
+        Ok(Some(context))
+    }
+
+    fn execution_items(snap: &Snapshot, item: &WorkItem) -> Vec<String> {
         let mut execution_items = std::collections::BTreeSet::from([item.id.clone()]);
         execution_items.extend(snap.ancestors(&item.id));
         let mut pending: Vec<_> = execution_items.iter().cloned().collect();
@@ -151,14 +192,30 @@ impl Controller {
                 }
             }
         }
-        let context = ProjectContext {
-            snapshot,
-            work,
-            base_sources: Vec::new(),
-            questions,
-            execution_items: execution_items.into_iter().collect(),
+        execution_items.into_iter().collect()
+    }
+
+    /// Reuse one reconstruction per project within one immutable preparation.
+    /// Execution slices and workspace/base selection still belong to each item.
+    pub(super) async fn cached_project_context(
+        &self,
+        snap: &Snapshot,
+        item: &WorkItem,
+        contexts: &mut BTreeMap<String, ProjectContext>,
+    ) -> Result<Option<ProjectContext>, Error> {
+        let Some(project) = self.project_id(snap, item).await? else {
+            return Ok(None);
         };
-        Ok(Some(context))
+        if let Some(context) = contexts.get(&project) {
+            let mut context = context.clone();
+            context.execution_items = Self::execution_items(snap, item);
+            return Ok(Some(context));
+        }
+        let context = self.project_context(snap, item).await?;
+        if let Some(context) = &context {
+            contexts.insert(project, context.clone());
+        }
+        Ok(context)
     }
 
     /// Check the actual prompt view after the workspace base has been pinned.
@@ -309,59 +366,101 @@ impl Controller {
         })
     }
 
-    /// Technical handoff holds are revalidated after updates and repository
-    /// repairs. A resolved condition makes its question obsolete; it supplies
-    /// no user answer and never releases a separate decision or approval.
-    pub(super) async fn recover_project_context_holds(
-        &self,
-        batch: &mut Batch,
-        waiting: &[QuestionRow],
-    ) -> Result<Vec<String>, Error> {
-        let technical = |q: &QuestionRow| {
-            q.status == QuestionStatus::Open
-                && q.kind == QuestionKind::Decision
-                && q.rule == "project_context"
-                && q.asked_by == "controller"
-        };
+    /// Prepare the periodic expensive reconstruction without holding loop_lock.
+    /// Only the later short graph pass may apply a still-current result.
+    pub(super) async fn prepare_handoff_rechecks(&self) -> Result<Option<HandoffChecks>, Error> {
+        if self.is_draining() {
+            return Ok(None);
+        }
+        let now = self.clock.now();
+        {
+            let mut state = self.state();
+            if state
+                .last_handoff_recheck
+                .is_some_and(|last| now.signed_duration_since(last) < TimeDelta::seconds(30))
+            {
+                return Ok(None);
+            }
+            state.last_handoff_recheck = Some(now);
+        }
+        let events = self.store.work_events_last_id().await?;
+        let snap = self.load().await?;
+        let waiting = self.waiting_questions().await?;
         let candidates: std::collections::BTreeSet<_> = waiting
             .iter()
             .filter(|q| technical(q))
             .map(|q| q.item.clone())
             .collect();
-        let mut changed = Vec::new();
+        let mut checks = HandoffChecks {
+            events,
+            projects: BTreeMap::new(),
+            passed: Vec::new(),
+        };
+        let mut contexts = BTreeMap::new();
         for id in candidates {
-            let Some(item) = batch.snap.item(&id).cloned() else {
+            let Some(item) = snap.item(&id) else {
                 continue;
             };
-            if item.status != Status::Blocked(BlockedReason::NeedsDecision)
-                || item.held_by.is_some()
-                || batch.snap.has_children(&id)
-                || waiting
-                    .iter()
-                    .any(|q| q.item == id && q.status == QuestionStatus::Open && !technical(q))
-                || (Workspace::repo_of(&item.writable_resources).is_some()
-                    && self.config.worktree_root.is_none())
-            {
+            if !eligible(&snap, item, &waiting, self.config.worktree_root.is_some()) {
                 continue;
             }
             let checked = async {
-                let mut context = self.project_context(&batch.snap, &item).await?;
-                self.plan_workspace(&item, "handoff-recheck", context.as_mut())
+                let mut context = self
+                    .cached_project_context(&snap, item, &mut contexts)
+                    .await?;
+                self.plan_workspace(item, "handoff-recheck", context.as_mut())
                     .await
                     .map_err(Error::Internal)?;
                 if let Some(context) = &context {
                     Self::check_execution_context(context)?;
+                    checks
+                        .projects
+                        .insert(context.snapshot.project.id, context.snapshot.clone());
                 }
                 Ok::<_, Error>(())
             }
             .await;
-            if let Err(why) = checked {
-                tracing::debug!(item = %id, %why, "project handoff remains unresolved");
+            match checked {
+                Ok(()) => checks.passed.push(id),
+                Err(why) => tracing::debug!(item = %id, %why, "project handoff remains unresolved"),
+            }
+        }
+        Ok(Some(checks))
+    }
+
+    /// Apply only unchanged preparation; owner direction and independent holds
+    /// win. Dispatch reconstructs and checks the execution context again.
+    pub(super) async fn recover_project_context_holds(
+        &self,
+        batch: &mut Batch,
+        waiting: &[QuestionRow],
+        checks: Option<HandoffChecks>,
+    ) -> Result<Vec<String>, Error> {
+        let Some(checks) = checks else {
+            return Ok(Vec::new());
+        };
+        if self.store.work_events_last_id().await? != checks.events {
+            return Ok(Vec::new());
+        }
+        for (id, expected) in &checks.projects {
+            if self.store.projects().get(id).await?.as_ref() != Some(expected) {
+                return Ok(Vec::new());
+            }
+        }
+        let mut changed = Vec::new();
+        for id in checks.passed {
+            let Some(item) = batch.snap.item(&id) else {
+                continue;
+            };
+            if !eligible(
+                &batch.snap,
+                item,
+                waiting,
+                self.config.worktree_root.is_some(),
+            ) {
                 continue;
             }
             for question in waiting.iter().filter(|q| q.item == id && technical(q)) {
-                // The question sweep may already have superseded a legacy
-                // duplicate. Settling it twice would roll back the whole batch.
                 let settled = batch.ops.iter().any(|op| match op {
                     WorkOp::Question(
                         QuestionWrite::Settle { id, .. } | QuestionWrite::Supersede { id, .. },

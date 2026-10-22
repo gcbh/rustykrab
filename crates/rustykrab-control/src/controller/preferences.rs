@@ -131,7 +131,7 @@ impl Controller {
                 .code_item;
         } else if item.held_by.is_some() {
             reply.released = self
-                .approve_with_preference_locked(id, actor, Some(row), None)
+                .approve_with_preference_locked(id, actor, Some(row), None, None)
                 .await?;
         } else if matches!(
             item.status,
@@ -287,6 +287,7 @@ impl Controller {
                         &actor,
                         None,
                         Some(row.text.clone()),
+                        None,
                     )
                     .await
                     .map(|_| ())

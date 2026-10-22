@@ -310,3 +310,22 @@ candidates chose the sections; the evidence and the audited scoring are in
 `docs/verification/compaction-state-handoff-2026-10-15.md`. The retention is
 unchanged: first and latest user input verbatim.
 
+
+## Answer-endpoint lock contention (2026-10-21)
+
+On live v6.6.3/b5c930f, the UI's 12-second request limit was shorter than
+64–69-second scheduling passes. A confirmed nonexistent question read in 5 ms;
+a no-op answer returned 404 after 24.831 seconds, 34 ms after a tick completed.
+Both scheduling and answer application held the same command lock. The live
+record had 34 eligible handoff rechecks and 269 stored contexts (65,854,090 JSON
+bytes); repeated reconstruction was a strong suspected cost, not a separately
+timed production attribution.
+
+The follow-up saves durable idempotent answer receipts before that lock,
+completes their effects atomically on the controller, and renders the sent
+message's receipt/application state. Handoff history is prepared outside the
+lock, cached per project within one preparation and guarded against stale work/
+project state before technical recovery. The original-lock negative control
+fails the prompt-intake regression; restored intake passes and the next actual
+scripted worker receives the decision. These are local regression observations,
+not a claim of deployed improvement or general chat-turn durability.

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.7] - 2026-10-22
+
+- Save answers promptly and show their application state (#732)
+
 ## [6.6.6] - 2026-10-22
 
 - feat(cli): `rustykrab-cli mcp-bridge` hands a native agent its run's granted tools over stdio MCP (#730)

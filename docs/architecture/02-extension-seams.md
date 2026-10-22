@@ -309,3 +309,13 @@ checkout. Local repository-shell and native adapters opt in, their CLI wrappers
 forward the guarantee, and peers/default executors retain shared repository
 locks. File grants reuse WorkerSpec and capabilities; the agent's scoped host
 file wrapper enforces exact paths without a new executor or queue.
+
+## Asynchronous owner-answer intake (base 9f717f7)
+
+`ControlHandle::submit_answer` separates durable intake from the existing
+serialized answer application. The default delegates to synchronous `answer`
+for compatible handles; the production controller saves a question receipt and
+the tick later processes it. Transport callers use `AnswerReply.question` to
+observe pending/applied/rejected status. The contract and receipt remain in
+control/store respectively, so gateway and CLI add no new backend trait or
+crate dependency.

@@ -1103,3 +1103,317 @@ async fn repeated_questions_inside_one_report_produce_one_decision_and_one_notic
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].body.matches("Asked:").count(), 1);
 }
+
+async fn answer_submission_fixture() -> (Harness, String, QuestionRow) {
+    answer_submission_fixture_with_options(&["Petals", "Stems"]).await
+}
+
+async fn answer_submission_fixture_with_options(
+    options: &[&str],
+) -> (Harness, String, QuestionRow) {
+    let h = Harness::new(&["pinch"]);
+    h.script.push(
+        "Choose a florist",
+        report(asking("Which florist?", "blocking_now", options)),
+    );
+    let item = h.file_one(draft("choose", "Choose a florist")).await;
+    h.drain_settled().await;
+    let q = questions_of(&h, &item)
+        .await
+        .into_iter()
+        .find(|q| q.status == QuestionStatus::Open)
+        .unwrap();
+    (h, item, q)
+}
+
+#[tokio::test]
+async fn saved_numeric_option_labels_are_not_resolved_again_during_application() {
+    for synchronous in [false, true] {
+        let (h, _, q) = answer_submission_fixture_with_options(&["2", "1"]).await;
+        let saved = h
+            .ctl
+            .submit_answer(&q.id, "1", "user:master", None)
+            .await
+            .unwrap();
+        assert_eq!(saved.question.answer_submission.unwrap().answer, "2");
+        if synchronous {
+            h.ctl.answer(&q.id, "1", "user:master").await.unwrap();
+        } else {
+            h.ctl.tick().await.unwrap();
+        }
+        let applied = h.store().question_get(&q.id).await.unwrap().unwrap();
+        assert_eq!(applied.answer.as_deref(), Some("2"));
+        assert_eq!(
+            applied.answer_submission.unwrap().status,
+            rustykrab_store::AnswerSubmissionStatus::Applied
+        );
+    }
+}
+
+#[tokio::test]
+async fn answer_submission_is_prompt_while_the_controller_lock_is_held_and_resumes_real_work() {
+    use rustykrab_store::AnswerSubmissionStatus;
+    let (h, item, q) = answer_submission_fixture().await;
+    let busy = h.ctl.loop_lock.lock().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let saved = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        h.ctl.submit_answer(&q.id, "2", "user:master", Some(&id)),
+    )
+    .await
+    .expect("accepting an answer must not wait for the controller pass")
+    .unwrap();
+    assert_eq!(
+        saved.question.answer_submission.as_ref().unwrap().status,
+        AnswerSubmissionStatus::Pending
+    );
+    assert_eq!(saved.question.answer, None);
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    let retry = h
+        .ctl
+        .submit_answer(&q.id, "2", "user:master", Some(&id))
+        .await
+        .unwrap();
+    assert_eq!(
+        saved, retry,
+        "a retry returns the original receipt and timestamp"
+    );
+    assert!(h
+        .ctl
+        .submit_answer(&q.id, "1", "user:master", Some(&id))
+        .await
+        .is_err());
+    assert!(h
+        .ctl
+        .submit_answer(&q.id, "1", "user:master", None)
+        .await
+        .is_err());
+    drop(busy);
+    h.drain_settled().await;
+    let applied = h.store().question_get(&q.id).await.unwrap().unwrap();
+    assert_eq!(
+        applied.answer_submission.as_ref().unwrap().status,
+        AnswerSubmissionStatus::Applied
+    );
+    assert_eq!(applied.answer.as_deref(), Some("Stems"));
+    assert_eq!(h.status(&item).await, Status::Done);
+    assert!(h
+        .script
+        .briefs_for("Choose a florist")
+        .last()
+        .unwrap()
+        .decisions_made
+        .iter()
+        .any(|d| d.contains("Stems")));
+    let retry = h
+        .ctl
+        .submit_answer(&q.id, "2", "user:master", Some(&id))
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.question, applied,
+        "a lost applied acknowledgement can also be reconciled"
+    );
+}
+
+#[tokio::test]
+async fn a_saved_answer_survives_controller_replacement_and_one_failed_tick() {
+    use rustykrab_store::AnswerSubmissionStatus;
+    let (h, _, q) = answer_submission_fixture().await;
+    h.ctl
+        .submit_answer(&q.id, "1", "user:master", None)
+        .await
+        .unwrap();
+    let restored = Controller::new(h.store().clone(), vec![], ControllerConfig::default())
+        .with_clock(h.clock.clone());
+    restored.state().fail_next_tick = Some(Error::Storage("temporary fixture failure".into()));
+    assert!(restored.tick().await.is_err());
+    let pending = h.store().question_get(&q.id).await.unwrap().unwrap();
+    assert_eq!(
+        pending.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Pending
+    );
+    restored.tick().await.unwrap();
+    let applied = h.store().question_get(&q.id).await.unwrap().unwrap();
+    assert_eq!(applied.answer.as_deref(), Some("Petals"));
+    assert_eq!(
+        applied.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Applied
+    );
+}
+
+#[tokio::test]
+async fn saved_answer_for_work_cancelled_before_application_is_rejected_visibly() {
+    use rustykrab_store::AnswerSubmissionStatus;
+    let (h, item, q) = answer_submission_fixture().await;
+    h.ctl
+        .submit_answer(&q.id, "1", "user:master", None)
+        .await
+        .unwrap();
+    h.ctl
+        .cancel(&item, Some("owner cancelled".into()), "user:master")
+        .await
+        .unwrap();
+    h.ctl.tick().await.unwrap();
+    let closed = h.store().question_get(&q.id).await.unwrap().unwrap();
+    let receipt = closed.answer_submission.unwrap();
+    assert_eq!(receipt.status, AnswerSubmissionStatus::Rejected);
+    assert!(receipt.error.unwrap().contains("closed"));
+    assert_eq!(closed.answer, None);
+    assert!(matches!(h.status(&item).await, Status::Cancelled(_)));
+}
+
+#[tokio::test]
+async fn superseding_a_question_does_not_redirect_accepted_owner_direction() {
+    use rustykrab_store::{AnswerSubmissionStatus, QuestionWrite};
+    let (h, item, q) = answer_submission_fixture().await;
+    let saved = h
+        .ctl
+        .submit_answer(&q.id, "1", "user:master", None)
+        .await
+        .unwrap();
+    let submission = saved.question.answer_submission.unwrap().id;
+    let mut replacement = q.clone();
+    replacement.id = uuid::Uuid::new_v4().to_string();
+    replacement.text = "A different decision now needs review".into();
+    h.store()
+        .question_write(QuestionWrite::Insert(Box::new(replacement.clone())))
+        .await
+        .unwrap();
+    h.store()
+        .question_write(QuestionWrite::Supersede {
+            id: q.id.clone(),
+            canonical: replacement.id.clone(),
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    let retry = h
+        .ctl
+        .submit_answer(&q.id[..8], "1", "user:master", Some(&submission))
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.question.id, q.id,
+        "a retry must not target the replacement question"
+    );
+    h.ctl.tick().await.unwrap();
+    let old = h.store().question_get(&q.id).await.unwrap().unwrap();
+    assert_eq!(
+        old.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Rejected
+    );
+    let retry = h
+        .ctl
+        .submit_answer(&q.id, "1", "user:master", Some(&submission))
+        .await
+        .unwrap();
+    assert_eq!(retry.question.id, q.id);
+    assert_eq!(
+        retry.question.answer_submission.unwrap().status,
+        AnswerSubmissionStatus::Rejected
+    );
+    assert_eq!(
+        h.store()
+            .question_get(&replacement.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .answer,
+        None
+    );
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+}
+
+#[tokio::test]
+async fn malformed_consent_is_rejected_before_receipt_acceptance() {
+    use rustykrab_store::QuestionWrite;
+    let (h, _, mut q) = answer_submission_fixture().await;
+    q.id = uuid::Uuid::new_v4().to_string();
+    q.kind = QuestionKind::Consent;
+    q.options.clear();
+    h.store()
+        .question_write(QuestionWrite::Insert(Box::new(q.clone())))
+        .await
+        .unwrap();
+    assert!(h
+        .ctl
+        .submit_answer(&q.id, "perhaps", "user:master", None)
+        .await
+        .is_err());
+    assert_eq!(
+        h.store()
+            .question_get(&q.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .answer_submission,
+        None
+    );
+}
+
+#[tokio::test]
+async fn saved_approval_and_rejection_complete_with_their_plan_effects() {
+    use rustykrab_store::AnswerSubmissionStatus;
+    for answer in ["approve", "reject"] {
+        let h = Harness::with(baseline_config(), StaticCatalog::default(), &["pinch"]);
+        let mut invite = draft("m", "Invite the friends");
+        invite.writable_resources = vec!["message:third_party".into()];
+        let accepted = h
+            .file(plan(vec![draft("P", "Plan the birthday"), invite]))
+            .await;
+        let root = &accepted.ids["P"];
+        let item = &accepted.ids["m"];
+        let q = questions_of(&h, root).await.remove(0);
+        assert_eq!(q.kind, QuestionKind::Approval);
+        let id = uuid::Uuid::new_v4().to_string();
+        h.ctl
+            .submit_answer(&q.id, answer, "user:master", Some(&id))
+            .await
+            .unwrap();
+        assert!(h
+            .store()
+            .work_get(item)
+            .await
+            .unwrap()
+            .unwrap()
+            .held_by
+            .is_some());
+        {
+            let _guard = h.ctl.loop_lock.lock().await;
+            h.ctl.apply_pending_answers_locked().await.unwrap();
+        }
+        let settled = h.store().question_get(&q.id).await.unwrap().unwrap();
+        assert_eq!(settled.status, QuestionStatus::Answered);
+        assert_eq!(
+            settled.answer_submission.as_ref().unwrap().status,
+            AnswerSubmissionStatus::Applied
+        );
+        if answer == "approve" {
+            assert!(h
+                .store()
+                .work_get(item)
+                .await
+                .unwrap()
+                .unwrap()
+                .held_by
+                .is_none());
+        } else {
+            assert!(matches!(h.status(item).await, Status::Cancelled(_)));
+        }
+        let retry = h
+            .ctl
+            .submit_answer(&q.id, answer, "user:master", Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(retry.question, settled);
+        assert!(retry.released.is_empty());
+        assert!(retry.cancelled.is_empty());
+    }
+}

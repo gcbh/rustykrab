@@ -311,14 +311,20 @@ impl Controller {
     /// records its time and class and counts up.
     ///
     /// [`LoopStatus`]: crate::handle::LoopStatus
-    pub(super) async fn tick_locked(&self) -> Result<TickReport, Error> {
+    pub(super) async fn tick_locked(
+        &self,
+        handoffs: Result<Option<super::project_context::HandoffChecks>, Error>,
+    ) -> Result<TickReport, Error> {
         #[cfg(test)]
         let injected = self.state().fail_next_tick.take();
         #[cfg(not(test))]
         let injected: Option<Error> = None;
         let result = match injected {
             Some(err) => Err(err),
-            None => self.tick_pass().await,
+            None => match handoffs {
+                Ok(handoffs) => self.tick_pass(handoffs).await,
+                Err(error) => Err(error),
+            },
         };
         let now = self.clock.now();
         let mut state = self.state();
@@ -335,7 +341,11 @@ impl Controller {
         result
     }
 
-    async fn tick_pass(&self) -> Result<TickReport, Error> {
+    async fn tick_pass(
+        &self,
+        handoffs: Option<super::project_context::HandoffChecks>,
+    ) -> Result<TickReport, Error> {
+        self.apply_pending_answers_locked().await?;
         let now = self.clock.now();
         let first = !self.state().resumed;
         if first {
@@ -345,7 +355,8 @@ impl Controller {
         self.judgment().await?;
         let mut report = TickReport::default();
         let mut noticed: HashSet<WorkItemId> = HashSet::new();
-        self.sweep(now, first, &mut report, &mut noticed).await?;
+        self.sweep(now, first, &mut report, &mut noticed, handoffs)
+            .await?;
         self.state().resumed = true;
         self.reconcile_all(now, &mut report, &mut noticed).await?;
         // Draining for shutdown: nothing new starts, what runs finishes.
@@ -366,6 +377,7 @@ impl Controller {
         first: bool,
         report: &mut TickReport,
         noticed: &mut HashSet<WorkItemId>,
+        handoffs: Option<super::project_context::HandoffChecks>,
     ) -> Result<(), Error> {
         let mut b = Batch::new(self.load().await?, now);
         let all: Vec<WorkItemId> = b.snap.items().iter().map(|i| i.id.clone()).collect();
@@ -582,19 +594,10 @@ impl Controller {
         let waiting = self.waiting_questions().await?;
         self.sweep_questions(&mut b, &waiting).await?;
         changed.extend(self.wake_on_credentials(&mut b, &waiting));
-        let recheck_handoffs = {
-            let mut state = self.state();
-            let due = state
-                .last_handoff_recheck
-                .is_none_or(|last| now.signed_duration_since(last) >= TimeDelta::seconds(30));
-            if due {
-                state.last_handoff_recheck = Some(now);
-            }
-            due
-        };
-        if recheck_handoffs {
-            changed.extend(self.recover_project_context_holds(&mut b, &waiting).await?);
-        }
+        changed.extend(
+            self.recover_project_context_holds(&mut b, &waiting, handoffs)
+                .await?,
+        );
 
         // Availability is queue waiting, never a failed attempt. Recover
         // historical holds without requiring a resource to be available yet.
