@@ -7678,7 +7678,7 @@ mod task_complete_tests {
         }
     }
 
-    fn make_runner(provider: Arc<ScriptedProvider>) -> (AgentRunner, Session, Uuid) {
+    fn make_runner(provider: Arc<dyn ModelProvider>) -> (AgentRunner, Session, Uuid) {
         use rustykrab_tools::TaskCompleteTool;
         let active = Arc::new(ActiveToolsRegistry::new());
         let tools: Vec<Arc<dyn Tool>> = vec![
@@ -8055,6 +8055,97 @@ mod task_complete_tests {
         conv.id = conv_id;
         let err = runner.run(&mut conv, &session).await.unwrap_err();
         assert!(matches!(err, Error::ModelMalformedOutput(_)), "{err:?}");
+    }
+
+    /// Serves `/api/chat` on a loopback port as Ollama streams it: each
+    /// request gets the next reply's lines as chunked NDJSON under a 200.
+    /// Hands back the JSON body of every request.
+    async fn ollama_streaming(
+        replies: Vec<Vec<&'static str>>,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            for lines in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let body = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length: usize = text[..split]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= split + 4 + length {
+                            break text[split + 4..split + 4 + length].to_string();
+                        }
+                    }
+                };
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body).unwrap());
+                let mut reply = String::from(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                     transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                );
+                for line in lines {
+                    let line = format!("{line}\n");
+                    reply.push_str(&format!("{:x}\r\n{line}\r\n", line.len()));
+                }
+                reply.push_str("0\r\n\r\n");
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, bodies)
+    }
+
+    /// The same notice through the real provider, for the shape a qwen3.8
+    /// eval run died on: Ollama had answered 200 and streamed part of the
+    /// reply before the tool call it could not parse, so the error came as
+    /// a line of the stream rather than as a 500.
+    #[tokio::test]
+    async fn an_unparseable_reply_reported_mid_stream_is_answered_with_a_notice() {
+        let (url, bodies) = ollama_streaming(vec![
+            vec![
+                r#"{"message":{"role":"assistant","content":"Writing it now."},"done":false}"#,
+                r#"{"error":"XML syntax error on line 41: unexpected EOF"}"#,
+            ],
+            vec![
+                r#"{"message":{"role":"assistant","content":"The answer is 4."},"done":false}"#,
+                r#"{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":40,"eval_count":6}"#,
+            ],
+        ])
+        .await;
+        let provider = rustykrab_providers::OllamaProvider::new("qwen3.8:27b").with_base_url(url);
+        let (runner, session, conv_id) = make_runner(Arc::new(provider));
+        let mut conv = make_conv();
+        conv.id = conv_id;
+
+        runner.run(&mut conv, &session).await.unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "the failed reply, then the model's next");
+        let notice = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .find(|t| t.contains("could not be read"))
+            .expect("the second request tells the model");
+        assert!(notice.contains("line 41"), "{notice}");
+        assert_eq!(
+            conv.messages.last().and_then(|m| m.content.as_text()),
+            Some("The answer is 4.")
+        );
     }
 
     #[tokio::test]
