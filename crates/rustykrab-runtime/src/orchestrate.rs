@@ -70,32 +70,18 @@ pub struct RunOptions {
     pub denied_tools: Vec<String>,
 }
 
-/// The manager's ceiling is enforced before granting capabilities, including
-/// dynamically disclosed tools. Workers retain their separate execution ceiling.
-pub(crate) fn manager_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "work_discuss"
-            | "work_assign"
-            | "work_file"
-            | "work_plan"
-            | "work_status"
-            | "cron"
-            | "work_resources"
-            | "service_control"
-            | "task_complete"
-            | "tools_list"
-            | "tools_load"
-    ) || name.starts_with("recall_")
-        || name.starts_with("memory_")
-        || name.starts_with("todo_")
-}
-
 const WORK_MANAGER_PROMPT: &str = "\n\n## Work manager\n\
-You manage the user's work through the durable controller. Converse about goals, \
-requirements and corrections. Before assigning work, call work_resources to inspect \
+You help the user directly and coordinate durable work through the controller. \
+Manager mode does not restrict your tool catalog: discover available tools with \
+tools_list and use them to advance the current request within the user's authority. \
+For a routine question, such as checking a subscription, discover the relevant \
+account or email tool and inspect its evidence. Do not treat old tool failures or \
+credential-hunting history as the current tool catalog. Report what actually ran \
+and what its results establish; a denied or failed call is not a completed search.\n\
+Use work_assign for work that needs durable tracking, delegation, parallel \
+execution or continuation beyond this conversation; use plan=true when it needs \
+decomposition. Before assigning work, call work_resources to inspect \
 registered agents, their health, capabilities, repositories, projects and schedules. \
-File actionable work with work_assign; use plan=true when it needs decomposition. \
 Give every item an observable done_when, bounded budget, relevant constraints and \
 a project artifact reference when continuing that project. For repository work, \
 name the exact advertised repo: writable resource. Tasks have no category or \
@@ -115,8 +101,8 @@ Use cron for recurring or future work: each firing becomes a controller-managed 
 work item, with assignment, verification and history. Service actions also go \
 through service_control and produce tracked work. Report the accepted item ID \
 and whether it is waiting for approval or a resource. Filing or starting is not \
-completion: only controller-verified done results are complete. You do not \
-execute project changes directly or send work to an independent task queue.";
+completion: only controller-verified done results complete assigned work. Keep \
+assigned work in the existing controller rather than an independent task queue.";
 
 /// Build the system prompt and inject it as the first message in the conversation.
 ///
@@ -431,7 +417,6 @@ async fn prepare_agent(
         .tools
         .iter()
         .filter(|t| t.available())
-        .filter(|t| !ctx.work_manager || manager_tool(t.name()))
         .map(|t| t.name())
         .filter(|name| !options.denied_tools.iter().any(|denied| denied == name))
         .collect();
@@ -833,10 +818,14 @@ mod work_manager_tests {
     use super::*;
     use async_trait::async_trait;
     use rustykrab_core::{
-        model::{ModelProvider, ModelResponse},
-        types::ToolSchema,
-        Tool,
+        model::{ModelProvider, ModelResponse, StopReason, Usage},
+        types::{ToolCall, ToolResult, ToolSchema},
+        LateToolBinding, Tool,
     };
+    use rustykrab_tools::{TaskCompleteTool, ToolsListTool, ToolsLoadTool};
+    use serde_json::{json, Value};
+    use std::sync::atomic::AtomicUsize;
+
     struct Never;
     #[async_trait]
     impl ModelProvider for Never {
@@ -851,7 +840,8 @@ mod work_manager_tests {
             panic!("preparation must not run inference")
         }
     }
-    struct Named(&'static str);
+
+    struct Named(&'static str, bool);
     #[async_trait]
     impl Tool for Named {
         fn name(&self) -> &str {
@@ -860,41 +850,26 @@ mod work_manager_tests {
         fn description(&self) -> &str {
             "fixture"
         }
+        fn available(&self) -> bool {
+            self.1
+        }
         fn schema(&self) -> ToolSchema {
             ToolSchema {
                 name: self.0.into(),
-                description: "fixture".into(),
-                parameters: serde_json::json!({"type":"object"}),
+                description: self.description().into(),
+                parameters: json!({"type":"object"}),
             }
         }
-        async fn execute(&self, _: serde_json::Value) -> rustykrab_core::Result<serde_json::Value> {
+        async fn execute(&self, _: Value) -> rustykrab_core::Result<Value> {
             panic!("preparation must not execute")
         }
     }
-    #[tokio::test]
-    async fn manager_turn_grants_assignment_and_schedule_capabilities_but_denies_direct_execution()
-    {
-        let dir = std::env::temp_dir().join(format!("rk-manager-{}", Uuid::new_v4()));
-        let store = rustykrab_store::Store::open(&dir, vec![7; 32]).unwrap();
-        let tools: Vec<Arc<dyn Tool>> = [
-            "work_assign",
-            "work_resources",
-            "cron",
-            "fs_write",
-            "shell",
-            "message",
-            "result_report",
-            "tools_load",
-        ]
-        .into_iter()
-        .map(|n| Arc::new(Named(n)) as Arc<dyn Tool>)
-        .collect();
-        let mut ctx = AgentContext::new(store, tools, Arc::new(Never));
-        ctx.work_manager = true;
+
+    fn conversation(messages: Vec<Message>) -> Conversation {
         let now = Utc::now();
-        let mut conv = Conversation {
+        Conversation {
             id: Uuid::new_v4(),
-            messages: vec![],
+            messages,
             created_at: now,
             updated_at: now,
             title: None,
@@ -903,27 +878,278 @@ mod work_manager_tests {
             channel_source: None,
             channel_id: None,
             channel_thread_id: None,
-        };
-        let (_, session) = prepare_agent(
-            &ctx,
-            &mut conv,
-            "Assign a project task",
-            &RunOptions::default(),
-        )
-        .await
-        .unwrap();
-        for allowed in ["work_assign", "work_resources", "cron", "tools_load"] {
-            assert!(session.capabilities.can_use_tool(allowed));
         }
-        for denied in ["fs_write", "shell", "message", "result_report"] {
-            assert!(!session.capabilities.can_use_tool(denied));
+    }
+
+    #[tokio::test]
+    async fn manager_has_the_normal_catalog_with_explicit_denies_and_opt_in_gates() {
+        for opt_in in [false, true] {
+            let dir = std::env::temp_dir().join(format!("rk-manager-{}", Uuid::new_v4()));
+            let store = rustykrab_store::Store::open(&dir, vec![7; 32]).unwrap();
+            let mut tools: Vec<Arc<dyn Tool>> = [
+                "work_assign",
+                "work_resources",
+                "cron",
+                "fs_write",
+                "exec",
+                "message",
+                "result_report",
+                "credential_read",
+                "gmail",
+                "tools_load",
+                "computer",
+                "sessions_spawn",
+            ]
+            .into_iter()
+            .map(|n| Arc::new(Named(n, true)) as Arc<dyn Tool>)
+            .collect();
+            tools.push(Arc::new(Named("unavailable", false)));
+            let mut ctx = AgentContext::new(store, tools, Arc::new(Never));
+            ctx.work_manager = true;
+            ctx.subagents_enabled = opt_in;
+            ctx.computer_use_enabled = opt_in;
+            let mut conv = conversation(vec![]);
+            let options = RunOptions {
+                denied_tools: vec!["result_report".into()],
+                ..RunOptions::default()
+            };
+            let (_, session) = prepare_agent(&ctx, &mut conv, "Read my subscription", &options)
+                .await
+                .unwrap();
+            for allowed in [
+                "work_assign",
+                "work_resources",
+                "cron",
+                "fs_write",
+                "exec",
+                "message",
+                "credential_read",
+                "gmail",
+                "tools_load",
+            ] {
+                assert!(
+                    session.capabilities.can_use_tool(allowed),
+                    "missing {allowed}"
+                );
+            }
+            for denied in ["result_report", "unavailable", "not_registered"] {
+                assert!(
+                    !session.capabilities.can_use_tool(denied),
+                    "granted {denied}"
+                );
+            }
+            for gated in ["computer", "sessions_spawn"] {
+                assert_eq!(session.capabilities.can_use_tool(gated), opt_in, "{gated}");
+            }
+            assert!(conv.messages[0]
+                .content
+                .as_text()
+                .unwrap()
+                .contains("## Work manager"));
+            drop(ctx);
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        assert!(conv.messages[0]
-            .content
-            .as_text()
-            .unwrap()
-            .contains("## Work manager"));
-        drop(ctx);
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// No account, network, credentials or model service: only the runner and
+    /// discovery are real. The provider scripts a valid discovery/use sequence.
+    struct SubscriptionMail(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Tool for SubscriptionMail {
+        fn name(&self) -> &str {
+            "gmail"
+        }
+        fn description(&self) -> &str {
+            "Search email subscription messages"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: self.description().into(),
+                parameters: json!({"type":"object", "properties": {
+                    "action":{"type":"string"}, "query":{"type":"string"}
+                }, "required":["action","query"]}),
+            }
+        }
+        async fn execute(&self, args: Value) -> rustykrab_core::Result<Value> {
+            assert_eq!(args, json!({"action":"search","query":"from:cometeer.com"}));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"source":"inert email fixture", "subscription":"paused"}))
+        }
+    }
+
+    struct DiscoverMail {
+        step: AtomicUsize,
+        binding: LateToolBinding,
+        denied: bool,
+    }
+    #[async_trait]
+    impl ModelProvider for DiscoverMail {
+        fn name(&self) -> &str {
+            "scripted-manager-discovery"
+        }
+        async fn chat(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+        ) -> rustykrab_core::Result<ModelResponse> {
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            let declared = tools.iter().any(|t| t.name == "gmail");
+            let (name, arguments) = match step {
+                0 => {
+                    assert!(!declared, "discovery must remain progressive");
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == Role::User)
+                            .unwrap()
+                            .content
+                            .as_text(),
+                        Some("What is my Cometeer subscription status?")
+                    );
+                    ("tools_list", json!({"query":"email subscription"}))
+                }
+                1 => {
+                    let MessageContent::ToolResult(result) = &messages.last().unwrap().content
+                    else {
+                        panic!("expected discovery result")
+                    };
+                    assert!(!result.is_error);
+                    let output = result.output.to_string();
+                    if self.denied {
+                        assert!(!declared);
+                        assert!(output.contains("No tool matched"), "{output}");
+                        ("tools_load", json!({"names":["gmail"]}))
+                    } else {
+                        assert!(
+                            output.contains("callable now") && output.contains("gmail"),
+                            "{output}"
+                        );
+                        assert_eq!(declared, self.binding == LateToolBinding::Rerender);
+                        if self.binding == LateToolBinding::Append {
+                            assert!(
+                                output.contains("parameters"),
+                                "definition must be delivered: {output}"
+                            );
+                        }
+                        (
+                            "gmail",
+                            json!({"action":"search","query":"from:cometeer.com"}),
+                        )
+                    }
+                }
+                2 => {
+                    let MessageContent::ToolResult(result) = &messages.last().unwrap().content
+                    else {
+                        panic!("expected tool result")
+                    };
+                    assert!(!result.is_error);
+                    let summary = if self.denied {
+                        assert_eq!(result.output["forbidden"], json!(["gmail"]));
+                        assert!(!declared);
+                        "Email access is unavailable for this run."
+                    } else {
+                        assert_eq!(result.output["subscription"], "paused");
+                        "The fixture email says the subscription is paused."
+                    };
+                    ("task_complete", json!({"summary":summary}))
+                }
+                _ => panic!("unexpected extra inference call {step}"),
+            };
+            Ok(ModelResponse {
+                message: Message::stamped(
+                    Role::Assistant,
+                    MessageContent::ToolCall(ToolCall {
+                        id: format!("discovery-{step}"),
+                        name: name.into(),
+                        arguments,
+                    }),
+                ),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                text: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_discovers_and_executes_mail_after_stale_credential_history() {
+        exercise_discovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn manager_discovery_and_loading_cannot_restore_an_explicitly_denied_tool() {
+        exercise_discovery(true).await;
+    }
+
+    async fn exercise_discovery(denied: bool) {
+        for binding in [LateToolBinding::Append, LateToolBinding::Rerender] {
+            let dir = std::env::temp_dir().join(format!("rk-discovery-{}", Uuid::new_v4()));
+            let store = rustykrab_store::Store::open(&dir, vec![7; 32]).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(DiscoverMail {
+                step: AtomicUsize::new(0),
+                binding,
+                denied,
+            });
+            let tools: Vec<Arc<dyn Tool>> = vec![
+                Arc::new(ToolsListTool::new()),
+                Arc::new(ToolsLoadTool::new()),
+                Arc::new(TaskCompleteTool::new()),
+                Arc::new(SubscriptionMail(calls.clone())),
+            ];
+            let mut ctx = AgentContext::new(store, tools, provider.clone());
+            ctx.work_manager = true;
+            ctx.harness_profile.late_tool_binding = Some(binding);
+            let user = "What is my Cometeer subscription status?";
+            let mut conv = conversation(vec![
+                Message::stamped(
+                    Role::User,
+                    MessageContent::Text("Find my old account credentials.".into()),
+                ),
+                Message::stamped(
+                    Role::Assistant,
+                    MessageContent::ToolCall(ToolCall {
+                        id: "old-credential-call".into(),
+                        name: "credential_read".into(),
+                        arguments: json!({"action":"list"}),
+                    }),
+                ),
+                Message::stamped(
+                    Role::Tool,
+                    MessageContent::ToolResult(ToolResult {
+                        call_id: "old-credential-call".into(),
+                        output: json!({"error":"permission_denied"}),
+                        is_error: true,
+                        images: vec![],
+                    }),
+                ),
+                Message::stamped(
+                    Role::Assistant,
+                    MessageContent::Text("Credential lookup was denied.".into()),
+                ),
+                Message::stamped(Role::User, MessageContent::Text(user.into())),
+            ]);
+            conv.summary =
+                Some("Old task: find account credentials; credential lookup was denied.".into());
+            let options = RunOptions {
+                max_iterations: Some(4),
+                denied_tools: if denied { vec!["gmail".into()] } else { vec![] },
+                ..RunOptions::default()
+            };
+            let answer = run_agent_with_options(&ctx, &mut conv, user, Uuid::new_v4(), &options)
+                .await
+                .unwrap();
+            assert_eq!(provider.step.load(Ordering::SeqCst), 3);
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!denied));
+            assert!(answer.content.as_text().unwrap().contains(if denied {
+                "unavailable"
+            } else {
+                "paused"
+            }));
+            drop(ctx);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

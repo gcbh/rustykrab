@@ -2,10 +2,19 @@
 
 Enable `RUSTYKRAB_WORK_MANAGER=1` on the instance that owns new work. Use its
 WebChat (`/`) to give a goal, project, constraints and a clear completion condition.
-The manager inspects `work_resources` and uses `work_assign`; the controller
+For routine requests, the manager can discover the relevant registered tools
+with `tools_list` and use them directly, for example to inspect subscription
+emails. Manager mode retains the ordinary available session catalog; tool
+definitions still load on demand. Existing explicit run denies, computer-use
+and subagent opt-ins, account access and approval checks continue to apply.
+
+For work needing durable tracking, delegation, parallel execution or later
+continuation, the manager inspects `work_resources` and uses `work_assign`; the controller
 validates, queues and leases a suitable available resource. Work can wait for
 capacity, a missing capability or an approval. A conversational acknowledgement
-means filed, while the work receipt shows assignment, evidence and verified result.
+means filed for an assignment, while the work receipt shows assignment, evidence
+and verified result. Direct answers must state what their tool evidence actually
+establishes; a failed or denied lookup does not establish account state.
 
 Keep native execution profiles registered with `--require-max` or
 `--require-chatgpt`. Different account profiles can provide distinct capacity;

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.9] - 2026-10-25
+
+- Let managers discover and use the full session tool catalog (#734)
+
 ## [6.6.8] - 2026-10-23
 
 - Restore Git access in confined worktrees under private data (#733)
