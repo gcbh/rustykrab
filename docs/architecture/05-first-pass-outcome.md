@@ -329,3 +329,29 @@ project state before technical recovery. The original-lock negative control
 fails the prompt-intake regression; restored intake passes and the next actual
 scripted worker receives the decision. These are local regression observations,
 not a claim of deployed improvement or general chat-turn durability.
+
+## Full manager tool discovery (2026-10-25)
+
+At base `74d3e9e` (v6.6.8), manager mode deliberately restricted tool grants to
+coordination and memory, including during dynamic discovery. Its preparation
+test proved direct execution tools were denied. This matched the earlier
+coordination-only design, but prevented the manager from directly using the
+email/account tools needed for routine requests. A recent Cometeer request
+repeated denied credential and exec calls without attempting discovery; the
+restriction was verified, while historical-context influence on the model's
+choice remains an inference.
+
+The owner directed a full manager toolset. Manager mode now adds coordination
+guidance without the separate allowlist, retaining the ordinary available
+catalog and progressive discovery. Explicit run denies, availability and
+computer/subagent opt-ins remain enforced. The prompt allows direct routine
+work and preserves durable controller assignments and tracked schedules/services.
+
+The new positive tests failed on the old policy: discovery could not find email
+and preparation omitted direct tools. With the restriction removed, actual
+runner/discovery tests can call an inert email tool after stale credential-error
+history, in append and rerender modes. A negative test confirms explicit denial
+survives search and exact-name loading. This closes that access regression;
+it does not prove a live model will select the right tool, that the change is
+deployed, or that the user's real subscription has been checked. See the
+[verification record](../verification/manager-tool-discovery-2026-10-25.md).

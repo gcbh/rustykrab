@@ -755,7 +755,10 @@ both, but empty capture is reported rather than interpreted as healthy.
 `overseer.rs` composes opt-in `RUSTYKRAB_WORK_MANAGER` and the optional
 operator-owned `RUSTYKRAB_SERVICE_RESOURCES` JSON file. Manager mode registers
 and seeds `work_assign`, `work_resources`, `work_status` and `cron`
-for conversation; execution remains in the existing controller and fleet.
+for conversation. The runtime retains the ordinary available session tool
+catalog with progressive discovery, so the manager can handle direct requests.
+Assigned work executes in the existing controller and fleet; registration does
+not bypass explicit run denies, computer/subagent opt-ins or tool enforcement.
 It also enables scheduled_work, so schedules can choose native CLI runtimes,
 registered infrastructure and exact repositories through frozen requirements.
 Native briefs contain the scheduled instructions and explicit requirements;

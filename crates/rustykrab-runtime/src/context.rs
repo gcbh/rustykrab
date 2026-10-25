@@ -27,7 +27,7 @@ use uuid::Uuid;
 /// Cheap to clone — every field is an `Arc`, a handle, or a flag.
 #[derive(Clone)]
 pub struct AgentContext {
-    /// Interactive turns manage durable work instead of executing it directly.
+    /// Add durable work coordination guidance while retaining direct tool access.
     pub work_manager: bool,
     pub store: Store,
     pub tools: Vec<Arc<dyn rustykrab_core::Tool>>,

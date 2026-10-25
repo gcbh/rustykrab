@@ -109,8 +109,10 @@ That is not a coincidence.
 
 The original zero-test finding is retired in the [outcome history](05-first-pass-outcome.md#interactive-continuity-follow-up):
 base `0b565fd` already had 14 distillation tests, and this follow-up adds three
-channel lifecycle tests. The work-manager follow-up adds a direct `prepare_agent` test of capability
-derivation, including denial of dynamically disclosed execution tools. Other
+channel lifecycle tests. The [full manager catalog follow-up](05-first-pass-outcome.md#full-manager-tool-discovery-2026-10-25)
+replaces the manager-only allowlist test with direct `prepare_agent` coverage of
+the ordinary available catalog, explicit denies and opt-in gates, plus actual
+runner/discovery tests in both late-binding modes. Other
 prompt-assembly behaviour still relies on indirect gateway/evaluation coverage.
 That narrower gap remains open.
 
