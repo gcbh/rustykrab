@@ -1566,6 +1566,19 @@ async fn main() -> anyhow::Result<()> {
             })
         })
         .unwrap_or(3000);
+    // Read-only inventory must exist before any worker snapshots its tools.
+    // It depends on the shared registry, not the controller. The controller-
+    // dependent ServiceTool stays below, after the deferred backend is bound.
+    let overseer = overseer::Overseer::from_env(port)?;
+    if overseer::manager_enabled()
+        || !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty()
+    {
+        tools.push(Arc::new(overseer::ResourcesTool {
+            store: store.clone(),
+            registry: fleet.registry.clone(),
+            overseer: overseer.clone(),
+        }));
+    }
     fleet.share_host_tools(native_resources::HostTools {
         tools: tools.clone(),
         backend: deferred_work_backend.clone(),
@@ -1789,7 +1802,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     deferred_work_backend.bind(controller.clone());
-    let overseer = overseer::Overseer::from_env(port)?;
     if !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty() {
         fleet
             .registry
@@ -1803,11 +1815,6 @@ async fn main() -> anyhow::Result<()> {
     if overseer::manager_enabled()
         || !rustykrab_gateway::resources::ResourceObserver::services(overseer.as_ref()).is_empty()
     {
-        tools.push(Arc::new(overseer::ResourcesTool {
-            store: store.clone(),
-            registry: fleet.registry.clone(),
-            overseer: overseer.clone(),
-        }));
         tools.push(Arc::new(overseer::ServiceTool {
             control: controller.clone(),
             overseer: overseer.clone(),

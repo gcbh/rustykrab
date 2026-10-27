@@ -377,3 +377,21 @@ hold, budget, repository scope, merge or deployment is changed by this patch.
 The generic ability to repair a broken controller without an external bootstrap,
 missing preflight transcripts and the automatic-start UI/API eligibility error
 remain separate gaps. [Evidence and limits](../verification/capability-recovery-2026-10-27.md).
+
+
+### Startup composition counterexample
+
+The pre-deployment full-daemon check falsified the constructor-level inventory
+claim above on v6.6.10 source `e2eee4b`: the filter was fixed, but main registered
+ResourcesTool after worker construction. The original now received one bounded
+ceiling-mismatch question instead of the old phantom-tool loop; inventory still
+could not execute. v6.6.10 deployment was held. The earlier unit fixture supplied
+the tool directly and therefore could not test production startup order.
+
+The follow-up moves read-only inventory registration before every worker tool
+snapshot, retaining the existing manager/services condition and shared registry;
+controller-dependent service actions remain late. A mandatory full-daemon CLI
+integration regression fails on the unchanged release source and checks the
+actual API → planner → acquisition → probe → original inventory path after the
+move, using an inert protocol server. This is composition evidence in addition
+to adapter proof, not evidence of the owner's live goal being complete.
