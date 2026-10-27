@@ -37,6 +37,9 @@ const TOOLS: &[&str] = &[
 ];
 const EXECUTION_TOOLS: &[&str] = &["gmail", "caldav", "obsidian", "web_search", "web_fetch"];
 const CONTEXT_TOOLS: &[&str] = &[
+    // Read-only inventory is needed before allocating or repairing work, even
+    // when a run has no repository or integration write scope.
+    "work_resources",
     "memory_search",
     "recall_search",
     "recall_info",
@@ -1157,6 +1160,178 @@ mod tests {
         assert_eq!(
             probe.observation,
             "probe deadline elapsed waiting for this worker's serial slot"
+        );
+    }
+
+    /// Replay the observed typed-name failure through the real general worker,
+    /// controller, inventory tool and operation-probe producer. No model/network
+    /// is used: scripted calls still pass the actual preflight and tool runner.
+    #[tokio::test]
+    async fn capability_recovery_calls_inventory_and_resumes_the_original_work() {
+        use rustykrab_control::{
+            controller::{Controller, ControllerConfig, StaticCatalog},
+            handle::ControlHandle,
+            registry::WorkerRegistry,
+        };
+        use rustykrab_core::work::{PlanOutcome, Status};
+        use rustykrab_store::Store;
+        use rustykrab_tools::work_backend::StubWorkBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), vec![9; 32]).unwrap();
+        struct CountedInventory {
+            inner: crate::overseer::ResourcesTool,
+            successful_calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl Tool for CountedInventory {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+            fn description(&self) -> &str {
+                self.inner.description()
+            }
+            fn schema(&self) -> ToolSchema {
+                self.inner.schema()
+            }
+            fn sandbox_requirements(&self) -> SandboxRequirements {
+                self.inner.sandbox_requirements()
+            }
+            async fn execute(&self, args: Value) -> Result<Value> {
+                let value = self.inner.execute(args).await?;
+                assert!(value["workers"].is_array() && value["projects"].is_array());
+                self.successful_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            }
+        }
+        let inventory = Arc::new(CountedInventory {
+            inner: crate::overseer::ResourcesTool {
+                store: store.clone(),
+                registry: Arc::new(WorkerRegistry::new(store.clone())),
+                overseer: crate::overseer::Overseer::from_env(0).unwrap(),
+            },
+            successful_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let provider = Arc::new(Scripted(
+            Mutex::new(
+                [
+                    fixture_call(
+                        "result_report",
+                        serde_json::json!({
+                            "summary":"Need the inventory before allocating resources",
+                            "blocked":{"reason":"needs_tool", "detail":"inventory unavailable",
+                                "needs":["capability:tool:work_resources"]}
+                        }),
+                    ),
+                    fixture_call(
+                        "result_report",
+                        serde_json::json!({"summary":"Inventory is available"}),
+                    ),
+                    fixture_call("work_resources", serde_json::json!({})),
+                    fixture_call(
+                        "result_report",
+                        serde_json::json!({"summary":"Original resource allocation completed"}),
+                    ),
+                ]
+                .into(),
+            ),
+            "ollama",
+        ));
+        let worker = Arc::new(
+            IntegrationWorker::general(
+                "planner",
+                Some("fixture-model".into()),
+                provider.clone(),
+                vec![inventory.clone()],
+                Arc::new(StubWorkBackend::new()),
+                Arc::new(DiscardTranscripts),
+                Arc::new(Semaphore::new(1)),
+                &[],
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(
+            worker
+                .capabilities()
+                .tools
+                .contains(&"work_resources".into()),
+            "inventory must survive the general worker's tool filter"
+        );
+        // Inventory access grants no repository or unrelated tool access.
+        assert!(worker.capabilities().writable_resources.is_empty());
+        assert!(!worker.capabilities().tools.contains(&"exec".into()));
+        let mut catalog = StaticCatalog::default();
+        for name in ["work_resources", "capability:tool:work_resources"] {
+            catalog
+                .tools
+                .insert(name.into(), ToolState::RegisteredUnloaded);
+        }
+        let ctl = Controller::new(store.clone(), vec![worker], ControllerConfig::default())
+            .with_catalog(Arc::new(catalog));
+        let PlanOutcome::Accepted(a) = WorkBackend::file(
+            &ctl,
+            WorkItemDraft {
+                title: "Allocate original resources".into(),
+                objective: "Inspect the fleet".into(),
+                done_when: "Original resource allocation completed".into(),
+                ..Default::default()
+            },
+            Provenance::default(),
+        )
+        .await
+        .unwrap() else {
+            panic!("fixture refused")
+        };
+        for _ in 0..20 {
+            ControlHandle::tick(&ctl).await.unwrap();
+            ctl.wait_for_runs(std::time::Duration::from_secs(2)).await;
+            if store.work_get(&a.root).await.unwrap().unwrap().status == Status::Done {
+                break;
+            }
+        }
+        assert_eq!(
+            store.work_get(&a.root).await.unwrap().unwrap().status,
+            Status::Done
+        );
+        assert_eq!(store.work_lease_history(&a.root).await.unwrap().len(), 2);
+        let items = store
+            .work_list(&rustykrab_store::WorkFilter {
+                include_closed: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let caps: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == WorkKind::Capability)
+            .collect();
+        assert_eq!(caps.len(), 1, "no recursive acquisition chain: {items:#?}");
+        assert_eq!(caps[0].title, "Acquire tool: work_resources");
+        assert_eq!(caps[0].status, Status::Done);
+        let evidence = store.work_evidence_list(&caps[0].id).await.unwrap();
+        let receipt = evidence
+            .iter()
+            .find(|e| e.kind == "operation_probe")
+            .expect("catalog/skill presence cannot replace a real operation receipt");
+        let probe: rustykrab_control::capability_proof::OperationProbe =
+            serde_json::from_str(&receipt.reference).unwrap();
+        assert_eq!(probe.operation, "tool.callable/work_resources");
+        assert_eq!(
+            probe.outcome,
+            rustykrab_control::capability_proof::ProbeOutcome::Ok
+        );
+        assert_eq!(receipt.verified_by.as_deref(), Some("executor:planner"));
+        assert_eq!(
+            inventory
+                .successful_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the host probe and the resumed original each called the actual inventory tool"
+        );
+        assert!(
+            provider.0.lock().unwrap().is_empty(),
+            "original operation ran after proof"
         );
     }
 }

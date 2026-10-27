@@ -272,6 +272,7 @@ async fn scenario_13_a_missing_tool_files_a_capability_build_and_the_original_re
     // original resumes with the tool activated up front and the build's
     // report among its inputs.
     catalog.write("pdf_render");
+    h.script.offer_tool("pdf_render");
     h.drain().await;
     assert_eq!(h.status(&caps[0].id).await, Status::Done);
     let evidence = h.store().work_evidence_list(&caps[0].id).await.unwrap();

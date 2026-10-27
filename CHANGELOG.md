@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.10] - 2026-10-27
+
+- Fix capability acquisition dispatch and inventory access (#735)
+
 ## [6.6.9] - 2026-10-25
 
 - Let managers discover and use the full session tool catalog (#734)

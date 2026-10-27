@@ -192,8 +192,13 @@ impl Controller {
     /// `node` is not a RustyKrab tool, and requiring it would stop a local
     /// run before it starts; once proven, the run uses it through `exec`.
     pub(super) fn activatable(&self, mut hist: History) -> History {
-        hist.activate
-            .retain(|tool| self.catalog.tool_state(tool) != ToolState::Unknown);
+        for tool in hist.activate.iter_mut().chain(hist.requires.iter_mut()) {
+            *tool = crate::routing::tool_subject(tool).to_string();
+        }
+        let mut seen = std::collections::HashSet::new();
+        hist.activate.retain(|tool| {
+            self.catalog.tool_state(tool) != ToolState::Unknown && seen.insert(tool.clone())
+        });
         hist
     }
 }

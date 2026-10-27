@@ -1255,6 +1255,7 @@ async fn a_catalog_tool_that_exists_is_acquired_not_built() {
         .tools
         .insert("pdf_render".to_string(), ToolState::RegisteredUnloaded);
     let h = Harness::with(ControllerConfig::default(), catalog, &["pinch"]);
+    h.script.offer_tool("pdf_render");
     h.script.push(
         "Render the invoice",
         report(failure(ErrorSubclass::ToolGap, "needs tool: pdf_render")),

@@ -11,6 +11,12 @@ evidence. These are new operational findings, not resolutions of the historical
 structural findings below. Their priority is original-work recovery under the
 [owner's agency direction](08-agent-agency-and-self-correction.md).
 
+The 2026-10-27 [capability recovery follow-up](05-first-pass-outcome.md#capability-recovery-follow-up)
+records a narrower implementation correction: serialized tool references,
+general-worker inventory access and dispatch/brief consistency. It leaves the
+broader self-repair bootstrap, live deployment and original-goal effectiveness
+questions open.
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

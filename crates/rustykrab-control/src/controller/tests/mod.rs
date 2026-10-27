@@ -6,6 +6,7 @@
 //! return canned [`ResultReport`]s per item title.
 
 mod bounds;
+mod capability_recovery;
 mod checks;
 mod closeout;
 mod dispatchability;
@@ -68,12 +69,18 @@ pub(super) enum Step {
 #[derive(Default)]
 pub(super) struct Script {
     steps: Mutex<HashMap<String, VecDeque<Step>>>,
+    /// Exact tools installed during a scripted acquisition/build.
+    offered_tools: Mutex<Vec<String>>,
     briefs: Mutex<Vec<(String, Brief)>>,
     active: Mutex<HashMap<String, usize>>,
     peak: Mutex<HashMap<String, usize>>,
 }
 
 impl Script {
+    pub fn offer_tool(&self, name: &str) {
+        self.offered_tools.lock().unwrap().push(name.into());
+    }
+
     pub fn push(&self, title: &str, step: Step) {
         self.steps
             .lock()
@@ -184,6 +191,7 @@ impl Worker for Scripted {
             ]
             .into_iter()
             .map(str::to_string)
+            .chain(self.script.offered_tools.lock().unwrap().iter().cloned())
             .collect(),
             mcp_servers: vec!["*".to_string()],
             writable_resources: vec!["*".to_string()],

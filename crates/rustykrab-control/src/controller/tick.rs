@@ -868,7 +868,7 @@ impl Controller {
                 let error = classify(
                     &FailureInput::CapabilityGap {
                         gap: GapKind::Tool,
-                        name: tool,
+                        name: crate::routing::tool_subject(&tool).to_string(),
                     },
                     &ctx,
                 );
@@ -1478,7 +1478,14 @@ impl Controller {
             None => 0,
         };
         let has_plan_b = has_open_plan_b(&b.snap, &item.id);
-        let gap = gap_of(&error);
+        // Keep historical error/rung evidence intact; use the decoded need
+        // for catalog lookup and routing, as filing and proof do.
+        let gap = gap_of(&error).map(|mut gap| {
+            if gap.kind == GapKind::Tool {
+                gap.subject = crate::routing::tool_subject(&gap.subject).to_string();
+            }
+            gap
+        });
         let user_gap = gap
             .as_ref()
             .is_some_and(|g| matches!(g.kind, GapKind::Credential | GapKind::Consent));
@@ -1489,19 +1496,25 @@ impl Controller {
             }
             _ => None,
         };
-        // A native coding agent (Claude Code, Codex) cannot host a RustyKrab
-        // tool: a capability item for it could only close on the catalog's
-        // word, and its probe could never be observed there, so completing
-        // it would revive the item to ask again (the 491-run loop). The item
-        // goes to a worker whose tool ceiling has the tool instead, or
-        // surfaces once.
+        // Acquiring a registered tool cannot widen an adapter's ceiling.
+        // This applies to a host worker too, not only to native coding agents.
+        // Host binaries use exec and their registered BinaryAvailable probe;
+        // they are not RustyKrab tool-ceiling requirements.
         if let (Some(g), Some(true)) = (&gap, tool_exists) {
-            if g.kind == GapKind::Tool
-                && matches!(
-                    self.worker_kind(worker),
-                    WorkerKind::ClaudeCode | WorkerKind::Codex
-                )
-            {
+            let binary = matches!(
+                super::proof::registered_action(&crate::routing::CapabilityRef {
+                    gap: g.kind,
+                    subject: g.subject.clone(),
+                }),
+                Some(crate::capability_proof::RegisteredAction::BinaryAvailable { .. })
+            );
+            let missing = self.worker(worker).is_some_and(|w| {
+                !w.capabilities()
+                    .tools
+                    .iter()
+                    .any(|t| t == &g.subject || t == "*")
+            });
+            if g.kind == GapKind::Tool && !binary && missing {
                 return self
                     .route_for_tool(b, item, worker, &error, &g.subject, &mut state, &excluded)
                     .await;
@@ -1893,7 +1906,7 @@ impl Controller {
         );
     }
 
-    /// Route `item`, which native coding agent `worker` could not run for
+    /// Route `item`, which `worker` could not run for
     /// want of the RustyKrab tool `tool`, to a worker whose tool ceiling has
     /// it: a worker switch whose outcome names the tool ([`ROUTED_FOR`]),
     /// so the next lease requires it. No capability item is filed. When no
@@ -1912,10 +1925,14 @@ impl Controller {
     ) -> Result<Vec<WorkItemId>, Error> {
         let has_tool =
             |w: &dyn Worker| w.capabilities().tools.iter().any(|t| t == tool || t == "*");
+        let mut effective = item.clone();
+        if !effective.required_tools.iter().any(|t| t == tool) {
+            effective.required_tools.push(tool.to_string());
+        }
         let routable = self.registry.workers().iter().any(|w| {
             w.name() != worker
                 && !excluded.contains(w.name())
-                && covers(w.as_ref(), item)
+                && covers(w.as_ref(), &effective)
                 && has_tool(w.as_ref())
         });
         let id = item.id.clone();
@@ -1932,15 +1949,13 @@ impl Controller {
                 &id,
                 Status::Queued,
                 "controller",
-                format!(
-                    "routed: {worker} runs natively and cannot host the RustyKrab tool `{tool}`"
-                ),
+                format!("routed: {worker} does not offer the RustyKrab tool `{tool}`"),
             ));
         }
         let ask = format!(
-            "{} needs the RustyKrab tool `{tool}`, which {worker} runs natively and cannot host, \
-             and no other registered worker has it in its tool ceiling. Add a worker that has \
-             it, or change what the item needs.",
+            "{} needs the RustyKrab tool `{tool}`, which {worker} does not offer, \
+             and no other registered worker covers the item with it in its tool ceiling. \
+             Add a worker that has it, or change what the item needs.",
             label(item)
         );
         self.rung(b, &id, state, Rung::Surface, error, ask.clone());
@@ -2280,6 +2295,11 @@ impl Controller {
         models: &HashSet<String>,
         busy: &[(Vec<String>, Option<String>)],
     ) -> Option<Arc<dyn Worker>> {
+        // The worker's accepts/coverage sees precisely the tool requirements
+        // that brief_for will send, including recovery activations.
+        let mut effective = item.clone();
+        effective.required_tools = super::brief::effective_requirements(item, hist).required_tools;
+        let item = &effective;
         let (excluded, floor) = (&hist.excluded, hist.floor);
         let workers = self.registry.workers();
         workers
