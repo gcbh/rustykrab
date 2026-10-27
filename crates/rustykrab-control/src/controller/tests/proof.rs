@@ -828,7 +828,16 @@ async fn a_need_without_a_registered_probe_stays_availability_only() {
     catalog
         .tools
         .insert("pdf_render".to_string(), ToolState::RegisteredUnloaded);
-    let (h, pinch) = with_prober(catalog);
+    let script = Arc::new(Script::default());
+    let mut worker = Prober::new("pinch", &script);
+    worker.caps.tools.push("pdf_render".into());
+    let pinch = Arc::new(worker);
+    let h = harness(
+        ControllerConfig::default(),
+        catalog,
+        script,
+        vec![pinch.clone()],
+    );
     h.script.push(
         "Render the invoice",
         report(failure(ErrorSubclass::ToolGap, "needs tool: pdf_render")),

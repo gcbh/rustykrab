@@ -67,11 +67,36 @@ pub struct CapabilityRef {
     pub subject: String,
 }
 
+/// Decode the explicit serialized tool-reference namespace at tool-need
+/// boundaries. Historical agents sometimes used `capability:tool:<name>` as
+/// the name, then wrapped it again on the next acquisition. This is a reference,
+/// not an alternate callable tool (even if a skill took that malformed name).
+/// Ordinary colon names and other gap namespaces keep their exact identity.
+/// Decoding never grants tool access; catalog, worker ceiling and proof still
+/// apply to the resulting name.
+pub(crate) fn tool_subject(mut name: &str) -> &str {
+    while let Some(subject) = name.strip_prefix("capability:tool:") {
+        if subject.trim().is_empty() {
+            break;
+        }
+        name = subject.trim();
+    }
+    name
+}
+
 impl CapabilityRef {
     pub fn to_ref(&self) -> ArtifactRef {
         ArtifactRef {
             kind: CAPABILITY_REF.to_string(),
-            value: format!("{}:{}", self.gap.as_str(), self.subject),
+            value: format!(
+                "{}:{}",
+                self.gap.as_str(),
+                if self.gap == GapKind::Tool {
+                    tool_subject(&self.subject)
+                } else {
+                    &self.subject
+                }
+            ),
         }
     }
 
@@ -81,9 +106,16 @@ impl CapabilityRef {
             return None;
         }
         let (gap, subject) = r.value.split_once(':')?;
+        let gap = GapKind::parse(gap.trim())?;
+        let subject = subject.trim();
         Some(CapabilityRef {
-            gap: GapKind::parse(gap.trim())?,
-            subject: subject.trim().to_string(),
+            gap,
+            subject: if gap == GapKind::Tool {
+                tool_subject(subject)
+            } else {
+                subject
+            }
+            .to_string(),
         })
         .filter(|c| !c.subject.is_empty())
     }

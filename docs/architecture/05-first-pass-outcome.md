@@ -355,3 +355,25 @@ survives search and exact-name loading. This closes that access regression;
 it does not prove a live model will select the right tool, that the change is
 deployed, or that the user's real subscription has been checked. See the
 [verification record](../verification/manager-tool-discovery-2026-10-25.md).
+
+
+## Capability recovery follow-up
+
+Against deployed base `de37684` (v6.6.9), item `39bcaa42` required
+`capability:tool:work_resources` before inference, and the general-worker filter
+excluded the actual `work_resources` implementation. A late SKILL.md bearing
+the reference's name made the catalog look populated without supplying that
+operation. An owner's instruction to build a repair was present in the brief
+but could not reach a model past preflight. These are controller/composition
+faults; changing the worker's prompt cannot repair that dispatch boundary.
+
+The correction decodes the explicit tool-reference namespace, makes the existing
+read-only inventory callable by general workers, checks acquired tools in the
+actual dispatch matcher, and routes/surfaces ceiling mismatches before creating
+more acquisition work. Legacy nested refs now require the existing functional
+probe rather than falling through as availability only. A real-adapter scripted
+fixture demonstrates proof followed by original work resumption; no live owner
+hold, budget, repository scope, merge or deployment is changed by this patch.
+The generic ability to repair a broken controller without an external bootstrap,
+missing preflight transcripts and the automatic-start UI/API eligibility error
+remain separate gaps. [Evidence and limits](../verification/capability-recovery-2026-10-27.md).

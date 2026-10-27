@@ -633,6 +633,10 @@ impl Controller {
         rung: Rung,
         need: &CapabilityNeed,
     ) -> Result<WorkItemId, String> {
+        let mut need = need.clone();
+        if need.gap == crate::errors::GapKind::Tool {
+            need.subject = crate::routing::tool_subject(&need.subject).to_string();
+        }
         let verb = match rung {
             Rung::Build => "Build",
             Rung::Request => "Request",
