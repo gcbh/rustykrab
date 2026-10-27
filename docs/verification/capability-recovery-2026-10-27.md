@@ -84,3 +84,38 @@ three scripted inventory/ceiling inconsistencies described above. All original
 assertions remain; the corrected explicit tool fixtures and final full suite
 pass. The focused real-adapter regression also passes with CLI default features
 disabled. No live model, integration account or held work item was exercised.
+
+
+## Pre-deployment startup counterexample and correction
+
+The isolated old signed v6.6.9 reproduces the original failure: two scripted
+protocol responses, then a second lease requires the phantom tool before the
+next inference request. The canary is isolated from production data/accounts
+and uses an inert Ollama-protocol server, not a model. Initial canary attempts
+had a wrong raw evidence-column name and missing NDJSON newline; their receipts
+are retained and do not count as product failures. The corrected fixture is the
+one used for the counterexample and subsequent verification.
+
+The same whole-daemon check on reviewed #735/v6.6.10 source finds another gap:
+ResourcesTool registration occurs after all worker vectors were copied. The
+constructor-level unit explicitly supplied inventory, so it missed this startup
+boundary. The daemon now normalizes the name and surfaces a canonical ceiling
+mismatch, but cannot perform inventory. v6.6.10 rollout was held without changing
+the running v6.6.9 daemon. The new mandatory CLI integration test reproduces that
+failure on the exact released source `e2eee4b` before the startup-order correction.
+
+The follow-up creates the shared Overseer and read-only ResourcesTool before
+native host snapshots, local/planner and integration/coding workers. The same
+registry supplies live inventory after registrations. Existing exposure gating
+is unchanged, and controller-dependent ServiceTool construction stays late.
+The regression launches the actual executable, files via API and requires one
+canonical acquisition, a bound successful probe, two original leases and actual
+inventory output received by the resumed original. Both fixture processes stop.
+No live held task, question or budget is changed by this regression.
+
+Follow-up validation: formatting, workspace/all-target Clippy with warnings
+denied, regenerated architecture metrics/check and environment docs all pass.
+The full workspace suite passes **2,466 tests, 0 failures, 39 ignored** across
+40 targets, including the new ordinary full-daemon integration target. The
+focused no-default-features daemon target also passes. The unchanged release
+source failed that same integration target before the startup move.
