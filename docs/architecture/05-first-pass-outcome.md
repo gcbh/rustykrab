@@ -395,3 +395,32 @@ integration regression fails on the unchanged release source and checks the
 actual API → planner → acquisition → probe → original inventory path after the
 move, using an inert protocol server. This is composition evidence in addition
 to adapter proof, not evidence of the owner's live goal being complete.
+
+
+## Shared Git handoff recovery
+
+Against `4d76cc5`, the controller prepared a future brief with an owner's answer,
+then failed automatic integration before leasing its worker. On the observed
+live task, “Create a new worktree and start from main” was saved at 01:11:35 UTC
+on October 28 and the identical conflict question returned about 2.6 seconds
+later, with no worker start. Permission/tool fixes did not repair this path.
+A real-Git regression also reproduced a verified two-parent resolution being
+ignored until after an earlier conflicting branch had already failed integration.
+
+The follow-up makes that technical failure executable work. Typed conflict data
+files/reuses one bounded Internal repair in the normal graph; its workspace starts
+at an observed parent without first integrating the failing history. Its result
+must pass ordinary Git branch/base/path checks and contain both recorded parents.
+Independent Git tips are selected before integration, so later verified resolutions
+suppress obsolete ancestor conflicts regardless of work-row ordering. Existing
+synthetic technical questions can be replaced by that owned repair without
+inventing owner answers; stale event/project or pending-answer state is refused.
+
+WaitsFor edges preserve original goals if a repair fails or is cancelled. The
+same repair identity, approval and cumulative budget survive restarts and new
+waiters. Successful repair is followed by actual original-handoff preparation,
+not a forced Done or permission override. Real Git/SQLite regressions exercise
+both repair execution and useful original execution, plus negative claims,
+independent holds, archival and bounded failure. This closes the deterministic
+handoff-recovery mechanism; model quality, promotion and live effectiveness
+remain separate. See [verification](../verification/shared-git-recovery-2026-10-28.md).

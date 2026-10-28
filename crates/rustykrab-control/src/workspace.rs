@@ -35,6 +35,39 @@ use serde::{Deserialize, Serialize};
 /// The prefix of a repository writable resource: `repo:<path>`.
 pub const REPO_PREFIX: &str = "repo:";
 
+/// A host-observed conflict, never reconstructed from a worker's prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeConflict {
+    pub repository: PathBuf,
+    pub left: String,
+    pub right: String,
+    pub paths: Vec<String>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for MergeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "project history diverges at {} and {}; automatic integration has conflicts: {}",
+            self.left, self.right, self.detail
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContinuationError {
+    #[error("{0}")]
+    Conflict(MergeConflict),
+    #[error("{0}")]
+    Other(String),
+}
+impl From<String> for ContinuationError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
 /// The evidence kind that records a run's workspace at lease time: the
 /// [`Workspace`] as JSON. Unverified, so never handed on as an input.
 pub const WORKSPACE_EVIDENCE: &str = "workspace";
@@ -420,18 +453,42 @@ pub fn prune_older_than(root: &Path, older_than: Duration) -> Vec<PathBuf> {
 /// Preserve every verified candidate, integrating independent branches when Git
 /// can merge them without conflicts. Neither HEAD nor the checkout is changed.
 pub fn continuation_base(repo: &Path, head: &str, commits: &[String]) -> Result<String, String> {
-    let mut base = head.to_owned();
-    for commit in commits {
+    continuation_base_checked(repo, head, commits).map_err(|error| error.to_string())
+}
+
+/// Remove historical ancestors before integrating any divergent tips. Git's
+/// independent-set operation preserves every candidate's ancestry and avoids
+/// replaying an old conflict before a later verified resolution is considered.
+pub fn continuation_base_checked(
+    repo: &Path,
+    head: &str,
+    commits: &[String],
+) -> Result<String, ContinuationError> {
+    let mut candidates = BTreeSet::new();
+    for commit in std::iter::once(head).chain(commits.iter().map(String::as_str)) {
         let resolved = git(
             repo,
             &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
         )?;
         if !resolved.status.success() {
-            return Err(format!(
-                "verified project commit {commit} is no longer available"
-            ));
+            return Err(format!("verified project commit {commit} is no longer available").into());
         }
-        let commit = stdout(&resolved);
+        candidates.insert(stdout(&resolved));
+    }
+    let mut args = vec!["merge-base", "--independent"];
+    args.extend(candidates.iter().map(String::as_str));
+    let independent = git(repo, &args)?;
+    if !independent.status.success() {
+        return Err(format!(
+            "cannot select project history tips: {}",
+            stderr(&independent)
+        )
+        .into());
+    }
+    let mut tips: Vec<String> = stdout(&independent).lines().map(str::to_owned).collect();
+    tips.sort();
+    let mut base = head.to_owned();
+    for commit in tips {
         if is_ancestor(repo, &base, &commit)? {
             base = commit;
         } else if !is_ancestor(repo, &commit, &base)? {
@@ -444,7 +501,7 @@ pub fn continuation_base(repo: &Path, head: &str, commits: &[String]) -> Result<
 /// Keep a clean integration reachable independently of a lease or worker run.
 /// The cache key pins both parents; a cached commit must still match the merge
 /// tree and parents. Conflict resolution remains explicit, never guessed.
-fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, String> {
+fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, ContinuationError> {
     // Configured merge drivers can run repository-controlled commands. Disable
     // them and renormalization: preparation may create Git objects, never run
     // project code. A driver-dependent merge remains a visible conflict.
@@ -458,10 +515,7 @@ fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, Strin
         ],
     )?;
     if !drivers.status.success() && drivers.status.code() != Some(1) {
-        return Err(format!(
-            "cannot inspect project merge drivers: {}",
-            stderr(&drivers)
-        ));
+        return Err(format!("cannot inspect project merge drivers: {}", stderr(&drivers)).into());
     }
     let mut options = vec!["-c".to_string(), "merge.renormalize=false".to_string()];
     if drivers.status.success() {
@@ -472,6 +526,7 @@ fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, Strin
     options.extend([
         "merge-tree".into(),
         "--write-tree".into(),
+        "--name-only".into(),
         base.into(),
         commit.into(),
     ]);
@@ -479,15 +534,24 @@ fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, Strin
         repo,
         &options.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
+    if merged.status.code() == Some(1) {
+        let detail = stdout(&merged);
+        let paths = detail
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        return Err(ContinuationError::Conflict(MergeConflict {
+            repository: repo.to_owned(),
+            left: base.to_owned(),
+            right: commit.to_owned(),
+            paths,
+            detail,
+        }));
+    }
     if !merged.status.success() {
-        return Err(format!(
-            "project history diverges at {base} and {commit}; automatic integration has conflicts: {}",
-            if merged.status.code() == Some(1) {
-                stdout(&merged)
-            } else {
-                stderr(&merged)
-            }
-        ));
+        return Err(format!("project integration failed: {}", stderr(&merged)).into());
     }
     let tree = stdout(&merged)
         .lines()
@@ -504,7 +568,8 @@ fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, Strin
         }
         return Err(format!(
             "project integration reference {reference} does not match its verified parents"
-        ));
+        )
+        .into());
     }
     let message = format!("Integrate verified project history {base} and {commit}");
     let created = git(
@@ -525,10 +590,7 @@ fn integrate_base(repo: &Path, base: &str, commit: &str) -> Result<String, Strin
         ],
     )?;
     if !created.status.success() {
-        return Err(format!(
-            "cannot record project integration: {}",
-            stderr(&created)
-        ));
+        return Err(format!("cannot record project integration: {}", stderr(&created)).into());
     }
     let integration = stdout(&created);
     require(

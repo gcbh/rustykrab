@@ -1101,3 +1101,17 @@ write/edit calls still require a requested exact output grant or the run's own
 repository worktree. Input grants do not advertise writable resources and remain
 out of native shell arguments. The native host path preserves both grant arrays
 from its stored spec.
+
+
+## Shared Git recovery records (2026-10-28)
+
+No schema or table is added. A controller-authored `work_item_evidence` row of
+kind `merge_recovery` on the originating item stores the shared repair id,
+project id, repository, observed parents, conflicting paths and Git diagnostic.
+`verified_by=controller` distinguishes this dispatch/verifier input from model
+artifacts; reports cannot write this kind. Existing `internal` work rows own
+repair budgets, leases, events and verified commit evidence. `waits_for` edges
+let original goals wait without inheriting cancellation of a failed repair.
+Evidence outlives live-row compaction, retaining deduplication and verified
+continuation history. Allocation retires only synthetic technical questions;
+independent owner decisions and pending answer receipts keep their semantics.

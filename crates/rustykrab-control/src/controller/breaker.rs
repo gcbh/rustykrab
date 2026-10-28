@@ -75,7 +75,7 @@ pub(super) const CIRCUIT_OPEN: &str = "circuit_open";
 /// mint controller evidence: an allotment of budget, a breaker state, a
 /// run or its log, a build, an investigation, an error or a summary, a
 /// host-observed operation probe or the repair generation it is bound to.
-pub(super) const CONTROLLER_KINDS: [&str; 16] = [
+pub(super) const CONTROLLER_KINDS: [&str; 17] = [
     super::brief::RUN,
     crate::worker::RUN_LOG,
     "workspace",
@@ -92,6 +92,7 @@ pub(super) const CONTROLLER_KINDS: [&str; 16] = [
     super::brief::SUMMARY,
     crate::capability_proof::OPERATION_PROBE,
     super::proof::REPAIR_GENERATION,
+    super::merge_recovery::MERGE_RECOVERY,
 ];
 
 /// The artifacts of `worker`'s report on `item` that may be stored: all but

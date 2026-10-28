@@ -319,3 +319,16 @@ the tick later processes it. Transport callers use `AnswerReply.question` to
 observe pending/applied/rejected status. The contract and receipt remain in
 control/store respectively, so gateway and CLI add no new backend trait or
 crate dependency.
+
+
+## Executable Git handoff recovery (base 4d76cc5)
+
+The workspace seam now offers a typed continuation error alongside the compatible
+string helper. The controller turns an observed conflict into one ordinary,
+bounded Internal prerequisite, prepares its isolated checkout at an observed
+parent, and checks its result through the existing Worker/report/Git boundaries.
+A trusted existing-evidence record binds that special workspace to the shared
+conflict. The verifier requires both parent histories after normal branch/path
+checks. Original dispatch rechecks the actual current continuation. Background
+legacy-hold recovery preserves event/project/pending-answer guards. No new public
+trait, model executor, persistence table, scheduler or authority grant is added.
