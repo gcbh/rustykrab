@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.14] - 2026-10-28
+
+- Let workers own execution and recover from persistent loops (#739)
+
 ## [6.6.13] - 2026-10-28
 
 - Skip obsolete unanswered questions in execution prompts (#738)

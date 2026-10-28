@@ -793,18 +793,18 @@ async fn a_failed_chain_re_plans_at_the_parent_once_then_surfaces_once() {
 // ── scenario 5 and the subtree stall ──────────────────────────────────
 
 #[test]
-fn a_stall_repairs_with_the_first_attempts_evidence() {
+fn a_persistent_stall_switches_worker_with_the_first_attempts_evidence() {
     // The worker half is `LocalWorker`'s ledger; the controller half is the
-    // ladder: a loop failure repairs, and the repair brief carries the
+    // ladder: a persistent loop offers a switch, and the successor carries the
     // first attempt's evidence (tested in `scenarios.rs` for scenario 13's
     // shape). Here the stall detail reaches the rung.
     use crate::errors::{classify, Context, FailureInput, ProviderProblem};
     use crate::progress::StepLedger;
     let mut ledger = StepLedger::new(2);
-    for _ in 0..3 {
+    for _ in 0..5 {
         ledger.record("todo_read", &serde_json::json!({}), "[]");
     }
-    let stall = ledger.stalled().unwrap();
+    let stall = ledger.recovery_due().unwrap();
     let error = classify(
         &FailureInput::Provider {
             problem: ProviderProblem::Loop,
@@ -815,7 +815,7 @@ fn a_stall_repairs_with_the_first_attempts_evidence() {
     assert_eq!(error.subclass, ErrorSubclass::Loop);
     let state = crate::ladder::LadderState::default();
     let decision = crate::ladder::next(&state, &crate::ladder::LadderContext::new(&error));
-    assert!(matches!(decision, crate::ladder::Decision::Repair { .. }));
+    assert_eq!(decision, crate::ladder::Decision::SwitchWorker);
 }
 
 #[tokio::test]

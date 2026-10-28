@@ -32,8 +32,8 @@
 //!   (section 5);
 //! - what the run spends counted at the provider (`metered.rs`) and kept
 //!   for the controller's [`Worker::usage`] (tokens, wall time, iterations
-//!   and completion reminders). Tokens are counted, never refused: the
-//!   prompt's size is compaction's to manage.
+//!   and completion reminders). A spent token allowance prevents another
+//!   model request; prompt size remains compaction's responsibility.
 //!
 //! A run whose id names a conversation the host keeps (a scheduled job's
 //! persistent conversation, [`RunTranscripts::resume`]) continues it
@@ -1145,8 +1145,9 @@ impl Worker for LocalWorker {
                 .collect();
         }
 
-        // A `code` run works in its own worktree: created now, `exec`
-        // bound to it, removed when the run ends (the branch stays).
+        // Repository work runs in its own worktree. Completed reports give
+        // the directory back; failures and parked work keep uncommitted edits
+        // for the next attempt to inspect (the branch always stays).
         if let Some(ws) = brief.workspace.clone() {
             tokio::task::spawn_blocking(move || ws.create())
                 .await
@@ -1167,7 +1168,10 @@ impl Worker for LocalWorker {
                 Err(e)
             }
         };
-        if let Some(ws) = brief.workspace {
+        let completed = result.as_ref().is_ok_and(|report| {
+            report.blocked.is_none() && report.error.is_none() && report.questions.is_empty()
+        });
+        if let Some(ws) = brief.workspace.filter(|_| completed) {
             if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
@@ -1276,6 +1280,8 @@ impl LocalWorker {
         let provider: Arc<dyn ModelProvider> = Arc::new(MeteredProvider::new(
             self.provider.clone(),
             spending.meter.clone(),
+            brief.budget.tokens,
+            ledger.clone(),
         ));
 
         let profile = profile_for(&self.definition, self.provider.as_ref());
@@ -1524,7 +1530,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
     if brief.required_tools.iter().any(|t| t == PLAN_TOOL) {
         out.push_str("This run files a plan: call work_plan with the bounded graph requested below. An accepted graph completes this run; do not execute its tasks or call result_report afterwards.\n");
     } else {
-        out.push_str("Execute this objective using the available tools, then call result_report with the actual outcome. Your agent name or previous specialty does not restrict the work.\n");
+        out.push_str("Own this objective from planning through execution and verification using the available tools and this brief's constraints. Choose and revise your approach yourself; routine steps within the assignment do not need a separate planner or manager turn. Then call result_report with the actual outcome and verification evidence. Your agent name or previous specialty does not restrict the work.\n");
     }
     bullets(&mut out, "constraints", &brief.constraints);
     bullets(&mut out, "decisions_made", &brief.decisions_made);
@@ -1833,11 +1839,12 @@ struct LedgerTool {
 }
 
 /// What a call that repeats an earlier call and its result carries back,
-/// once the ledger calls the run stalled: the run goes on, told so.
+/// once the ledger calls the run stalled: one more window to change course.
 fn repeat_notice(stall: &rustykrab_control::progress::Stall) -> String {
     format!(
         "Note: this is call {} in a row that repeats an earlier call with the same result, so \
-         it tells you nothing new. Change the approach, or finish with what you have.",
+         it tells you nothing new. Change the approach, or finish with what you have. \
+         Continuing without new evidence will end this attempt and preserve it for recovery.",
         stall.without_progress
     )
 }
@@ -1869,6 +1876,20 @@ impl Tool for LedgerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        // A single model response can request many calls. Do not let a large
+        // batch keep executing effects after the recovery boundary.
+        if let Some(stall) = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recovery_due()
+        {
+            return Err(RunFailure::Model {
+                problem: ProviderProblem::Loop,
+                detail: stall.detail(),
+            }
+            .into_error());
+        }
         let result = self.inner.execute(args.clone()).await;
         // Only a host-dispatched exec with a process result attests a command.
         // Rejected/tool-error calls and model-authored artifacts are not proof.
@@ -1896,8 +1917,8 @@ impl Tool for LedgerTool {
             ledger.record(self.inner.name(), &args, &outcome);
             ledger.stalled()
         };
-        // A repeat is answered as text the model can act on, never by ending
-        // the run: the iteration cap is the only stop (feather's rule).
+        // The first window is advisory, giving the worker room to change its
+        // own approach. The next model request ends a persistently stalled run.
         let Some(stall) = stalled else {
             return result;
         };
@@ -3551,6 +3572,63 @@ mod tests {
         assert!(err.to_string().contains("progress ledger"), "{err}");
     }
 
+    #[tokio::test]
+    async fn worker_autonomy_persistent_repetition_stops_before_the_run_cap() {
+        let provider = Recording::new(
+            (0..20)
+                .map(|_| costing(call("noop", json!({})), 100))
+                .collect(),
+        );
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let w = w.with_stall_steps(2);
+        let mut b = brief("item-persistent-stall");
+        b.required_tools = vec!["noop".into()];
+        b.budget.iterations = 50;
+        b.run = Some(Uuid::new_v4().to_string());
+        let run = b.run.clone().unwrap();
+        let err = w.run(b).await.unwrap_err();
+        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
+        assert!(err.to_string().contains("progress ledger"), "{err}");
+        assert_eq!(
+            provider.requests().len(),
+            5,
+            "one fresh call, two repeats before warning, two to change course"
+        );
+        assert_eq!(w.usage(&run).unwrap().tokens, 500);
+    }
+
+    #[tokio::test]
+    async fn worker_autonomy_can_change_approach_after_a_repeat_warning() {
+        let mut script: Vec<ModelResponse> = (0..4).map(|_| call("noop", json!({}))).collect();
+        script.push(call("noop", json!({"approach": "different input"})));
+        script.push(report("Changed approach and completed the task."));
+        let provider = Recording::new(script);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
+        let mut b = brief("item-change-course");
+        b.required_tools = vec!["noop".into()];
+        assert!(w.with_stall_steps(2).run(b).await.is_ok());
+        assert_eq!(provider.requests().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn worker_autonomy_batch_cannot_start_more_calls_after_persistent_stall() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let provider = Recording::new(vec![batch(
+            (0..12).map(|_| tool_call("probe", json!({}))).collect(),
+        )]);
+        let (w, _) = worker(provider.clone(), vec![Arc::new(Probe(observed.clone()))]);
+        let mut b = brief("item-batch-stall");
+        b.required_tools = vec!["probe".into()];
+        let err = w.with_stall_steps(2).run(b).await.unwrap_err();
+        assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Loop));
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            5,
+            "calls after the recovery boundary never reach the tool"
+        );
+    }
+
     /// Scenario 31's shape: the worker keeps its own scratch list, and the
     /// result carries exactly the one draft it reported.
     #[tokio::test]
@@ -3772,7 +3850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokens_are_counted_but_never_stop_the_run() {
+    async fn worker_autonomy_tokens_stop_further_model_calls_and_retain_actual_spend() {
         let provider = Recording::new(vec![
             costing(call("noop", json!({})), 700),
             costing(call("noop", json!({})), 700),
@@ -3785,13 +3863,21 @@ mod tests {
         b.run = Some(Uuid::new_v4().to_string());
         let run = b.run.clone().unwrap();
 
-        let report = w.run(b).await.unwrap();
-
-        assert_eq!(report.summary, "done");
-        assert_eq!(provider.requests().len(), 3);
+        let err = w.run(b).await.unwrap_err();
+        assert_eq!(
+            classified(&err),
+            (ErrorClass::Budget, ErrorSubclass::Tokens)
+        );
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "do not start a third paid request"
+        );
         let usage = w.usage(&run).expect("the run's spend");
-        assert_eq!(usage.tokens, 2_100);
-        assert_eq!(usage.iterations, 3);
+        assert_eq!(
+            usage.tokens, 1_400,
+            "retain even the final call's overshoot"
+        );
         assert_eq!(w.usage(&run), None, "taken once");
     }
 

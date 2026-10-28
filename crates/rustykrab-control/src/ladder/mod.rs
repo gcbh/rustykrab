@@ -405,6 +405,13 @@ fn own_rung(state: &LadderState, ctx: &LadderContext) -> Option<Decision> {
         // The item's own budget is spent; running it again would overrun it.
         return None;
     }
+    // A persistent loop already had a warning and room to change course in
+    // the run. Try a different executor before more repairs of that approach.
+    // Without an alternative, the controller records a skipped switch and
+    // continues the existing bounded ladder.
+    if err.subclass == ErrorSubclass::Loop && state.left(Rung::SwitchWorker) > 0 {
+        return Some(Decision::SwitchWorker);
+    }
     if err.subclass.is_transient() && state.left(Rung::Retry) > 0 {
         return Some(Decision::Retry);
     }

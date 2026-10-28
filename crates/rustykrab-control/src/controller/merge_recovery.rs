@@ -18,6 +18,15 @@ use crate::Provenance;
 /// or require the additional verifier. A worker cannot mint one in its report.
 pub(super) const MERGE_RECOVERY: &str = "merge_recovery";
 const CONTROLLER: &str = "controller";
+pub(super) const LEGACY_CONSTRAINT: &str = "Work only in the supplied isolated worktree. Preserve both parent histories. Do not move the repository checkout/main, push, deploy, answer owner questions or change budgets.";
+
+fn execution_constraints() -> Vec<String> {
+    vec![
+        "Plan, implement and verify this repair yourself; choose and revise the approach within this assignment.".into(),
+        "Work only in the supplied isolated worktree. Preserve both parent histories and applicable recorded owner decisions. This brief is the repair's execution contract; copied historical constraints in project context remain scoped to their original source tasks.".into(),
+        "Do not move the repository checkout/main, push, deploy, answer owner questions or change budgets.".into(),
+    ]
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct Recovery {
@@ -38,6 +47,31 @@ impl Recovery {
 }
 
 impl Controller {
+    /// Only fresh leases recognize the exact old controller-generated form.
+    /// Retain stored history, and never erase additional/edited repair-specific
+    /// constraints. Untrusted markers cannot opt into this execution contract.
+    pub(super) async fn merge_execution_constraints(
+        &self,
+        snap: &crate::graph::Snapshot,
+        item: &WorkItem,
+    ) -> Result<Vec<String>, Error> {
+        if item.constraints.last().map(String::as_str) != Some(LEGACY_CONSTRAINT) {
+            return Ok(item.constraints.clone());
+        }
+        let source = item
+            .artifact_refs
+            .iter()
+            .find(|a| a.kind == "item")
+            .and_then(|a| snap.item(&a.value));
+        let copied_source = source.is_some_and(|source| {
+            item.constraints[..item.constraints.len() - 1] == source.constraints
+        });
+        if copied_source && self.merge_recovery(item).await?.is_some() {
+            return Ok(execution_constraints());
+        }
+        Ok(item.constraints.clone())
+    }
+
     pub(super) async fn merge_recovery(&self, item: &WorkItem) -> Result<Option<Recovery>, Error> {
         if item.kind != WorkKind::Internal {
             return Ok(None);
@@ -152,8 +186,11 @@ impl Controller {
         budget.rungs.improvements = 0;
         budget.rungs.replans = 0;
         let c = &recovery.conflict;
-        let mut constraints = item.constraints.clone();
-        constraints.push("Work only in the supplied isolated worktree. Preserve both parent histories. Do not move the repository checkout/main, push, deploy, answer owner questions or change budgets.".into());
+        // This independent prerequisite implements a Git repair, even when
+        // the first waiter is a planning-only step. Its task-local contract
+        // must not become the repair's contract. All waiters' constraints and
+        // owner decisions remain in project context with their source items.
+        let constraints = execution_constraints();
         let draft = WorkItemDraft {
             tmp: Some("merge-repair".into()), kind: Some(WorkKind::Internal),
             title: format!("Resolve shared Git conflict {}", &key[..12]),

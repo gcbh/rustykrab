@@ -27,6 +27,8 @@ shlex = "1.3"
 reqwest.workspace = true
 
 [dev-dependencies]
+rustykrab-store.workspace = true
+rustykrab-projects.workspace = true
 tempfile = "3"
 # Paused time for the MCP grants' deadline and cap tests.
 tokio = { workspace = true, features = ["test-util"] }

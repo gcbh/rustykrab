@@ -3,16 +3,21 @@
 //! section 4).
 //!
 //! Every response's prompt and completion tokens are added to a [`Meter`]
-//! shared with the worker. Nothing is refused: the meter counts the whole
-//! prompt on every call, so a limit on it stopped healthy runs once their
-//! history grew (6 of qwen's 30 real failures on 2026-10-12 to 14), while
-//! keeping the prompt inside the window is compaction's job. Everything
-//! passes straight through to the wrapped provider.
+//! shared with the worker. Before each request, enforce the controller's
+//! remaining token allowance and the progress ledger's recovery boundary.
+//! This is cumulative work spending, distinct from context-window capacity.
+//! Usage arrives after a response, so one call can overshoot; retain all of
+//! that spend and never start another request once the allowance is spent.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rustykrab_control::{
+    errors::{BudgetKind, ProviderProblem},
+    progress::StepLedger,
+    worker::RunFailure,
+};
 use rustykrab_core::model::{
     CallOptions, ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
 };
@@ -44,11 +49,46 @@ impl Meter {
 pub struct MeteredProvider {
     inner: Arc<dyn ModelProvider>,
     meter: Arc<Meter>,
+    token_limit: u64,
+    progress: Arc<Mutex<StepLedger>>,
 }
 
 impl MeteredProvider {
-    pub fn new(inner: Arc<dyn ModelProvider>, meter: Arc<Meter>) -> MeteredProvider {
-        MeteredProvider { inner, meter }
+    pub fn new(
+        inner: Arc<dyn ModelProvider>,
+        meter: Arc<Meter>,
+        token_limit: u64,
+        progress: Arc<Mutex<StepLedger>>,
+    ) -> MeteredProvider {
+        MeteredProvider {
+            inner,
+            meter,
+            token_limit,
+            progress,
+        }
+    }
+
+    fn before_request(&self) -> Result<()> {
+        let used = self.meter.used();
+        if self.token_limit > 0 && used >= self.token_limit {
+            return Err(RunFailure::Budget {
+                budget: BudgetKind::Tokens,
+                detail: format!("{used} tokens consumed of this attempt's {} remaining allowance; no further model request dispatched", self.token_limit),
+            }.into_error());
+        }
+        if let Some(stall) = self
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recovery_due()
+        {
+            return Err(RunFailure::Model {
+                problem: ProviderProblem::Loop,
+                detail: stall.detail(),
+            }
+            .into_error());
+        }
+        Ok(())
     }
 
     fn count(&self, response: Result<ModelResponse>) -> Result<ModelResponse> {
@@ -105,6 +145,7 @@ impl ModelProvider for MeteredProvider {
     }
 
     async fn chat(&self, messages: &[Message], tools: &[ToolSchema]) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(self.inner.chat(messages, tools).await)
     }
 
@@ -114,6 +155,7 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         options: CallOptions,
     ) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(self.inner.chat_with_options(messages, tools, options).await)
     }
 
@@ -123,6 +165,7 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         num_ctx: u32,
     ) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(self.inner.chat_with_ctx(messages, tools, num_ctx).await)
     }
 
@@ -132,6 +175,7 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         choice: ToolChoice,
     ) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(self.inner.chat_with_choice(messages, tools, choice).await)
     }
 
@@ -141,6 +185,7 @@ impl ModelProvider for MeteredProvider {
         tools: &[ToolSchema],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(self.inner.chat_stream(messages, tools, on_event).await)
     }
 
@@ -151,6 +196,7 @@ impl ModelProvider for MeteredProvider {
         choice: ToolChoice,
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ModelResponse> {
+        self.before_request()?;
         self.count(
             self.inner
                 .chat_stream_with_choice(messages, tools, choice, on_event)
@@ -182,7 +228,81 @@ mod tests {
     /// worker run is this wrapper.
     #[test]
     fn forwards_the_late_binding_capability() {
-        let metered = MeteredProvider::new(Arc::new(Appends), Arc::new(Meter::new()));
+        let metered = MeteredProvider::new(
+            Arc::new(Appends),
+            Arc::new(Meter::new()),
+            0,
+            Arc::new(Mutex::new(StepLedger::new(6))),
+        );
         assert!(metered.accepts_undeclared_tool_calls());
+    }
+
+    #[tokio::test]
+    async fn worker_autonomy_all_request_paths_enforce_the_same_spent_allowance() {
+        let meter = Arc::new(Meter::new());
+        meter.add(&Usage {
+            prompt_tokens: 90,
+            completion_tokens: 10,
+            ..Default::default()
+        });
+        let provider = MeteredProvider::new(
+            Arc::new(Appends),
+            meter.clone(),
+            100,
+            Arc::new(Mutex::new(StepLedger::new(6))),
+        );
+        let sink = |_: StreamEvent| {};
+        let outcomes = [
+            provider.chat(&[], &[]).await,
+            provider
+                .chat_with_options(&[], &[], CallOptions::default())
+                .await,
+            provider.chat_with_ctx(&[], &[], 4096).await,
+            provider.chat_with_choice(&[], &[], ToolChoice::Auto).await,
+            provider.chat_stream(&[], &[], &sink).await,
+            provider
+                .chat_stream_with_choice(&[], &[], ToolChoice::Auto, &sink)
+                .await,
+        ];
+        for result in outcomes {
+            assert!(matches!(
+                RunFailure::from_error(&result.unwrap_err()),
+                Some(RunFailure::Budget {
+                    budget: BudgetKind::Tokens,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(meter.used(), 100, "refused requests spend nothing");
+    }
+
+    #[test]
+    fn worker_autonomy_zero_token_limit_remains_unbounded_and_progress_resets() {
+        let meter = Arc::new(Meter::new());
+        meter.add(&Usage {
+            prompt_tokens: 100_000,
+            ..Default::default()
+        });
+        let ledger = Arc::new(Mutex::new(StepLedger::new(1)));
+        let provider = MeteredProvider::new(Arc::new(Appends), meter, 0, ledger.clone());
+        assert!(provider.before_request().is_ok());
+        for _ in 0..3 {
+            ledger
+                .lock()
+                .unwrap()
+                .record("read", &serde_json::json!({}), "same");
+        }
+        assert!(matches!(
+            RunFailure::from_error(&provider.before_request().unwrap_err()),
+            Some(RunFailure::Model {
+                problem: ProviderProblem::Loop,
+                ..
+            })
+        ));
+        ledger
+            .lock()
+            .unwrap()
+            .record("read", &serde_json::json!({"path":"new"}), "new evidence");
+        assert!(provider.before_request().is_ok());
     }
 }

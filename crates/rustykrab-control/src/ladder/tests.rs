@@ -148,7 +148,6 @@ fn only_transient_subclasses_retry() {
         Format,
         Refusal,
         HallucinatedTool,
-        Loop,
         Empty,
         Disk,
         Permission,
@@ -170,6 +169,28 @@ fn only_transient_subclasses_retry() {
     let err = check_failed();
     let moves = climb(&mut LadderState::default(), &LadderContext::new(&err));
     assert!(!rungs(&moves).contains(&Rung::Retry));
+}
+
+#[test]
+fn worker_autonomy_persistent_model_loop_switches_before_repairing_same_worker() {
+    let err = of(ErrorSubclass::Loop);
+    let mut state = LadderState::default();
+    let ctx = LadderContext::new(&err);
+    assert_eq!(next(&state, &ctx), Decision::SwitchWorker);
+    record(
+        &mut state,
+        Rung::SwitchWorker,
+        err.clone(),
+        "switched",
+        at(0),
+    );
+    assert_eq!(
+        next(&state, &ctx),
+        Decision::Repair {
+            with_diagnosis: false
+        }
+    );
+    assert_eq!(state.used(Rung::Retry), 0);
 }
 
 #[test]

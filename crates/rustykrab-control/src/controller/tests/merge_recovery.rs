@@ -355,6 +355,115 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn worker_autonomy_repair_does_not_inherit_a_waiters_planning_only_contract() {
+    let f = Fixture::new(RepairMode::Resolve).await;
+    let mut original = draft(
+        "planning-original",
+        "Keep the original task's planning scope",
+    );
+    original.constraints = vec!["Plan only; no implementation in this item".into()];
+    original.writable_resources = vec![format!("repo:{}", f.repo.display())];
+    original.artifact_refs = vec![ArtifactRef {
+        kind: "project".into(),
+        value: f.project.to_string(),
+    }];
+    let original_id = f.h.file_one(original).await;
+    f.h.tick().await;
+    let repairs = f.repairs().await;
+    assert_eq!(repairs.len(), 1);
+    let repair = f.h.store().work_get(&repairs[0]).await.unwrap().unwrap();
+    assert!(
+        !repair.constraints.iter().any(|s| s.contains("Plan only")),
+        "independent repair must have its own execution contract: {:?}",
+        repair.constraints
+    );
+    assert!(repair.objective.contains("commit"));
+    assert!(
+        f.h.store()
+            .work_get(&original_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .constraints
+            .iter()
+            .any(|s| s.contains("Plan only")),
+        "the original task's constraints remain unchanged"
+    );
+    f.h.drain_settled().await;
+    assert_eq!(f.h.status(&repairs[0]).await, Status::Done);
+    let seen = f.worker.seen.lock().unwrap();
+    let brief = seen.iter().find(|b| b.item == repairs[0]).unwrap();
+    let context = serde_json::to_string(&brief.project_context).unwrap();
+    assert!(
+        context.contains("Plan only"),
+        "retain original constraints as source context, not repair instructions"
+    );
+}
+
+#[tokio::test]
+async fn worker_autonomy_legacy_generated_contract_is_recognized_without_erasing_new_restrictions()
+{
+    let mut f = Fixture::new(RepairMode::Resolve).await;
+    let original = f.original("legacy-source").await;
+    f.h.tick().await;
+    let repairs = f.repairs().await;
+    let mut legacy = f.h.store().work_get(&repairs[0]).await.unwrap().unwrap();
+    let source = f.h.store().work_get(&original).await.unwrap().unwrap();
+    let snap = f.h.ctl.load().await.unwrap();
+    legacy.constraints = source.constraints.clone();
+    legacy
+        .constraints
+        .push(super::super::merge_recovery::LEGACY_CONSTRAINT.into());
+    let upgraded =
+        f.h.ctl
+            .merge_execution_constraints(&snap, &legacy)
+            .await
+            .unwrap();
+    assert_ne!(upgraded, legacy.constraints);
+    assert!(upgraded
+        .iter()
+        .any(|c| c.contains("Plan, implement and verify")));
+    // A repair-specific restriction is not an inherited source contract.
+    legacy
+        .constraints
+        .insert(0, "Only inspect until the owner decides otherwise".into());
+    assert_eq!(
+        f.h.ctl
+            .merge_execution_constraints(&snap, &legacy)
+            .await
+            .unwrap(),
+        legacy.constraints
+    );
+    // The signature alone cannot make an ordinary item an implementation repair.
+    let mut untrusted = source.clone();
+    untrusted.kind = rustykrab_core::work::WorkKind::Internal;
+    untrusted
+        .constraints
+        .push(super::super::merge_recovery::LEGACY_CONSTRAINT.into());
+    untrusted.artifact_refs.push(ArtifactRef {
+        kind: "item".into(),
+        value: original,
+    });
+    assert_eq!(
+        f.h.ctl
+            .merge_execution_constraints(&snap, &untrusted)
+            .await
+            .unwrap(),
+        untrusted.constraints
+    );
+    assert_eq!(
+        f.h.store()
+            .work_get(&repairs[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .constraints,
+        upgraded,
+        "stored contract unchanged by a projection"
+    );
+}
+
+#[tokio::test]
 async fn one_shared_repair_receives_a_real_worktree_and_originals_resume_across_restart() {
     let mut f = Fixture::new(RepairMode::Resolve).await;
     let first = f.original("first-original").await;
