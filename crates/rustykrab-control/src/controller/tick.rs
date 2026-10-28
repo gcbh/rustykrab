@@ -930,6 +930,20 @@ impl Controller {
                 return self.fail(b, item, worker, error, &result.artifacts).await;
             }
         };
+        let verified_commit = proofs
+            .iter()
+            .find(|(kind, _, by)| kind == "commit" && by.as_deref() == Some(BY_GIT))
+            .map(|(_, commit, _)| commit.clone());
+        if let Some(why) = self.verify_merge_recovery(item, verified_commit).await? {
+            let error = classify(
+                &FailureInput::Verifier {
+                    verdict: VerifierVerdict::ClaimMismatch,
+                    detail: why,
+                },
+                &ctx,
+            );
+            return self.fail(b, item, worker, error, &result.artifacts).await;
+        }
         // A capability item: proven on the executor that needs it, or, with
         // no registered probe, available (`proof.rs`). Catalog presence is
         // never proof.
@@ -2087,7 +2101,7 @@ impl Controller {
             {
                 Ok(workspace) => workspace,
                 Err(why) => {
-                    report.transitions += self.hold_context(&item, why).await?;
+                    report.transitions += self.hold_workspace(&item, why).await?;
                     continue;
                 }
             };
@@ -2200,13 +2214,36 @@ impl Controller {
         item: &WorkItem,
         run: &str,
         context: Option<&mut crate::handoff::ProjectContext>,
-    ) -> Result<Option<Workspace>, String> {
+    ) -> Result<Option<Workspace>, workspace::ContinuationError> {
         let Some(root) = self.config.worktree_root.clone() else {
             return Ok(None);
         };
         let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
             return Ok(None);
         };
+        if let Some(recovery) = self.merge_recovery(item).await.map_err(|e| e.to_string())? {
+            if let Some(context) = context {
+                // Include the goals/constraints and saved owner answers of
+                // actual waiters in the repair's execution view. References
+                // added by the controller are context, never scheduling edges
+                // back onto the blocked original (which would deadlock it).
+                context.execution_items.extend(
+                    item.artifact_refs
+                        .iter()
+                        .filter(|a| a.kind == "item")
+                        .map(|a| a.value.clone()),
+                );
+                context.execution_items.sort();
+                context.execution_items.dedup();
+            }
+            return Ok(Some(Workspace::plan(
+                &root,
+                &repo,
+                &recovery.conflict.left,
+                &item.id,
+                run,
+            )));
+        }
         // A fix item reads the code the failure ran on: the running build in
         // the daemon's own source, else the commit the failing run started
         // from, not wherever the repository has moved to since.
@@ -2229,7 +2266,7 @@ impl Controller {
         let candidates: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
         let base = tokio::task::spawn_blocking(move || {
             let head = workspace::head(&at)?;
-            workspace::continuation_base(&at, &head, &candidates)
+            workspace::continuation_base_checked(&at, &head, &candidates)
         })
         .await
         .map_err(|e| e.to_string())??;

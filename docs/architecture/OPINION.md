@@ -251,5 +251,8 @@ hitting the 128 KiB prompt bound is resolved by task-scoped execution views
 (recorded in the outcome history). The exact current planning snapshot and any
 actual oversized execution slice still retain that bound. The earlier gap for
 clean integration of divergent verified branches is closed by the handoff
-recovery follow-up in the outcome history. Actual merge conflicts and promotion
-of unverified mid-run changes remain separate; neither is silently accepted.
+recovery follow-up in the outcome history. Actual merge conflicts now enter the bounded recovery workflow described in
+[the outcome history](05-first-pass-outcome.md#shared-git-handoff-recovery).
+Promotion of unverified mid-run changes remains separate and is never accepted
+as continuation evidence. Model resolution quality and live rollout remain
+measurements to perform, not consequences of a passing deterministic fixture.

@@ -16,7 +16,7 @@ use crate::graph::Snapshot;
 use crate::handoff::{
     binding, ProjectAttempt, ProjectContext, ProjectWork, CONTROLLER, PROJECT_CONTEXT,
 };
-use crate::workspace::{Workspace, WORKSPACE_EVIDENCE};
+use crate::workspace::{ContinuationError, MergeConflict, Workspace, WORKSPACE_EVIDENCE};
 
 const CONTEXT_BYTES: usize = 128 * 1024;
 
@@ -26,6 +26,7 @@ pub(super) struct HandoffChecks {
     events: i64,
     projects: BTreeMap<ProjectId, ProjectSnapshot>,
     passed: Vec<String>,
+    conflicts: Vec<(String, MergeConflict)>,
 }
 
 fn technical(q: &QuestionRow) -> bool {
@@ -37,6 +38,28 @@ fn technical(q: &QuestionRow) -> bool {
             .answer_submission
             .as_ref()
             .is_some_and(|s| s.status == rustykrab_store::AnswerSubmissionStatus::Pending)
+}
+
+fn obsolete_technical_questions(batch: &mut Batch, waiting: &[QuestionRow], id: &str) {
+    for question in waiting.iter().filter(|q| q.item == id && technical(q)) {
+        let settled = batch.ops.iter().any(|op| match op {
+            WorkOp::Question(
+                QuestionWrite::Settle { id, .. } | QuestionWrite::Supersede { id, .. },
+            ) => id == &question.id,
+            _ => false,
+        });
+        if settled {
+            continue;
+        }
+        batch.ops.push(WorkOp::Question(QuestionWrite::Settle {
+            id: question.id.clone(),
+            status: QuestionStatus::Obsolete,
+            answer: None,
+            by: Some("controller".into()),
+            decision: None,
+            at: batch.now,
+        }));
+    }
 }
 
 fn eligible(snap: &Snapshot, item: &WorkItem, waiting: &[QuestionRow], worktrees: bool) -> bool {
@@ -395,6 +418,7 @@ impl Controller {
             events,
             projects: BTreeMap::new(),
             passed: Vec::new(),
+            conflicts: Vec::new(),
         };
         let mut contexts = BTreeMap::new();
         for id in candidates {
@@ -407,21 +431,27 @@ impl Controller {
             let checked = async {
                 let mut context = self
                     .cached_project_context(&snap, item, &mut contexts)
-                    .await?;
-                self.plan_workspace(item, "handoff-recheck", context.as_mut())
                     .await
-                    .map_err(Error::Internal)?;
+                    .map_err(|e| ContinuationError::Other(e.to_string()))?;
+                // Conflicts as well as passes are hints bound to this exact
+                // immutable project revision and event head.
                 if let Some(context) = &context {
-                    Self::check_execution_context(context)?;
                     checks
                         .projects
                         .insert(context.snapshot.project.id, context.snapshot.clone());
                 }
-                Ok::<_, Error>(())
+                self.plan_workspace(item, "handoff-recheck", context.as_mut())
+                    .await?;
+                if let Some(context) = &context {
+                    Self::check_execution_context(context)
+                        .map_err(|e| ContinuationError::Other(e.to_string()))?;
+                }
+                Ok::<_, ContinuationError>(())
             }
             .await;
             match checked {
                 Ok(()) => checks.passed.push(id),
+                Err(ContinuationError::Conflict(conflict)) => checks.conflicts.push((id, conflict)),
                 Err(why) => tracing::debug!(item = %id, %why, "project handoff remains unresolved"),
             }
         }
@@ -448,6 +478,30 @@ impl Controller {
             }
         }
         let mut changed = Vec::new();
+        for (id, conflict) in checks.conflicts {
+            let Some(item) = batch.snap.item(&id).cloned() else {
+                continue;
+            };
+            if !eligible(
+                &batch.snap,
+                &item,
+                waiting,
+                self.config.worktree_root.is_some(),
+            ) {
+                continue;
+            }
+            match self.ensure_merge_recovery(batch, &item, conflict).await {
+                Ok(repair) => {
+                    // Retire a synthetic request for owner Git surgery because
+                    // an owned technical repair now carries that work. No owner
+                    // answer, completion claim or independent hold is invented.
+                    obsolete_technical_questions(batch, waiting, &id);
+                    changed.extend(batch.move_to(&id, Status::Queued, "controller",
+                        format!("Waiting for shared Git repair {repair}; technical question replaced by executable recovery")));
+                }
+                Err(why) => tracing::debug!(item = %id, %why, "shared Git recovery remains held"),
+            }
+        }
         for id in checks.passed {
             let Some(item) = batch.snap.item(&id) else {
                 continue;
@@ -460,25 +514,7 @@ impl Controller {
             ) {
                 continue;
             }
-            for question in waiting.iter().filter(|q| q.item == id && technical(q)) {
-                let settled = batch.ops.iter().any(|op| match op {
-                    WorkOp::Question(
-                        QuestionWrite::Settle { id, .. } | QuestionWrite::Supersede { id, .. },
-                    ) => id == &question.id,
-                    _ => false,
-                });
-                if settled {
-                    continue;
-                }
-                batch.ops.push(WorkOp::Question(QuestionWrite::Settle {
-                    id: question.id.clone(),
-                    status: QuestionStatus::Obsolete,
-                    answer: None,
-                    by: Some("controller".into()),
-                    decision: None,
-                    at: batch.now,
-                }));
-            }
+            obsolete_technical_questions(batch, waiting, &id);
             changed.extend(batch.move_to(
                 &id,
                 Status::Queued,

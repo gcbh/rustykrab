@@ -72,6 +72,7 @@ mod dispatchability;
 mod filing;
 mod investigation;
 mod load;
+mod merge_recovery;
 mod notice;
 mod planning;
 mod preferences;

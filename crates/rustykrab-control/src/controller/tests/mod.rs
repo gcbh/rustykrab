@@ -13,6 +13,7 @@ mod dispatchability;
 mod drain;
 mod investigation;
 mod loop_status;
+mod merge_recovery;
 mod model_check;
 mod paths;
 mod peers;

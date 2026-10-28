@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.12] - 2026-10-28
+
+- Make shared Git conflicts executable recovery work (#737)
+
 ## [6.6.11] - 2026-10-27
 
 - Register inventory before worker tool snapshots (#736)
