@@ -451,3 +451,38 @@ view fits. A separate case retains active/obsolete-but-answered and pending
 owner input and rejects oversized active input. This corrects the earlier
 blanket claim about historical-context overflow; subsequent live outcome still
 requires promotion and observation. See [verification](../verification/shared-git-recovery-context-2026-10-28.md).
+
+## Worker autonomy and bounded attempt recovery
+
+Against exact main/deployed e27efed on 2026-10-28, live shared repair e8402ec7
+started but failed: 31 successful exec reads, one diff repeated 12 times, no Git
+changes or commit, timeout after 1800 seconds and 1,603,490 reported tokens
+against a 200,000-token allowance. Its first waiter's plan-only constraint had
+been copied into the independent implementation repair. The log does not prove
+that contradiction caused the model's behavior. Existing tests explicitly
+permitted unlimited repetition before the iteration cap and token overspending
+without stopping; the timeout chose same-worker retry before a budget hold.
+Earlier context and workspace-access fixes established startup, not recovery.
+
+The follow-up gives the repair its own execution constraints, retains source
+constraints/owner direction in project context, and explicitly puts planning,
+implementation and verification in one local assignment. A repeat warning gives
+the worker another threshold of steps to change course. Persistent unchanged
+results stop the attempt as model/loop before another model request, allowing
+the existing finite worker-switch rung before same-worker repair. Actual token
+spend prevents later requests once the brief allowance is spent; one in-flight
+response can overshoot and is fully charged. No permission or budget is widened.
+
+The regressions retain both self-correction and alternate-worker recovery paths
+with actual LocalWorker/tool calls, SQLite, Git merges, both-parent verification
+and original-work continuation. Models and the alternate Worker are deterministic
+fixtures. This does not prove native Codex execution, useful live model reasoning,
+a reasoning-manager recovery turn, release deployment or the held original
+goals' effectiveness. See the [verification record](../verification/worker-autonomy-recovery-2026-10-28.md).
+
+The exact legacy generated constraint form is also recognized on fresh leases
+under the trusted controller record. Only the execution brief is corrected;
+extra repair restrictions, persisted history, active runs and budget holds remain.
+The initial broad run caught an older standalone test expecting Repair before
+SwitchWorker for a loop; it is updated to the approved new order, while the
+adjacent real no-alternative repair-evidence case remains in place.

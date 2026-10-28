@@ -2105,6 +2105,13 @@ impl Controller {
                     continue;
                 }
             };
+            brief.constraints = match self.merge_execution_constraints(&snap, &item).await {
+                Ok(constraints) => constraints,
+                Err(why) => {
+                    report.transitions += self.hold_context(&item, why.to_string()).await?;
+                    continue;
+                }
+            };
             if let Some(context) = &brief.project_context {
                 if let Err(why) = Self::check_execution_context(context) {
                     report.transitions += self.hold_context(&item, why.to_string()).await?;

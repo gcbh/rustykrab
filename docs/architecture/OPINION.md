@@ -17,6 +17,14 @@ general-worker inventory access and dispatch/brief consistency. It leaves the
 broader self-repair bootstrap, live deployment and original-goal effectiveness
 questions open.
 
+The 2026-10-28 [worker autonomy follow-up](05-first-pass-outcome.md#worker-autonomy-and-bounded-attempt-recovery)
+records the observed live failure after successful startup: inherited plan-only
+constraints, advisory repetition handling, post-run-only token enforcement and
+same-worker recovery ordering. The implementation and deterministic recovery
+regressions address those paths. Automatic reasoning-manager intervention,
+semantic progress assessment and effective live original-goal recovery remain
+unverified or unimplemented; they are not closed by fixture completion.
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

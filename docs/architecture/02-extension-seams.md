@@ -332,3 +332,16 @@ conflict. The verifier requires both parent histories after normal branch/path
 checks. Original dispatch rechecks the actual current continuation. Background
 legacy-hold recovery preserves event/project/pending-answer guards. No new public
 trait, model executor, persistence table, scheduler or authority grant is added.
+
+## Worker autonomy follow-up (base e27efed)
+
+The existing Worker/Brief/RunFailure seam carries bounded no-progress recovery.
+LocalWorker gives the executor room to plan, act and change course; its private
+MeteredProvider checks token allowance and StepLedger before provider calls.
+Persistent repetition becomes the existing typed model/loop failure, and the
+controller prefers the existing SwitchWorker action before same-worker repair.
+A shared Git prerequisite now owns its execution contract rather than copying
+a planning waiter's constraints. No new public trait, queue, table, worker role,
+manager process or authority grant is introduced. The agent integration tests
+add test-only store/projects dependencies to exercise the existing graph, real
+Git verification and original-work continuation across these seams.

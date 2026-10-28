@@ -6,9 +6,10 @@
 //! fingerprint the run has not seen is progress, and one it has seen is
 //! not. Once `threshold` steps in a row bring nothing new, the run has
 //! stalled: the worker adapter says so in each repeating step's result and
-//! the run goes on, so the model can change course. A run that reaches its
-//! iteration cap still stalled fails as `model/loop` with [`Stall::detail`],
-//! so the repair run's brief has this attempt's evidence. Deterministic and
+//! gives the model another threshold of steps to change course. If those
+//! also bring nothing new, [`StepLedger::recovery_due`] ends the local
+//! attempt as `model/loop`, retaining [`Stall::detail`] for the next worker.
+//! A new result resets both windows. Deterministic and
 //! pure: the same steps always give the same verdict.
 //!
 //! The subtree half of step 7 (a parent with nothing moving beneath it) is
@@ -99,6 +100,15 @@ impl StepLedger {
         })
     }
 
+    /// The warning did not produce a change of approach: end this attempt
+    /// after a second window without new evidence. Checked before model
+    /// requests and tool effects, leaving the worker room to self-correct.
+    pub fn recovery_due(&self) -> Option<Stall> {
+        (self.since_progress >= self.threshold.saturating_mul(2))
+            .then(|| self.stalled())
+            .flatten()
+    }
+
     pub fn steps(&self) -> u32 {
         self.steps
     }
@@ -136,5 +146,23 @@ mod tests {
         l.record("read", &json!({"path": "b"}), "x");
         assert!(l.record("read", &json!({"path": "b"}), "y"), "a new answer");
         assert!(l.stalled().is_none());
+    }
+
+    #[test]
+    fn worker_autonomy_warns_then_allows_a_full_window_before_recovery() {
+        let mut ledger = StepLedger::new(2);
+        ledger.record("read", &serde_json::json!({}), "same");
+        for _ in 0..2 {
+            ledger.record("read", &serde_json::json!({}), "same");
+        }
+        assert!(ledger.stalled().is_some());
+        assert!(ledger.recovery_due().is_none());
+        ledger.record("read", &serde_json::json!({}), "same");
+        assert!(ledger.recovery_due().is_none());
+        ledger.record("read", &serde_json::json!({}), "same");
+        assert_eq!(ledger.recovery_due().unwrap().without_progress, 4);
+        ledger.record("read", &serde_json::json!({}), "changed result");
+        assert!(ledger.stalled().is_none());
+        assert!(ledger.recovery_due().is_none());
     }
 }
