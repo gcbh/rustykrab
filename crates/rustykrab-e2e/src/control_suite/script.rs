@@ -640,9 +640,9 @@ pub(crate) fn agent_script_scenarios() -> Vec<Value> {
                 done("Asked when to check in."),
             ],
         ),
-        // 5: turns that add no evidence, past the progress ledger's notice
-        // and on to the run's iteration cap (the default budget's 100),
-        // where the stall is the failure.
+        // 5: an executor that ignores the progress warning and keeps reading
+        // unchanged state. The worker must stop early, retaining budget for
+        // bounded recovery; it must not run all 110 scripted turns.
         script(
             W_STALL,
             std::iter::repeat_n(call("todo_read", json!({})), 110).collect(),

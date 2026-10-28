@@ -47,8 +47,9 @@ The worker's opportunity to change course already passes at that base.
 The actual agent integration fixture uses LocalWorker, ExecTool, its macOS
 sandbox, controller, SQLite and real Git worktrees. One case changes course after
 a warning, resolves both parent histories, commits and completes the original
-useful work in a successor workspace. Another persistent loop ends after five
-100-token model responses with a test threshold of two, then a deterministic
+useful work in a successor workspace. Another persistent loop ends after six
+100-token model responses (one partial write and five unchanged reads) with a
+test threshold of two, then a deterministic
 alternate Worker receives the normal failure evidence and reduced remaining
 budget, resolves the real conflict, and the original local worker resumes and
 commits its result. Both-parent commits and the original result are independently
@@ -82,3 +83,36 @@ and native subscription execution are unmeasured. No live work was rewritten,
 answered, granted budget, retried or restarted. The existing e840 repair remains
 budget-held; this change neither clears that hold nor allocates a replacement
 repair identity. No merge or deployment is part of this implementation run.
+
+## Final review refinements and retained failures
+
+The first hosted run 40764939301 passed Rust tests, Clippy, docs, formatting and
+security, but its required scenario5 expected every stall to exhaust all100
+iterations before an owner budget grant. Early stopping correctly reached a
+finite technical hold first. The required-pass driver now asserts a second
+attempt with first-attempt evidence, less than the original iteration allowance,
+and no invented grant. The independent spent-budget/owner-grant case is unchanged.
+The complete local scripted suite then passes:70pass/7xfail/0fail/0xpass.
+
+Final source review also found unconditional force-removal of failed local
+workspaces. The actual Git handoff fixture now writes a partial uncommitted file
+before looping and checks its old workspace pointer in the successor's project
+context. The first run reproduces loss with ENOENT (retention-red.log); preserving
+failed/blocked/error/question-bearing attempts makes the same fixture complete
+(retention-green.log). Successful normal reports keep existing cleanup. Partial
+files remain unverified; no automatic carry-forward or proof is added.
+
+An initial local context run used the legacy default and failed four exact
+prior-answer retention checks (24/28pass). The signed unchanged6.6.13/e27efed
+binary reproduces exactly those same four failures under the same legacy
+strategy. They are retained baseline observations, not attributed to this change.
+CI explicitly selects structured-message-tail in ci.yml; final context validation
+uses that exact strategy. No compactor, context assertion or workflow is weakened.
+Final refreshed required checks and exact hosted head are in task-local receipts.
+
+Final local refresh after retention:2492tests/0fail/39ignore across41targets,
+format, strict workspace/all-target Clippy, architecture/env checks and all28/28
+context trials with CI's explicit structured-message-tail strategy pass. The
+70pass/7xfail scripted run above precedes the retention refinement; final hosted
+checks must re-exercise the entire suite on the published head. Both final
+real-Git integration cases pass, including the retained partial file.

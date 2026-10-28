@@ -100,6 +100,12 @@ impl ModelProvider for FixtureModel {
         } else {
             self.original_calls.fetch_add(1, Ordering::SeqCst)
         };
+        if repair && !self.self_correct && n == 0 {
+            return Ok(call(
+                "exec",
+                json!({"command": "printf 'unverified partial repair\\n' > partial.txt"}),
+            ));
+        }
         if repair && (!self.self_correct || n < 4) {
             return Ok(call("exec", json!({"command": "git diff -- policy.txt"})));
         }
@@ -167,6 +173,21 @@ impl Worker for Alternate {
             .as_ref()
             .is_some_and(|e| e.contains("progress ledger")));
         self.seen.lock().unwrap().push(brief.clone());
+        let previous = brief
+            .project_context
+            .as_ref()
+            .unwrap()
+            .work
+            .iter()
+            .find(|w| w.item == brief.item)
+            .and_then(|w| w.unfinished_attempt.as_ref())
+            .and_then(|attempt| attempt.workspace.as_ref())
+            .expect("the successor receives the failed attempt's workspace pointer");
+        assert_eq!(
+            std::fs::read_to_string(previous.path.join("partial.txt"))
+                .expect("failed attempt's uncommitted work must survive handoff"),
+            "unverified partial repair\n"
+        );
         let other = self.other.clone();
         tokio::task::spawn_blocking(move || {
             let ws = brief.workspace.unwrap();
@@ -399,10 +420,7 @@ async fn exercise(self_correct: bool) {
             .is_empty(),
         "no owner intervention or budget grant"
     );
-    assert_eq!(
-        model.repair_calls.load(Ordering::SeqCst),
-        if self_correct { 6 } else { 5 }
-    );
+    assert_eq!(model.repair_calls.load(Ordering::SeqCst), 6);
 }
 
 #[tokio::test]

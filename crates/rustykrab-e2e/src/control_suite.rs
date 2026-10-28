@@ -3495,9 +3495,9 @@ async fn s03(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Scenario 5: A worker stalls; the progress ledger triggers repair; its owner
-/// grants the spent budget one more allotment; the second
-/// attempt uses the first attempt's evidence.
+/// Scenario 5: A worker stalls; bounded recovery starts another attempt while
+/// budget remains, carrying the first attempt's evidence without an owner grant.
+/// An executor scripted to keep looping ends at a finite technical hold.
 async fn s05(ctx: &Ctx) -> Result<()> {
     let tag = tag(5);
     let task = file(
@@ -3518,19 +3518,21 @@ async fn s05(ctx: &Ctx) -> Result<()> {
         trigger.contains("stall") || trigger.contains("progress"),
         "the repair was not triggered by the progress ledger: {trigger}"
     );
-    // The stall ran to its run's cap, which is the whole of the item's
-    // remaining budget, so bounded recovery parks the repair on its owner:
-    // one question, and the answer grants the second attempt.
-    wait_status(ctx, &task, Status::Blocked(BlockedReason::BudgetExhausted)).await?;
-    let asked = questions_for(ctx, &task).await?;
-    let question = asked
-        .first()
-        .context("the spent budget asks the item's owner")?;
-    let qid = question["id"].as_str().unwrap_or_default();
-    let answer = submit_answer(ctx, qid, "Yes, one more attempt.").await?;
+    // The fixture never changes approach. Every attempt must stop before
+    // spending all remaining iterations, and finite recovery ends in a
+    // technical hold. Budget-grant behavior has its own independent scenario.
+    let held = wait_status(ctx, &task, Status::Blocked(BlockedReason::NeedsDecision)).await?;
+    let budget = &body(&held)["budget"];
+    let (spend_text, spend) = spend_report(ctx, &task, budget, 1)?;
     ensure!(
-        answer["applied"]["answer_submission"]["status"] == "applied",
-        "the owner's saved answer was applied: {answer}"
+        spend["runs"].as_u64().unwrap_or(0) >= 2
+            && spend["iterations"].as_u64().unwrap_or(u64::MAX)
+                < budget["iterations"].as_u64().unwrap_or(0),
+        "persistent loops must hand off before exhausting the item's allowance: {spend_text}"
+    );
+    ensure!(
+        evidence_of(&held, "budget_grant").is_empty(),
+        "recovery must not invent an owner grant"
     );
     let deadline = Instant::now() + SETTLE;
     let attempts = loop {
@@ -3540,7 +3542,7 @@ async fn s05(ctx: &Ctx) -> Result<()> {
         }
         ensure!(
             Instant::now() < deadline,
-            "no second attempt after {SETTLE:?}"
+            "no second attempt without a budget grant after {SETTLE:?}"
         );
         tokio::time::sleep(POLL).await;
     };

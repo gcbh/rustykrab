@@ -486,3 +486,12 @@ extra repair restrictions, persisted history, active runs and budget holds remai
 The initial broad run caught an older standalone test expecting Repair before
 SwitchWorker for a loop; it is updated to the approved new order, while the
 adjacent real no-alternative repair-evidence case remains in place.
+
+The final review closes another directly affected boundary: failed, blocked,
+error-reported or question-bearing local attempts retain their workspaces instead
+of force-removing partial edits. The real-Git handoff case reproduces ENOENT
+before this refinement, then verifies the successor receives a valid workspace
+pointer with uncommitted data intact and completes the original goal. Retained
+files do not count as verified work and are not automatically replayed. Required
+scripted scenario5 is aligned to early stopping while budget remains, preserving
+its first-attempt evidence and the independent owner-grant scenario.

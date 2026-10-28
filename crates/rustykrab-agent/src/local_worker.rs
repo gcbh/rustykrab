@@ -1145,8 +1145,9 @@ impl Worker for LocalWorker {
                 .collect();
         }
 
-        // A `code` run works in its own worktree: created now, `exec`
-        // bound to it, removed when the run ends (the branch stays).
+        // Repository work runs in its own worktree. Completed reports give
+        // the directory back; failures and parked work keep uncommitted edits
+        // for the next attempt to inspect (the branch always stays).
         if let Some(ws) = brief.workspace.clone() {
             tokio::task::spawn_blocking(move || ws.create())
                 .await
@@ -1167,7 +1168,10 @@ impl Worker for LocalWorker {
                 Err(e)
             }
         };
-        if let Some(ws) = brief.workspace {
+        let completed = result.as_ref().is_ok_and(|report| {
+            report.blocked.is_none() && report.error.is_none() && report.questions.is_empty()
+        });
+        if let Some(ws) = brief.workspace.filter(|_| completed) {
             if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
