@@ -898,3 +898,121 @@ async fn repair_brief_carries_owner_direction_from_its_actual_waiters() {
         );
     }
 }
+
+#[tokio::test]
+async fn shared_repair_omits_obsolete_unanswered_history_but_retains_every_owner_answer() {
+    use rustykrab_core::questions::QuestionStatus;
+    use rustykrab_store::QuestionWrite;
+
+    let mut f = Fixture::new(RepairMode::Resolve).await;
+    let mut originals = Vec::new();
+    for n in 0..36 {
+        originals.push(f.original(&format!("owner-goal-{n}")).await);
+    }
+    let mut template = None;
+    for (n, id) in originals.iter().take(18).enumerate() {
+        let row = f.h.store().work_get(id).await.unwrap().unwrap();
+        f.h.ctl
+            .hold_context(&row, "legacy project conflict".into())
+            .await
+            .unwrap();
+        let q =
+            f.h.store()
+                .questions_list(&Default::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|q| q.item == *id)
+                .unwrap();
+        f.h.ctl
+            .answer(
+                &q.id,
+                &format!("Preserve owner direction {n}"),
+                "user:owner",
+            )
+            .await
+            .unwrap();
+        template = Some(q);
+    }
+    // Reproduce the observed 36-waiter/101-obsolete-question shape. A repaired
+    // technical question remains durable history, not fresh execution input.
+    for n in 0..101 {
+        let mut q = template.clone().unwrap();
+        q.id = uuid::Uuid::new_v4().to_string();
+        q.item = originals[n % originals.len()].clone();
+        q.root = q.item.clone();
+        q.status = QuestionStatus::Obsolete;
+        q.text = "Retired technical conflict diagnostic. ".repeat(50);
+        f.h.store()
+            .question_write(QuestionWrite::Insert(Box::new(q)))
+            .await
+            .unwrap();
+    }
+    f.h.drain_settled().await;
+    let repairs = f.repairs().await;
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(f.h.status(&repairs[0]).await, Status::Done);
+    for id in &originals {
+        assert_eq!(f.h.status(id).await, Status::Done);
+    }
+    let briefs = f.worker.seen.lock().unwrap();
+    let context = briefs
+        .iter()
+        .find(|b| b.item == repairs[0])
+        .unwrap()
+        .project_context
+        .as_ref()
+        .unwrap();
+    assert!(serde_json::to_vec(context).unwrap().len() > 128 * 1024);
+    let view = context.execution_view();
+    assert!(serde_json::to_vec(&view).unwrap().len() < 128 * 1024);
+    assert_eq!(context.questions.len(), 119, "durable history is complete");
+    assert_eq!(view.questions.len(), 18);
+    for n in 0..18 {
+        assert!(view
+            .questions
+            .iter()
+            .any(|q| q.answer.as_deref() == Some(&format!("Preserve owner direction {n}"))));
+    }
+    assert!(originals
+        .iter()
+        .all(|id| view.work.iter().any(|w| w.item == *id)));
+    drop(briefs);
+    assert_eq!(workspace::head(&f.repo).unwrap(), f.current);
+}
+
+#[tokio::test]
+async fn prompt_projection_preserves_unresolved_and_recorded_owner_input_and_size_guard() {
+    use rustykrab_core::questions::QuestionStatus;
+
+    let mut f = Fixture::new(RepairMode::Resolve).await;
+    let original = f.original("owner-input").await;
+    let row = f.h.store().work_get(&original).await.unwrap().unwrap();
+    f.h.ctl
+        .hold_context(&row, "open question".into())
+        .await
+        .unwrap();
+    let snap = f.h.ctl.load().await.unwrap();
+    let mut context = f.h.ctl.project_context(&snap, &row).await.unwrap().unwrap();
+    assert_eq!(context.execution_view().questions.len(), 1);
+    let q = &mut context.questions[0];
+    q.status = QuestionStatus::Obsolete;
+    q.answer = Some("Retain this recorded owner answer".into());
+    assert_eq!(context.execution_view().questions.len(), 1);
+    context.questions[0].answer = None;
+    context.questions[0].answer_submission = Some(rustykrab_store::AnswerSubmission {
+        id: uuid::Uuid::new_v4().to_string(),
+        answer: "Preserve this pending owner input".into(),
+        actor: "user:owner".into(),
+        submitted_at: Utc::now(),
+        status: rustykrab_store::AnswerSubmissionStatus::Pending,
+        completed_at: None,
+        error: None,
+    });
+    assert_eq!(context.execution_view().questions.len(), 1);
+    context.questions[0].answer_submission = None;
+    assert!(context.execution_view().questions.is_empty());
+    context.questions[0].status = QuestionStatus::Open;
+    context.questions[0].text = "Active input must not be silently truncated. ".repeat(4000);
+    assert!(Controller::check_execution_context(&context).is_err());
+}

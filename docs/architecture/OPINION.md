@@ -247,8 +247,14 @@ HEAD for every native run, and `Brief` carried no planning revision. The verifie
 branch history therefore did not supply the next agent's files or project state.
 The existing worker boundary now carries durable project context and verified
 code ancestry; real git/SQLite tests exercise the loss path. Accumulated history
-hitting the 128 KiB prompt bound is resolved by task-scoped execution views
-(recorded in the outcome history). The exact current planning snapshot and any
+hitting the 128 KiB prompt bound is reduced by task-scoped execution views.
+The earlier claim that this resolved accumulated-history overflow was too broad:
+the v6.6.12 live shared repair joined 36 waiters and replayed 101 obsolete,
+unanswered questions (about 110 KiB) before a worker could start. The narrow
+projection follow-up omits those retired diagnostics while retaining the full
+receipt, owner input and active questions; its real-Git regression and limits
+are [recorded in the outcome history](05-first-pass-outcome.md#obsolete-question-history-in-shared-recovery).
+The exact current planning snapshot and any
 actual oversized execution slice still retain that bound. The earlier gap for
 clean integration of divergent verified branches is closed by the handoff
 recovery follow-up in the outcome history. Actual merge conflicts now enter the bounded recovery workflow described in

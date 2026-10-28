@@ -47,7 +47,17 @@ impl ProjectContext {
             questions: self
                 .questions
                 .iter()
-                .filter(|q| relevant(&q.item))
+                // Retired unanswered diagnostics stay in the durable receipt.
+                // Replaying them into every shared waiter's prompt can prevent
+                // the repair from ever starting. Never drop owner input or a
+                // delegated decision merely because its question is obsolete.
+                .filter(|q| {
+                    relevant(&q.item)
+                        && (q.status != rustykrab_core::questions::QuestionStatus::Obsolete
+                            || q.answer.is_some()
+                            || q.answer_submission.is_some()
+                            || q.decision.is_some())
+                })
                 .collect(),
             history_items: self.work.len(),
         }

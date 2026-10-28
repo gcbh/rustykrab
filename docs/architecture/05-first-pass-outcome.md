@@ -424,3 +424,30 @@ both repair execution and useful original execution, plus negative claims,
 independent holds, archival and bounded failure. This closes the deterministic
 handoff-recovery mechanism; model quality, promotion and live effectiveness
 remain separate. See [verification](../verification/shared-git-recovery-2026-10-28.md).
+
+## Obsolete question history in shared recovery
+
+The v6.6.12 rollout at `b5c0a82` passed the official signed binary's isolated
+daemon/LocalWorker/Git repair and original-resumption canary. Production then
+created one shared repair for 36 waiters, but its execution view exceeded
+128 KiB before lease. Read-only observation found 101 obsolete unanswered
+question rows (110,237 JSON bytes), 18 answered rows (18,363 bytes), and
+42,614 bytes of current work definitions. The smaller deterministic cases had
+not covered that accumulated-question shape. Allocation was progress, not
+effective live recovery or evidence of model performance.
+
+`ProjectContext::execution_view` now omits an obsolete question only when it
+has no answer, answer submission or delegated decision. The complete context
+and SQLite history keep every row. All waiters' goals, constraints, owner
+answers, active questions and project revision remain; the existing size check
+still rejects genuinely oversized active input. No scheduler, budget, question
+settlement, persistence format or permission changes are involved.
+
+A real-Git/SQLite regression with 36 waiters, 101 retired questions and 18
+owner answers failed on the exact deployed base with the repair blocked. With
+the projection change, one worker repairs both histories, every original runs,
+all 18 answers reach the repair, the full receipt exceeds 128 KiB and its prompt
+view fits. A separate case retains active/obsolete-but-answered and pending
+owner input and rejects oversized active input. This corrects the earlier
+blanket claim about historical-context overflow; subsequent live outcome still
+requires promotion and observation. See [verification](../verification/shared-git-recovery-context-2026-10-28.md).
