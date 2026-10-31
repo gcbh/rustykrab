@@ -1,152 +1,21 @@
-//! What runs spend (plan sections 4.2, 4.6 and 13): each run's tokens and
-//! wall time go to `work_spend` when it ends, its self-counts (iterations,
-//! completion reminders) to a `run` event on its item, and a parent's
-//! remaining budget is its budget less what its subtree actually spent.
-//!
-//! A leaf's budget is cumulative across every attempt, restart and revival
-//! ([`Controller::cumulative_budget`]): a run is briefed with what is left of
-//! `budget × (1 + grants) − spent` in iterations, tokens and wall time, where
-//! a grant is one `budget_grant` row an owner's answer recorded
-//! ([`BUDGET_GRANT`]). An item with less left than [`exhausted`]'s floors is
-//! not leased; it fails `budget/<dimension>` observed by
-//! [`CUMULATIVE_GUARD`] and surfaces as `blocked(budget_exhausted)`.
-//!
-//! The totals are read once, on the first load, and kept current here as
-//! runs end: the controller is the only writer of `work_spend`.
-
-use std::collections::{BTreeMap, HashSet};
-
-use chrono::Utc;
-use rustykrab_core::questions::QuestionStatus;
-use rustykrab_core::work::{Budget, EventKind, Evidence, WorkEvent, WorkItem, WorkItemId};
-use rustykrab_core::Error;
-use rustykrab_store::{RunSpend, Spend};
-
-use crate::errors::BudgetKind;
-use crate::graph::Snapshot;
+//! Observed execution usage, retained across attempts and restarts.
+//! No estimated token, iteration or task wall-time allowance gates work.
+use super::{batch::Batch, Controller, Run};
 use crate::worker::RUN_LOG;
+use chrono::Utc;
+use rustykrab_core::questions::{QuestionClass, QuestionKind, QuestionStatus};
+use rustykrab_core::work::{BlockedReason, EventKind, Evidence, Status, WorkEvent};
+use rustykrab_core::Error;
+use rustykrab_store::{AnswerSubmissionStatus, QuestionWrite, RunSpend, Spend, WorkOp};
+use std::collections::HashSet;
 
-use super::{Controller, Run};
-
-/// The evidence kind of one more allotment of an item's budget: recorded
-/// when an owner's answer releases the item from `blocked(budget_exhausted)`
-/// (`questions.rs`), at most one per question. Its reference is the
-/// question's id and `verified_by` the actor who answered.
+/// Reserved historical evidence; never accepted as a worker-authored artifact.
 pub(super) const BUDGET_GRANT: &str = "budget_grant";
-
-/// Who observed a cumulative budget running out: the controller, at lease
-/// time, before anything ran. The `observed_by` of its `budget/*` error.
+/// Historical failure provenance retained for recurrence analysis.
 pub(super) const CUMULATIVE_GUARD: &str = "cumulative_budget_guard";
 
-/// The least wall time worth starting a run with, in seconds: below it an
-/// agent cannot read its brief and act. Capped at a tenth of one allotment,
-/// so an item budgeted under ten minutes still gets most of its allotment.
-const MIN_WALL_SECONDS: u64 = 60;
-
-/// The least token budget worth starting a run with: below it a model
-/// cannot read a brief. Capped at a tenth of one allotment, like the wall.
-const MIN_TOKENS: u64 = 2_000;
-
-/// Milliseconds of wall time, rounded up to whole seconds.
-fn seconds(wall_ms: u64) -> u64 {
-    wall_ms.div_ceil(1000)
-}
-
-/// `budget`'s iterations, tokens and wall time `allotments` times over.
-/// Repairs and rung budgets are per item and pass through.
-pub(super) fn scaled(budget: &Budget, allotments: u32) -> Budget {
-    let n = u64::from(allotments.max(1));
-    Budget {
-        iterations: u32::try_from(u64::from(budget.iterations).saturating_mul(n))
-            .unwrap_or(u32::MAX),
-        tokens: budget.tokens.saturating_mul(n),
-        wall_seconds: budget.wall_seconds.saturating_mul(n),
-        ..*budget
-    }
-}
-
-/// The floor below which `left` of one `allotment` is too little to start a
-/// run with: a tenth of the allotment, at most `cap`, at least 1. A zero
-/// allotment is unbounded in that dimension and has no floor.
-fn floor(allotment: u64, cap: u64) -> Option<u64> {
-    (allotment > 0).then(|| (allotment / 10).clamp(1, cap))
-}
-
-/// The first dimension whose cumulative budget is spent or too small to be
-/// useful, with a sentence saying so, or `None` when a run may start.
-/// `remaining` is what [`Controller::cumulative_budget`] left, `allotment` the
-/// item's own budget, `allotments` how many it has had (1 + grants).
-/// Floors: under one iteration, under a tenth of an allotment's tokens
-/// (at most [`MIN_TOKENS`]) or wall time (at most [`MIN_WALL_SECONDS`]).
-pub(super) fn exhausted(
-    remaining: &Budget,
-    allotment: &Budget,
-    allotments: u32,
-    spent: Spend,
-) -> Option<(BudgetKind, String)> {
-    let allotments = allotments.max(1);
-    // (kind, unit, one allotment, what is left, what was spent)
-    let dimensions = [
-        (
-            BudgetKind::Iterations,
-            "iterations",
-            u64::from(allotment.iterations),
-            u64::from(remaining.iterations),
-            spent.iterations,
-            1,
-        ),
-        (
-            BudgetKind::Tokens,
-            "tokens",
-            allotment.tokens,
-            remaining.tokens,
-            spent.tokens,
-            MIN_TOKENS,
-        ),
-        (
-            BudgetKind::Wall,
-            "wall seconds",
-            allotment.wall_seconds,
-            remaining.wall_seconds,
-            seconds(spent.wall_ms),
-            MIN_WALL_SECONDS,
-        ),
-    ];
-    dimensions
-        .into_iter()
-        .find_map(|(kind, unit, one, left, used, cap)| {
-            let floor = floor(one, cap)?;
-            (left < floor).then(|| {
-                (
-                    kind,
-                    // The classifier puts `<dimension> budget spent: ` in
-                    // front of this.
-                    format!(
-                        "{used} of {} {unit} used over {} run(s) ({allotments} allotment(s) of \
-                         {one}, counted across every attempt); {left} left, under the {floor} a \
-                         run needs",
-                        one.saturating_mul(u64::from(allotments)),
-                        spent.runs,
-                    ),
-                )
-            })
-        })
-}
-
-/// `budget` less `spent`, never below zero. Repairs and rung budgets are
-/// per item and pass through.
-pub(super) fn left(budget: &Budget, spent: Spend) -> Budget {
-    Budget {
-        iterations: u32::try_from(u64::from(budget.iterations).saturating_sub(spent.iterations))
-            .unwrap_or(0),
-        tokens: budget.tokens.saturating_sub(spent.tokens),
-        wall_seconds: budget.wall_seconds.saturating_sub(seconds(spent.wall_ms)),
-        ..*budget
-    }
-}
-
 impl Controller {
-    /// Read the spend totals once, on the first load.
+    /// Keep durable usage available for observations and outcome analysis.
     pub(super) async fn ensure_spent(&self) -> Result<(), Error> {
         if self.state().spent.is_some() {
             return Ok(());
@@ -159,80 +28,212 @@ impl Controller {
         Ok(())
     }
 
-    /// How many allotments of its budget `item` has had: one, and one per
-    /// [`BUDGET_GRANT`] row an owner's answer recorded. A row counts only
-    /// when its provenance holds: it names a question on this item that its
-    /// owner (`verified_by`, `user` or `user:<who>`) answered, at most once
-    /// per question. A row nothing answered (a report's artifact stored
-    /// before reports were filtered, or any other forgery) buys nothing.
-    pub(super) async fn allotments(&self, item: &str) -> Result<u32, Error> {
-        let mut questions: HashSet<String> = HashSet::new();
-        let mut grants: u32 = 0;
-        for row in self.store.work_evidence_list(item).await? {
-            if row.kind != BUDGET_GRANT {
+    /// Retire only the removed execution-budget gate. Independent consent,
+    /// questions, dependencies, cancellation and historical spend stay intact.
+    pub(super) async fn retire_execution_budget_holds(&self) -> Result<(), Error> {
+        let mut b = Batch::new(self.load().await?, self.clock.now());
+        let mut changed = self.retire_budget_approval_holds(&mut b).await?;
+        let released: HashSet<_> = changed.iter().cloned().collect();
+        // The working transaction already retires these questions, even though
+        // store reads below still see their pre-commit open status.
+        let obsolete: HashSet<_> = b
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                WorkOp::Question(QuestionWrite::Settle {
+                    id,
+                    status: QuestionStatus::Obsolete,
+                    ..
+                }) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let items: Vec<_> = b
+            .snap
+            .items()
+            .iter()
+            .filter(|i| {
+                (i.status == Status::Blocked(BlockedReason::BudgetExhausted)
+                    || released.contains(&i.id))
+                    && !b.snap.has_children(&i.id)
+            })
+            .cloned()
+            .collect();
+        for item in items {
+            let questions = self.questions_of(&item.id).await?;
+            // An accepted cancellation must retain its original stopped-state
+            // semantics until applied. A rejected receipt is history, not a hold.
+            if questions.iter().any(|q| {
+                q.rule == "surfaced"
+                    && q.text.starts_with("Its budget is spent (budget/")
+                    && q.answer_submission
+                        .as_ref()
+                        .is_some_and(|a| a.status == AnswerSubmissionStatus::Pending)
+            }) {
                 continue;
             }
-            let Some(actor) = row.verified_by.as_deref() else {
+            let retired: HashSet<_> = questions
+                .iter()
+                .filter(|q| {
+                    q.status == QuestionStatus::Open
+                        && q.asked_by == "controller"
+                        && q.rule == "surfaced"
+                        && q.text.starts_with("Its budget is spent (budget/")
+                        && q.answer_submission
+                            .as_ref()
+                            .is_none_or(|a| a.status == AnswerSubmissionStatus::Rejected)
+                })
+                .map(|q| q.id.clone())
+                .collect();
+            for q in questions.iter().filter(|q| retired.contains(&q.id)) {
+                b.ops.push(WorkOp::Question(QuestionWrite::Settle {
+                    id: q.id.clone(),
+                    status: QuestionStatus::Obsolete,
+                    answer: None,
+                    by: None,
+                    decision: None,
+                    at: b.now,
+                }));
+                b.note(&item.id, EventKind::Question, "controller",
+                    format!("Retired execution-budget question {}; usage history retained, no owner answer supplied.", q.id));
+            }
+            if item.held_by.is_some() {
+                changed.extend(b.move_to(
+                    &item.id,
+                    Status::Blocked(BlockedReason::NeedsConsent),
+                    "controller",
+                    "Execution budget retired; independent owner approval remains",
+                ));
+                continue;
+            }
+            let other = questions.iter().any(|q| {
+                !retired.contains(&q.id)
+                    && !obsolete.contains(&q.id)
+                    && q.class == QuestionClass::BlockingNow
+                    && matches!(q.status, QuestionStatus::Open | QuestionStatus::Researching)
+            });
+            let status = if other {
+                Status::Blocked(BlockedReason::NeedsDecision)
+            } else {
+                Status::Queued
+            };
+            changed.extend(b.move_to(
+                &item.id,
+                status,
+                "controller",
+                "Execution budgets retired; observed usage retained; independent holds still apply",
+            ));
+        }
+        b.settle(changed);
+        self.commit(b, &mut HashSet::new()).await?;
+        Ok(())
+    }
+
+    /// Old plan approvals are released only when the durable host-authored plan
+    /// links this question and its exact sole trigger was an execution estimate.
+    /// Mixed approval triggers, edited scopes and review proposals remain held.
+    async fn retire_budget_approval_holds(&self, b: &mut Batch) -> Result<Vec<String>, Error> {
+        let held: Vec<_> = b
+            .snap
+            .items()
+            .iter()
+            .filter(|i| i.held_by.is_some() && !i.status.is_closed())
+            .cloned()
+            .collect();
+        let ids: HashSet<_> = held.iter().filter_map(|i| i.held_by.clone()).collect();
+        let mut changed = Vec::new();
+        for id in ids {
+            let Some(q) = self.store.question_get(&id).await? else {
                 continue;
             };
-            if !super::questions::is_owner(actor) || questions.contains(&row.reference) {
+            if q.status != QuestionStatus::Open
+                || q.kind != QuestionKind::Approval
+                || q.rule != "approval"
+                || q.answer_submission
+                    .as_ref()
+                    .is_some_and(|a| a.status != AnswerSubmissionStatus::Rejected)
+            {
                 continue;
             }
-            let answered = self
-                .store
-                .question_get(&row.reference)
-                .await?
-                .is_some_and(|q| {
-                    q.item == item
-                        && q.status == QuestionStatus::Answered
-                        && q.answered_by.as_deref() == Some(actor)
+            let Some(root) = b.snap.item(&q.item) else {
+                continue;
+            };
+            let prefix = format!("Approve the plan \"{}\" (", root.title.trim());
+            let Some(rest) = q.text.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((trigger, count)) = rest.split_once(")? ") else {
+                continue;
+            };
+            let Some((tokens, cap)) = trigger.split_once(" tokens, over the ") else {
+                continue;
+            };
+            let Some(cap) = cap.strip_suffix(" the policy allows") else {
+                continue;
+            };
+            let Some(count) = count.strip_suffix(" item(s) held.") else {
+                continue;
+            };
+            if tokens.parse::<u64>().is_err()
+                || cap.parse::<u64>().is_err()
+                || count.parse::<usize>().is_err()
+            {
+                continue;
+            }
+            let members: Vec<_> = held
+                .iter()
+                .filter(|i| i.held_by.as_deref() == Some(&id))
+                .collect();
+            let mut proven = false;
+            for item in &members {
+                if let Some(plan) = &item.plan_id {
+                    proven |= self.store.work_plan_get(plan).await?.is_some_and(|p| {
+                        p.approval_question.as_deref() == Some(&id) && p.root == q.item
+                    });
+                }
+            }
+            if !proven {
+                continue;
+            }
+            b.ops.push(WorkOp::Question(QuestionWrite::Settle {
+                id: id.clone(),
+                status: QuestionStatus::Obsolete,
+                answer: None,
+                by: None,
+                decision: None,
+                at: b.now,
+            }));
+            for item in members {
+                if let Some(row) = b.snap.item_mut(&item.id) {
+                    row.held_by = None;
+                }
+                b.ops.push(WorkOp::ReleaseHold(item.id.clone()));
+                let independent = self.questions_of(&item.id).await?.iter().any(|other| {
+                    other.id != id
+                        && other.class == QuestionClass::BlockingNow
+                        && matches!(
+                            other.status,
+                            QuestionStatus::Open | QuestionStatus::Researching
+                        )
                 });
-            if answered {
-                questions.insert(row.reference.clone());
-                grants = grants.saturating_add(1);
+                if item.status == Status::Blocked(BlockedReason::NeedsConsent) {
+                    let status = if independent {
+                        Status::Blocked(BlockedReason::NeedsDecision)
+                    } else {
+                        Status::Queued
+                    };
+                    b.own(
+                        &item.id,
+                        status,
+                        "controller",
+                        "Retired sole execution-budget approval; no owner decision supplied",
+                        None,
+                    );
+                }
+                changed.push(item.id.clone());
             }
         }
-        Ok(grants.saturating_add(1))
-    }
-
-    /// What `item` has left to spend over all its attempts (4.2 for a
-    /// leaf): its budget `allotments` times over, less what every run of
-    /// it spent, from the durable totals, so a restart or a revival does
-    /// not refill it. Returned with what was spent.
-    pub(super) fn cumulative_budget(&self, item: &WorkItem, allotments: u32) -> (Budget, Spend) {
-        let spent = self
-            .state()
-            .spent
-            .as_ref()
-            .and_then(|s| s.get(&item.id).copied())
-            .unwrap_or_default();
-        (left(&scaled(&item.budget, allotments), spent), spent)
-    }
-
-    /// What each existing parent in `snap` has left: its budget less what
-    /// every item under it spent. A parent that has spent nothing has its
-    /// whole budget, however much its open children were allocated, so a
-    /// follow-up under a busy parent is judged against actual spend (4.2).
-    /// Empty until the totals are loaded, which leaves the validator's own
-    /// fallback (the budget less its open children's).
-    pub(super) fn remaining_budgets(&self, snap: &Snapshot) -> BTreeMap<WorkItemId, Budget> {
-        let state = self.state();
-        let Some(spent) = state.spent.as_ref() else {
-            return BTreeMap::new();
-        };
-        snap.items()
-            .iter()
-            .filter(|i| snap.has_children(&i.id))
-            .map(|parent| {
-                let total = snap
-                    .descendants(&parent.id)
-                    .iter()
-                    .chain(std::iter::once(&parent.id))
-                    .filter_map(|id| spent.get(id).copied())
-                    .fold(Spend::default(), Spend::plus);
-                (parent.id.clone(), left(&parent.budget, total))
-            })
-            .collect()
+        Ok(changed)
     }
 
     /// Record a run that has ended or been stopped: its spend, from the
@@ -325,110 +326,5 @@ impl Controller {
             .as_ref()
             .and_then(|s| s.get(item).copied())
             .unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn allotment() -> Budget {
-        Budget {
-            iterations: 25,
-            tokens: 200_000,
-            wall_seconds: 3_600,
-            ..Budget::default()
-        }
-    }
-
-    fn spend(iterations: u64, tokens: u64, wall_seconds: u64) -> Spend {
-        Spend {
-            runs: 4,
-            tokens,
-            wall_ms: wall_seconds * 1_000,
-            iterations,
-        }
-    }
-
-    /// What is left of `allotments` of [`allotment`] after `spent`, and
-    /// whether that stops the lease.
-    fn check(allotments: u32, spent: Spend) -> Option<(BudgetKind, String)> {
-        let remaining = left(&scaled(&allotment(), allotments), spent);
-        exhausted(&remaining, &allotment(), allotments, spent)
-    }
-
-    #[test]
-    fn a_grant_adds_one_allotment_in_every_dimension() {
-        let two = scaled(&allotment(), 2);
-        assert_eq!(
-            (two.iterations, two.tokens, two.wall_seconds),
-            (50, 400_000, 7_200)
-        );
-        assert_eq!(two.rungs, allotment().rungs, "rung budgets are per item");
-        assert_eq!(scaled(&allotment(), 0), allotment(), "never less than one");
-    }
-
-    #[test]
-    fn a_budget_with_room_left_leases() {
-        assert_eq!(check(1, spend(24, 150_000, 3_000)), None);
-    }
-
-    #[test]
-    fn a_spent_dimension_stops_the_lease_and_says_how() {
-        let (kind, why) = check(1, spend(25, 1_000, 10)).expect("iterations spent");
-        assert_eq!(kind, BudgetKind::Iterations);
-        assert_eq!(
-            why,
-            "25 of 25 iterations used over 4 run(s) (1 allotment(s) of 25, counted across \
-             every attempt); 0 left, under the 1 a run needs"
-        );
-        // Overspent by a run that ran past what it was given: still spent.
-        assert_eq!(check(1, spend(31, 0, 0)).unwrap().0, BudgetKind::Iterations);
-    }
-
-    #[test]
-    fn too_little_left_to_be_useful_stops_the_lease() {
-        // Under a minute of wall time left of an hour.
-        assert_eq!(
-            check(1, spend(1, 0, 3_541)).unwrap().0,
-            BudgetKind::Wall,
-            "59 s left"
-        );
-        assert_eq!(check(1, spend(1, 0, 3_540)), None, "60 s left");
-        // Under 2,000 tokens left.
-        assert_eq!(
-            check(1, spend(1, 198_001, 0)).unwrap().0,
-            BudgetKind::Tokens
-        );
-        // A grant lifts every floor.
-        assert_eq!(check(2, spend(25, 198_001, 3_541)), None);
-    }
-
-    #[test]
-    fn a_small_allotment_has_a_floor_in_proportion() {
-        let small = Budget {
-            iterations: 3,
-            tokens: 5_000,
-            wall_seconds: 120,
-            ..Budget::default()
-        };
-        let at = |spent: Spend| exhausted(&left(&small, spent), &small, 1, spent);
-        // A tenth of 120 s is 12 s, a tenth of 5,000 tokens is 500.
-        assert_eq!(at(spend(0, 0, 108)), None);
-        assert_eq!(at(spend(0, 0, 109)).unwrap().0, BudgetKind::Wall);
-        assert_eq!(at(spend(0, 4_500, 0)), None);
-        assert_eq!(at(spend(0, 4_501, 0)).unwrap().0, BudgetKind::Tokens);
-    }
-
-    #[test]
-    fn a_zero_dimension_is_unbounded() {
-        let open = Budget {
-            iterations: 0,
-            tokens: 0,
-            wall_seconds: 0,
-            ..Budget::default()
-        };
-        let spent = spend(100, 1_000_000, 100_000);
-        assert_eq!(exhausted(&left(&open, spent), &open, 1, spent), None);
     }
 }

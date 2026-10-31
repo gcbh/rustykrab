@@ -302,8 +302,8 @@ fn fleet_scenarios() -> Vec<(Expected, (&'static str, ScenarioFn))> {
         (
             Expected::Pass,
             (
-                "control/bounded-recovery-spent-budget-waits-for-its-owners-grant",
-                |ctx| Box::pin(budget_grant_resumes(ctx)),
+                "control/usage-only-work-passes-old-estimates-and-keeps-real-decisions",
+                |ctx| Box::pin(usage_only_decision_resumes(ctx)),
             ),
         ),
         (
@@ -602,8 +602,8 @@ async fn s14(ctx: &Ctx) -> Result<()> {
 }
 
 /// Scenario 19: Validation bounds over-decomposition: twelve items for a three-step
-/// errand, children over the root's budget and a `code` item are each
-/// rejected, each rejection an event; two `blocks`-chained steps that add
+/// errand is rejected with an event. Legacy token estimates and categories
+/// do not prevent otherwise valid work; two `blocks`-chained steps that add
 /// nothing to each other are accepted as small execution slices without
 /// a split warning. Driven by a scripted caller until the planner
 /// exists.
@@ -637,35 +637,31 @@ async fn s19(ctx: &Ctx) -> Result<()> {
         "twelve items for a three-step errand are rejected with too_many_items: {:?}",
         reasons(&too_many)
     );
+    ensure!(
+        children(ctx, &root).await?.is_empty(),
+        "rejected graphs store nothing"
+    );
+    let rejections =
+        Value::Array(events_of(&item(ctx, &root).await?, EventKind::Rejection)).to_string();
+    ensure!(
+        rejections.contains(RejectionReason::TooManyItems.as_str()),
+        "the structural rejection remains an event dreaming can count: {rejections}"
+    );
     let shops = vec![
         step("groceries", "Buy the groceries", "personal", 80_000),
         step("paint", "Buy the paint", "personal", 80_000),
     ];
-    let over = rejected(plan(ctx, under(shops, vec![])).await?)?;
+    accepted(plan(ctx, under(shops, vec![])).await?)?;
     ensure!(
-        reasons(&over).contains(&RejectionReason::OverBudget),
-        "children over the root's budget are rejected with over_budget: {:?}",
-        reasons(&over)
+        children(ctx, &root).await?.len() == 2,
+        "child estimates do not reserve or exhaust a parent's capacity"
     );
-    ensure!(
-        children(ctx, &root).await?.is_empty(),
-        "nothing from a rejected graph was stored"
-    );
-    let rejections =
-        Value::Array(events_of(&item(ctx, &root).await?, EventKind::Rejection)).to_string();
-    for reason in [RejectionReason::TooManyItems, RejectionReason::OverBudget] {
-        ensure!(
-            rejections.contains(reason.as_str()),
-            "the {} rejection is an event dreaming can count: {rejections}",
-            reason.as_str()
-        );
-    }
     let fix = vec![step("fix", "Fix the errand app", "code", 5_000)];
     accepted(plan(ctx, under(fix, vec![])).await?)?;
     let fixed = children(ctx, &root).await?;
-    ensure!(fixed.len() == 1, "the accepted graph has one child");
+    ensure!(fixed.len() == 3, "all three valid steps were accepted");
     ensure!(
-        body(&item(ctx, &fixed[0]).await?)["kind"] == "task",
+        body(&item(ctx, fixed.last().unwrap()).await?)["kind"] == "task",
         "a legacy category cannot reject an otherwise valid planned task"
     );
 
@@ -2792,9 +2788,8 @@ fn evidence_of(view: &Value, kind: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The `work_spend` rows of `id` with their totals, set against what its
-/// budget allows over `allotments` allotments, as text and as JSON.
-fn spend_report(ctx: &Ctx, id: &str, budget: &Value, allotments: u64) -> Result<(String, Value)> {
+/// Observed run usage without a predicted allowance or parent reservation.
+fn spend_report(ctx: &Ctx, id: &str) -> Result<(String, Value)> {
     let conn = read_only(ctx)?;
     let mut statement = conn.prepare(
         "SELECT COALESCE(run, ''), worker, tokens, wall_ms, iterations, at
@@ -2812,47 +2807,29 @@ fn spend_report(ctx: &Ctx, id: &str, budget: &Value, allotments: u64) -> Result<
             ))
         })?
         .collect::<Result<_, _>>()?;
-    let mut text = format!(
-        "work_spend for item {id}\n{:<36}  {:<10}  {:>8}  {:>8}  {:>10}  at\n",
-        "run", "worker", "tokens", "wall_ms", "iterations"
-    );
+    let mut text = format!("Observed work_spend for item {id} (no task allowance)\n");
     let (mut tokens, mut wall_ms, mut iterations) = (0i64, 0i64, 0i64);
     for (run, worker, t, w, i, at) in &rows {
         text.push_str(&format!(
-            "{run:<36}  {worker:<10}  {t:>8}  {w:>8}  {i:>10}  {at}\n"
+            "{run}  {worker}  {t} tokens  {w} ms  {i} iterations  {at}\n"
         ));
         tokens += t;
         wall_ms += w;
         iterations += i;
     }
-    let allowed = |key: &str| budget[key].as_u64().unwrap_or(0) * allotments;
     text.push_str(&format!(
-        "\ntotal: {} run(s), {iterations} iterations, {tokens} tokens, {wall_ms} ms wall\n\
-         budget: {} iterations, {} tokens, {} s wall per allotment; {allotments} allotment(s) \
-         allow {} iterations, {} tokens, {} s wall\n",
-        rows.len(),
-        budget["iterations"],
-        budget["tokens"],
-        budget["wall_seconds"],
-        allowed("iterations"),
-        allowed("tokens"),
-        allowed("wall_seconds"),
+        "total: {} runs, {iterations} iterations, {tokens} tokens, {wall_ms} ms\n",
+        rows.len()
     ));
-    let totals = json!({
-        "runs": rows.len(),
-        "iterations": iterations,
-        "tokens": tokens,
-        "wall_ms": wall_ms,
-        "budget": budget,
-        "allotments": allotments,
-    });
-    Ok((text, totals))
+    Ok((
+        text,
+        json!({"runs": rows.len(), "iterations": iterations, "tokens": tokens, "wall_ms": wall_ms}),
+    ))
 }
 
-/// The `budget: N steps` line of every local worker run whose brief
-/// carries `marker`, oldest first: what each attempt was given.
-fn brief_budgets(ctx: &Ctx, marker: &str) -> Result<Vec<u64>> {
-    let mut out = Vec::new();
+/// Every durable worker prompt explicitly records usage without task estimates.
+fn usage_only_briefs(ctx: &Ctx, marker: &str) -> Result<usize> {
+    let mut count = 0;
     for conversation in conversations_mentioning(ctx, marker)? {
         let text = strings(
             ctx,
@@ -2860,18 +2837,15 @@ fn brief_budgets(ctx: &Ctx, marker: &str) -> Result<Vec<u64>> {
             &conversation,
         )?
         .join("\n");
-        let steps = text.split("budget: ").skip(1).find_map(|rest| {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            rest[digits.len()..]
-                .starts_with(" steps")
-                .then(|| digits.parse::<u64>().ok())
-                .flatten()
-        });
-        if let Some(steps) = steps {
-            out.push(steps);
+        ensure!(
+            !text.contains("budget: "),
+            "legacy step allowance in {conversation}"
+        );
+        if text.contains("Execution usage is recorded; there is no per-task token, iteration or runtime allowance.") {
+            count += 1;
         }
     }
-    Ok(out)
+    Ok(count)
 }
 
 /// Bounded recovery, the repeated-outcome circuit breaker, on a daemon of
@@ -2892,7 +2866,7 @@ fn brief_budgets(ctx: &Ctx, marker: &str) -> Result<Vec<u64>> {
 /// - the investigation lands a classifier rule that replays the failure,
 ///   which is a new repair generation: the item's next attempt state
 ///   differs, it resumes and reads the gauge;
-/// - five runs in all, within the item's one budget, one investigation.
+/// - five observed runs, one investigation and a useful result.
 async fn breaker_trips_once(shared: &Ctx) -> Result<()> {
     let daemon = OwnDaemon::boot_with(shared, &[]).await?;
     let ctx = &daemon.ctx;
@@ -3015,19 +2989,15 @@ async fn breaker_trips_once(shared: &Ctx) -> Result<()> {
         "the resumed attempt ran in the investigation's generation: {last_state}"
     );
 
-    // ── spend: one budget, never refilled ─────────────────────────────
-    let (spend_text, totals) = spend_report(ctx, &x, &budget, 1)?;
+    let (spend_text, totals) = spend_report(ctx, &x)?;
     ensure!(
-        totals["runs"] == 5
-            && totals["iterations"].as_i64().unwrap_or(i64::MAX) <= 30
-            && totals["tokens"].as_i64().unwrap_or(i64::MAX) <= 200_000
-            && totals["wall_ms"].as_i64().unwrap_or(i64::MAX) <= 600_000,
-        "five runs within the one budget: {totals}"
+        totals["runs"] == 5 && totals["iterations"].as_u64().unwrap_or(0) >= 5,
+        "all five attempts retain observed usage: {totals}"
     );
-    let given = brief_budgets(ctx, tag)?;
+    let given = usage_only_briefs(ctx, tag)?;
     ensure!(
-        given.len() == 5 && given.windows(2).all(|w| w[1] < w[0]) && given[0] == 30,
-        "each attempt was briefed with what was left, not a fresh budget: {given:?}"
+        given == 5,
+        "each of five attempts received usage-only instructions: {given}"
     );
 
     // ── the investigation record an operator reads ────────────────────
@@ -3060,12 +3030,8 @@ async fn breaker_trips_once(shared: &Ctx) -> Result<()> {
     )?;
     keep_evidence("breaker/item.spend.txt", &spend_text)?;
     keep_evidence(
-        "breaker/item.brief-budgets.txt",
-        given
-            .iter()
-            .enumerate()
-            .map(|(i, steps)| format!("attempt {}: budget: {steps} steps\n", i + 1))
-            .collect::<String>(),
+        "breaker/item.usage-only-briefs.txt",
+        format!("{given} prompts without task execution allowances\n"),
     )?;
     keep_evidence(
         "breaker/investigation.events.txt",
@@ -3076,133 +3042,103 @@ async fn breaker_trips_once(shared: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Bounded recovery, the cumulative budget and its grant, on a daemon of
-/// its own. An item whose budget holds two runs fails twice; its third run
-/// is never leased: the cumulative guard fails it `budget/iterations`
-/// before anything runs, and it parks `blocked(budget_exhausted)` with one
-/// question. Its owner's answer grants one more allotment (a `budget_grant`
-/// row naming the question) and resumes it, with that allotment as its
-/// brief; a second answer to the same question is refused and grants
-/// nothing.
-async fn budget_grant_resumes(shared: &Ctx) -> Result<()> {
-    let daemon = OwnDaemon::boot_with(shared, &[]).await?;
+/// Retired estimates cannot interrupt execution; an unchanged technical failure
+/// still reaches a real decision, whose answer selects a working station.
+async fn usage_only_decision_resumes(shared: &Ctx) -> Result<()> {
+    let daemon = OwnDaemon::boot_with(shared, &[("RUSTYKRAB_BREAKER_REPEATS", "10")]).await?;
     let ctx = &daemon.ctx;
-    let tag = "[e2e-control bounded-recovery budget]";
-    let budget = json!({ "iterations": 2, "tokens": 200_000, "wall_seconds": 600, "repairs": 2 });
+    let tag = "[e2e-control usage-only decision]";
     let mut station = draft("personal", "Query the gauge station", tag, W_STATION);
-    station["budget"] = budget.clone();
+    station["budget"] = json!({"iterations": 2, "tokens": 1, "wall_seconds": 1, "repairs": 2});
     let x = file(ctx, station).await?;
-    let spent = wait_status(ctx, &x, Status::Blocked(BlockedReason::BudgetExhausted)).await?;
+    let held = wait_status(ctx, &x, Status::Blocked(BlockedReason::NeedsDecision)).await?;
     let error: rustykrab_core::work::WorkError =
-        serde_json::from_value(field(&spent, "last_error").clone())?;
+        serde_json::from_value(field(&held, "last_error").clone())?;
     ensure!(
-        error.class == ErrorClass::Budget
-            && error.subclass.as_str() == "iterations"
-            && error.observed_by == "cumulative_budget_guard",
-        "the cumulative guard stopped it: {error:?}"
+        error.class == ErrorClass::Tool && error.subclass.as_str() == "invalid_args",
+        "the actual technical failure is preserved: {error:?}"
     );
     let leased = |view: &Value| events_of(view, EventKind::Lease).len();
-    let runs_before = leased(&spent);
+    let runs_before = leased(&held);
+    let (before_text, before) = spend_report(ctx, &x)?;
+    ensure!(
+        before["iterations"].as_u64().unwrap_or(0) > 2 && runs_before >= 3,
+        "useful recovery passed the old two-iteration estimate: {before}"
+    );
     tokio::time::sleep(QUIET).await;
     let still = expect_status(
         ctx,
         &x,
-        Status::Blocked(BlockedReason::BudgetExhausted),
-        "a spent budget stays parked",
+        Status::Blocked(BlockedReason::NeedsDecision),
+        "technical decision remains held",
     )
     .await?;
     ensure!(
         leased(&still) == runs_before,
-        "nothing is leased on a spent budget"
+        "an unanswered technical question cannot requeue work"
     );
     let asked = questions_for(ctx, &x).await?;
-    ensure!(asked.len() == 1, "one question: {asked:?}");
+    ensure!(asked.len() == 1, "one technical decision: {asked:?}");
     let question = asked[0].clone();
     ensure!(
-        question["text"]
+        !question["text"]
             .as_str()
-            .is_some_and(|t| t.contains("budget is spent")),
-        "the question says the budget is spent: {question}"
+            .unwrap_or_default()
+            .contains("budget is spent"),
+        "no task allowance question: {question}"
     );
-    let (before_text, before) = spend_report(ctx, &x, &budget, 1)?;
-    let spent_before = before["iterations"].as_u64().unwrap_or(0);
-
     let qid = question["id"].as_str().unwrap_or_default().to_string();
     let answer = submit_answer(ctx, &qid, ANSWER_STATION).await?;
     ensure!(
         answer["applied"]["answer_submission"]["status"] == "applied",
-        "the saved answer was applied: {answer}"
+        "saved answer applied: {answer}"
     );
     let again = expect(
         ctx.post(
             &format!("{QUESTIONS}/{qid}/answer"),
-            json!({ "answer": ANSWER_STATION }),
+            json!({"answer": ANSWER_STATION}),
         )
         .await?,
         &[409],
-        "a second answer to the same question",
+        "duplicate answer",
     )
     .await?;
     let done = wait_status(ctx, &x, Status::Done).await?;
-    let grants = evidence_of(&done, "budget_grant");
     ensure!(
-        grants.len() == 1
-            && grants[0]["reference"] == qid.as_str()
-            && grants[0]["verified_by"]
-                .as_str()
-                .is_some_and(|by| by.starts_with("user")),
-        "one grant, naming the question and who answered: {grants:?}"
-    );
-    let given = brief_budgets(ctx, tag)?;
-    let (spend_text, totals) = spend_report(ctx, &x, &budget, 2)?;
-    ensure!(
-        totals["iterations"].as_i64().unwrap_or(i64::MAX) <= 4
-            && totals["runs"].as_u64() == Some(runs_before as u64 + 1),
-        "one more run, within two allotments: {totals}"
+        evidence_of(&done, "budget_grant").is_empty(),
+        "answer must not mint an execution grant"
     );
     ensure!(
-        given.len() == runs_before + 1
-            && given.first() == Some(&2)
-            && given.last() == Some(&(4 - spent_before)),
-        "each run was briefed with what was left, the resumed one with two allotments less \
-         the {spent_before} iterations spent: {given:?}"
+        evidence_text(&done).contains("e2e-control-station-8"),
+        "the corrected operation produced its result"
+    );
+    let (spend_text, totals) = spend_report(ctx, &x)?;
+    ensure!(
+        totals["runs"].as_u64() == Some(runs_before as u64 + 1)
+            && totals["iterations"].as_u64() > before["iterations"].as_u64(),
+        "one resumed run with cumulative observed usage: {totals}"
+    );
+    let given = usage_only_briefs(ctx, tag)?;
+    ensure!(
+        given == runs_before + 1,
+        "every attempt received usage-only instructions: {given}"
     );
     let trail = event_trail(ctx, &x).await?;
-    keep_evidence("budget/item.events.txt", trail_text(&trail))?;
-    keep_evidence(
-        "budget/item.events.json",
-        serde_json::to_string_pretty(&trail)?,
-    )?;
-    keep_evidence(
-        "budget/item.question.json",
-        serde_json::to_string_pretty(&question)?,
-    )?;
-    keep_evidence(
-        "budget/item.answer.json",
-        serde_json::to_string_pretty(&answer)?,
-    )?;
-    keep_evidence(
-        "budget/item.second-answer.json",
-        serde_json::to_string_pretty(&again)?,
-    )?;
-    keep_evidence(
-        "budget/item.budget-grant.json",
-        serde_json::to_string_pretty(&grants)?,
-    )?;
-    keep_evidence(
-        "budget/item.guard-error.json",
-        serde_json::to_string_pretty(field(&spent, "last_error"))?,
-    )?;
-    keep_evidence("budget/item.spend.before-grant.txt", &before_text)?;
-    keep_evidence("budget/item.spend.txt", &spend_text)?;
-    keep_evidence(
-        "budget/item.brief-budgets.txt",
-        given
-            .iter()
-            .enumerate()
-            .map(|(i, steps)| format!("attempt {}: budget: {steps} steps\n", i + 1))
-            .collect::<String>(),
-    )?;
+    for (name, value) in [
+        ("events", serde_json::to_value(&trail)?),
+        ("question", question),
+        ("answer", answer),
+        ("second-answer", again),
+        ("usage", totals),
+    ] {
+        keep_evidence(
+            &format!("usage-only/item.{name}.json"),
+            serde_json::to_string_pretty(&value)?,
+        )?;
+    }
+    keep_evidence("usage-only/item.events.txt", trail_text(&trail))?;
+    keep_evidence("usage-only/item.spend.before-answer.txt", before_text)?;
+    keep_evidence("usage-only/item.spend.txt", spend_text)?;
     Ok(())
 }
 
@@ -3496,7 +3432,7 @@ async fn s03(ctx: &Ctx) -> Result<()> {
 }
 
 /// Scenario 5: A worker stalls; bounded recovery starts another attempt while
-/// budget remains, carrying the first attempt's evidence without an owner grant.
+/// carrying the first attempt's evidence without an owner grant.
 /// An executor scripted to keep looping ends at a finite technical hold.
 async fn s05(ctx: &Ctx) -> Result<()> {
     let tag = tag(5);
@@ -3518,17 +3454,14 @@ async fn s05(ctx: &Ctx) -> Result<()> {
         trigger.contains("stall") || trigger.contains("progress"),
         "the repair was not triggered by the progress ledger: {trigger}"
     );
-    // The fixture never changes approach. Every attempt must stop before
-    // spending all remaining iterations, and finite recovery ends in a
-    // technical hold. Budget-grant behavior has its own independent scenario.
+    // The fixture never changes approach. Its progress ledger and finite
+    // recovery rungs stop that loop independently of estimated task effort.
     let held = wait_status(ctx, &task, Status::Blocked(BlockedReason::NeedsDecision)).await?;
-    let budget = &body(&held)["budget"];
-    let (spend_text, spend) = spend_report(ctx, &task, budget, 1)?;
+    let (spend_text, spend) = spend_report(ctx, &task)?;
+    let runs = spend["runs"].as_u64().unwrap_or(0);
     ensure!(
-        spend["runs"].as_u64().unwrap_or(0) >= 2
-            && spend["iterations"].as_u64().unwrap_or(u64::MAX)
-                < budget["iterations"].as_u64().unwrap_or(0),
-        "persistent loops must hand off before exhausting the item's allowance: {spend_text}"
+        (2..=6).contains(&runs) && spend["iterations"].as_u64().unwrap_or(u64::MAX) <= runs * 26,
+        "persistent loops hand off within the fingerprint-ledger protocol: {spend_text}"
     );
     ensure!(
         evidence_of(&held, "budget_grant").is_empty(),

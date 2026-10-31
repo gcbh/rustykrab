@@ -23,9 +23,9 @@
 //!   type. A done task with only text (a node without structured
 //!   delegation) is a `model/format` failure; a failed or cancelled one
 //!   without a type is a process failure.
-//! - **a timeout**: the smaller of the worker's and the brief's wall
-//!   budget. When it passes the node's task is cancelled and the run ends
-//!   `budget/wall`, or with a network error when the node never answered.
+//! - **a timeout**: the worker's operational transport timeout. When it
+//!   passes the node's task is cancelled and the run ends `tool/timeout`,
+//!   or with a network error when the node never answered.
 //! - **cancel** is propagated: [`Worker::stop`] (the controller stopped the
 //!   run) sends `DELETE /api/tasks/{id}`. Dropping the run's future alone,
 //!   as a controller that shuts down does, cancels nothing, so a restarted
@@ -50,7 +50,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rustykrab_control::errors::{BudgetKind, GapKind, PolicyStop, ProviderProblem};
+use rustykrab_control::errors::{GapKind, PolicyStop, ProviderProblem};
 use rustykrab_control::peer::{
     CeilingRefused, NodeAdvertisement, RefusalReason, TaskSubmission, TaskView, NODE_PATH,
     OUTSIDE_CEILING, TASKS_PATH,
@@ -82,8 +82,7 @@ pub struct PeerConfig {
     /// The node's gateway, without a trailing `/`.
     pub base_url: String,
     pub token: String,
-    /// The longest one run may take; the brief's wall budget may make it
-    /// shorter.
+    /// Operational timeout for one delegated task; task estimates do not alter it.
     pub timeout: Duration,
     /// Between polls of a running task.
     pub poll: Duration,
@@ -376,10 +375,8 @@ impl Worker for PeerWorker {
             .run
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let limit = match brief.budget.wall_seconds {
-            0 => self.config.timeout,
-            secs => self.config.timeout.min(Duration::from_secs(secs)),
-        };
+        // The host process/transport timeout is operational, never a task estimate.
+        let limit = self.config.timeout;
         let deadline = started + limit;
         let body = self.submission(brief, &run);
         let mut task = self.submit(&body, deadline).await?;
@@ -398,15 +395,11 @@ impl Worker for PeerWorker {
                     ))));
                 }
                 self.cancel_task(&task.id).await;
-                return Err(RunFailure::Budget {
-                    budget: BudgetKind::Wall,
-                    detail: format!(
-                        "{}s on {} without a result; the node's task was cancelled",
-                        limit.as_secs(),
-                        self.name
-                    ),
-                }
-                .into_error());
+                return Err(Error::ToolExecution(ToolError::timeout(format!(
+                    "{}s transport timeout on {} without a result; the node's task was cancelled",
+                    limit.as_secs(),
+                    self.name
+                ))));
             }
             tokio::time::sleep(self.config.poll.min(deadline - now)).await;
             let request = self.request(reqwest::Method::GET, &format!("{TASKS_PATH}/{}", task.id));
@@ -771,7 +764,7 @@ mod tests {
         typed.report = Some(rustykrab_control::peer::failed_run_report(
             "krabby",
             &RunFailure::Budget {
-                budget: BudgetKind::Tokens,
+                budget: rustykrab_control::errors::BudgetKind::Tokens,
                 detail: "spent".into(),
             }
             .into_error(),

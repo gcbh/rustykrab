@@ -114,12 +114,8 @@ pub(super) fn ask(reason: SurfaceReason, err: &WorkError) -> String {
             "Stopped by policy ({what}): {}. Allow it, change it, or cancel it?",
             err.detail
         ),
-        // A spent budget parks in `budget_exhausted`, where an owner's
-        // answer grants one more allotment and resumes it, and a no
-        // cancels it (`controller/questions.rs`).
         SurfaceReason::LadderSpent if err.class == ErrorClass::Budget => format!(
-            "Its budget is spent ({what}): {}. Answer to grant one more allotment of its budget \
-             and resume it, or no to cancel it.",
+            "The executor reported a retired task limit ({what}): {}. Update or reconfigure the executor before retrying; task usage does not require an allowance.",
             err.detail
         ),
         SurfaceReason::LadderSpent => format!(

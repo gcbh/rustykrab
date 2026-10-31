@@ -622,11 +622,11 @@ a cancelled or lost run still points at its partial work.
 
 **Spend is one row per run.** `work_spend` records what each worker run
 spent (tokens across its model calls, wall time, iterations) when it ends
-or is stopped, whether or not its item is still live. A parent's remaining
-budget is its budget less what its subtree spent (section 4.2), a leaf's is
-its budget, once per allotment, less what all its runs spent (each run is
-briefed with that remainder, and a leaf with too little left is not leased),
-and compaction writes the item's total into the archive's `cost`.
+or is stopped, whether or not its item is still live. Totals survive retries
+and restarts as observations; they never gate admission or reserve parent
+capacity. Compaction writes the item's total into the archive's `cost`.
+The legacy `budget` JSON stays readable, but new execution fields are zero;
+finite recovery rungs remain. No schema migration is needed.
 
 **Evidence kinds the controller reads back.** Besides the artifacts a report
 claims, `work_item_evidence` carries the controller's own rows: `summary`,
@@ -647,8 +647,8 @@ attempt's outcome, `reference` the JSON it digests), `attempt_failure` (a
 judged failed attempt: its run, fingerprint and class as JSON, `hash` its
 attempt state), `circuit_open` (the repeated-outcome breaker tripped: the
 runs and the attempt state as JSON, `hash` the fingerprint), `budget_grant`
-(one more allotment of a leaf's budget: `reference` the question whose answer
-released it, `verified_by` who answered; each row adds one allotment),
+(historical top-up evidence: `reference` the question whose answer released it,
+`verified_by` who answered; retained for audit, never grants execution capacity),
 `repair_generation` (on an item parked behind a capability with a registered
 probe, written before the probes that judge it: `{n, cause, source_item,
 permission_digest, probes}` as JSON, `hash` `<item>:<n>`, `verified_by =
@@ -1082,7 +1082,8 @@ the per-24-hour start counter. No training or fuzzy authorization is performed.
 Ordinary tasks use kind=task in the existing text column. Historical category
 and backend pin values remain readable but do not constrain dispatch. Draft
 transport ignores retired selectors; reviewed-template matching ignores them
-while retaining exact scope, objectives and budgets. Recovery of legacy
+while retaining exact scope, objectives and recovery policy. Retired execution
+estimates are normalized before matching. Recovery of legacy
 worker-unavailable rows uses existing transitions and question settlements;
 audit rows are retained. No schema migration is needed.
 

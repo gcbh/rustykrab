@@ -206,8 +206,8 @@ fn scenario_19_a_split_that_adds_something_is_not_flagged() {
 }
 
 #[test]
-fn scenario_19_children_over_the_root_budget_are_rejected() {
-    let s = G::new().snap();
+fn scenario_19_child_estimates_do_not_have_to_fit_a_parent_allowance() {
+    let mut s = G::new().snap();
     let mut root = draft("R");
     root.budget = Some(small());
     let mut a = draft("a");
@@ -216,13 +216,13 @@ fn scenario_19_children_over_the_root_budget_are_rejected() {
     let mut b = draft("b");
     b.budget = Some(small());
     b.parent = Some(tmp("R"));
-    let r = reject(
-        &s,
+    let a = accept(
+        &mut s,
         &plan(tmp("R"), vec![root, a, b], vec![]),
         &ctx(FilingSource::Planner),
     );
-    assert_eq!(names(&r), vec!["over_budget"]);
-    assert_eq!(r.failed[0].offending, vec![tmp("a"), tmp("b")]);
+    assert_eq!(a.items.len(), 3);
+    assert!(a.held.is_empty());
 }
 
 #[test]

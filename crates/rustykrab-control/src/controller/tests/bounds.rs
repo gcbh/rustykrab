@@ -1,8 +1,6 @@
-//! Bounded recovery against a real store: a leaf's budget is cumulative
-//! over its attempts and restarts, a spent one is not leased and goes to
-//! its owner, an owner's answer resumes a spent or unverified item (a
-//! spent one with one more allotment), and the same failure in the same
-//! state trips the circuit breaker into one investigation.
+//! Observed usage and bounded recovery against a real store: execution estimates
+//! never gate work, legacy budget stops retire without inventing owner decisions,
+//! independent holds remain, and unchanged failures trip one investigation.
 //!
 //! Every scripted run spends [`SCRIPTED_USAGE`]: three iterations, 1,000
 //! tokens and 1.5 s of wall time. The evidence kinds are spelled out, not
@@ -12,8 +10,8 @@ use std::collections::HashSet;
 
 use rustykrab_core::questions::{QuestionKind, QuestionStatus};
 use rustykrab_core::work::{
-    ArtifactRef, BlockedReason, CancelReason, EdgeKind, ErrorClass, ErrorSubclass, EventKind,
-    Evidence, ResultReport, WorkKind,
+    ArtifactRef, BlockedReason, CancelReason, EdgeKind, ErrorSubclass, EventKind, Evidence,
+    ResultReport, WorkKind,
 };
 use rustykrab_store::{QuestionFilter, QuestionRow};
 
@@ -112,17 +110,44 @@ async fn ask_also(h: &Harness, item: &str, text: &str) -> String {
 /// An item whose budget holds two runs: both fail, so the third is the
 /// cumulative guard's.
 async fn spent(h: &Harness) -> WorkItemId {
-    h.script.push(GAUGE, rejected());
-    h.script.push(GAUGE, rejected());
     let x = h.file_one(gauge(budget(6))).await;
-    h.drain().await;
+    h.store()
+        .work_spend_record(rustykrab_store::RunSpend {
+            item: x.clone(),
+            run: Some("legacy-spend".into()),
+            worker: "pinch".into(),
+            tokens: 2_000,
+            iterations: 6,
+            wall_ms: 3_000,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    h.ctl.state().spent = None;
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    h.ctl.record_question_sync(
+        &mut b,
+        NewQuestion::open(
+            &x,
+            QuestionKind::Decision,
+            "Its budget is spent (budget/iterations): historic limit".into(),
+            "surfaced",
+        ),
+    );
+    b.move_to(
+        &x,
+        Status::Blocked(BlockedReason::BudgetExhausted),
+        "controller",
+        "historic limit",
+    );
+    h.ctl.commit(b, &mut HashSet::new()).await.unwrap();
     x
 }
 
 // ── 1. the cumulative leaf budget ──────────────────────────────────────
 
 #[tokio::test]
-async fn every_attempt_is_briefed_with_what_is_left_of_one_budget() {
+async fn every_attempt_has_no_execution_allowance_and_usage_is_measured() {
     let h = Harness::new(&["pinch"]);
     h.script.push(GAUGE, rejected());
     let x = h
@@ -143,11 +168,15 @@ async fn every_attempt_is_briefed_with_what_is_left_of_one_budget() {
         .collect();
     // The repair gets what the first run left: 3 iterations, 1,000 tokens
     // and 2 s (1.5 s rounded up) less.
-    assert_eq!(budgets, vec![(12, 10_000, 600), (9, 9_000, 598)]);
+    assert_eq!(budgets, vec![(0, 0, 0), (0, 0, 0)]);
+    assert_eq!(
+        h.store().work_spend_totals().await.unwrap()[&x].tokens,
+        2_000
+    );
 }
 
 #[tokio::test]
-async fn the_cumulative_budget_survives_a_restart() {
+async fn observed_usage_survives_a_restart_without_refilling_a_limit() {
     let h = Harness::new(&["pinch"]);
     h.script.push(GAUGE, rejected());
     let x = h.file_one(gauge(budget(12))).await;
@@ -164,81 +193,45 @@ async fn the_cumulative_budget_survives_a_restart() {
         .iter()
         .map(|b| b.budget.iterations)
         .collect();
-    assert_eq!(iterations, vec![12, 9], "a restart refills nothing");
+    assert_eq!(iterations, vec![0, 0]);
+    assert_eq!(
+        h.store().work_spend_totals().await.unwrap()[&x].tokens,
+        2_000
+    );
 }
 
 // ── 2. the guard at lease time ─────────────────────────────────────────
 
 #[tokio::test]
-async fn a_spent_budget_is_not_leased_and_surfaces_budget_exhausted_once() {
+async fn a_legacy_spent_budget_is_retired_once_and_does_not_ask_for_more() {
     let h = Harness::new(&["pinch"]);
     let x = spent(&h).await;
-    assert_eq!(
-        h.script.briefs_for(GAUGE).len(),
-        2,
-        "no third run on a spent budget"
-    );
-    assert_eq!(h.leases(&x).await, 2);
-    assert_eq!(
-        h.status(&x).await,
-        Status::Blocked(BlockedReason::BudgetExhausted)
-    );
-    let error = last_error(&h, &x).await;
-    assert_eq!(error.class, ErrorClass::Budget);
-    assert_eq!(error.subclass, ErrorSubclass::Iterations);
-    assert_eq!(error.observed_by, "cumulative_budget_guard");
-    assert!(
-        error
-            .detail
-            .contains("6 of 6 iterations used over 2 run(s)"),
-        "{}",
-        error.detail
-    );
-    let q = open_question(&h, &x).await;
-    assert_eq!(q.kind, QuestionKind::Decision);
-    assert!(q.text.contains("budget is spent"), "{}", q.text);
-    let spend = h.store().work_spend_totals().await.unwrap()[&x];
-    assert_eq!((spend.runs, spend.iterations), (2, 6));
-    // Nothing more happens however long it waits: no lease, no question.
     h.drain().await;
-    assert_eq!(h.script.briefs_for(GAUGE).len(), 2);
+    assert_eq!(h.status(&x).await, Status::Done);
+    assert_eq!(h.leases(&x).await, 1);
+    let questions = questions_of(&h, &x).await;
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].status, QuestionStatus::Obsolete);
+    h.drain().await;
+    assert_eq!(h.leases(&x).await, 1);
     assert_eq!(questions_of(&h, &x).await.len(), 1);
-    assert!(
-        h.of_kind(WorkKind::Internal).await.is_empty(),
-        "a spent budget goes to its owner, never to an improvement item"
-    );
 }
 
 // ── 3. answers resume work ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn an_owners_answer_grants_one_allotment_and_resumes_a_spent_budget() {
+async fn an_owners_legacy_answer_resumes_without_minting_an_execution_allowance() {
     let h = Harness::new(&["pinch"]);
     let x = spent(&h).await;
     let q = open_question(&h, &x).await;
-    let reply = ControlHandle::answer(&h.ctl, &q.id, "yes, one more round", "user:owner")
+    let reply = ControlHandle::answer(&h.ctl, &q.id, "continue", "user:owner")
         .await
         .unwrap();
     assert_eq!(reply.resumed, vec![x.clone()]);
-    let grants = evidence(&h, &x, "budget_grant").await;
-    assert_eq!(grants.len(), 1);
-    assert_eq!(grants[0].reference, q.id, "the grant names its question");
-    assert_eq!(grants[0].verified_by.as_deref(), Some("user:owner"));
-    // A second answer to the same question is refused and grants nothing.
-    assert!(ControlHandle::answer(&h.ctl, &q.id, "yes", "user:owner")
-        .await
-        .is_err());
+    assert!(evidence(&h, &x, "budget_grant").await.is_empty());
     h.drain().await;
     assert_eq!(h.status(&x).await, Status::Done);
-    let briefs = h.script.briefs_for(GAUGE);
-    assert_eq!(briefs.len(), 3);
-    assert_eq!(
-        briefs[2].budget.iterations, 6,
-        "one more allotment, not a fresh budget on top of what was spent"
-    );
-    assert_eq!(evidence(&h, &x, "budget_grant").await.len(), 1);
-    let spend = h.store().work_spend_totals().await.unwrap()[&x];
-    assert!(spend.iterations <= 12, "within two allotments: {spend:?}");
+    assert_eq!(h.script.briefs_for(GAUGE).len(), 1);
 }
 
 /// A report may name any artifact kind; the controller's own kinds are
@@ -305,7 +298,6 @@ async fn a_report_cannot_mint_budget_or_breaker_evidence() {
             .any(|e| e.kind == "path" && e.reference == "notes/gauge.txt"),
         "an ordinary artifact is kept"
     );
-    assert_eq!(h.ctl.allotments(&x).await.unwrap(), 1);
     let warnings: Vec<String> = h
         .store()
         .work_events(&x)
@@ -323,46 +315,32 @@ async fn a_report_cannot_mint_budget_or_breaker_evidence() {
     );
 }
 
-/// A grant counts only with its owner's answer behind it: a row naming no
-/// question, an unanswered one, another item's, or an answer by someone
-/// else buys nothing, and one answer buys one allotment however many rows
-/// name it.
+/// Historical grant rows remain auditable but cannot alter observed usage or
+/// create an execution allowance, regardless of their old provenance.
 #[tokio::test]
-async fn a_grant_without_its_owners_answer_buys_nothing() {
+async fn historical_budget_grants_never_gate_execution_or_replace_usage() {
     let h = Harness::new(&["pinch"]);
     let x = spent(&h).await;
-    let q = open_question(&h, &x).await;
-    let y = spent(&h).await;
-    let other = open_question(&h, &y).await;
-    let forge = |reference: &str, by: Option<&str>| Evidence {
-        item: x.clone(),
-        kind: "budget_grant".into(),
-        reference: reference.into(),
-        hash: None,
-        verified_by: by.map(str::to_string),
-        at: Utc::now(),
-    };
-    for row in [
-        forge("no-such-question", Some("user:owner")),
-        forge(&q.id, Some("user:owner")),
-        forge(&q.id, None),
-        forge(&q.id, Some("worker:pinch")),
-        forge(&other.id, Some("user:owner")),
-    ] {
-        h.store().work_evidence_add(row).await.unwrap();
-    }
-    assert_eq!(
-        h.ctl.allotments(&x).await.unwrap(),
-        1,
-        "nothing answered yet"
-    );
-    ControlHandle::answer(&h.ctl, &q.id, "yes", "user:owner")
+    let before = h.store().work_spend_totals().await.unwrap()[&x];
+    h.store()
+        .work_evidence_add(Evidence {
+            item: x.clone(),
+            kind: "budget_grant".into(),
+            reference: "historical-owner-grant".into(),
+            hash: None,
+            verified_by: Some("user:owner".into()),
+            at: Utc::now(),
+        })
         .await
         .unwrap();
+    h.drain().await;
+    assert_eq!(h.status(&x).await, Status::Done);
+    let after = h.store().work_spend_totals().await.unwrap()[&x];
+    assert_eq!(after.tokens, before.tokens + 1_000);
     assert_eq!(
-        h.ctl.allotments(&x).await.unwrap(),
-        2,
-        "the owner's answer buys one allotment, however many rows name it"
+        evidence(&h, &x, "budget_grant").await.len(),
+        1,
+        "history survives"
     );
 }
 
@@ -427,14 +405,13 @@ async fn another_open_question_keeps_a_spent_budget_parked_until_it_is_answered(
         h.status(&x).await,
         Status::Blocked(BlockedReason::BudgetExhausted)
     );
-    // The last hold answered releases it, with exactly one allotment.
+    // The last independent hold answered releases it without a budget grant.
     let reply = ControlHandle::answer(&h.ctl, &other, "station 8", "user")
         .await
         .unwrap();
     assert_eq!(reply.resumed, vec![x.clone()]);
     let grants = evidence(&h, &x, "budget_grant").await;
-    assert_eq!(grants.len(), 1);
-    assert_eq!(grants[0].reference, other);
+    assert!(grants.is_empty());
     h.drain().await;
     assert_eq!(h.status(&x).await, Status::Done);
 }
@@ -743,7 +720,7 @@ async fn retrying_a_saved_budget_answer_never_grants_a_second_allotment() {
         let _guard = h.ctl.loop_lock.lock().await;
         h.ctl.apply_pending_answers_locked().await.unwrap();
     }
-    assert_eq!(evidence(&h, &item, "budget_grant").await.len(), 1);
+    assert!(evidence(&h, &item, "budget_grant").await.is_empty());
     h.ctl
         .submit_answer(&q.id, "yes", "user:master", Some(&id))
         .await
@@ -752,5 +729,318 @@ async fn retrying_a_saved_budget_answer_never_grants_a_second_allotment() {
         let _guard = h.ctl.loop_lock.lock().await;
         h.ctl.apply_pending_answers_locked().await.unwrap();
     }
-    assert_eq!(evidence(&h, &item, "budget_grant").await.len(), 1);
+    assert!(evidence(&h, &item, "budget_grant").await.is_empty());
+}
+
+/// Regression for the live repair: old usage must remain measurable without
+/// preventing a new attempt, even after it exceeded several nominal allowances.
+#[tokio::test]
+async fn usage_only_retires_legacy_budget_hold_and_completes_original_work() {
+    let h = Harness::new(&["pinch"]);
+    let item = h
+        .file_one(gauge(Budget {
+            tokens: 200_000,
+            ..budget(100)
+        }))
+        .await;
+    h.store()
+        .work_spend_record(rustykrab_store::RunSpend {
+            item: item.clone(),
+            run: Some("historic-overrun".into()),
+            worker: "planner".into(),
+            tokens: 1_603_490,
+            iterations: 25,
+            wall_ms: 1_802_805,
+            at: h.clock.now(),
+        })
+        .await
+        .unwrap();
+    h.ctl.state().spent = None;
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    let question = h.ctl.record_question_sync(
+        &mut b,
+        NewQuestion::open(
+            &item,
+            QuestionKind::Decision,
+            "Its budget is spent (budget/tokens): 1603490 of 600000 tokens used".into(),
+            "surfaced",
+        ),
+    );
+    b.move_to(
+        &item,
+        Status::Blocked(BlockedReason::BudgetExhausted),
+        "controller",
+        "historic cumulative budget stop",
+    );
+    h.ctl.commit(b, &mut HashSet::new()).await.unwrap();
+    h.drain().await;
+    assert_eq!(h.status(&item).await, Status::Done);
+    assert_eq!(
+        h.leases(&item).await,
+        1,
+        "one new attempt, no approval clicking"
+    );
+    assert_eq!(
+        h.store()
+            .question_get(&question)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        QuestionStatus::Obsolete
+    );
+    assert!(evidence(&h, &item, "budget_grant").await.is_empty());
+    assert_eq!(
+        h.store().work_spend_totals().await.unwrap()[&item].tokens,
+        1_604_490
+    );
+    assert_eq!(h.script.briefs_for(GAUGE).len(), 1);
+}
+
+#[tokio::test]
+async fn retiring_a_budget_hold_keeps_an_independent_question_open() {
+    let h = Harness::new(&["pinch"]);
+    let item = spent(&h).await;
+    let question = ask_also(&h, &item, "Which station should the gauge use?").await;
+    h.drain().await;
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    assert_eq!(h.leases(&item).await, 0);
+    assert_eq!(
+        h.store()
+            .question_get(&question)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        QuestionStatus::Open
+    );
+    ControlHandle::answer(&h.ctl, &question, "station 8", "user:owner")
+        .await
+        .unwrap();
+    h.drain().await;
+    assert_eq!(h.status(&item).await, Status::Done);
+}
+
+async fn legacy_budget_approval(h: &Harness, mixed: bool, linked: bool) -> (String, String) {
+    use crate::graph::{validate, FilingContext, Validation};
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    let p = plan(vec![draft("x", GAUGE)]);
+    let mut ctx = FilingContext::new(FilingSource::WorkFile, h.clock.now());
+    // Seed a durable old host-approved graph; the current token trigger is retired.
+    ctx.approval.max_items = Some(0);
+    let Validation::Accepted(a) = validate(&b.snap, &p, &ctx) else {
+        panic!("fixture graph");
+    };
+    let id = a.root.clone();
+    let qid = a.question.clone().unwrap();
+    b.file(
+        &a,
+        rustykrab_store::WorkPlanRow {
+            id: a.plan_id.clone(),
+            root: id.clone(),
+            filed_by: None,
+            rationale: String::new(),
+            approval_question: linked.then(|| qid.clone()),
+            policy: None,
+            created_at: h.clock.now(),
+        },
+        "controller",
+    );
+    let extra = if mixed {
+        "; writes mail, which is not delegated"
+    } else {
+        ""
+    };
+    h.ctl.record_question_sync(&mut b, NewQuestion {
+        id: Some(qid.clone()),
+        ..NewQuestion::open(&id, QuestionKind::Approval,
+            format!("Approve the plan \"{GAUGE}\" (200000 tokens, over the 100000 the policy allows{extra})? 1 item(s) held."), "approval")
+    });
+    h.ctl.commit(b, &mut HashSet::new()).await.unwrap();
+    (id, qid)
+}
+
+#[tokio::test]
+async fn retiring_a_sole_legacy_budget_approval_resumes_without_inventing_consent() {
+    let h = Harness::new(&["pinch"]);
+    let (item, q) = legacy_budget_approval(&h, false, true).await;
+    h.drain().await;
+    assert_eq!(h.status(&item).await, Status::Done);
+    let q = h.store().question_get(&q).await.unwrap().unwrap();
+    assert_eq!(q.status, QuestionStatus::Obsolete);
+    assert!(q.answer.is_none() && q.answered_by.is_none());
+    assert!(h.item(&item).await.held_by.is_none());
+}
+
+#[tokio::test]
+async fn mixed_or_unlinked_approvals_are_never_retired_by_budget_question_text() {
+    for (mixed, linked) in [(true, true), (false, false)] {
+        let h = Harness::new(&["pinch"]);
+        let (item, q) = legacy_budget_approval(&h, mixed, linked).await;
+        h.drain().await;
+        assert_eq!(
+            h.status(&item).await,
+            Status::Blocked(BlockedReason::NeedsConsent)
+        );
+        assert_eq!(h.item(&item).await.held_by.as_deref(), Some(q.as_str()));
+        assert_eq!(
+            h.store().question_get(&q).await.unwrap().unwrap().status,
+            QuestionStatus::Open
+        );
+        assert_eq!(h.leases(&item).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn retiring_budget_does_not_clear_a_separate_plan_permission() {
+    let h = Harness::new(&["pinch"]);
+    let (item, consent) = legacy_budget_approval(&h, true, true).await;
+    let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+    h.ctl.record_question_sync(
+        &mut b,
+        NewQuestion::open(
+            &item,
+            QuestionKind::Decision,
+            "Its budget is spent (budget/tokens): legacy".into(),
+            "surfaced",
+        ),
+    );
+    b.move_to(
+        &item,
+        Status::Blocked(BlockedReason::BudgetExhausted),
+        "controller",
+        "old budget gate",
+    );
+    h.ctl.commit(b, &mut HashSet::new()).await.unwrap();
+    h.drain().await;
+    assert_eq!(
+        h.status(&item).await,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+    assert_eq!(
+        h.item(&item).await.held_by.as_deref(),
+        Some(consent.as_str())
+    );
+    assert_eq!(h.leases(&item).await, 0);
+}
+
+#[tokio::test]
+async fn retiring_budget_preserves_pending_cancellation_and_rejected_receipt_history() {
+    use rustykrab_store::{AnswerSubmission, AnswerSubmissionStatus, QuestionWrite};
+    for rejected in [false, true] {
+        let h = Harness::new(&["pinch"]);
+        let item = spent(&h).await;
+        let q = open_question(&h, &item).await;
+        let receipt = AnswerSubmission {
+            id: format!("budget-receipt-{rejected}"),
+            answer: if rejected { "retry" } else { "no" }.into(),
+            actor: "user:owner".into(),
+            submitted_at: h.clock.now(),
+            status: AnswerSubmissionStatus::Pending,
+            completed_at: None,
+            error: None,
+        };
+        h.store()
+            .question_submit_answer(&q.id, receipt.clone())
+            .await
+            .unwrap();
+        if rejected {
+            h.store()
+                .question_write(QuestionWrite::AnswerProcessed {
+                    id: q.id.clone(),
+                    submission: receipt.id.clone(),
+                    error: Some("historical answer could not be applied".into()),
+                    at: h.clock.now(),
+                })
+                .await
+                .unwrap();
+        }
+        // Exercise retirement independently of the tick's preceding receipt pass.
+        h.ctl.retire_execution_budget_holds().await.unwrap();
+        let observed = h.store().question_get(&q.id).await.unwrap().unwrap();
+        let saved = observed.answer_submission.unwrap();
+        assert_eq!(saved.id, receipt.id);
+        assert_eq!(saved.answer, receipt.answer);
+        if rejected {
+            assert_eq!(observed.status, QuestionStatus::Obsolete);
+            assert_eq!(saved.status, AnswerSubmissionStatus::Rejected);
+            assert!(observed.answer.is_none());
+            h.drain().await;
+            assert_eq!(h.status(&item).await, Status::Done);
+        } else {
+            assert_eq!(
+                h.status(&item).await,
+                Status::Blocked(BlockedReason::BudgetExhausted)
+            );
+            assert_eq!(saved.status, AnswerSubmissionStatus::Pending);
+            h.drain().await;
+            assert_eq!(
+                h.status(&item).await,
+                Status::Cancelled(CancelReason::Requested)
+            );
+            assert_eq!(h.leases(&item).await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn stacked_legacy_budget_gates_retire_in_one_transaction_without_a_phantom_hold() {
+    for reason in [BlockedReason::NeedsConsent, BlockedReason::BudgetExhausted] {
+        for independent in [false, true] {
+            let h = Harness::new(&["pinch"]);
+            let (item, approval) = legacy_budget_approval(&h, false, true).await;
+            let mut b = Batch::new(h.ctl.load().await.unwrap(), h.clock.now());
+            let budget_question = h.ctl.record_question_sync(
+                &mut b,
+                NewQuestion::open(
+                    &item,
+                    QuestionKind::Decision,
+                    "Its budget is spent (budget/tokens): historical limit".into(),
+                    "surfaced",
+                ),
+            );
+            b.move_to(
+                &item,
+                Status::Blocked(reason),
+                "controller",
+                "legacy stacked stop",
+            );
+            h.ctl.commit(b, &mut HashSet::new()).await.unwrap();
+            let other = if independent {
+                Some(ask_also(&h, &item, "Which station?").await)
+            } else {
+                None
+            };
+            h.drain().await;
+            for id in [&approval, &budget_question] {
+                let q = h.store().question_get(id).await.unwrap().unwrap();
+                assert_eq!(q.status, QuestionStatus::Obsolete);
+                assert!(q.answer.is_none() && q.answered_by.is_none());
+            }
+            assert!(h.item(&item).await.held_by.is_none());
+            if let Some(other) = other {
+                assert_eq!(
+                    h.status(&item).await,
+                    Status::Blocked(BlockedReason::NeedsDecision)
+                );
+                assert_eq!(
+                    h.store()
+                        .question_get(&other)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    QuestionStatus::Open
+                );
+                assert_eq!(h.leases(&item).await, 0);
+            } else {
+                assert_eq!(h.status(&item).await, Status::Done);
+                assert_eq!(h.leases(&item).await, 1);
+            }
+            assert!(evidence(&h, &item, "budget_grant").await.is_empty());
+        }
+    }
 }

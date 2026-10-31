@@ -140,7 +140,7 @@ async fn each_run_records_its_spend_and_a_run_event_with_its_reminders() {
 }
 
 #[tokio::test]
-async fn a_follow_up_under_a_busy_parent_is_judged_by_spend_not_allocation() {
+async fn a_follow_up_is_not_limited_by_estimated_or_observed_parent_usage() {
     let h = Harness::new(&["pinch"]);
     let mut parent = draft("P", "Plan the move");
     parent.budget = Some(budget(10, 10_000, 600));
@@ -193,13 +193,10 @@ async fn a_follow_up_under_a_busy_parent_is_judged_by_spend_not_allocation() {
             FilingSource::Planner,
         )
     };
-    match file("Clean the flat", 8_500).await.unwrap() {
-        PlanOutcome::Rejected(r) => assert!(
-            r.failed.iter().any(|f| f.detail.contains("8000 tokens")),
-            "{r:?}"
-        ),
-        PlanOutcome::Accepted(a) => panic!("over what is left: {a:?}"),
-    }
+    assert!(matches!(
+        file("Clean the flat", 8_500).await.unwrap(),
+        PlanOutcome::Accepted(_)
+    ));
     assert!(matches!(
         file("Return the keys", 7_500).await.unwrap(),
         PlanOutcome::Accepted(_)

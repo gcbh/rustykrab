@@ -421,9 +421,6 @@ impl Judgment {
         if let Some(n) = self.approval.max_items {
             out.push(format!("plans of more than {n} items need approval"));
         }
-        if let Some(n) = self.approval.max_total_tokens {
-            out.push(format!("plans budgeted over {n} tokens need approval"));
-        }
         for r in &self.approval.consent_resources {
             out.push(format!("anything that writes {r} needs approval"));
         }

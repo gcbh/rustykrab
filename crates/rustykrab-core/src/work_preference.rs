@@ -67,12 +67,13 @@ impl WorkTemplate {
         let mut reviewed = self.clone();
         // Legacy task labels and backend pins have no execution semantics.
         // Approval still requires the same objective, tools, resources,
-        // constraints, budget and internal lifecycle facets.
+        // constraints, recovery rungs and internal lifecycle facets.
         for template in [&mut reviewed, &mut candidate] {
             if !matches!(template.kind, WorkKind::Proposal | WorkKind::Capability) {
                 template.kind = WorkKind::Task;
             }
             template.worker_kind = WorkerKind::Any;
+            template.budget = template.budget.without_execution_limits();
         }
         reviewed == candidate
     }
@@ -96,5 +97,56 @@ impl std::hash::Hash for WorkTemplate {
         self.kind.hash(state);
         self.objective.hash(state);
         self.done_when.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn scope() -> WorkTemplate {
+        WorkTemplate {
+            example_item: "original".into(),
+            title: "Useful work".into(),
+            kind: WorkKind::Task,
+            project_id: None,
+            objective: "Complete the task".into(),
+            done_when: "Verified result".into(),
+            constraints: vec!["Only the assigned repository".into()],
+            decisions_made: vec![],
+            artifact_refs: vec![],
+            required_tools: vec![],
+            required_mcp_servers: vec![],
+            writable_resources: vec![],
+            worker_kind: WorkerKind::Any,
+            inputs_from: vec![],
+            trigger: Trigger::Now,
+            preconditions: vec![],
+            budget: Budget::default(),
+            facets: None,
+        }
+    }
+    #[test]
+    fn retired_execution_estimates_do_not_change_an_otherwise_identical_reviewed_scope() {
+        let original = scope();
+        let mut candidate = original.clone();
+        candidate.budget.tokens = 1_603_490;
+        candidate.budget.iterations = 1;
+        candidate.budget.wall_seconds = 10;
+        assert!(original.matches(&candidate));
+        candidate.required_tools.push("exec".into());
+        assert!(
+            !original.matches(&candidate),
+            "tool authority remains exact"
+        );
+    }
+    #[test]
+    fn finite_recovery_rungs_and_constraints_still_require_the_reviewed_scope() {
+        let original = scope();
+        let mut candidate = original.clone();
+        candidate.budget.rungs.repairs += 1;
+        assert!(!original.matches(&candidate));
+        candidate = original.clone();
+        candidate.constraints.clear();
+        assert!(!original.matches(&candidate));
     }
 }

@@ -105,14 +105,6 @@ fn too_many_items() -> Rejection {
     reject(&base(), &under_p(vec![draft("a"), draft("b")]), &c)
 }
 
-fn over_budget() -> Rejection {
-    let mut a = draft("a");
-    a.budget = Some(big());
-    let mut c = planner();
-    c.remaining_budget.insert("P".into(), small());
-    reject(&base(), &under_p(vec![a]), &c)
-}
-
 fn single_writer_conflict() -> Rejection {
     let mut a = draft("a");
     a.writable_resources = vec!["calendar".into()];
@@ -239,7 +231,7 @@ fn rejects_invalid_item() {
     let r = invalid_item();
     assert_eq!(
         only(&r, RejectionReason::InvalidItem),
-        vec![vec![tmp("a")], vec![tmp("b")], vec![tmp("c")]]
+        vec![vec![tmp("a")], vec![tmp("b")]]
     );
     assert_eq!(r.failed[0].detail, "missing done_when");
 }
@@ -305,11 +297,14 @@ fn rejects_too_many_items() {
 }
 
 #[test]
-fn rejects_over_budget() {
-    assert_eq!(
-        only(&over_budget(), RejectionReason::OverBudget),
-        vec![vec![tmp("a")]]
-    );
+fn retired_parent_estimates_do_not_reject_new_work() {
+    let mut a = draft("a");
+    a.budget = Some(big());
+    let mut c = planner();
+    c.remaining_budget.insert("P".into(), small());
+    let mut state = base();
+    let accepted = accept(&mut state, &under_p(vec![a]), &c);
+    assert!(accepted.held.is_empty());
 }
 
 #[test]
@@ -460,7 +455,6 @@ fn every_rejection_reason_is_reachable() {
         cycle(),
         depth_exceeded(),
         too_many_items(),
-        over_budget(),
         single_writer_conflict(),
         plan_b_edges(),
         edge_onto_active(),
@@ -480,7 +474,6 @@ fn every_rejection_reason_is_reachable() {
         RejectionReason::Cycle,
         RejectionReason::DepthExceeded,
         RejectionReason::TooManyItems,
-        RejectionReason::OverBudget,
         RejectionReason::SingleWriterConflict,
         RejectionReason::PlanBEdges,
         RejectionReason::EdgeOntoActive,

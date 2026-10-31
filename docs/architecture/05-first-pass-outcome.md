@@ -495,3 +495,22 @@ pointer with uncommitted data intact and completes the original goal. Retained
 files do not count as verified work and are not automatically replayed. Required
 scripted scenario5 is aligned to early stopping while budget remains, preserving
 its first-attempt evidence and the independent owner-grant scenario.
+
+
+## Retiring predicted task budgets (2026-10-31)
+
+Exact base: `7b0814f` (v6.6.14). The previous cumulative guard fixed repeated
+fresh allowances, but its estimate was not evidence of the effort useful work
+required. A live repair attempt recorded 1,603,490 tokens. Owner answers raised
+the old 200k estimate to 400k and 600k; both reblocked before another attempt.
+This was an admission deadlock, not proof that a worker tried the repair again.
+
+Geoffrey asked to remove budgets and discover effort empirically. The candidate
+removes per-task execution gates, parent reservations, token-threshold approval
+and local worker token/turn/runtime stops; actual usage survives. Controller
+retirement is narrow and auditable: no synthetic answer, grant, independent
+consent release or deletion of historical evidence. Finite no-progress recovery
+and real operational/permission limits remain. The exact-base regression fails
+at `BudgetExhausted`; the candidate resumes and completes with usage retained.
+See [verification](../verification/usage-without-task-budgets-2026-10-31.md).
+This records tested implementation, not a deployment or measured model quality.

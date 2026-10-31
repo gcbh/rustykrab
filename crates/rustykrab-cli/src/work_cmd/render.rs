@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use rustykrab_control::handle::{GraphNode, GraphView, TickReport};
 use rustykrab_core::work::{
-    Budget, CancelReason, Edge, EdgeKind, Rung, Status, Trigger, WorkItem, WorkItemId,
+    CancelReason, Edge, EdgeKind, Rung, Status, Trigger, WorkItem, WorkItemId,
 };
 use rustykrab_gateway::work_routes::{ApproveReply, CancelReply, ItemDetail, PlanPreview, WorkRow};
 use rustykrab_store::ArchivedItem;
@@ -115,74 +115,6 @@ fn edge_words<'a>(
         parts.push(format!("inputs from {}", tags(inputs)));
     }
     (!parts.is_empty()).then(|| parts.join("; "))
-}
-
-fn tokens(n: u64) -> String {
-    let scaled = |value: f64, unit: &str| {
-        let text = format!("{value:.1}");
-        format!("{}{unit}", text.trim_end_matches(".0"))
-    };
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => scaled(n as f64 / 1_000.0, "k"),
-        _ => scaled(n as f64 / 1_000_000.0, "M"),
-    }
-}
-
-fn wall(seconds: u64) -> String {
-    let (h, m, s) = (seconds / 3_600, seconds % 3_600 / 60, seconds % 60);
-    let mut text = String::new();
-    if h > 0 {
-        text.push_str(&format!("{h}h"));
-    }
-    if m > 0 {
-        text.push_str(&format!("{m}m"));
-    }
-    if s > 0 || text.is_empty() {
-        text.push_str(&format!("{s}s"));
-    }
-    text
-}
-
-/// What a budget spends, or a sum of them: tokens, iterations, wall time.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Spend {
-    tokens: u64,
-    iterations: u64,
-    wall_seconds: u64,
-}
-
-impl Spend {
-    fn of(budget: &Budget) -> Spend {
-        Spend {
-            tokens: budget.tokens,
-            iterations: u64::from(budget.iterations),
-            wall_seconds: budget.wall_seconds,
-        }
-    }
-
-    fn add(self, other: Spend) -> Spend {
-        Spend {
-            tokens: self.tokens.saturating_add(other.tokens),
-            iterations: self.iterations.saturating_add(other.iterations),
-            wall_seconds: self.wall_seconds.saturating_add(other.wall_seconds),
-        }
-    }
-
-    fn exceeds(&self, envelope: &Spend) -> bool {
-        self.tokens > envelope.tokens
-            || self.iterations > envelope.iterations
-            || self.wall_seconds > envelope.wall_seconds
-    }
-
-    fn text(&self) -> String {
-        format!(
-            "{} tokens, {} iterations, {}",
-            tokens(self.tokens),
-            self.iterations,
-            wall(self.wall_seconds)
-        )
-    }
 }
 
 fn when(at: &DateTime<Utc>) -> String {
@@ -448,7 +380,7 @@ pub(super) fn detail(d: &ItemDetail) -> String {
     field(&mut out, "worker", item.worker_kind.as_str());
     field(&mut out, "writes", item.writable_resources.join(", "));
     field(&mut out, "tools", item.required_tools.join(", "));
-    field(&mut out, "budget", Spend::of(&item.budget).text());
+    field(&mut out, "usage", "recorded; no task execution limit");
     if let Some(lease) = &d.lease {
         field(
             &mut out,
@@ -480,8 +412,7 @@ pub(super) fn detail(d: &ItemDetail) -> String {
 
 // ── plans and commands ─────────────────────────────────────────────────
 
-/// `work plan <id>`: the tree with each item's terms, the budget total
-/// against the root's, the rationale and the policy (plan section 14.2).
+/// `work plan <id>`: the tree, scope, rationale and approval policy.
 pub(super) fn plan(p: &PlanPreview) -> String {
     let root_id = &p.graph.root;
     let root = p.graph.nodes.iter().find(|n| &n.item.id == root_id);
@@ -510,25 +441,7 @@ pub(super) fn plan(p: &PlanPreview) -> String {
     });
     out.push_str(&lay_out(&rows));
 
-    let children: Vec<&GraphNode> = p
-        .graph
-        .nodes
-        .iter()
-        .filter(|n| n.depth == 1 && n.archived_summary.is_none())
-        .collect();
-    let total = children.iter().fold(Spend::default(), |sum, n| {
-        sum.add(Spend::of(&n.item.budget))
-    });
-    let mut budget = format!("Budget: {} across {} items", total.text(), children.len());
-    if let Some(root) = root {
-        let envelope = Spend::of(&root.item.budget);
-        budget.push_str(&format!("; {} allows {}", tag(root_id), envelope.text()));
-        if total.exceeds(&envelope) {
-            budget.push_str(" (over)");
-        }
-    }
-    out.push_str(&budget);
-    out.push('\n');
+    out.push_str("Execution usage is recorded; task estimates do not gate work.\n");
     if !p.held.is_empty() {
         out.push_str(&format!(
             "Approve with `rustykrab work approve {id}`, or decline with `rustykrab work reject {id} [reason]`.\n",
@@ -542,7 +455,6 @@ pub(super) fn plan(p: &PlanPreview) -> String {
 /// writable resources, and whether approval holds it.
 fn terms(item: &WorkItem, held: bool) -> String {
     let mut terms = vec![
-        format!("budget {}", Spend::of(&item.budget).text()),
         format!("worker {}", item.worker_kind.as_str()),
         format!("trigger {}", trigger(&item.trigger)),
     ];
@@ -711,7 +623,7 @@ mod tests {
             trigger: Trigger::Now,
             preconditions: vec![],
             expires_at: None,
-            budget: Budget::default(),
+            budget: rustykrab_core::work::Budget::default(),
             priority: 0,
             status,
             status_origin: None,
@@ -963,11 +875,11 @@ Rationale: compare the plans, then switch
 Policy: approval.default; held: #t #y
 #t Switch the phone plan         personal  blocked(needs_consent) 0/2 done
 ├─ #x Compare three phone plans  research  ready
-│     budget 150k tokens, 20 iterations, 30m; worker any; trigger now
+│     worker any; trigger now
 └─ #y Switch the carrier         personal  blocked(needs_consent)
       blocked by #x
-      budget 200k tokens, 10 iterations, 1h30m; worker local; trigger at 2026-09-28 10:00 UTC; writes carrier account; held
-Budget: 350k tokens, 30 iterations, 2h across 2 items; #t allows 300k tokens, 40 iterations, 2h (over)
+      worker local; trigger at 2026-09-28 10:00 UTC; writes carrier account; held
+Execution usage is recorded; task estimates do not gate work.
 Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject #t [reason]`.
 ";
         assert_eq!(plan(&preview), expected);
@@ -1092,7 +1004,7 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
             "  edges      blocked by #42; discovered from #9; inputs from #42",
             "  archived   #9 Renew the passport  personal  done",
             "  needed by  #45 (blocks)",
-            "  budget     200k tokens, 100 iterations, 1h",
+            "  usage      recorded; no task execution limit",
             "  rungs      retry",
             "  history    3 events, 1 evidence",
         ] {
@@ -1130,14 +1042,6 @@ Approve with `rustykrab work approve #t`, or decline with `rustykrab work reject
 
     #[test]
     fn numbers_and_ids_print_compactly() {
-        assert_eq!(tokens(950), "950");
-        assert_eq!(tokens(200_000), "200k");
-        assert_eq!(tokens(1_500), "1.5k");
-        assert_eq!(tokens(2_000_000), "2M");
-        assert_eq!(wall(3_600), "1h");
-        assert_eq!(wall(5_400), "1h30m");
-        assert_eq!(wall(90), "1m30s");
-        assert_eq!(wall(0), "0s");
         assert_eq!(tag("3f2a9c1e-0000-4000-8000-000000000001"), "#3f2a9c1e");
         assert_eq!(tag("41"), "#41");
         assert_eq!(title(&"word ".repeat(30)).chars().count(), TITLE_MAX);

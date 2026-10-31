@@ -262,7 +262,8 @@ impl Controller {
         ctx.sequential_split = self.config.split_mode;
         ctx.default_budget = self.config.default_budget;
         ctx.supersede_limit = self.config.supersede_limit;
-        ctx.remaining_budget = self.remaining_budgets(snap);
+        // Legacy parent-envelope estimates no longer restrict a filing.
+        ctx.remaining_budget.clear();
         ctx.origin_conversation_id = provenance.conversation_id.clone();
         ctx.approval = self.approval_for(source);
         // A planned request's envelope is not a plan: the planner's graph

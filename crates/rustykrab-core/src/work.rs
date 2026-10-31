@@ -482,8 +482,8 @@ impl Default for RungBudgets {
     }
 }
 
-/// What an item may spend. A parent's budget is an envelope over its
-/// subtree (section 4.2).
+/// Legacy execution estimates and finite failure-recovery limits.
+/// New work stores zero execution estimates; observed usage lives in the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     pub iterations: u32,
@@ -494,17 +494,26 @@ pub struct Budget {
     pub rungs: RungBudgets,
 }
 
+impl Budget {
+    /// Execution usage is observed, never admitted or stopped by a task estimate.
+    /// Legacy fields remain readable; finite recovery rungs are independent.
+    pub fn without_execution_limits(self) -> Self {
+        Self {
+            iterations: 0,
+            tokens: 0,
+            wall_seconds: 0,
+            ..self
+        }
+    }
+}
+
 impl Default for Budget {
     fn default() -> Self {
         Budget {
-            // A backstop against a run that loops, not the measure of a
-            // run's size: the wall clock bounds a run. At 25, half of the
-            // qwen3.8 long-context eval runs (2026-10-15/16) ended on the
-            // turn count, some after committing their work, and a run that
-            // ends on it files no report.
-            iterations: 100,
-            tokens: 200_000,
-            wall_seconds: 3_600,
+            // Legacy execution fields use zero; usage is recorded independently.
+            iterations: 0,
+            tokens: 0,
+            wall_seconds: 0,
             repairs: 2,
             rungs: RungBudgets::default(),
         }

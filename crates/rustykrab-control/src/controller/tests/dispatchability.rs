@@ -51,7 +51,7 @@ async fn unexecutable_backlog_distinguishes_dependencies_holds_and_missing_cover
 }
 
 #[tokio::test]
-async fn spent_leaf_budget_is_waiting_not_dispatchable_and_is_not_replenished() {
+async fn recorded_usage_does_not_block_dispatch_or_mutate_work() {
     let h = Harness::new(&["pinch"]);
     let _lock = warm(&h).await;
     let accepted = h
@@ -73,8 +73,8 @@ async fn spent_leaf_budget_is_waiting_not_dispatchable_and_is_not_replenished() 
     h.ctl.state().spent = None;
     let before = h.store.work_get(&accepted.root).await.unwrap();
     let demand = h.ctl.foreground_dispatchability().await.unwrap().unwrap();
-    assert_eq!(demand.dispatchable_foreground_leaves, 0);
-    assert_eq!(demand.waiting["cumulative_budget"], 1);
+    assert_eq!(demand.dispatchable_foreground_leaves, 1);
+    assert!(!demand.waiting.contains_key("cumulative_budget"));
     assert_eq!(h.store.work_get(&accepted.root).await.unwrap(), before);
     assert!(h.script.briefs().is_empty());
 }

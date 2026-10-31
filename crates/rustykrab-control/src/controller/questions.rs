@@ -18,7 +18,7 @@
 //!   the item (not the conversation): it returns to `queued` and its next
 //!   brief carries the answer ([`Controller::answers_for`]). An item the
 //!   ladder stopped on a spent budget or a failed verification resumes on
-//!   its owner's answer too, a spent budget with one more allotment, and
+//!   its owner's answer too (legacy budget stops are also retired at tick), and
 //!   a no cancels it. Another open question or an approval hold still
 //!   holds it.
 //! - Standing judgment ([`Controller::judgment`]) is the active grants
@@ -49,7 +49,6 @@ use rustykrab_tools::work_backend::{AskOutcome, AskRequest, CapabilityAsk, Prove
 use super::batch::{has_open_plan_b, Batch};
 use super::filing::describe_rejection;
 use super::notice::{label, short, short_question, Cause};
-use super::spend::BUDGET_GRANT;
 use super::{Controller, Finished};
 
 /// The constraint that marks a `research` item the router filed: system
@@ -144,11 +143,8 @@ fn may_resume(actor: &str) -> bool {
     is_owner(actor) || actor.starts_with("policy:")
 }
 
-/// Whether `actor`'s answer may grant a spent budget one more allotment, or
-/// cancel a stopped item: its owner only. No standing-judgment check
-/// delegates budget, so a delegate's answer, like a default's, neither
-/// replenishes a budget nor resumes it (resuming without a grant would only
-/// stop again at the guard).
+/// Whether `actor` is the owner, as required for cancelling or explicitly
+/// answering a historical budget stop. No answer creates a new allowance.
 pub(super) fn is_owner(actor: &str) -> bool {
     actor == "user" || actor.starts_with("user:")
 }
@@ -248,7 +244,6 @@ impl Controller {
             .iter()
             .filter(|i| !b.snap.has_children(&i.id))
             .collect();
-        let tokens: u64 = leaves.iter().map(|i| i.budget.tokens).sum();
         let writes: BTreeSet<&str> = leaves
             .iter()
             .flat_map(|i| i.writable_resources.iter().map(String::as_str))
@@ -256,9 +251,6 @@ impl Controller {
         let mut limits = Vec::new();
         if let Some(n) = approval.max_items {
             limits.push(format!("up to {n} items"));
-        }
-        if let Some(n) = approval.max_total_tokens {
-            limits.push(format!("up to {n} tokens"));
         }
         if !approval.consent_resources.is_empty() {
             let named: Vec<&str> = approval
@@ -272,7 +264,7 @@ impl Controller {
             chosen: "run the plan without asking".to_string(),
             alternatives: vec!["hold it for the user's approval".to_string()],
             rationale: format!(
-                "{} new items, {tokens} tokens across its leaves, writing {}",
+                "{} new items, writing {}",
                 accepted.items.len(),
                 if writes.is_empty() {
                     "no resources".to_string()
@@ -1532,8 +1524,8 @@ impl Controller {
             ))
         );
         // A leaf the ladder stopped on a failed verification resumes on its
-        // owner's or a delegate's answer; one stopped on a spent budget only
-        // on its owner's, which grants one more allotment ([`BUDGET_GRANT`]).
+        // owner's or a delegate's answer. Historical budget stops retain their
+        // owner-answer semantics until the tick retires the obsolete gate.
         // The owner's no cancels either, as a declined consent does.
         let recovering = !b.snap.has_children(&q.item)
             && matches!(
@@ -1561,27 +1553,7 @@ impl Controller {
             ));
             reply.resumed.push(q.item.clone());
         } else if recovering && authority && !still_open && !held {
-            let mut why = format!("answered question {}", short_question(&q.id));
-            if status == Some(Status::Blocked(BlockedReason::BudgetExhausted)) {
-                // One allotment per question, however often it is answered.
-                let granted = self
-                    .store
-                    .work_evidence_list(&q.item)
-                    .await?
-                    .iter()
-                    .any(|e| e.kind == BUDGET_GRANT && answered_ids.contains(&e.reference));
-                if !granted {
-                    b.evidence.push(rustykrab_core::work::Evidence {
-                        item: q.item.clone(),
-                        kind: BUDGET_GRANT.to_string(),
-                        reference: q.id.clone(),
-                        hash: None,
-                        verified_by: Some(actor.to_string()),
-                        at: now,
-                    });
-                }
-                why.push_str("; one more allotment of its budget granted");
-            }
+            let why = format!("answered question {}", short_question(&q.id));
             changed.extend(b.move_to(&q.item, Status::Queued, actor, why));
             reply.resumed.push(q.item.clone());
         }

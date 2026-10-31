@@ -701,12 +701,12 @@ consume a fresh observation from the existing controller matcher: active or
 dispatchable foreground yields priority; a waiting-only backlog can admit a due
 incident review. Missing, stale, future, failed or timed-out demand defers
 explicitly. Manual requests remain durable while waiting but do not override
-capacity or spending limits. The fresh meta-evaluator checks the same admission
+capacity or independent owner holds. The fresh meta-evaluator checks the same admission
 rule before its own job is filed.
 
-Inference still uses the existing low-priority report-only Research jobs, finite
-per-leaf budgets, cumulative controller guard/breaker, interval and three-cycle
-24-hour limit. No grant or independent owner hold is changed. Already running
+Inference still uses low-priority report-only Research jobs, observed usage,
+finite failure recovery, the repeated-outcome breaker, interval and three-cycle
+24-hour limit. Predicted per-task execution allowances are retired. No grant or independent owner hold is changed. Already running
 model calls remain bounded rather than immediately preempted. Admission permits
 enqueuing a review; it does not demonstrate an available analysis executor,
 model quality, a delivered repair or original-goal improvement. The monitor API

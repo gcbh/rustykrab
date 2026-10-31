@@ -2,22 +2,15 @@
 //! reports a work item's token use to the controller (control-layer plan,
 //! section 4).
 //!
-//! Every response's prompt and completion tokens are added to a [`Meter`]
-//! shared with the worker. Before each request, enforce the controller's
-//! remaining token allowance and the progress ledger's recovery boundary.
-//! This is cumulative work spending, distinct from context-window capacity.
-//! Usage arrives after a response, so one call can overshoot; retain all of
-//! that spend and never start another request once the allowance is spent.
+//! Counts prompt and completion tokens for observations. Before requests,
+//! only the no-progress recovery boundary is enforced; task token allowances
+//! are retired. Provider context windows remain separate physical limits.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rustykrab_control::{
-    errors::{BudgetKind, ProviderProblem},
-    progress::StepLedger,
-    worker::RunFailure,
-};
+use rustykrab_control::{errors::ProviderProblem, progress::StepLedger, worker::RunFailure};
 use rustykrab_core::model::{
     CallOptions, ModelCheck, ModelProvider, ModelResponse, StreamEvent, ToolChoice, Usage,
 };
@@ -49,7 +42,6 @@ impl Meter {
 pub struct MeteredProvider {
     inner: Arc<dyn ModelProvider>,
     meter: Arc<Meter>,
-    token_limit: u64,
     progress: Arc<Mutex<StepLedger>>,
 }
 
@@ -57,25 +49,16 @@ impl MeteredProvider {
     pub fn new(
         inner: Arc<dyn ModelProvider>,
         meter: Arc<Meter>,
-        token_limit: u64,
         progress: Arc<Mutex<StepLedger>>,
     ) -> MeteredProvider {
         MeteredProvider {
             inner,
             meter,
-            token_limit,
             progress,
         }
     }
 
     fn before_request(&self) -> Result<()> {
-        let used = self.meter.used();
-        if self.token_limit > 0 && used >= self.token_limit {
-            return Err(RunFailure::Budget {
-                budget: BudgetKind::Tokens,
-                detail: format!("{used} tokens consumed of this attempt's {} remaining allowance; no further model request dispatched", self.token_limit),
-            }.into_error());
-        }
         if let Some(stall) = self
             .progress
             .lock()
@@ -220,7 +203,19 @@ mod tests {
             true
         }
         async fn chat(&self, _: &[Message], _: &[ToolSchema]) -> Result<ModelResponse> {
-            unreachable!("capability data only")
+            Ok(ModelResponse {
+                message: Message::stamped(
+                    rustykrab_core::types::Role::Assistant,
+                    rustykrab_core::types::MessageContent::Text("measured".into()),
+                ),
+                usage: Usage {
+                    prompt_tokens: 90,
+                    completion_tokens: 10,
+                    ..Default::default()
+                },
+                stop_reason: rustykrab_core::model::StopReason::EndTurn,
+                text: None,
+            })
         }
     }
 
@@ -231,14 +226,13 @@ mod tests {
         let metered = MeteredProvider::new(
             Arc::new(Appends),
             Arc::new(Meter::new()),
-            0,
             Arc::new(Mutex::new(StepLedger::new(6))),
         );
         assert!(metered.accepts_undeclared_tool_calls());
     }
 
     #[tokio::test]
-    async fn worker_autonomy_all_request_paths_enforce_the_same_spent_allowance() {
+    async fn all_request_paths_keep_counting_after_historical_usage() {
         let meter = Arc::new(Meter::new());
         meter.add(&Usage {
             prompt_tokens: 90,
@@ -248,7 +242,6 @@ mod tests {
         let provider = MeteredProvider::new(
             Arc::new(Appends),
             meter.clone(),
-            100,
             Arc::new(Mutex::new(StepLedger::new(6))),
         );
         let sink = |_: StreamEvent| {};
@@ -265,15 +258,13 @@ mod tests {
                 .await,
         ];
         for result in outcomes {
-            assert!(matches!(
-                RunFailure::from_error(&result.unwrap_err()),
-                Some(RunFailure::Budget {
-                    budget: BudgetKind::Tokens,
-                    ..
-                })
-            ));
+            assert!(result.is_ok(), "{result:?}");
         }
-        assert_eq!(meter.used(), 100, "refused requests spend nothing");
+        assert_eq!(
+            meter.used(),
+            700,
+            "all six calls count; old usage stops none"
+        );
     }
 
     #[test]
@@ -284,7 +275,7 @@ mod tests {
             ..Default::default()
         });
         let ledger = Arc::new(Mutex::new(StepLedger::new(1)));
-        let provider = MeteredProvider::new(Arc::new(Appends), meter, 0, ledger.clone());
+        let provider = MeteredProvider::new(Arc::new(Appends), meter, ledger.clone());
         assert!(provider.before_request().is_ok());
         for _ in 0..3 {
             ledger

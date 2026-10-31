@@ -1034,3 +1034,17 @@ write/edit calls still require a requested exact output grant or the run's own
 repository worktree. Input grants do not advertise writable resources and remain
 out of native shell arguments. The native host path preserves both grant arrays
 from its stored spec.
+
+
+### Task effort is measured, not budgeted
+
+Durable work has no predicted token, iteration or task-runtime allowance. Usage
+is recorded across attempts and restarts so task effort can be learned from
+actual results. Plans do not reserve parent estimates or ask for token top-ups.
+Legacy execution-budget stops are retired by the controller, preserving usage,
+evidence, independent consent and unresolved questions. Exact reviewed templates
+ignore retired execution estimates while preserving scope and recovery policy.
+
+Finite failure-recovery rungs, repeated-outcome and no-progress checks remain.
+Model context windows, process/transport/lease timeouts, actual account capacity,
+explicit schedule frequency and owner permission boundaries remain in force.

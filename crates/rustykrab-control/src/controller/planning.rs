@@ -74,22 +74,13 @@ impl Controller {
         self.registry.workers().iter().any(|w| plans(w.as_ref()))
     }
 
-    /// The budget of a planned request that named none: an envelope for a
-    /// graph of the caps' size, since a parent's budget bounds its
-    /// children's (4.2).
+    /// Keep recovery policy while retiring execution estimates on planned roots.
     fn plan_envelope(&self) -> Budget {
-        let d = self.config.default_budget;
-        let n = self.config.caps.max_items.max(1);
-        Budget {
-            iterations: d.iterations.saturating_mul(n),
-            tokens: d.tokens.saturating_mul(u64::from(n)),
-            wall_seconds: d.wall_seconds.saturating_mul(u64::from(n)),
-            ..d
-        }
+        self.config.default_budget.without_execution_limits()
     }
 
-    /// Shape a filing before validation: a planned request gets an envelope
-    /// budget, and a planner's graph attaches beneath its request behind
+    /// Shape a filing before validation: a planned request gets the recovery
+    /// policy, and a planner's graph attaches beneath its request behind
     /// the planning item (6.1).
     pub(super) fn shape_filing(
         &self,
@@ -181,11 +172,11 @@ impl Controller {
                     request.id
                 ),
                 format!(
-                    "At most {} items and {} levels; budgets sum within the root's.",
+                    "At most {} items and {} levels; split by useful deliverables and dependencies.",
                     caps.max_items, caps.max_depth
                 ),
                 "Break large work into small, verifiable execution slices that fit one run. \
-                 A context, token or turn budget is a reason to split even when the same \
+                 A context-window limit is a reason to split even when the same \
                  worker could do every step. Give each slice a precise done_when and \
                  inspection pointers; order dependent slices with blocks and inputs_from, \
                  leave independent work parallel, and keep shared writable resources ordered."
@@ -390,28 +381,7 @@ impl Controller {
         constraints: Vec<String>,
         artifact_refs: Vec<ArtifactRef>,
     ) -> Result<WorkItemId, Rejection> {
-        // Re-planning shares the parent's remaining envelope with earlier runs.
-        // A small planning run is preferable to exceeding that envelope.
-        let available = self
-            .remaining_budgets(&b.snap)
-            .get(&parent.id)
-            .copied()
-            .unwrap_or(parent.budget);
-        let mut budget = self.config.plan_budget;
-        budget.iterations = budget.iterations.min(available.iterations);
-        budget.tokens = budget.tokens.min(available.tokens);
-        budget.wall_seconds = budget.wall_seconds.min(available.wall_seconds);
-        if budget.iterations == 0 || budget.tokens == 0 || budget.wall_seconds == 0 {
-            return Err(Rejection {
-                failed: vec![crate::graph::Failure {
-                    check: crate::graph::Check::Reason(
-                        rustykrab_core::work::RejectionReason::OverBudget,
-                    ),
-                    offending: vec![ItemRef::Id(parent.id.clone())],
-                    detail: "the parent has no budget left for a planning run".into(),
-                }],
-            });
-        }
+        let budget = self.config.plan_budget.without_execution_limits();
         let tmp = "replan".to_string();
         let plan = WorkPlan {
             root: ItemRef::Id(parent.id.clone()),

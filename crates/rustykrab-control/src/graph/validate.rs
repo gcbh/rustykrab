@@ -13,7 +13,6 @@
 //! the edges `supersedes` re-points (4.4).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::work::{
@@ -76,7 +75,7 @@ pub struct ApprovalPolicy {
     pub id: Option<String>,
     /// More new items than this holds the whole graph.
     pub max_items: Option<u32>,
-    /// More tokens across the new leaves' budgets than this holds the whole
+    /// Legacy serialized setting, ignored: execution estimates no longer hold the
     /// graph.
     pub max_total_tokens: Option<u64>,
     /// The writable resources the user has delegated. `Some`: an item
@@ -117,7 +116,6 @@ impl ApprovalPolicy {
     /// fired none was a decision the policy made.
     pub fn evaluates(&self) -> bool {
         self.max_items.is_some()
-            || self.max_total_tokens.is_some()
             || self.delegated_resources.is_some()
             || self.authorized_slices.is_some()
             || !self.consent_resources.is_empty()
@@ -182,12 +180,9 @@ pub struct FilingContext {
     pub approval: ApprovalPolicy,
     /// Repository writers may execute independently in controller-owned worktrees.
     pub isolated_repo_writes: bool,
-    /// The budget of a new item that names none and sits under no parent,
-    /// and the per-item ceiling of a share of a parent's remainder.
+    /// Default recovery policy for a new item; execution estimates are ignored.
     pub default_budget: Budget,
-    /// What existing parents have left, from the controller's spend
-    /// records. A parent missing here has its budget less the budgets of
-    /// its open children.
+    /// Legacy compatibility field; estimates do not reserve parent capacity.
     pub remaining_budget: BTreeMap<WorkItemId, Budget>,
     /// Stamped on every new item.
     pub origin_conversation_id: Option<String>,
@@ -418,11 +413,10 @@ pub fn review_scope_violation(draft: &rustykrab_core::work::WorkItemDraft) -> Op
 /// | Check | Reason |
 /// |---|---|
 /// | every ref is a temp id of this call or an item the caller may see; temp ids unique | `unknown_ref`, `duplicate_tmp` |
-/// | each draft has a title, objective and `done_when`, sets no field its path may not (`plan: true` outside `work_file`), names a usable budget, and a target has one replacement | `invalid_item` |
+/// | each draft has a title, objective and `done_when`, sets no field its path may not (`plan: true` outside `work_file`), and a target has one replacement | `invalid_item` |
 /// | the root, existing parents and supersede targets sit under the caller's scope | `out_of_scope` |
 /// | no cycle over every edge kind and parent link, a parent depending on each child and each child inheriting its parent's ordering edges; no ordering edge between an item and its own ancestor or descendant | `cycle` |
 /// | parent-tree depth and open items under the root within the caps | `depth_exceeded`, `too_many_items` |
-/// | children's budgets within the parent's (remaining) budget | `over_budget` |
 /// | a plan B has no other ordering edge, and no `blocks` or `waits_for` edge names an unreleased plan B | `plan_b_edges` |
 /// | an ordering edge onto an existing item only while it waits; no new child under a verifying parent or an active leaf | `edge_onto_active` |
 /// | every `inputs_from` entry is an item the downstream is ordered after | `input_unordered` |
@@ -511,7 +505,6 @@ pub fn validate(snap: &Snapshot, plan: &WorkPlan, ctx: &FilingContext) -> Valida
     run.check_cycles(&work, &touched);
     run.check_depth(&work);
     run.check_count(&work, root.as_deref());
-    run.fill_budgets(&mut work, &parents);
     run.check_plan_b(&work, &touched);
     let mut dead = run.check_onto_active(&new_edges, &parents);
     run.default_inputs(&mut work);
@@ -849,15 +842,6 @@ impl<'a> Run<'a> {
                     "`plan: true` belongs to work_file; an item of a graph is already planned",
                 );
             }
-            if let Some(b) = &draft.budget {
-                if b.iterations == 0 || b.tokens == 0 || b.wall_seconds == 0 {
-                    self.fail(
-                        RejectionReason::InvalidItem,
-                        vec![label.clone()],
-                        "a budget needs iterations, tokens and wall seconds",
-                    );
-                }
-            }
             // Section 10's scope limit: a proposal touching policy,
             // credentials, the controller, the ladder budgets or the
             // system's own measurement is filed only at the highest review
@@ -954,7 +938,10 @@ impl<'a> Run<'a> {
             trigger: d.trigger.clone(),
             preconditions: d.preconditions.clone(),
             expires_at: d.expires_at,
-            budget: d.budget.unwrap_or(self.ctx.default_budget),
+            budget: d
+                .budget
+                .unwrap_or(self.ctx.default_budget)
+                .without_execution_limits(),
             priority: d.priority,
             status: Status::Queued,
             status_origin: None,
@@ -1105,85 +1092,6 @@ impl<'a> Run<'a> {
                 offending,
                 format!("{count} open items in the tree; the cap is {max}"),
             );
-        }
-    }
-
-    /// Check each parent's envelope (4.2) and fill the budgets of drafts
-    /// that named none with an equal share of what is left, capped at the
-    /// default budget.
-    fn fill_budgets(&mut self, work: &mut Snapshot, parents: &[Option<WorkItemId>]) {
-        let mut groups: Vec<(WorkItemId, Vec<usize>)> = Vec::new();
-        for (i, parent) in parents.iter().enumerate() {
-            let Some(p) = parent else {
-                continue;
-            };
-            match groups.iter_mut().find(|(q, _)| q == p) {
-                Some((_, kids)) => kids.push(i),
-                None => groups.push((p.clone(), vec![i])),
-            }
-        }
-        groups.sort_by_key(|(p, _)| work.ancestors(p).len());
-
-        for (p, kids) in groups {
-            let Some(row) = work.item(&p) else {
-                continue;
-            };
-            let remaining = if self.fresh.contains(&p) {
-                Envelope::of(&row.budget)
-            } else if let Some(b) = self.ctx.remaining_budget.get(&p) {
-                Envelope::of(b)
-            } else {
-                let committed = work
-                    .children(&p)
-                    .iter()
-                    .filter(|c| !self.fresh.contains(*c))
-                    .filter_map(|c| work.item(c))
-                    .filter(|c| !c.status.is_closed())
-                    .fold(Envelope::default(), |acc, c| {
-                        acc.plus(Envelope::of(&c.budget))
-                    });
-                Envelope::of(&row.budget).minus(committed)
-            };
-            let (explicit, unbudgeted): (Vec<usize>, Vec<usize>) = kids
-                .iter()
-                .partition(|&&i| self.plan.items[i].budget.is_some());
-            let asked = explicit
-                .iter()
-                .filter_map(|&i| self.plan.items[i].budget.as_ref())
-                .fold(Envelope::default(), |acc, b| acc.plus(Envelope::of(b)));
-            if !asked.fits_in(remaining) {
-                let offending = explicit.iter().map(|&i| self.label(&self.ids[i])).collect();
-                self.fail(
-                    RejectionReason::OverBudget,
-                    offending,
-                    format!("the children ask for {asked}; {p} has {remaining} left"),
-                );
-                continue;
-            }
-            if unbudgeted.is_empty() {
-                continue;
-            }
-            let share = remaining
-                .minus(asked)
-                .share(unbudgeted.len())
-                .min(Envelope::of(&self.ctx.default_budget));
-            if share.any_zero() {
-                let offending = unbudgeted
-                    .iter()
-                    .map(|&i| self.label(&self.ids[i]))
-                    .collect();
-                self.fail(
-                    RejectionReason::OverBudget,
-                    offending,
-                    format!("nothing is left of {p}'s budget for the items that name none"),
-                );
-                continue;
-            }
-            for &i in &unbudgeted {
-                if let Some(item) = work.item_mut(&self.ids[i]) {
-                    item.budget = share.budget(self.ctx.default_budget);
-                }
-            }
         }
     }
 
@@ -1625,7 +1533,7 @@ fn unreleased_plan_b(work: &Snapshot, id: &str) -> bool {
 }
 
 /// The approval holds of 6.1 over the new items: the whole graph for the
-/// item-count and budget triggers, else each triggering item with what
+/// item-count triggers, else each triggering item with what
 /// depends on it (through ordering edges and parent links).
 fn approve(
     work: &Snapshot,
@@ -1659,13 +1567,6 @@ fn approve(
         .filter(|id| !work.has_children(id))
         .filter_map(|id| work.item(id))
         .collect();
-    let tokens: u64 = leaves.iter().map(|i| i.budget.tokens).sum();
-    if let Some(threshold) = policy.max_total_tokens {
-        if tokens > threshold {
-            triggers.push(ApprovalTrigger::Budget { tokens, threshold });
-            whole = true;
-        }
-    }
     let mut seeds: Vec<WorkItemId> = Vec::new();
     for item in &leaves {
         if let Some(delegated) = &policy.delegated_resources {
@@ -1730,86 +1631,5 @@ fn describe(r: &ItemRef) -> String {
     match r {
         ItemRef::Id(id) => id.clone(),
         ItemRef::Tmp { tmp } => tmp.clone(),
-    }
-}
-
-/// The parts of a [`Budget`] a parent's envelope bounds (4.2): iterations,
-/// tokens and wall time. Repairs and rung budgets are per item.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Envelope {
-    iterations: u64,
-    tokens: u64,
-    wall_seconds: u64,
-}
-
-impl Envelope {
-    fn of(b: &Budget) -> Envelope {
-        Envelope {
-            iterations: u64::from(b.iterations),
-            tokens: b.tokens,
-            wall_seconds: b.wall_seconds,
-        }
-    }
-
-    fn plus(self, o: Envelope) -> Envelope {
-        Envelope {
-            iterations: self.iterations.saturating_add(o.iterations),
-            tokens: self.tokens.saturating_add(o.tokens),
-            wall_seconds: self.wall_seconds.saturating_add(o.wall_seconds),
-        }
-    }
-
-    fn minus(self, o: Envelope) -> Envelope {
-        Envelope {
-            iterations: self.iterations.saturating_sub(o.iterations),
-            tokens: self.tokens.saturating_sub(o.tokens),
-            wall_seconds: self.wall_seconds.saturating_sub(o.wall_seconds),
-        }
-    }
-
-    fn fits_in(self, o: Envelope) -> bool {
-        self.iterations <= o.iterations
-            && self.tokens <= o.tokens
-            && self.wall_seconds <= o.wall_seconds
-    }
-
-    fn share(self, n: usize) -> Envelope {
-        let n = n.max(1) as u64;
-        Envelope {
-            iterations: self.iterations / n,
-            tokens: self.tokens / n,
-            wall_seconds: self.wall_seconds / n,
-        }
-    }
-
-    fn min(self, o: Envelope) -> Envelope {
-        Envelope {
-            iterations: self.iterations.min(o.iterations),
-            tokens: self.tokens.min(o.tokens),
-            wall_seconds: self.wall_seconds.min(o.wall_seconds),
-        }
-    }
-
-    fn any_zero(self) -> bool {
-        self.iterations == 0 || self.tokens == 0 || self.wall_seconds == 0
-    }
-
-    fn budget(self, base: Budget) -> Budget {
-        Budget {
-            iterations: u32::try_from(self.iterations).unwrap_or(u32::MAX),
-            tokens: self.tokens,
-            wall_seconds: self.wall_seconds,
-            ..base
-        }
-    }
-}
-
-impl fmt::Display for Envelope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} iterations, {} tokens, {}s",
-            self.iterations, self.tokens, self.wall_seconds
-        )
     }
 }

@@ -81,10 +81,10 @@ impl Tool for WorkPlanTool {
 
     fn description(&self) -> &str {
         "File the WHOLE graph for a multi-step request in ONE call: items (each with a tmp \
-         name, title, objective, done_when, and a budget), typed edges ({item, kind: blocks | \
+         name, title, objective and done_when), typed edges ({item, kind: blocks | \
          waits_for | conditional_on_failure | supersedes, depends_on}) and parent links. Refer \
          to new items as {\"tmp\": name} and existing ones by id. Break large work into small, \
-         verifiable execution slices within each run's context and budget. Use blocks and \
+         verifiable execution slices with clear inputs and outputs. Use blocks and \
          inputs_from for dependent slices; independent tasks may run in parallel, while \
          tasks sharing writable resources stay ordered. The parent retains the whole \
          request's done_when. Write every title as a plain-language action and subject; \
@@ -106,7 +106,7 @@ impl Tool for WorkPlanTool {
                     },
                     "items": {
                         "type": "array",
-                        "description": "The new items. Each: tmp, title, objective, done_when, budget {iterations, tokens, wall_seconds, repairs}; optional parent ({\"tmp\"} or id), kind (personal | research), constraints, decisions_made, artifact_refs, required_tools, writable_resources, inputs_from, trigger, expires_at, priority.",
+                        "description": "The new items. Each: tmp, title, objective, done_when; optional parent ({\"tmp\"} or id), kind (personal | research), constraints, decisions_made, artifact_refs, required_tools, writable_resources, inputs_from, trigger, expires_at, priority.",
                         "items": { "type": "object" }
                     },
                     "edges": {

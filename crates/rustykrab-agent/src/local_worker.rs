@@ -44,8 +44,8 @@
 //!
 //! `run` returns the [`ResultReport`] the run's `result_report` call handed
 //! the injected [`WorkBackend`], exactly as the backend received it. A run
-//! that ends without one returns a typed [`RunFailure`] (a spent iteration or
-//! wall budget, nothing at all from the model, prose with no report), and a
+//! that ends without one returns a typed [`RunFailure`] (persistent unchanged
+//! tool evidence, nothing from the model or prose with no report), and a
 //! provider error passes through unchanged; the controller reads either with
 //! [`rustykrab_control::worker::run_failure_input`].
 
@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use rustykrab_control::capability_proof::OPERATION_PROBE;
-use rustykrab_control::errors::{BudgetKind, GapKind, ProviderProblem};
+use rustykrab_control::errors::{GapKind, ProviderProblem};
 use rustykrab_control::progress::{StepLedger, DEFAULT_STALL_STEPS};
 use rustykrab_control::worker::{
     Brief, RunFailure, RunUsage, Worker, WorkerCapabilities, COMMAND_RUN,
@@ -1280,18 +1280,15 @@ impl LocalWorker {
         let provider: Arc<dyn ModelProvider> = Arc::new(MeteredProvider::new(
             self.provider.clone(),
             spending.meter.clone(),
-            brief.budget.tokens,
             ledger.clone(),
         ));
 
         let profile = profile_for(&self.definition, self.provider.as_ref());
-        let max_iterations = profile
-            .max_iterations
-            .min(usize::try_from(brief.budget.iterations).unwrap_or(usize::MAX))
-            .max(1);
+        // Zero disables arbitrary task iteration caps; StepLedger detects loops.
+        let max_iterations = 0;
         let config = AgentConfig {
             max_iterations,
-            // No budget warnings: the controller owns the budget.
+            // Usage is measured; no task estimate produces warnings or stops.
             soft_iteration_warning: 0,
             result_report_reminder: self
                 .result_report_reminder
@@ -1331,16 +1328,8 @@ impl LocalWorker {
             item: brief.item.clone(),
             actor: format!("worker:{}", self.name),
         };
-        let wall = brief.budget.wall_seconds;
         let run = WORK_RUN_CONTEXT.scope(binding, runner.run_traced(&mut conv, &session, &tracer));
-        // `None`: the wall budget ran out and the run was dropped mid-step.
-        let ended = match wall {
-            0 => Some(run.await),
-            secs => tokio::time::timeout(Duration::from_secs(secs), run)
-                .await
-                .ok(),
-        };
-        let stalled = ledger.lock().unwrap_or_else(|e| e.into_inner()).stalled();
+        let ended = run.await;
 
         *spending.wall.lock().unwrap_or_else(|e| e.into_inner()) = Some(spending.started.elapsed());
         self.keep(&conv).await;
@@ -1406,10 +1395,7 @@ impl LocalWorker {
         // A run that stopped on text gave its answer (feather's rule): the
         // text is the report, filed through the backend `result_report`
         // uses, so attestation and the controller see it the same way.
-        if matches!(ended, Some(Ok(())))
-            && !tracer.iteration_limit_reached()
-            && !tracer.ended_by_tool()
-        {
+        if matches!(ended, Ok(())) && !tracer.iteration_limit_reached() && !tracer.ended_by_tool() {
             if let Some(text) = last_assistant_text(&conv) {
                 let provenance = Provenance {
                     conversation_id: Some(conv_id.to_string()),
@@ -1426,35 +1412,8 @@ impl LocalWorker {
             }
         }
         let failure = match ended {
-            None => RunFailure::Budget {
-                budget: BudgetKind::Wall,
-                detail: format!(
-                    "{wall}s wall budget spent after {} iterations, before result_report",
-                    stats.iterations
-                ),
-            },
-            // A provider or runner error: classified as the core reports it.
-            Some(Err(e)) => return Err(e),
-            // Told it was repeating itself, the run went on to its cap: the
-            // loop is why, and the repair run gets the ledger's evidence.
-            Some(Ok(())) if tracer.iteration_limit_reached() => match stalled {
-                Some(stall) => RunFailure::Model {
-                    problem: ProviderProblem::Loop,
-                    detail: format!(
-                        "{max_iterations} iterations used without result_report; {}",
-                        stall.detail()
-                    ),
-                },
-                None => RunFailure::Budget {
-                    budget: BudgetKind::Iterations,
-                    detail: format!(
-                        "{max_iterations} iterations used without result_report \
-                         ({} reminders)",
-                        stats.reminders
-                    ),
-                },
-            },
-            Some(Ok(())) => RunFailure::Model {
+            Err(e) => return Err(e),
+            Ok(()) => RunFailure::Model {
                 problem: ProviderProblem::Empty,
                 detail: format!(
                     "the model stopped with no text and no result_report \
@@ -1646,7 +1605,7 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
              repository root, exactly the files the commit changes. Inspection without edits reports a null commit and no changed paths."
         );
     }
-    let _ = writeln!(out, "budget: {} steps", brief.budget.iterations);
+    out.push_str("Execution usage is recorded; there is no per-task token, iteration or runtime allowance. Continue useful progress, change approach after repeated evidence, and report actual results.\n");
     if let Some(origin) = &brief.origin_conversation_id {
         let _ = writeln!(out, "origin_conversation: {origin}");
     }
@@ -2895,32 +2854,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_that_never_reports_ends_with_a_classifiable_error() {
-        // The iteration budget runs out.
+        // Historical iteration estimates do not stop useful execution.
         let provider = Recording::new(vec![
             call("noop", json!({})),
             call("noop", json!({})),
             call("noop", json!({})),
+            report("measured work completed"),
         ]);
         let (w, stub) = worker(provider.clone(), vec![Arc::new(Named("noop"))]);
         let mut b = brief("item-1");
         b.budget.iterations = 2;
-        let err = w.run(b).await.unwrap_err();
-        assert!(
-            matches!(
-                RunFailure::from_error(&err),
-                Some(RunFailure::Budget {
-                    budget: BudgetKind::Iterations,
-                    ..
-                })
-            ),
-            "{err}"
-        );
-        assert_eq!(
-            classified(&err),
-            (ErrorClass::Budget, ErrorSubclass::Iterations)
-        );
-        assert_eq!(provider.requests().len(), 2);
-        assert!(stub.calls().is_empty());
+        assert_eq!(w.run(b).await.unwrap().summary, "measured work completed");
+        assert_eq!(provider.requests().len(), 4);
+        assert!(!stub.calls().is_empty());
 
         // Prose to every reminder: once they run out, the prose is the answer.
         let provider = Recording::new(
@@ -2955,14 +2901,13 @@ mod tests {
         assert!(matches!(err, Error::ModelEmptyResponse(_)), "{err:?}");
         assert_eq!(classified(&err), (ErrorClass::Model, ErrorSubclass::Empty));
 
-        // The wall budget runs out mid-call.
+        // A legacy task wall estimate does not cut off an otherwise healthy call.
         let provider = Recording::slow(vec![report("too late")], Duration::from_secs(5));
         let (w, stub) = worker(provider, Vec::new());
         let mut b = brief("item-5");
         b.budget.wall_seconds = 1;
-        let err = w.run(b).await.unwrap_err();
-        assert_eq!(classified(&err), (ErrorClass::Budget, ErrorSubclass::Wall));
-        assert!(stub.calls().is_empty());
+        assert_eq!(w.run(b).await.unwrap().summary, "too late");
+        assert!(!stub.calls().is_empty());
     }
 
     /// Plan section 8, order 2: a worker that keeps searching for a tool
@@ -3850,7 +3795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_autonomy_tokens_stop_further_model_calls_and_retain_actual_spend() {
+    async fn task_token_estimates_do_not_stop_calls_and_actual_usage_is_retained() {
         let provider = Recording::new(vec![
             costing(call("noop", json!({})), 700),
             costing(call("noop", json!({})), 700),
@@ -3863,20 +3808,12 @@ mod tests {
         b.run = Some(Uuid::new_v4().to_string());
         let run = b.run.clone().unwrap();
 
-        let err = w.run(b).await.unwrap_err();
+        assert_eq!(w.run(b).await.unwrap().summary, "done");
+        assert_eq!(provider.requests().len(), 3);
+        let usage = w.usage(&run).expect("the run's observed usage");
         assert_eq!(
-            classified(&err),
-            (ErrorClass::Budget, ErrorSubclass::Tokens)
-        );
-        assert_eq!(
-            provider.requests().len(),
-            2,
-            "do not start a third paid request"
-        );
-        let usage = w.usage(&run).expect("the run's spend");
-        assert_eq!(
-            usage.tokens, 1_400,
-            "retain even the final call's overshoot"
+            usage.tokens, 2_100,
+            "all calls count beyond the old estimate"
         );
         assert_eq!(w.usage(&run), None, "taken once");
     }
@@ -4202,7 +4139,7 @@ mod tests {
             "repair: an earlier attempt at this item failed\n",
             "  last_error: tool/timeout: carrier site timed out\n",
             "  prior_evidence: [path:notes/attempt-1.md]\n",
-            "budget: 100 steps\n",
+            "Execution usage is recorded; there is no per-task token, iteration or runtime allowance.",
             "origin_conversation: conv-1\n",
         ] {
             assert!(r.contains(line), "missing {line:?} in:\n{r}");

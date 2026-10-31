@@ -402,14 +402,12 @@ async fn exercise(self_correct: bool) {
     let switches = alternate.seen.lock().unwrap().clone();
     assert_eq!(switches.len(), usize::from(!self_correct));
     if let Some(brief) = switches.first() {
-        let row = store.work_get(repair_id).await.unwrap().unwrap();
+        assert_eq!(brief.budget.tokens, 0);
+        assert_eq!(brief.budget.iterations, 0);
+        assert_eq!(brief.budget.wall_seconds, 0);
         assert!(
-            brief.budget.tokens < row.budget.tokens,
-            "handoff retains prior spending"
-        );
-        assert!(
-            brief.budget.tokens > 0,
-            "bounded no-progress leaves capacity for another executor"
+            store.work_spend_of(repair_id).await.unwrap().tokens >= 600,
+            "handoff retains observed usage without withholding execution"
         );
     }
     assert!(
