@@ -39,7 +39,7 @@ use rustykrab_control::worker::Brief;
 use rustykrab_control::Provenance;
 use rustykrab_core::types::Conversation;
 use rustykrab_core::work::{
-    ArtifactRef, Budget, Evidence, PlanOutcome, Status, Trigger, WorkItem, WorkItemDraft, WorkKind,
+    ArtifactRef, Evidence, PlanOutcome, Status, Trigger, WorkItem, WorkItemDraft, WorkKind,
     WorkerKind,
 };
 use rustykrab_gateway::AppState;
@@ -66,19 +66,6 @@ const ACTOR: &str = "scheduler";
 /// controller cannot lease it before its job points at it (the job's link
 /// is what runs it in the job's conversation).
 const LINK_MARGIN: TimeDelta = TimeDelta::seconds(2);
-
-/// A firing's budget: a job run has always had the profile's iterations and
-/// no token or time cap of its own. Keep a generous but finite envelope
-/// within the default standing judgment, so every normal firing does not
-/// create a fresh plan approval. A tighter user policy still applies.
-fn firing_budget() -> Budget {
-    Budget {
-        iterations: 200,
-        tokens: 1_000_000,
-        wall_seconds: 3_600,
-        ..Budget::default()
-    }
-}
 
 /// Whether the switch is on.
 pub(crate) fn enabled() -> bool {
@@ -288,7 +275,12 @@ async fn file(
         writable_resources: execution.writable_resources,
         constraints: execution.constraints,
         trigger: Trigger::At(job.next_run_at.max(now + LINK_MARGIN)),
-        budget: Some(execution.budget.unwrap_or_else(firing_budget)),
+        budget: Some(
+            execution
+                .budget
+                .unwrap_or_default()
+                .without_execution_limits(),
+        ),
         ..WorkItemDraft::default()
     };
     let provenance = Provenance {

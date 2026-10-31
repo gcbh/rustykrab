@@ -254,17 +254,6 @@ fn assess(
                     Some(&lease.worker),
                 ));
             }
-            if i.budget.wall_seconds > 0
-                && (now - lease.since).num_seconds().max(0) as u64 > i.budget.wall_seconds
-            {
-                out.push(alert(
-                    "critical",
-                    "run_over_budget",
-                    format!("{} is past its wall-time budget.", i.title),
-                    Some(&i.id),
-                    Some(&lease.worker),
-                ));
-            }
         } else if row.children == 0 && i.status.is_active() {
             out.push(alert(
                 "critical",

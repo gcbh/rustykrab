@@ -45,12 +45,12 @@
 //! including request-only formats, as `command_run` artifacts (a model-written
 //! `command_run` is dropped), which is the evidence the controller checks
 //! `checks_run` against. A run that ends without a contract is a typed
-//! [`RunFailure`]: the timeout `budget/wall`, a failed process
+//! [`RunFailure`]: an operational `tool/timeout`, a failed process
 //! `process/<code>`, an unreadable final message `model/format`.
 //!
 //! **No turn budget.** A run is not capped in turns: the agent works until
 //! it returns its final message, in its own harness, and the wall limit
-//! (the worker's timeout, or the brief's wall budget when smaller) is the
+//! (the worker's operational process timeout) is the
 //! only stop. A Claude Code cap (`--max-turns`, 30 a round) used to end runs
 //! mid-work, resume them in rounds and finally ask for a contract; it
 //! limited nothing the wall limit did not, and cut work short.
@@ -89,7 +89,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rustykrab_control::capability_proof::OPERATION_PROBE;
-use rustykrab_control::errors::{BudgetKind, PolicyStop, ProviderProblem};
+use rustykrab_control::errors::{PolicyStop, ProviderProblem};
 use rustykrab_control::registry::WorkerSpec;
 use rustykrab_control::routing::built_tool;
 use rustykrab_control::worker::{
@@ -1051,15 +1051,11 @@ impl ExternalWorker {
                     stdout: taken(&stdout),
                     stderr: taken(&stderr),
                 });
-                let failure = RunFailure::Budget {
-                    budget: BudgetKind::Wall,
-                    detail: format!(
-                        "{}s wall budget spent before {} returned",
-                        limit.as_secs(),
-                        self.config.command.display()
-                    ),
-                }
-                .into_error();
+                let failure = Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
+                    "{}s process timeout before {} returned",
+                    limit.as_secs(),
+                    self.config.command.display()
+                )));
                 (Err(failure), partial, interrupted)
             }
         }
@@ -1351,10 +1347,8 @@ impl Worker for ExternalWorker {
             uuid::Uuid::new_v4()
         ));
         let cmd = self.command(&prompt, &dir, &brief, &last);
-        let limit = match brief.budget.wall_seconds {
-            0 => self.config.timeout,
-            secs => self.config.timeout.min(Duration::from_secs(secs)),
-        };
+        // The host process/transport timeout is operational, never a task estimate.
+        let limit = self.config.timeout;
         let started = std::time::Instant::now();
         prune_files(&self.logs_root(), RUN_LOG_RETENTION);
         let (executed, partial, interrupted) = self.execute(cmd, limit).await;
@@ -1563,9 +1557,11 @@ fn read_claude(stdout: &str) -> Transcript {
                 };
                 let subtype = event["subtype"].as_str().unwrap_or("success");
                 if subtype == "error_max_turns" {
-                    t.failure = Some(RunFailure::Budget {
-                        budget: BudgetKind::Iterations,
-                        detail: format!("claude stopped at its turn cap after {turns} turns"),
+                    t.failure = Some(RunFailure::Process {
+                        code: None,
+                        stderr_tail: format!(
+                            "claude reported its own turn limit after {turns} turns"
+                        ),
                     });
                 } else if subtype != "success" || event["is_error"] == true {
                     t.failure = Some(RunFailure::Process {
@@ -2632,7 +2628,7 @@ wait
             "killed, not waited"
         );
         let e = classify(&run_failure_input(&err), &Context::default());
-        assert_eq!(e.subclass, ErrorSubclass::Wall);
+        assert_eq!(e.subclass, ErrorSubclass::Timeout);
         let text = std::fs::read_to_string(worker.run_log("run-1").unwrap()).unwrap();
         let partial = text
             .lines()
@@ -2690,8 +2686,10 @@ wait
             .run(brief(None))
             .await
             .unwrap_err();
-        let e = classify(&run_failure_input(&err), &Context::default());
-        assert_eq!(e.subclass, ErrorSubclass::Iterations);
+        assert!(matches!(
+            RunFailure::from_error(&err),
+            Some(RunFailure::Process { .. })
+        ));
 
         let slow = f.agent("slow", "#!/bin/sh\nsleep 30\n");
         let mut worker = f.worker(WorkerKind::ClaudeCode, slow);
@@ -2703,7 +2701,7 @@ wait
             "killed, not waited"
         );
         let e = classify(&run_failure_input(&err), &Context::default());
-        assert_eq!(e.subclass, ErrorSubclass::Wall);
+        assert_eq!(e.subclass, ErrorSubclass::Timeout);
 
         let broken = f.agent(
             "broken",

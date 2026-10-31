@@ -25,6 +25,11 @@ regressions address those paths. Automatic reasoning-manager intervention,
 semantic progress assessment and effective live original-goal recovery remain
 unverified or unimplemented; they are not closed by fixture completion.
 
+The 2026-10-31 [usage-only follow-up](05-first-pass-outcome.md#retiring-predicted-task-budgets-2026-10-31)
+retires the estimated task-budget gate after owner top-ups reblocked below the
+same historical usage without running. Finite no-progress recovery and actual
+usage remain. Implementation tests do not establish deployment or live recovery.
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

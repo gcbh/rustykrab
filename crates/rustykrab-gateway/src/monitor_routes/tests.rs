@@ -526,7 +526,7 @@ async fn lease_loss_wall_budget_and_expected_questions_are_reported_without_clai
     assert!(alerts
         .iter()
         .any(|a| a.code == "lease_expired" && a.worker.as_deref() == Some("pinch")));
-    assert!(alerts.iter().any(|a| a.code == "run_over_budget"));
+    assert!(!alerts.iter().any(|a| a.code == "run_over_budget"));
     work.items[0].lease = None;
     assert!(assess(control.loop_status().as_ref(), &[], &work, now)
         .iter()

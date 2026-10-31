@@ -38,7 +38,7 @@ use super::load::{history, ladder_from, ESCALATING_ABOVE, REPLAYED, ROUTED_FOR, 
 use super::notice::{label, Cause};
 use super::proof::CapabilityVerdict;
 use super::questions::NewQuestion;
-use super::spend::{exhausted, CUMULATIVE_GUARD};
+use super::spend::CUMULATIVE_GUARD;
 use super::{Controller, Finished, Run, RunResult};
 
 /// Moves the ladder may make on one failure before it must surface: the
@@ -102,7 +102,7 @@ pub(super) fn surface_reason(error: &WorkError, why: SurfaceReason) -> BlockedRe
         };
     }
     match error.class {
-        ErrorClass::Budget => BlockedReason::BudgetExhausted,
+        ErrorClass::Budget => BlockedReason::NeedsDecision,
         ErrorClass::Verification => BlockedReason::VerificationFailed,
         _ => BlockedReason::NeedsDecision,
     }
@@ -346,6 +346,7 @@ impl Controller {
         handoffs: Option<super::project_context::HandoffChecks>,
     ) -> Result<TickReport, Error> {
         self.apply_pending_answers_locked().await?;
+        self.retire_execution_budget_holds().await?;
         let now = self.clock.now();
         let first = !self.state().resumed;
         if first {
@@ -1347,61 +1348,6 @@ impl Controller {
         self.climb(b, item, worker, error).await
     }
 
-    /// The cumulative guard's stop (`spend.rs`): `item`, ready but with its
-    /// budget spent in `kind`, fails `budget/<kind>` observed by
-    /// [`CUMULATIVE_GUARD`], through the ladder like any failure, which
-    /// skips its own rungs for a spent budget and surfaces it as
-    /// `blocked(budget_exhausted)` with one question (a plan B or the
-    /// parent's re-plan first, inside a graph). Nothing is leased, nothing
-    /// runs and nothing is spent. Returns the transitions written.
-    async fn stop_spent(
-        &self,
-        item: &WorkItem,
-        kind: crate::errors::BudgetKind,
-        detail: String,
-    ) -> Result<usize, Error> {
-        let mut b = Batch::new(self.load().await?, self.clock.now());
-        let Some(item) = b
-            .snap
-            .item(&item.id)
-            .filter(|i| i.status == Status::Ready)
-            .cloned()
-        else {
-            return Ok(0);
-        };
-        let mut error = classify(
-            &FailureInput::BudgetExhausted {
-                budget: kind,
-                detail,
-            },
-            &Context {
-                tool: None,
-                worker_kind: None,
-            },
-        );
-        error.observed_by = CUMULATIVE_GUARD.to_string();
-        b.evidence.push(rustykrab_core::work::Evidence {
-            item: item.id.clone(),
-            kind: ERROR.to_string(),
-            reference: format!(
-                "{}/{}: {}",
-                error.class.as_str(),
-                error.subclass.as_str(),
-                error.detail
-            ),
-            hash: Some(error.fingerprint.clone()),
-            verified_by: Some(error.observed_by.clone()),
-            at: b.now,
-        });
-        tracing::info!(item = %item.id, detail = %error.detail, "cumulative budget spent: not leased");
-        let changed = self.climb(&mut b, &item, "controller", error).await?;
-        b.settle(changed);
-        Ok(self
-            .commit(b, &mut HashSet::new())
-            .await?
-            .map_or(0, |w| w.transitions))
-    }
-
     /// A block or a question only the user can answer (section 7): the
     /// item's plan B runs first when it has one (6.4); otherwise the item
     /// parks in its typed state and its root's notice asks.
@@ -2045,15 +1991,7 @@ impl Controller {
             {
                 continue;
             }
-            // The cumulative guard: what every earlier attempt spent is
-            // gone, however the item got back to ready. A spent budget is
-            // not leased; it fails `budget/*` and goes to the owner.
-            let allotments = self.allotments(&item.id).await?;
-            let (budget, spent) = self.cumulative_budget(&item, allotments);
-            if let Some((kind, detail)) = exhausted(&budget, &item.budget, allotments, spent) {
-                report.transitions += self.stop_spent(&item, kind, detail).await?;
-                continue;
-            }
+            let budget = item.budget.without_execution_limits();
             let events = self.store.work_events(&item.id).await?;
             let hist = self.activatable(history(&events));
             let mode = match item.kind {

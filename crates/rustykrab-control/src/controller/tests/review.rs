@@ -598,11 +598,6 @@ async fn template_drift_requires_another_decision() {
         value: "other-project".into(),
     }];
     variants.push(project);
-    let mut budget = d.clone();
-    let mut b = rustykrab_core::work::Budget::default();
-    b.tokens += 1;
-    budget.budget = Some(b);
-    variants.push(budget);
     let mut constraints = d;
     constraints.constraints.clear();
     variants.push(constraints);
@@ -694,7 +689,7 @@ async fn workers_and_failed_starts_cannot_leave_permissions() {
 }
 
 #[tokio::test]
-async fn accepted_proposal_preserves_reviewed_execution_limits() {
+async fn accepted_proposal_preserves_tools_and_recovery_policy_without_execution_estimates() {
     let h = Harness::new(&["pinch"]);
     let mut d = proposal("Small cleanup", None, None);
     let budget = rustykrab_core::work::Budget {
@@ -708,6 +703,6 @@ async fn accepted_proposal_preserves_reviewed_execution_limits() {
         .await
         .unwrap();
     let execution = h.item(&result.implementation.unwrap()).await;
-    assert_eq!(execution.budget, budget);
+    assert_eq!(execution.budget, budget.without_execution_limits());
     assert_eq!(execution.required_tools, vec!["web_fetch"]);
 }

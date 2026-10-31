@@ -1,6 +1,6 @@
 //! Read-only foreground demand through the controller's existing gates/matcher.
 //! Counts describe potential dispatches, not a new scheduling queue or grant.
-use super::{load::history, spend::exhausted, Controller};
+use super::{load::history, Controller};
 use crate::{
     graph,
     handle::{ControlHandle, DispatchDemand, LockState},
@@ -120,19 +120,13 @@ impl Controller {
             {
                 Some("preconditions".to_string())
             } else {
-                let allotments = self.allotments(&item.id).await?;
-                let (remaining, spent) = self.cumulative_budget(item, allotments);
-                if exhausted(&remaining, &item.budget, allotments, spent).is_some() {
-                    Some("cumulative_budget".to_string())
+                let events = self.store.work_events(&item.id).await?;
+                let history = history(&events);
+                if self.pick(item, &history, &load, &models, &busy).is_some() {
+                    dispatchable += 1;
+                    None
                 } else {
-                    let events = self.store.work_events(&item.id).await?;
-                    let history = history(&events);
-                    if self.pick(item, &history, &load, &models, &busy).is_some() {
-                        dispatchable += 1;
-                        None
-                    } else {
-                        Some("matcher_unavailable".to_string())
-                    }
+                    Some("matcher_unavailable".to_string())
                 }
             };
             if let Some(reason) = reason {

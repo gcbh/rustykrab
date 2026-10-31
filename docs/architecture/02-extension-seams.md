@@ -249,7 +249,7 @@ this adds no worker kind, model call, table or public trait.
 
 Project dreaming extends EvaluationHandle with defaulted observational status
 and bounded advancement on the existing serialized evaluator. Generation and
-meta-evaluation reuse Worker/ControlHandle with Research work, budgets, leases
+meta-evaluation reuse Worker/ControlHandle with Research work, recorded usage, leases
 and native CLI adapters; no model executor or execution queue is added.
 
 ## Work-manager additions (base 3e85f48, 2026-10-08)

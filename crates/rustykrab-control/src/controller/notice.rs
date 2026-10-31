@@ -340,17 +340,15 @@ pub(super) fn render(snap: &Snapshot, root: &str, data: &NoticeData, causes: &[C
 }
 
 /// The pushed plan preview (14.2, `work plan <id>`): each held item with
-/// its budget, worker kind, trigger and writable resources, the budget
-/// total against the root's, the planner's rationale and the policy.
+/// its worker kind, trigger and writable resources, rationale and policy.
 fn preview(
     snap: &Snapshot,
-    root: &str,
+    _root: &str,
     held: &[WorkItemId],
     rationale: &str,
     policy: Option<&str>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    let mut total: u64 = 0;
     for id in held.iter().take(LIST_MAX * 2) {
         let Some(item) = snap.item(id) else {
             continue;
@@ -359,13 +357,7 @@ fn preview(
             out.push(format!("- {} (a group)", label(item)));
             continue;
         }
-        total = total.saturating_add(item.budget.tokens);
-        let mut line = format!(
-            "- {}: {} tokens, worker {}",
-            label(item),
-            item.budget.tokens,
-            item.worker_kind.as_str()
-        );
+        let mut line = format!("- {}: worker {}", label(item), item.worker_kind.as_str());
         if !item.writable_resources.is_empty() {
             line.push_str(&format!(", writes {}", item.writable_resources.join(", ")));
         }
@@ -373,12 +365,6 @@ fn preview(
             line.push_str(&format!(" {}", why_waiting(snap, item)));
         }
         out.push(line);
-    }
-    if let Some(r) = snap.item(root) {
-        out.push(format!(
-            "Held budget: {total} tokens of the root's {}.",
-            r.budget.tokens
-        ));
     }
     if !rationale.trim().is_empty() {
         out.push(format!("Rationale: {}", clip(rationale, 200)));

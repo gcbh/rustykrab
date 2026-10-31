@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.15] - 2026-10-31
+
+- Remove task execution budgets and retain observed usage (#740)
+
 ## [6.6.14] - 2026-10-28
 
 - Let workers own execution and recover from persistent loops (#739)

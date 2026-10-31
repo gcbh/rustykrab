@@ -17,8 +17,8 @@ use chrono::{DateTime, Utc};
 use rustykrab_core::active_tools::with_session_context;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::work::{
-    ArtifactRef, Budget, DraftEdge, EdgeKind, FailedCheck, ItemRef, PlanOutcome, RejectionReason,
-    Trigger, WorkItemDraft, WorkKind, WorkerKind,
+    ArtifactRef, DraftEdge, EdgeKind, FailedCheck, ItemRef, PlanOutcome, RejectionReason, Trigger,
+    WorkItemDraft, WorkKind, WorkerKind,
 };
 use rustykrab_core::{validate_tool_args, Error, Result, Tool, ToolError};
 use serde_json::{json, Map, Value};
@@ -85,6 +85,7 @@ pub(crate) fn strip_draft_categories(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("kind");
         object.remove("worker_kind");
+        object.remove("budget");
     }
 }
 
@@ -116,7 +117,6 @@ fn host_owned(key: &str) -> Option<&'static str> {
     match key {
         "status" | "reason" | "status_origin" => Some("the controller sets status"),
         "id" => Some("the host assigns ids; the result gives you the new id"),
-        "budget" => Some("the controller sets budgets"),
         "conversation_id"
         | "origin_conversation_id"
         | "filed_by_item"
@@ -546,9 +546,8 @@ pub(crate) fn parse_draft(
     if matches!(mode, DraftMode::Discovered { .. }) {
         allowed.push("tmp");
     }
-    if matches!(mode, DraftMode::Manager) {
-        allowed.push("budget");
-    }
+    // Accept but ignore old clients' task estimates; never advertise them.
+    allowed.push("budget");
     check_keys(obj, &allowed, path, out);
 
     let tmp = match mode {
@@ -795,14 +794,7 @@ pub(crate) fn parse_draft(
         }
     };
 
-    let budget = if matches!(mode, DraftMode::Manager) {
-        obj.get("budget").and_then(|v| match serde_json::from_value::<Budget>(v.clone()) {
-            Ok(b) if b.iterations > 0 && b.tokens > 0 && b.wall_seconds > 0 => Some(b),
-            _ => { out.push(Problem::invalid(path,"budget","requires positive iterations, tokens and wall_seconds, plus non-negative repairs")); None }
-        })
-    } else {
-        None
-    };
+    let budget = None; // retired execution estimates, including legacy payloads
 
     WorkItemDraft {
         tmp,
@@ -1026,7 +1018,7 @@ impl WorkFileTool {
     }
 
     /// Only the host exposes this tool to the interactive manager. Execution
-    /// workers keep work_file under their existing scope and budget ceilings.
+    /// workers keep work_file under their existing scope and tool ceilings.
     pub fn manager(backend: Arc<dyn WorkBackend>) -> Self {
         Self {
             backend,
@@ -1160,22 +1152,19 @@ impl Tool for WorkFileTool {
 
     fn description(&self) -> &str {
         if self.manager {
-            return "Assign ONE durable work item to the controller. It selects a suitable available registered worker and verifies the result. Code requires an authorized repository resource and keeps all approval gates. Include project references, observable done_when and explicit constraints. For large work, set plan: true so the planner breaks the request into small, verifiable execution slices within each run's context, token and turn budgets. The result is an assignment receipt, not completion.";
+            return "Assign ONE durable work item to the controller. It selects a suitable available registered worker and verifies the result. Code requires an authorized repository resource and keeps all approval gates. Include project references, observable done_when and explicit constraints. For large work, set plan: true so the planner breaks the request into small, verifiable execution slices around concrete deliverables and each model's context window. The result is an assignment receipt, not completion.";
         }
         "File ONE work item that should not be done in this run: follow-up work you found \
          that needs another time, tool, person or worker. Give title, objective and \
          done_when; constraints, decisions and refs are separate short entries, and refs are \
          pointers, not content. Set plan: true for large work that needs small execution \
-         slices, several deliverables, a wait between steps, or independent parts. You never set status, ids or budget; \
+         slices, several deliverables, a wait between steps, or independent parts. You never set status or ids; \
          the result gives the new id. If a required tool is merely not loaded, load it and \
          do the work yourself."
     }
 
     fn schema(&self) -> ToolSchema {
-        let mut properties = draft_properties(false);
-        if self.manager {
-            properties.insert("budget".into(), json!({"type":"object","required":["iterations","tokens","wall_seconds","repairs"],"additionalProperties":false,"properties":{"iterations":{"type":"integer","minimum":1},"tokens":{"type":"integer","minimum":1},"wall_seconds":{"type":"integer","minimum":1},"repairs":{"type":"integer","minimum":0}},"description":"Explicit finite execution envelope; controller approval and caps still apply."}));
-        }
+        let properties = draft_properties(false);
         ToolSchema {
             name: self.name().to_string(),
             description: self.description().to_string(),
@@ -1450,7 +1439,6 @@ mod tests {
             "at most one supersedes target",
             "expires_at: is in the past",
             "status: not yours to set: the controller sets status",
-            "budget: not yours to set",
         ] {
             assert!(failed.contains(needle), "missing {needle:?} in {failed}");
         }
@@ -1668,17 +1656,17 @@ mod manager_assignment_tests {
     use super::*;
     use crate::work_backend::{StubWorkBackend, WorkCall};
     #[tokio::test]
-    async fn manager_assigns_code_but_execution_workers_keep_their_existing_ceiling() {
+    async fn manager_and_worker_ignore_retired_estimates_but_cannot_set_status() {
         let args = json!({"title":"Implement the change","objective":"Build it","done_when":"Repository checks pass","kind":"code","worker_kind":"codex","writable_resources":["repo:/approved/project"],"budget":{"iterations":10,"tokens":7000,"wall_seconds":60,"repairs":0}});
         let backend = Arc::new(StubWorkBackend::new());
         let manager = WorkFileTool::manager(backend.clone());
         assert_eq!(manager.name(), "work_assign");
         manager.execute(args.clone()).await.unwrap();
-        assert!(backend.calls().iter().any(|c| matches!(c,WorkCall::File { draft,.. } if draft.kind.is_none() && draft.worker_kind==rustykrab_core::work::WorkerKind::Any && draft.budget.is_some_and(|b| b.tokens == 7000))));
+        assert!(backend.calls().iter().any(|c| matches!(c,WorkCall::File { draft,.. } if draft.kind.is_none() && draft.worker_kind==rustykrab_core::work::WorkerKind::Any && draft.budget.is_none())));
         let worker = WorkFileTool::new(backend.clone());
         let before = backend.calls().len();
-        assert_eq!(worker.execute(args).await.unwrap()["outcome"], "rejected");
-        assert_eq!(backend.calls().len(), before);
+        assert_eq!(worker.execute(args).await.unwrap()["outcome"], "accepted");
+        assert_eq!(backend.calls().len(), before + 1);
         let before = backend.calls().len();
         let rejected = manager
             .execute(json!({"title":"t","objective":"o","done_when":"d","status":"done"}))

@@ -225,10 +225,10 @@ async fn restart_recovers_only_controller_resolution_waits_on_a_stopped_prerequi
     let other = h.file_one(other).await;
     let mut parked = TransitionSpec::new(
         &fix.id,
-        Status::Blocked(BlockedReason::BudgetExhausted),
+        Status::Blocked(BlockedReason::NeedsDecision),
         "controller",
     );
-    parked.reason = Some("repair budget exhausted".into());
+    parked.reason = Some("repair failed".into());
     h.store()
         .work_apply(vec![WorkOp::Transition(parked)])
         .await
@@ -240,7 +240,7 @@ async fn restart_recovers_only_controller_resolution_waits_on_a_stopped_prerequi
     assert_eq!(h.status(&other).await, Status::Queued);
     assert_eq!(
         h.status(&fix.id).await,
-        Status::Blocked(BlockedReason::BudgetExhausted)
+        Status::Blocked(BlockedReason::NeedsDecision)
     );
     let snap = h.ctl.load().await.unwrap();
     assert!(!snap

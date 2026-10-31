@@ -541,7 +541,7 @@
     const form = node('form',undefined,'start-options'), title = node('h3', item.kind === 'proposal' ? 'Start this proposal' : item.held_by ? 'Approve and start this work' : 'Record how to handle this work');
     const checkbox = node('input'); checkbox.type = 'checkbox'; checkbox.checked = draft.automatic;
     const choice = node('label'); choice.append(checkbox, node('span','Allow this exact work template to start automatically in future'));
-    const scope = node('p', 'Same goal, completion criteria, constraints, project references, tools, resources and budget. Changed work needs another decision.', 'note');
+    const scope = node('p', 'Same goal, completion criteria, constraints, project references, tools and resources. Changed work needs another decision.', 'note');
     const note = node('textarea'); note.maxLength = 4096; note.value = draft.note; note.placeholder = 'Why this work matters, or how you want it handled'; note.setAttribute('aria-label','Work preference note');
     const limit = node('input'); limit.type = 'number'; limit.min = '1'; limit.max = '50'; limit.value = draft.limit; limit.setAttribute('aria-label','Maximum automatic starts per day');
     const limitLabel = node('label','Maximum automatic starts per 24 hours'); limitLabel.append(limit); limitLabel.hidden = !checkbox.checked;

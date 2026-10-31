@@ -71,10 +71,9 @@ pub(super) const GAUGE_REPAIRED: &str =
 /// Bounded recovery: a worker whose station is rejected until its owner
 /// says which one to use.
 pub(super) const W_STATION: &str = "e2e-control worker: query the rejected gauge station";
-/// The owner's answer to the spent budget's question: one more allotment,
-/// and the station that works. Longer than [`W_STATION`].
+/// The owner's technical answer selects a working station. Longer than [`W_STATION`].
 pub(super) const ANSWER_STATION: &str =
-    "e2e-control answer: one more round of budget, and use gauge station 8 instead";
+    "e2e-control answer: use gauge station 8 instead and read its actual result";
 /// Capability proof: a worker that needs `node`, which the daemon's exec
 /// path holds only as a broken stand-in until a build repairs it.
 pub(super) const W_NODE: &str = "e2e-control worker: run the node stand-in";

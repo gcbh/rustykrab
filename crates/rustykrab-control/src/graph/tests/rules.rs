@@ -468,22 +468,18 @@ fn approval_holds_an_undelegated_writer_and_what_depends_on_it() {
 }
 
 #[test]
-fn approval_over_a_whole_graph_threshold_holds_every_new_item() {
-    for policy in [
-        ApprovalPolicy {
-            max_items: Some(5),
-            ..ApprovalPolicy::default()
-        },
-        ApprovalPolicy {
-            max_total_tokens: Some(1_000),
-            ..ApprovalPolicy::default()
-        },
-    ] {
-        let (s, accepted) = phone_plans(policy);
-        assert_eq!(accepted.held.len(), 6);
-        assert!(readiness(&s, now()).is_empty());
-        assert_eq!(st(&s, "P"), Status::Blocked(BlockedReason::NeedsConsent));
-    }
+fn approval_item_count_still_holds_but_token_estimates_do_not() {
+    let (s, accepted) = phone_plans(ApprovalPolicy {
+        max_items: Some(5),
+        ..Default::default()
+    });
+    assert_eq!(accepted.held.len(), 6);
+    assert!(readiness(&s, now()).is_empty());
+    let (_, accepted) = phone_plans(ApprovalPolicy {
+        max_total_tokens: Some(1_000),
+        ..Default::default()
+    });
+    assert!(accepted.held.is_empty());
 }
 
 #[test]

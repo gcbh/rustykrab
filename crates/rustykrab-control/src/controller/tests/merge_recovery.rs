@@ -572,7 +572,7 @@ async fn legacy_technical_questions_become_owned_recovery_without_an_invented_an
 }
 
 #[tokio::test]
-async fn shared_recovery_preserves_independent_consent_and_original_budget_holds() {
+async fn shared_recovery_preserves_independent_consent_and_retires_original_budget_holds() {
     let mut f = Fixture::new(RepairMode::Resolve).await;
     let protected = f.original("owner-held").await;
     let allowed = f.original("allowed-original").await;
@@ -619,10 +619,7 @@ async fn shared_recovery_preserves_independent_consent_and_original_budget_holds
         f.h.status(&protected).await,
         Status::Blocked(BlockedReason::NeedsDecision)
     );
-    assert_eq!(
-        f.h.status(&spent).await,
-        Status::Blocked(BlockedReason::BudgetExhausted)
-    );
+    assert_eq!(f.h.status(&spent).await, Status::Done);
     let questions =
         f.h.store()
             .questions_list(&Default::default())
@@ -637,7 +634,7 @@ async fn shared_recovery_preserves_independent_consent_and_original_budget_holds
         .lock()
         .unwrap()
         .iter()
-        .any(|b| b.item == protected || b.item == spent));
+        .any(|b| b.item == protected));
     assert!(f
         .h
         .store()
@@ -819,7 +816,7 @@ async fn cancelling_a_shared_repair_preserves_original_goals_and_does_not_buy_an
 }
 
 #[tokio::test]
-async fn exhausted_shared_repair_keeps_one_budget_across_restart_and_new_waiters() {
+async fn shared_repair_usage_survives_restart_and_new_waiters_without_blocking_work() {
     let mut f = Fixture::new(RepairMode::Resolve).await;
     let original = f.original("first-waiter").await;
     f.h.tick().await;
@@ -830,7 +827,7 @@ async fn exhausted_shared_repair_keeps_one_budget_across_restart_and_new_waiters
             item: repair.clone(),
             run: Some("prior-exhausted-run".into()),
             worker: "git-worker".into(),
-            tokens: 10_000,
+            tokens: 1_603_490,
             wall_ms: 0,
             iterations: 5,
             at: Utc::now(),
@@ -845,11 +842,8 @@ async fn exhausted_shared_repair_keeps_one_budget_across_restart_and_new_waiters
         f.h.config.clone(),
     )
     .with_clock(f.h.clock.clone());
-    f.h.tick().await;
-    assert_eq!(
-        f.h.status(repair).await,
-        Status::Blocked(BlockedReason::BudgetExhausted)
-    );
+    f.h.drain_settled().await;
+    assert_eq!(f.h.status(repair).await, Status::Done);
     f.h.ctl = Controller::new(
         f.h.store().clone(),
         vec![f.worker.clone()],
@@ -857,16 +851,20 @@ async fn exhausted_shared_repair_keeps_one_budget_across_restart_and_new_waiters
     )
     .with_clock(f.h.clock.clone());
     let later = f.original("second-waiter").await;
-    for _ in 0..5 {
-        f.h.tick().await;
-    }
+    f.h.drain_settled().await;
     assert_eq!(f.repairs().await, repairs);
-    assert!(!f.h.status(&original).await.is_closed());
-    assert!(!f.h.status(&later).await.is_closed());
-    assert!(f.worker.seen.lock().unwrap().is_empty());
+    assert_eq!(f.h.status(&original).await, Status::Done);
+    assert_eq!(f.h.status(&later).await, Status::Done);
+    assert!(f
+        .worker
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|b| &b.item == repair));
     assert_eq!(
         f.h.store().work_spend_of(repair).await.unwrap().tokens,
-        10_000
+        1_603_490
     );
     assert!(f
         .h

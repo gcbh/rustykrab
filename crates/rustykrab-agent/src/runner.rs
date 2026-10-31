@@ -2040,7 +2040,7 @@ impl AgentRunner {
                 if pending == 0 {
                     return Ok(());
                 }
-                if iterations >= self.config.max_iterations {
+                if self.config.max_iterations > 0 && iterations >= self.config.max_iterations {
                     return Err(Error::Internal(
                         "iteration limit reached with pending user messages; history retained"
                             .into(),
@@ -2235,7 +2235,7 @@ impl AgentRunner {
             .rev()
             .find(|m| m.is_user_turn())
             .cloned();
-        while *iterations < self.config.max_iterations {
+        while self.config.max_iterations == 0 || *iterations < self.config.max_iterations {
             let iteration = *iterations;
             *iterations += 1;
             if let Some(rx) = inbound.as_deref_mut() {

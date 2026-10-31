@@ -37,9 +37,9 @@
 //!    [`ModelActivity`] says an interactive turn holds it), the cheapest
 //!    available compatible resource by cost, without category gates; the
 //!    lease carries the fan-in inputs of 4.3 and 6.3 and, for a repository-scoped
-//!    item, its workspace, and the run is spawned under tokio. A leaf whose
-//!    cumulative budget is spent is not leased: it fails `budget/*` and
-//!    surfaces for its owner (`spend.rs`). Each lease records the attempt's
+//!    item, its workspace, and the run is spawned under tokio. Legacy budget
+//!    holds retire without clearing independent permission holds (`spend.rs`).
+//!    Each lease records the attempt's
 //!    state, and a failure judged later is compared with the item's last
 //!    ones by the repeated-outcome breaker (`breaker.rs`). A run that ends
 //!    or is stopped has its spend recorded (`spend.rs`).
@@ -52,8 +52,8 @@
 //!
 //! Layout: `batch.rs` builds one transaction over a working snapshot;
 //! `load.rs` reads the store back (the snapshot, rung histories, a
-//! firing's conversation); `spend.rs` records what runs spend and gives
-//! parents their remaining budgets and leaves their cumulative one;
+//! firing's conversation); `spend.rs` records usage and retires obsolete
+//! execution-budget holds without inventing owner decisions;
 //! `breaker.rs` is the repeated-outcome circuit breaker; `proof.rs` asks the
 //! failing worker to probe a capability's operation and gates its `done` and
 //! the revival behind it on the proof; `reattach.rs` keeps a run that
@@ -105,8 +105,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::work::{
-    Budget, GraphCaps, PlanOutcome, Precondition, ResultReport, RungBudgets, WorkItem,
-    WorkItemDraft, WorkItemId, WorkKind, WorkPlan, WorkerKind,
+    Budget, GraphCaps, PlanOutcome, Precondition, ResultReport, WorkItem, WorkItemDraft,
+    WorkItemId, WorkKind, WorkPlan, WorkerKind,
 };
 use rustykrab_core::Error;
 use rustykrab_store::{JudgmentRow, Spend, Store};
@@ -319,7 +319,7 @@ pub struct ControllerConfig {
     pub aging_max_gap: TimeDelta,
     /// The outbox channel notices are written for.
     pub notice_channel: String,
-    /// The approval triggers of 6.1: item count, total budget, delegated
+    /// The approval triggers: item count and delegated
     /// writable resources.
     pub approval: ApprovalPolicy,
     pub split_mode: SplitMode,
@@ -331,7 +331,7 @@ pub struct ControllerConfig {
     /// 12.1: at most one running item per local worker, and per local
     /// model, so scheduled and interactive work never share a KV slot.
     pub serialise_local: bool,
-    /// The budget of a new item that names none.
+    /// Default finite recovery policy; execution estimates are ignored.
     pub default_budget: Budget,
     /// Items a fingerprint must fail on before the ladder files the
     /// improvement (section 9).
@@ -349,7 +349,7 @@ pub struct ControllerConfig {
     pub coalesce_window: TimeDelta,
     /// A chain open this long with no message about it gets a digest (6.6).
     pub digest_window: TimeDelta,
-    /// The budget of a planning item (6.1, 6.4).
+    /// Planning recovery policy; execution estimates are ignored.
     pub plan_budget: Budget,
     /// Re-plan at the parent when a chain fails or stalls (6.4), when a
     /// `planner` worker is registered.
@@ -402,13 +402,7 @@ impl Default for ControllerConfig {
             worktree_root: None,
             coalesce_window: TimeDelta::zero(),
             digest_window: TimeDelta::hours(24),
-            plan_budget: Budget {
-                iterations: 12,
-                tokens: 60_000,
-                wall_seconds: 900,
-                repairs: 2,
-                rungs: RungBudgets::default(),
-            },
+            plan_budget: Budget::default(),
             replan: true,
             investigation_root: None,
             daemon_log_dir: None,
@@ -474,8 +468,7 @@ struct State {
     /// their evidence on the first tick.
     learned: Vec<LearnedRule>,
     /// What each item's runs spent (`work_spend`), read once on the first
-    /// load and kept current as runs end: a parent's remaining budget is
-    /// its budget less what its subtree spent (4.2).
+    /// load and kept current as runs end. Usage is observational, not an allowance.
     spent: Option<HashMap<WorkItemId, Spend>>,
     /// When the last aging pass ran, for `aging_max_gap`.
     last_aged: Option<DateTime<Utc>>,

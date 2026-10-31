@@ -4,8 +4,8 @@ Owner direction, recorded 2026-10-14: simplify the system so an agent can take
 the actions its work requires, receive the information needed to choose those
 actions, and improve the system through analysis of actual execution.
 
-This is the design target for development, harness evaluation and dreaming.
-It does not itself grant new permissions or establish that the target is built.
+This development, evaluation and dreaming target grants neither permissions nor
+proof that the target is built.
 The dated [execution review](../verification/agent-agency-review-2026-10-14.md)
 separates observed behavior, the concurrent repair and remaining work.
 
@@ -51,7 +51,7 @@ without explaining its purpose and the concrete capability that replaces it.
 ## Make the relevant state observable
 
 Every successor needs the current objective and acceptance, owner decisions,
-remaining budget, exact code/build base, current access, dependencies and why
+observed usage, exact code/build base, current access, dependencies and why
 they wait, last failure, previous repairs, and evidence of what actually ran.
 Keep that state provider-neutral so Claude, Codex and local inference can
 continue the same work without another provider's conversation history.
@@ -87,11 +87,12 @@ needed evidence is a visible limitation requiring repair, not a healthy result.
    the fix present, retain the failed hypothesis, reassess or reverse it, and
    strengthen the regression scenario.
 
-Use cumulative item budgets across attempts, finite repair budgets and a stop
-for repeated failures without a relevant state change or new evidence. These
-make experimentation informative and leave resources for a fresh diagnosis.
-Do not spend the same full budget on every retry or allow repairs to form an
-unowned chain of blocked repairs.
+Owner update, 2026-10-31: remove per-task token, iteration and runtime limits.
+Learn effort from recorded usage across attempts, restarts and useful results.
+No top-ups or parent reservations. Keep finite recovery rungs, repeated-failure
+stops, context windows, operational timeouts, account limits and owner scope.
+Retiring budget holds cannot clear independent decisions or permit unowned
+repair chains.
 
 ## Analysis must remain available during failure
 
@@ -120,7 +121,7 @@ These are requirements; metrics absent from the current registered schema must
 be implemented before a reviewer claims to have measured them.
 
 Replay real fault patterns: a discovered skill whose operation still fails;
-stale Done prerequisites; many attempts across one budget; one merge conflict
+stale Done prerequisites; retained usage across many attempts; one merge conflict
 blocking many items; missing artifact access; planning constraints inherited by
 implementation; a stalled backlog suppressing review; and handoff from local
 inference to a native runtime. Include failure, recovery and recurrence checks.

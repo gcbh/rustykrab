@@ -205,9 +205,8 @@ impl Controller {
 
 /// The brief for one run (plan section 6, step 4): the item's typed fields,
 /// its inputs, and for a repair run its own evidence and last error. Tools
-/// a capability rung acquired are activated up front. `budget` is what is
-/// left of the item's cumulative budget ([`Controller::cumulative_budget`]),
-/// not a fresh allotment: every attempt draws on the same one.
+/// a capability rung acquired are activated up front. Legacy execution
+/// estimates in `budget` are normalized to zero; recovery policy is preserved.
 pub(super) fn brief_for(
     item: &WorkItem,
     inputs: Vec<InputRef>,
@@ -234,7 +233,7 @@ pub(super) fn brief_for(
         more_inputs,
         prior_evidence,
         last_error: history.repair.clone(),
-        budget,
+        budget: budget.without_execution_limits(),
         origin_conversation_id: item.origin_conversation_id.clone(),
         run: None,
         workspace: None,
