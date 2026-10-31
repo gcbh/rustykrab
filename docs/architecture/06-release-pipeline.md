@@ -66,3 +66,13 @@ post-job write attempt.
 - The macOS leg verifies its code signature before publishing and notarizes
   when the Apple credentials are configured.
 - The GitHub Release is created only after both target builds complete.
+
+## macOS runner availability
+
+The ARM64 release build uses the pinned `macos-15` hosted runner. The former
+`macos-14` image was cancelled before acquiring a runner during GitHub's
+2026-10-31 brownout, and retires on 2026-11-02. See the
+[runner retirement notice](https://github.com/actions/runner-images/issues/13518).
+Rust bootstrap, the `aarch64-apple-darwin` target, signing identity,
+notarization, packaging, artifact digest checks and publication gates retain
+their existing responsibilities.
