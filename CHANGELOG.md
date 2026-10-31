@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.17] - 2026-10-31
+
+- Guide missing credentials into secure requests (#742)
+
 ## [6.6.16] - 2026-10-31
 
 - Move macOS release builds to the supported macOS 15 runner (#741)

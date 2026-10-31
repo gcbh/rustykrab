@@ -32,6 +32,12 @@ impl Tool for CredentialReadTool {
         "Read a stored credential/secret by name, or list all stored credential names. \
          Use this to retrieve API keys, passwords, or tokens needed to authenticate \
          with external services. Credentials are stored encrypted at rest.\n\n\
+         When a credential needed for the user's task is missing, call \
+         credential_request to ask for it through a secure form. Do not repeat \
+         failed lookups, guess other credential names, or switch stores to keep \
+         searching. Once the request is filed, tell the user you are waiting \
+         for their credentials and stop until they answer. Never ask for \
+         passwords in chat.\n\n\
          Only 'action' is always required. 'source' defaults to 'store' (the encrypted \
          local store). 'name' is required for 'get'/'read' against the store. 'service' \
          and 'account' are required ONLY when source is 'keychain' — do not pass them \
@@ -140,7 +146,12 @@ impl CredentialReadTool {
                     })),
                     Err(rustykrab_core::Error::NotFound(_)) => Ok(json!({
                         "error": format!("no secret found with name '{name}'"),
-                        "hint": "Use action 'list' to see available secret names, or try source 'keychain' to check the macOS Keychain",
+                        "hint": "This credential is missing. If it is needed for the user's task, \
+                                 call credential_request to obtain it through a secure form. Do not \
+                                 retry this lookup, guess other names, or switch stores to keep \
+                                 searching. Once the request is filed, tell the user you are waiting \
+                                 for their credentials and stop until they answer. Never ask for \
+                                 passwords in chat.",
                     })),
                     Err(e) => Err(Error::ToolExecution(
                         format!("failed to read secret: {e}").into(),
@@ -173,7 +184,11 @@ impl CredentialReadTool {
                              for them. Sign in with browser(action='fill_credential', \
                              ref=<ref>, field='username'|'password'), which reads them \
                              directly. You already have these; there is no need to ask the \
-                             user for them again.",
+                             user for them again. If a credential needed for the user's task is \
+                             absent from this list, call credential_request to obtain it through \
+                             a secure form instead of guessing names or searching other stores. \
+                             Once the request is filed, tell the user you are waiting for their \
+                             credentials and stop until they answer. Never ask for passwords in chat.",
                     "keychain_available": rustykrab_store::keychain::keychain_available(),
                 }))
             }
@@ -229,7 +244,12 @@ impl CredentialReadTool {
                     }
                     Ok(None) => Ok(json!({
                         "error": format!("no credential found in Keychain for service '{service}', account '{account}'"),
-                        "hint": "Verify the service and account names in Keychain Access.app, or store the credential with credential_write using source 'keychain'",
+                        "hint": "This credential is missing. If it is needed for the user's task, \
+                                 call credential_request to obtain it through a secure form. Do not \
+                                 retry this lookup, guess other names, or switch stores to keep \
+                                 searching. Once the request is filed, tell the user you are waiting \
+                                 for their credentials and stop until they answer. Never ask for \
+                                 passwords in chat.",
                     })),
                     Err(e) => Err(Error::ToolExecution(
                         format!("keychain lookup failed: {e}").into(),
@@ -238,12 +258,17 @@ impl CredentialReadTool {
             }
             "list" => {
                 // macOS Keychain does not provide a generic "list all items" API
-                // via security-framework. Direct the user to use Keychain Access
-                // or `security dump-keychain` for discovery.
+                // via security-framework. A missing credential should go
+                // through the secure request flow, not an unbounded search.
                 Ok(json!({
                     "source": "keychain",
                     "error": "listing all Keychain items is not supported via this tool",
-                    "hint": "Use Keychain Access.app or `security dump-keychain` to discover service/account names, then use action 'get' with the specific service and account",
+                    "hint": "Use action 'get' only when you already know the exact service and \
+                             account names. If you need a credential you do not have, call \
+                             credential_request to obtain it through a secure form. Do not guess \
+                             names or repeatedly try unsupported listing. Once the request is \
+                             filed, tell the user you are waiting for their credentials and stop \
+                             until they answer. Never ask for passwords in chat.",
                 }))
             }
             other => Err(Error::ToolExecution(
