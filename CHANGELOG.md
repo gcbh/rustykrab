@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.16] - 2026-10-31
+
+- Move macOS release builds to the supported macOS 15 runner (#741)
+
 ## [6.6.15] - 2026-10-31
 
 - Remove task execution budgets and retain observed usage (#740)
