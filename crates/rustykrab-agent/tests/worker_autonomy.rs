@@ -351,7 +351,12 @@ async fn exercise(self_correct: bool) {
             .await
             .unwrap();
     }
-    let original = file(&ctl, draft("original-useful-work")).await;
+    let mut original_draft = draft("original-useful-work");
+    original_draft.edges.push(rustykrab_core::work::DraftEdge {
+        kind: rustykrab_core::work::EdgeKind::Blocks,
+        depends_on: rustykrab_core::work::ItemRef::Id(historical.clone()),
+    });
+    let original = file(&ctl, original_draft).await;
     tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             ctl.tick().await.unwrap();

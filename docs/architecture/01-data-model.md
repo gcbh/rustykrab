@@ -620,6 +620,15 @@ lease time: the id the run's transcript is kept under (the local worker's
 conversation id, or a scheduled job's own conversation for its firing), so
 a cancelled or lost run still points at its partial work.
 
+**Activity is not completion.** The existing lease heartbeat is renewed from
+adapter-observed activity; its original since timestamp remains unchanged.
+Per-run counters and trusted merge-repair fingerprints are ephemeral controller
+state, not new database tables or model-authored evidence. A restart reattaches
+only under the existing attempt rules and rebuilds an observation baseline.
+Workspace evidence freezes the fetched upstream/exact dependency base; full
+project context remains durable even when unrelated history is excluded from
+that base. No status alone establishes landed, deployed or effective repair.
+
 **Spend is one row per run.** `work_spend` records what each worker run
 spent (tokens across its model calls, wall time, iterations) when it ends
 or is stopped, whether or not its item is still live. Totals survive retries

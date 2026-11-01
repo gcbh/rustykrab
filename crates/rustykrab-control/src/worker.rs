@@ -204,6 +204,15 @@ pub trait Worker: Send + Sync {
     /// before anything counts; a worker never transitions an item.
     async fn run(&self, brief: Brief) -> Result<ResultReport, Error>;
 
+    /// Host-observed activity for this invocation, monotonically increasing.
+    /// Local adapters count delivered messages; native adapters count captured
+    /// process output. This is liveness, never evidence of useful work or done.
+    /// Unknown adapters retain the inactivity timeout. Must not block or read
+    /// model-written files. Wrappers must delegate to the actual executor.
+    fn activity(&self, _run: &str) -> Option<u64> {
+        None
+    }
+
     /// What the run with this id (the brief's `run`) spent and what the
     /// worker counted about itself, once the run has ended or been
     /// stopped. The controller asks once per run, records the spend

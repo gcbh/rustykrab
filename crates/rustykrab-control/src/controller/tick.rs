@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use rustykrab_core::work::ErrorSubclass;
 use rustykrab_core::work::{
     BlockedReason, ErrorClass, Rung, RungEvent, Status, WorkError, WorkItem, WorkItemId, WorkKind,
     WorkerKind,
@@ -52,6 +53,8 @@ const BY_GIT: &str = "git";
 
 /// One evidence row a verified claim adds: kind, reference, verifier.
 type Proof = (String, String, Option<String>);
+
+pub(super) type UpstreamBases = HashMap<std::path::PathBuf, Result<String, String>>;
 
 /// How a failure counts in the routing record: a capability gap or a
 /// policy stop is not the worker's result, so it is not recorded.
@@ -306,6 +309,31 @@ pub(super) fn failure_class(err: &Error) -> &'static str {
 }
 
 impl Controller {
+    /// One upstream observation per repository per pass, outside loop_lock.
+    /// Selection rechecks current authority, scope and state under the lock;
+    /// these Git objects are data, never authorization to start an item.
+    pub(super) async fn prepare_upstream_bases(&self) -> Result<UpstreamBases, Error> {
+        let mut bases = UpstreamBases::new();
+        if self.is_draining() || self.config.worktree_root.is_none() {
+            return Ok(bases);
+        }
+        let snap = self.load().await?;
+        for item in snap.items().iter().filter(|i| {
+            matches!(i.status, Status::Queued | Status::Ready)
+                && i.held_by.is_none()
+                && !snap.has_children(&i.id)
+        }) {
+            let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
+                continue;
+            };
+            if bases.contains_key(&repo) {
+                continue;
+            }
+            bases.insert(repo.clone(), workspace::fresh_base(&repo).await);
+        }
+        Ok(bases)
+    }
+
     /// One pass, and its outcome recorded for [`LoopStatus`]: a completed
     /// pass sets `last_tick` and clears the failure count, a failed one
     /// records its time and class and counts up.
@@ -314,6 +342,7 @@ impl Controller {
     pub(super) async fn tick_locked(
         &self,
         handoffs: Result<Option<super::project_context::HandoffChecks>, Error>,
+        upstream: Result<UpstreamBases, Error>,
     ) -> Result<TickReport, Error> {
         #[cfg(test)]
         let injected = self.state().fail_next_tick.take();
@@ -322,7 +351,10 @@ impl Controller {
         let result = match injected {
             Some(err) => Err(err),
             None => match handoffs {
-                Ok(handoffs) => self.tick_pass(handoffs).await,
+                Ok(handoffs) => match upstream {
+                    Ok(upstream) => self.tick_pass(handoffs, &upstream).await,
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             },
         };
@@ -344,6 +376,7 @@ impl Controller {
     async fn tick_pass(
         &self,
         handoffs: Option<super::project_context::HandoffChecks>,
+        upstream: &UpstreamBases,
     ) -> Result<TickReport, Error> {
         self.apply_pending_answers_locked().await?;
         self.retire_execution_budget_holds().await?;
@@ -363,7 +396,7 @@ impl Controller {
         // Draining for shutdown: nothing new starts, what runs finishes.
         if !self.is_draining() {
             self.start_matching_templates_locked().await?;
-            self.select_and_lease(&mut report).await?;
+            self.select_and_lease(&mut report, upstream).await?;
         }
         self.age(now, &mut report).await?;
         Ok(report)
@@ -448,9 +481,9 @@ impl Controller {
             report.expired.push(id);
         }
 
-        // Runs past their lease TTL on the controller's clock have stalled
-        // (step 7) unless a progress ledger says otherwise: the run stops
-        // and the ladder climbs.
+        // Liveness renews an inactivity lease. Trusted merge repairs also
+        // need observed changes to the conflicted work, not just more output.
+        let mut merge_stalls = self.observe_execution().await?;
         let ttl = i64::try_from(self.config.lease_ttl_seconds)
             .ok()
             .and_then(TimeDelta::try_seconds)
@@ -461,32 +494,32 @@ impl Controller {
             .state()
             .runs
             .iter()
-            .filter(|(_, r)| !r.reported && !r.handle.is_finished() && past_ttl(r.since))
+            .filter(|(id, r)| {
+                !r.reported
+                    && !r.handle.is_finished()
+                    && (past_ttl(r.since) || merge_stalls.contains_key(*id))
+            })
             .map(|(id, r)| (id.clone(), r.worker.clone(), r.since))
             .collect();
-        for (id, worker, since) in stalled {
+        for (id, worker, _since) in stalled {
             if !b.status(&id).is_some_and(|s| s.is_active()) {
-                continue;
-            }
-            if self.ledger.progressed(&id, since) {
-                if let Some(run) = self.state().runs.get_mut(&id) {
-                    run.since = now;
-                }
-                self.store.work_lease_heartbeat(&id).await?;
                 continue;
             }
             let Some(item) = b.snap.item(&id).cloned() else {
                 continue;
             };
-            let error = classify(
-                &FailureInput::ToolResult {
+            let failure = merge_stalls
+                .remove(&id)
+                .unwrap_or_else(|| FailureInput::ToolResult {
                     tool: String::new(),
                     kind: ToolErrorKind::Timeout,
                     message: format!(
-                        "stalled: no progress within the {}s lease",
+                        "stalled: no observed worker activity within the {}s lease",
                         self.config.lease_ttl_seconds
                     ),
-                },
+                });
+            let error = classify(
+                &failure,
                 &Context {
                     tool: None,
                     worker_kind: Some(self.worker_kind(&worker)),
@@ -1480,13 +1513,11 @@ impl Controller {
                     .await;
             }
         }
-        // A failed verification escalates: the switch rung looks above the
-        // failing worker's tier, not beside it (sections 5 and 8).
-        let floor = (error.class == ErrorClass::Verification)
-            .then(|| {
-                self.worker(worker)
-                    .map(|w| self.routing.cost_tier(w.as_ref()))
-            })
+        // Failed verification and persistent non-progress need an upgrade.
+        // Renaming the same local model must not spend the only switch rung.
+        let floor = (error.class == ErrorClass::Verification
+            || error.subclass == ErrorSubclass::Loop)
+            .then(|| self.escalation_floor(worker, error.subclass == ErrorSubclass::Loop))
             .flatten()
             .into_iter()
             .chain(history(&events).floor)
@@ -1929,6 +1960,22 @@ impl Controller {
         Ok(changed)
     }
 
+    fn escalation_floor(&self, worker: &str, skip_same_model: bool) -> Option<u32> {
+        let failed = self.worker(worker)?;
+        let models = failed.capabilities().models;
+        self.registry
+            .workers()
+            .iter()
+            .filter(|w| {
+                w.name() == worker
+                    || (skip_same_model
+                        && w.kind() == failed.kind()
+                        && w.capabilities().models.iter().any(|m| models.contains(m)))
+            })
+            .map(|w| self.routing.cost_tier(w.as_ref()))
+            .max()
+    }
+
     /// Whether a healthy worker other than `excluded`, and above `floor`'s
     /// cost tier when one is set, could take `item`.
     pub(super) fn has_alternative(
@@ -1958,7 +2005,11 @@ impl Controller {
         }
     }
 
-    async fn select_and_lease(&self, report: &mut TickReport) -> Result<(), Error> {
+    async fn select_and_lease(
+        &self,
+        report: &mut TickReport,
+        upstream: &UpstreamBases,
+    ) -> Result<(), Error> {
         let snap = self.load().await?;
         let list = graph::priority_list(&snap, self.clock.now());
         let ready: Vec<WorkItem> = list
@@ -1984,6 +2035,14 @@ impl Controller {
             .collect();
         let (mut load, mut models) = self.load_by_worker();
         for item in ready {
+            // A newly filed repository not observed during preparation waits
+            // for the next pass. Never perform remote I/O under the command lock.
+            if self.config.worktree_root.is_some()
+                && Workspace::repo_of(&item.writable_resources)
+                    .is_some_and(|repo| !upstream.contains_key(&repo))
+            {
+                continue;
+            }
             if !item
                 .preconditions
                 .iter()
@@ -2034,7 +2093,12 @@ impl Controller {
                 }
             };
             brief.workspace = match self
-                .plan_workspace(&item, &run_id, brief.project_context.as_mut())
+                .plan_workspace_at(
+                    &item,
+                    &run_id,
+                    brief.project_context.as_mut(),
+                    Some(upstream),
+                )
                 .await
             {
                 Ok(workspace) => workspace,
@@ -2111,6 +2175,9 @@ impl Controller {
                     at: Utc::now(),
                 });
             }
+            let merge_progress = self
+                .merge_progress_for(&item, brief.workspace.as_ref())
+                .await?;
             if let Err(e) = self
                 .store
                 .work_lease_acquire_recorded(
@@ -2126,7 +2193,8 @@ impl Controller {
                 continue;
             }
             let name = worker.name().to_string();
-            let run = spawn(worker.clone(), brief, self.clock.now());
+            let mut run = spawn(worker.clone(), brief, self.clock.now());
+            run.merge_progress = merge_progress;
             let isolated_repo = run.isolated_repo.clone();
             self.state().runs.insert(item.id.clone(), run);
             let mut spec = TransitionSpec::new(&item.id, Status::Running, format!("worker:{name}"));
@@ -2149,16 +2217,27 @@ impl Controller {
         Ok(())
     }
 
-    /// Pin project code to the newest verified ancestor chain, otherwise
-    /// repository HEAD. A fix item is pinned by [`Self::fix_base`]: in the
+    /// Start from fresh upstream plus explicit execution dependencies, never
+    /// every completed branch in a project. A fix item is pinned by [`Self::fix_base`]: in the
     /// daemon's own source to the running build's commit, elsewhere to the
     /// commit the failing run started from, and to HEAD only when neither
     /// is on record.
+    #[cfg(test)]
     pub(super) async fn plan_workspace(
         &self,
         item: &WorkItem,
         run: &str,
         context: Option<&mut crate::handoff::ProjectContext>,
+    ) -> Result<Option<Workspace>, workspace::ContinuationError> {
+        self.plan_workspace_at(item, run, context, None).await
+    }
+
+    pub(super) async fn plan_workspace_at(
+        &self,
+        item: &WorkItem,
+        run: &str,
+        context: Option<&mut crate::handoff::ProjectContext>,
+        upstream: Option<&UpstreamBases>,
     ) -> Result<Option<Workspace>, workspace::ContinuationError> {
         let Some(root) = self.config.worktree_root.clone() else {
             return Ok(None);
@@ -2195,11 +2274,16 @@ impl Controller {
         if let Some(base) = self.fix_base(item, &repo).await {
             return Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)));
         }
-        let commits: Vec<(String, String)> = context
+        let mut commits: Vec<(String, String)> = context
             .as_ref()
             .into_iter()
             .flat_map(|ctx| &ctx.work)
             .filter(|w| w.status == Status::Done && w.repository.as_deref() == repo.to_str())
+            .filter(|w| {
+                context
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.execution_items.contains(&w.item))
+            })
             .flat_map(|w| {
                 w.evidence
                     .iter()
@@ -2207,11 +2291,79 @@ impl Controller {
                     .map(|e| (w.item.clone(), e.value.clone()))
             })
             .collect();
+        // A completed, host-verified repair can be reused for its exact parents.
+        // It is not a license to integrate unrelated project branches. The
+        // ancestry check below requires both parents in the requested history.
+        let mut resolutions = Vec::new();
+        if let Some(ctx) = context.as_ref().filter(|_| !commits.is_empty()) {
+            for row in self
+                .store
+                .work_evidence_of_kind(super::merge_recovery::MERGE_RECOVERY)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|e| e.verified_by.as_deref() == Some("controller"))
+            {
+                let recovery: super::merge_recovery::Recovery =
+                    serde_json::from_str(&row.reference).map_err(|e| e.to_string())?;
+                if recovery.project != ctx.snapshot.project.id.to_string()
+                    || recovery.conflict.repository != repo
+                {
+                    continue;
+                }
+                if let Some(work) = ctx.work.iter().find(|w| {
+                    w.item == recovery.repair
+                        && w.status == Status::Done
+                        && w.repository.as_deref() == repo.to_str()
+                }) {
+                    for ev in work.evidence.iter().filter(|e| e.kind == "commit") {
+                        resolutions.push((
+                            work.item.clone(),
+                            ev.value.clone(),
+                            recovery.conflict.left.clone(),
+                            recovery.conflict.right.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        let head = match upstream {
+            Some(upstream) => upstream
+                .get(&repo)
+                .ok_or_else(|| "repository was not prepared in this pass".to_owned())?
+                .clone()?,
+            None => workspace::fresh_base(&repo).await?,
+        };
         let at = repo.clone();
-        let candidates: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
-        let base = tokio::task::spawn_blocking(move || {
-            let head = workspace::head(&at)?;
-            workspace::continuation_base_checked(&at, &head, &candidates)
+        let (base, commits) = tokio::task::spawn_blocking(move || {
+            loop {
+                let before = commits.len();
+                for (id, commit, left, right) in &resolutions {
+                    if commits.iter().any(|(_, c)| c == commit) {
+                        continue;
+                    }
+                    let mut covered = true;
+                    for parent in [left, right] {
+                        let mut found = false;
+                        for candidate in
+                            std::iter::once(&head).chain(commits.iter().map(|(_, c)| c))
+                        {
+                            found |= workspace::is_ancestor(&at, parent, candidate)?;
+                        }
+                        // Recheck retained evidence against actual Git ancestry.
+                        covered &= found && workspace::is_ancestor(&at, parent, commit)?;
+                    }
+                    if covered {
+                        commits.push((id.clone(), commit.clone()));
+                    }
+                }
+                if commits.len() == before {
+                    break;
+                }
+            }
+            let candidates: Vec<_> = commits.iter().map(|(_, c)| c.clone()).collect();
+            let base = workspace::continuation_base_checked(&at, &head, &candidates)?;
+            Ok::<_, workspace::ContinuationError>((base, commits))
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -2376,6 +2528,8 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
         handle,
         since,
         reported: false,
+        activity: None,
+        merge_progress: None,
     }
 }
 

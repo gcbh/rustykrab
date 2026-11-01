@@ -230,6 +230,7 @@ struct Fixture {
     h: Harness,
     worker: Arc<RepairWorker>,
     project: ProjectId,
+    history: Option<String>,
 }
 impl Fixture {
     async fn new(mode: RepairMode) -> Self {
@@ -280,6 +281,7 @@ impl Fixture {
             h,
             worker,
             project,
+            history: None,
         };
         let history = f.original("verified-history").await;
         // Host-owned fixture setup: an earlier, real Git-verified branch is
@@ -326,6 +328,7 @@ impl Fixture {
             })
             .await
             .unwrap();
+        f.history = Some(history);
         f
     }
     async fn original(&mut self, title: &str) -> String {
@@ -335,6 +338,12 @@ impl Fixture {
             kind: "project".into(),
             value: self.project.to_string(),
         }];
+        if let Some(history) = &self.history {
+            d.edges.push(rustykrab_core::work::DraftEdge {
+                kind: rustykrab_core::work::EdgeKind::Blocks,
+                depends_on: rustykrab_core::work::ItemRef::Id(history.clone()),
+            });
+        }
         self.h.file_one(d).await
     }
     async fn repairs(&self) -> Vec<String> {
@@ -362,6 +371,10 @@ async fn worker_autonomy_repair_does_not_inherit_a_waiters_planning_only_contrac
         "Keep the original task's planning scope",
     );
     original.constraints = vec!["Plan only; no implementation in this item".into()];
+    original.edges.push(rustykrab_core::work::DraftEdge {
+        kind: rustykrab_core::work::EdgeKind::Blocks,
+        depends_on: rustykrab_core::work::ItemRef::Id(f.history.clone().unwrap()),
+    });
     original.writable_resources = vec![format!("repo:{}", f.repo.display())];
     original.artifact_refs = vec![ArtifactRef {
         kind: "project".into(),
@@ -461,6 +474,38 @@ async fn worker_autonomy_legacy_generated_contract_is_recognized_without_erasing
         upgraded,
         "stored contract unchanged by a projection"
     );
+}
+
+#[tokio::test]
+async fn independent_work_does_not_inherit_a_conflicting_project_branch() {
+    let mut f = Fixture::new(RepairMode::Resolve).await;
+    let historical = f.history.take().unwrap();
+    let original = f.original("independent work").await;
+    let item = f.h.store().work_get(&original).await.unwrap().unwrap();
+    let snap = f.h.ctl.load().await.unwrap();
+    let mut context =
+        f.h.ctl
+            .project_context(&snap, &item)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(context.work.iter().any(|w| w.item == historical));
+    let ws =
+        f.h.ctl
+            .plan_workspace(&item, "fresh-test", Some(&mut context))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(ws.base, f.current);
+    assert!(context.base_sources.is_empty());
+    ws.create().unwrap();
+    assert!(git(&ws.path, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        fs::read_to_string(ws.path.join("permissions.txt")).unwrap(),
+        "new tool policy\n"
+    );
+    assert!(f.repairs().await.is_empty());
+    ws.remove().unwrap();
 }
 
 #[tokio::test]

@@ -164,6 +164,7 @@ pub struct Resumed {
 /// What an ongoing or ended run has spent, until the controller asks
 /// ([`Worker::usage`]).
 struct Spending {
+    activity: Arc<std::sync::atomic::AtomicU64>,
     meter: Arc<Meter>,
     tracer: Arc<ExecutionTracer>,
     started: Instant,
@@ -1031,6 +1032,15 @@ impl Worker for LocalWorker {
         true
     }
 
+    /// Actual runner messages observed for this invocation, independent of logging.
+    fn activity(&self, run: &str) -> Option<u64> {
+        self.spending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run)
+            .map(|s| s.activity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// The run's tokens (every model call it made, counted at the
     /// provider), wall time, iterations and completion reminders, taken
     /// once. A run the controller stopped counts up to where it stopped.
@@ -1268,6 +1278,7 @@ impl LocalWorker {
 
         // What the run spends, kept for the controller whatever happens to it.
         let spending = Arc::new(Spending {
+            activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             meter: Arc::new(Meter::new()),
             tracer: Arc::new(ExecutionTracer::new()),
             started: Instant::now(),
@@ -1319,10 +1330,14 @@ impl LocalWorker {
             crate::external_worker::prune_files(dir, crate::external_worker::RUN_LOG_RETENTION);
         }
         let log = self.start_log(&log_id, &conv);
-        if let Some(log) = &log {
-            let log = log.clone();
-            runner = runner.with_on_message(Arc::new(move |m: &Message| log.record(m)));
-        }
+        let activity = spending.activity.clone();
+        let message_log = log.clone();
+        runner = runner.with_on_message(Arc::new(move |m: &Message| {
+            activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(log) = &message_log {
+                log.record(m);
+            }
+        }));
         let tracer = spending.tracer.clone();
         let binding = WorkRunContext {
             item: brief.item.clone(),
@@ -2742,6 +2757,19 @@ mod tests {
         let all = lines.iter().map(Value::to_string).collect::<String>();
         assert!(all.contains("early exploration"), "{all}");
         assert!(all.contains("summary of the early work"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn activity_is_observed_without_logs_and_scoped_to_the_run() {
+        let provider = Recording::new(vec![call("noop", json!({})), report("done")]);
+        let (worker, _) = worker(provider, vec![Arc::new(Named("noop"))]);
+        let mut b = brief("activity-item");
+        b.run = Some("activity-run".into());
+        assert_eq!(worker.activity("activity-run"), None);
+        worker.run(b).await.unwrap();
+        assert!(worker.activity("activity-run").unwrap() >= 3);
+        assert_eq!(worker.activity("another-run"), None);
+        assert_eq!(worker.run_log("activity-run"), None);
     }
 
     #[tokio::test]
