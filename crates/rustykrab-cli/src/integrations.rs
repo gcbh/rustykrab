@@ -584,6 +584,9 @@ impl Worker for IntegrationWorker {
             serde_json::json!({"provider":self.provider_name,"model":self.model,"adapter":"general-host-agent","completion_requires":"verified host execution"}),
         )
     }
+    fn activity(&self, run: &str) -> Option<u64> {
+        self.worker.activity(run)
+    }
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.worker.usage(run)
     }

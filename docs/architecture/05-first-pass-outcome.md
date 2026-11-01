@@ -514,3 +514,26 @@ and real operational/permission limits remain. The exact-base regression fails
 at `BudgetExhausted`; the candidate resumes and completes with usage retained.
 See [verification](../verification/usage-without-task-budgets-2026-10-31.md).
 This records tested implementation, not a deployment or measured model quality.
+
+## Fresh workspaces and observed recovery (2026-11-01)
+
+Against edae999 (v6.6.17), source inspection found that every completed project
+commit participated in startup integration, even for unrelated work. Creating
+an isolated directory did not prevent old branch conflicts from recurring.
+The controller's ProgressLedger hook was never wired; a continuing worker could
+expire after 1800 seconds despite output. Separately, a model/loop switch could
+select another local adapter advertising the same model.
+
+Independent work now fetches the upstream default commit and creates its own
+clean worktree. Only explicit execution dependencies participate in integration;
+trusted failure reproducers retain exact bases. Dirty shared checkouts and
+unresolved shared merges remain untouched. Dependency conflicts still require
+verified resolution rather than dropping requested history.
+
+Adapters now expose actual activity for inactivity renewal. A separate bounded
+Git observation watches conflict-file/index/commit changes on shared repairs,
+and a loop escalation skips same-model aliases through existing routing floors.
+No new budget, controller, persistence store or authority grant is introduced.
+The [verification record](../verification/self-healing-execution-2026-11-01.md)
+separates deterministic tests, real native execution, live baseline and rollout.
+This does not establish generic semantic progress assessment or live recovery.

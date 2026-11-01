@@ -142,7 +142,11 @@ impl Controller {
             })
             .await?;
         tracing::info!(item = %item.id, worker = %lease.worker, %run, "re-attached to a run that survived the restart");
-        let run = spawn(worker, brief, self.clock.now());
+        let merge_progress = self
+            .merge_progress_for(item, brief.workspace.as_ref())
+            .await?;
+        let mut run = spawn(worker, brief, self.clock.now());
+        run.merge_progress = merge_progress;
         self.state().runs.insert(item.id.clone(), run);
         Ok(true)
     }

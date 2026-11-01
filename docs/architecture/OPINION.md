@@ -30,6 +30,13 @@ retires the estimated task-budget gate after owner top-ups reblocked below the
 same historical usage without running. Finite no-progress recovery and actual
 usage remain. Implementation tests do not establish deployment or live recovery.
 
+The 2026-11-01 [workspace and execution follow-up](05-first-pass-outcome.md#fresh-workspaces-and-observed-recovery-2026-11-01)
+addresses project-wide implicit integration, the unused lease-progress hook and
+same-model switching. It narrows progress detection to actual shared-merge
+artifacts; general semantic supervision and live original-goal effectiveness
+remain separate, unclosed findings. See the dated verification record for which
+regressions and model executions actually ran.
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

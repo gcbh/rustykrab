@@ -421,6 +421,7 @@ impl Controller {
             conflicts: Vec::new(),
         };
         let mut contexts = BTreeMap::new();
+        let mut upstream = super::tick::UpstreamBases::new();
         for id in candidates {
             let Some(item) = snap.item(&id) else {
                 continue;
@@ -440,7 +441,13 @@ impl Controller {
                         .projects
                         .insert(context.snapshot.project.id, context.snapshot.clone());
                 }
-                self.plan_workspace(item, "handoff-recheck", context.as_mut())
+                if let Some(repo) = Workspace::repo_of(&item.writable_resources) {
+                    if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
+                        let base = crate::workspace::fresh_base(entry.key()).await;
+                        entry.insert(base);
+                    }
+                }
+                self.plan_workspace_at(item, "handoff-recheck", context.as_mut(), Some(&upstream))
                     .await?;
                 if let Some(context) = &context {
                     Self::check_execution_context(context)

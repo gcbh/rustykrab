@@ -184,6 +184,9 @@ impl Worker for CodingWorker {
     fn runtime_status(&self) -> Option<Value> {
         self.worker.runtime_status()
     }
+    fn activity(&self, run: &str) -> Option<u64> {
+        self.worker.activity(run)
+    }
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.worker.usage(run)
     }

@@ -2,7 +2,10 @@
 
 Only the temporary fixture database is seeded with historical verified work.
 New recovery allocation, tool execution, Git verification and original resumption
-are performed by the actual daemon. No live credentials, model or data are used.
+are performed by the actual daemon. The default modes use no real model/login.
+The explicit native_recovery mode uses the supplied Codex subscription through
+RustyKrab in a disposable fixture, then independently builds the verified merge.
+No mode contacts the live gateway or modifies live work.
 """
 import argparse
 from datetime import datetime, timezone
@@ -30,8 +33,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--fixture', required=True, type=Path)
-    parser.add_argument('--expect', choices=['self_correct', 'stalled'], default='self_correct')
+    parser.add_argument('--expect', choices=['self_correct', 'stalled', 'native_recovery'], default='self_correct')
+    parser.add_argument('--native-codex-command', type=Path)
+    parser.add_argument('--native-codex-home', type=Path)
     args = parser.parse_args()
+    native = args.expect == 'native_recovery'
+    if native and (not args.native_codex_command or not args.native_codex_home):
+        parser.error('native_recovery requires explicit Codex command and authenticated home')
     binary = args.binary.resolve(strict=True)
     fixture = args.fixture.absolute()
     fixture.mkdir(mode=0o700, exist_ok=False)
@@ -46,15 +54,30 @@ def main():
 
     git('init', '-b', 'main')
     (repo / 'policy.txt').write_text('base\n')
-    git('add', 'policy.txt')
+    if native:
+        (repo / 'src').mkdir()
+        (repo / 'tests').mkdir()
+        (repo / 'Cargo.toml').write_text('[package]\nname="recovery-fixture"\nversion="0.1.0"\nedition="2021"\n')
+        (repo / '.gitignore').write_text('/target\n')
+        (repo / 'src/lib.rs').write_text('pub fn allowed(name: &str) -> bool { name == "read" }\n')
+    git('add', '.')
     git('commit', '-m', 'base')
     ancestor = git('rev-parse', 'HEAD')
     git('checkout', '-b', 'old-change')
     (repo / 'policy.txt').write_text('old policy\n')
+    if native:
+        (repo / 'src/lib.rs').write_text('pub fn allowed(name: &str) -> bool { matches!(name, "read" | "node" | "git restore") }\npub fn explanation() -> &' + "'static str" + ' { "authorized tools" }\n')
+        (repo / 'tests/explanation.rs').write_text('#[test] fn preserves_feature() { assert_eq!(recovery_fixture::explanation(), "authorized tools"); }\n')
+        git('add', '.')
     git('commit', '-am', 'old branch')
     old = git('rev-parse', 'HEAD')
     git('checkout', 'main')
     (repo / 'policy.txt').write_text('new policy\n')
+    if native:
+        (repo / 'tests').mkdir(exist_ok=True)
+        (repo / 'src/lib.rs').write_text('pub fn allowed(_: &str) -> bool { true }\n')
+        (repo / 'tests/authority.rs').write_text('#[test] fn retains_owner_authority() { for tool in ["read", "node", "edit", "cargo", "new tool"] { assert!(recovery_fixture::allowed(tool)); } }\n')
+        git('add', '.')
     git('commit', '-am', 'current branch')
     current = git('rev-parse', 'HEAD')
     marker = 'OWNER_DIRECTION_USAGE_ONLY'
@@ -121,7 +144,7 @@ def main():
                     warnings_seen.append(n)
                 if n == 0:
                     assert all('FIXTURE_OWNER_ANSWER_' + str(i) + '_END' in text for i in range(18)), 'saved owner answers absent'
-                if args.expect == 'stalled':
+                if args.expect == 'stalled' or (native and repair):
                     assert repair, 'stalled fixture must not execute original work'
                     offset = k % 15
                     if offset == 0:
@@ -170,6 +193,11 @@ def main():
         'RUSTYKRAB_ALLOWED_ORIGINS': base, 'RUSTYKRAB_HARNESS_ROUTER': 'off', 'RUSTYKRAB_LOG_STDOUT': '1',
         'RUST_LOG': 'info', 'RUSTYKRAB_DRAIN_SECS': '1', 'RUSTYKRAB_RATE_LIMIT_MAX': '100000'}
 
+    if native:
+        # Explicit toolchain roots preserve compilation under the isolated HOME.
+        env['CARGO_HOME'] = os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))
+        env['RUSTUP_HOME'] = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
+
     def api(path, body=None):
         request = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
             headers={'Origin': base, 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
@@ -203,22 +231,31 @@ def main():
 
     receipt = {'binary': str(binary), 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
         'fixture': str(fixture), 'model_service_used': False, 'live_gateway_contacted': False,
-        'expect': args.expect, 'parents': [current, old], 'expectation_met': False}
+        'expect': args.expect, 'real_native_model_requested': native, 'parents': [current, old], 'expectation_met': False}
     try:
         receipt['version'] = start()
+        if native:
+            receipt['native_worker'] = api('/api/workers', {
+                'kind': 'codex', 'name': 'native-recovery', 'repos': [str(repo)],
+                'command': str(args.native_codex_command.resolve(strict=True)),
+                'codex_home': str(args.native_codex_home.resolve(strict=True)),
+                'require_chatgpt': True, 'cost_tier': 2, 'concurrency': 1,
+                'timeout_seconds': 900, 'env': ['CARGO_HOME', 'RUSTUP_HOME'],
+            })
         project = str(uuid.uuid4())
         save(fixture / 'project.json', api('/api/projects', {'project_id': project, 'title': 'Isolated Git recovery',
-            'repository_path': str(repo), 'intent': marker + ': preserve current policy and both histories'}))
+            'repository_path': str(repo), 'intent': marker + ': preserve current policy and both histories' + ('; retain unrestricted allowed() and the older explanation() feature. Run cargo test and git diff --check in the supplied worktree. Commit the merge and report exact paths and commit. Do not change source main or contact any other service.' if native else '')}))
         draft = {'title': 'Historical fixture work', 'objective': marker, 'done_when': 'fixture historical branch',
             'artifact_refs': [{'kind': 'project', 'value': project}], 'writable_resources': ['repo:' + str(repo)],
             'trigger': {'kind': 'at', 'value': '2099-01-01T00:00:00Z'}}
         historical = api('/api/work', draft)['root']
         draft.update(title='Original operation fixture', objective=marker + ': complete original operation',
             done_when='original-result.txt committed after Git recovery',
+            edges=[{'kind':'blocks', 'depends_on':historical}],
             decisions_made=[marker + ': preserve current policy and both histories'])
         original = api('/api/work', draft)['root']
         receipt['original_item'] = original
-        draft.update(title='Independent consent fixture', objective='An independently held operation', done_when='Owner approval remains required')
+        draft.update(title='Independent consent fixture', objective='An independently held operation', done_when='Owner approval remains required', edges=[])
         independent = api('/api/work', draft)['root']
         receipt['independent_item'] = independent
         stop()
@@ -249,7 +286,7 @@ def main():
         receipt['obsolete_questions'] = 101
         receipt['recorded_owner_answers'] = 18
         receipt['version_after_restart'] = start()
-        deadline = time.monotonic() + 100
+        deadline = time.monotonic() + (900 if native else 100)
         while time.monotonic() < deadline:
             db = sqlite3.connect('file:' + str(data / 'db/store.db') + '?mode=ro', uri=True)
             db.row_factory = sqlite3.Row
@@ -259,18 +296,43 @@ def main():
             evidence = [dict(r) for r in db.execute('SELECT item,kind,ref AS reference,verified_by FROM work_item_evidence')]
             events = [dict(r) for r in db.execute('SELECT item,kind,actor,reason FROM work_item_events')]
             questions = [dict(row) for row in db.execute("SELECT id,item,status,answer,answered_by FROM questions WHERE id IN ('fixture-budget-question','fixture-consent-question')")]
-            usage = [dict(row) for row in db.execute('SELECT item,run,tokens,wall_ms,iterations FROM work_spend')]
+            usage = [dict(row) for row in db.execute('SELECT item,run,worker,tokens,wall_ms,iterations FROM work_spend')]
             db.close()
             state = next(i for i in items if i['id'] == original)
-            if state['status'] == 'done' or args.expect == 'stalled' and any(i['title'].startswith('Resolve shared Git conflict') and i['status'] == 'blocked' for i in items):
+            if state['status'] == 'done' or args.expect in ('stalled', 'native_recovery') and any(i['title'].startswith('Resolve shared Git conflict') and i['status'] == 'blocked' for i in items):
                 break
             time.sleep(.3)
         receipt.update(items=items, questions=questions, usage=usage, evidence=evidence, events=events, wire_errors=errors, model_calls=len(wire), commits=commits, repair_calls=repair_calls, original_calls=original_calls, warnings_seen=warnings_seen)
         repairs = {json.loads(e['reference'])['repair'] for e in evidence if e['kind'] == 'merge_recovery' and e['verified_by'] == 'controller'}
         receipt['repair_ids'] = sorted(repairs)
+        receipt['model_service_used'] = any(u['worker'] == 'native-recovery' and u['tokens'] > 0 for u in usage)
         receipt['repository_unchanged'] = git('rev-parse', 'HEAD') == current and git('status', '--porcelain') == '' and not (repo / 'original-result.txt').exists()
         verified = [e for e in evidence if e['kind'] == 'commit' and e['verified_by'] == 'git' and e['item'] != historical]
-        if args.expect == 'self_correct':
+        if native:
+            assert state['status'] == 'done' and len(repairs) == 1 and not errors, 'native recovery/original did not complete'
+            assert len(verified) == 2, 'missing controller Git evidence for repair and original'
+            repair_commit = next(e['reference'] for e in verified if e['item'] in repairs)
+            git('merge-base', '--is-ancestor', old, repair_commit)
+            git('merge-base', '--is-ancestor', current, repair_commit)
+            assert git('show', repair_commit + ':policy.txt') == 'new policy'
+            assert any(e['actor'] == 'worker:native-recovery' and e['kind'] == 'lease' and e['item'] in repairs for e in events), 'native worker never received repair'
+            assert any('escalating above tier' in (e['reason'] or '') for e in events), 'escalation not recorded'
+            assert len(list(data.glob('worktrees/*/partial.txt'))) >= 1, 'failed local partial work was lost'
+            receipt['native_repair_commit'] = repair_commit
+            assert receipt['model_service_used'], 'no observed native model usage'
+            native_runs = {u['run'] for u in usage if u['worker'] == 'native-recovery'}
+            receipt['native_run_logs'] = [str(p) for p in (data / 'run-logs').glob('*.jsonl') if p.stem in native_runs]
+            # Independently build the verified merge, away from the agent and
+            # source checkout, using the real toolchain with no dependencies.
+            verification = fixture / 'verify-merge'
+            git('worktree', 'add', '--detach', str(verification), repair_commit)
+            checked = subprocess.run(['cargo', 'test', '--offline'], cwd=verification,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+            (fixture / 'verified-merge-cargo-test.log').write_text(checked.stdout)
+            assert checked.returncode == 0, 'verified merge fails independent cargo test'
+            git('diff', '--check', cwd=verification)
+            receipt['independent_cargo_test_passed'] = True
+        elif args.expect == 'self_correct':
             assert state['status'] == 'done' and len(repairs) == 1 and len(commits) == 2 and len(wire) == 13 and not errors, 'recovery/original did not complete'
             assert len(verified) == 2, 'missing real controller Git evidence'
             repair_contexts = [json.loads(e['reference']) for e in evidence if e['item'] in repairs and e['kind'] == 'project_context']
@@ -310,7 +372,7 @@ def main():
         assert not any(e['item'] == independent and e['kind'] == 'lease' for e in events), 'held operation executed'
         original_usage = [u for u in usage if u['item'] == original]
         assert sum(u['tokens'] for u in original_usage) >= 1603490, 'observed prior usage lost'
-        if args.expect == 'self_correct':
+        if args.expect in ('self_correct', 'native_recovery'):
             assert sum(u['tokens'] for u in original_usage) > 1603490, 'new execution usage not accumulated'
         assert not any(e['kind'] == 'budget_grant' for e in evidence), 'new execution grant created'
         receipt['legacy_usage_retained'] = True

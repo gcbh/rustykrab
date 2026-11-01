@@ -4,8 +4,8 @@
 //!
 //! A `code` item names its repository as a `repo:<path>` writable
 //! resource, which is also what the single-writer rule serialises on. At
-//! lease time the controller pins the repository's `HEAD` as the run's
-//! parent commit and plans a [`Workspace`]: a new branch
+//! preparation time the controller pins fresh upstream plus explicit verified
+//! dependencies (or a failure reproducer's exact base) and plans a [`Workspace`]: a new branch
 //! (`rustykrab/work/<item>-<run>`) checked out in a worktree under the
 //! daemon's data directory, never inside the user's own checkout. The
 //! worker adapter creates it before the run and removes the worktree
@@ -22,8 +22,8 @@
 //!
 //! Every git call runs with hooks disabled (`core.hooksPath=/dev/null`) and
 //! no terminal prompt, so creating a worktree in a user's repository runs
-//! none of that repository's code. All of it is blocking; async callers
-//! wrap it in `spawn_blocking`.
+//! none of that repository's hooks. Most helpers are blocking; async callers
+//! wrap blocking helpers in `spawn_blocking`; `fresh_base` bounds remote calls asynchronously.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -262,6 +262,104 @@ pub fn head(repo: &Path) -> Result<String, String> {
             "{} has no HEAD commit: {}",
             repo.display(),
             stderr(&out)
+        ));
+    }
+    Ok(stdout(&out))
+}
+
+/// Start independent work from the remote default branch, fetched at preparation
+/// time. Fetch only objects: never move a local branch, index or working file,
+/// including a dirty checkout or another session's in-progress merge. Offline
+/// repositories use local main/master; an unreachable configured remote is an
+/// explicit preparation failure, not permission to silently use stale HEAD.
+pub async fn fresh_base(repo: &Path) -> Result<String, String> {
+    let remotes = upstream_git(repo, &["remote"]).await?;
+    let remotes: Vec<_> = remotes.lines().collect();
+    let remote = if remotes.contains(&"origin") {
+        Some("origin")
+    } else if remotes.len() == 1 {
+        Some(remotes[0])
+    } else if remotes.is_empty() {
+        None
+    } else {
+        return Err("repository has multiple remotes and no origin; identify its upstream".into());
+    };
+    if let Some(remote) = remote {
+        let advertised = upstream_git(repo, &["ls-remote", "--exit-code", remote, "HEAD"]).await?;
+        let sha = advertised
+            .lines()
+            .find_map(|line| {
+                let (sha, name) = line.split_once('\t')?;
+                (name == "HEAD"
+                    && matches!(sha.len(), 40 | 64)
+                    && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then_some(sha)
+            })
+            .ok_or("upstream does not advertise a default-branch commit")?;
+        upstream_git(
+            repo,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                remote,
+                sha,
+            ],
+        )
+        .await?;
+        return upstream_git(
+            repo,
+            &["rev-parse", "--verify", &format!("{sha}^{{commit}}")],
+        )
+        .await;
+    }
+    for branch in ["main", "master"] {
+        if let Ok(sha) = upstream_git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ],
+        )
+        .await
+        {
+            return Ok(sha);
+        }
+    }
+    Err("repository has no remote or local main/master branch; identify its upstream".into())
+}
+
+async fn upstream_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.interactive=false",
+        ])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .map_err(|_| format!("upstream git {} timed out", args[0]))?
+        .map_err(|e| format!("cannot observe upstream: {e}"))?;
+    if !out.status.success() {
+        // Remote diagnostics can contain credential-bearing URLs.
+        return Err(format!(
+            "upstream git {} failed ({}); current base unavailable",
+            args[0], out.status
         ));
     }
     Ok(stdout(&out))
@@ -649,6 +747,99 @@ fn short(sha: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_upstream_ignores_a_dirty_feature_checkout_and_preserves_it() {
+        let upstream = Repo::new();
+        let checkout = tempfile::tempdir().unwrap();
+        run_git(
+            checkout.path(),
+            &["clone", upstream.path().to_str().unwrap(), "."],
+        );
+        let original = head(checkout.path()).unwrap();
+        run_git(checkout.path(), &["checkout", "-b", "someone-elses-work"]);
+        std::fs::write(checkout.path().join("local.txt"), "committed feature").unwrap();
+        let feature = commit_all(checkout.path(), "feature");
+        std::fs::write(checkout.path().join("README.md"), "uncommitted owner work").unwrap();
+        std::fs::write(checkout.path().join("untracked.txt"), "keep me").unwrap();
+        let status = run_git(checkout.path(), &["status", "--porcelain"]);
+        std::fs::write(upstream.path().join("README.md"), "upstream advanced").unwrap();
+        let latest = commit_all(upstream.path(), "new main");
+        let base = fresh_base(checkout.path()).await.unwrap();
+        assert_eq!(base, latest);
+        assert_eq!(head(checkout.path()).unwrap(), feature);
+        assert_eq!(run_git(checkout.path(), &["rev-parse", "main"]), original);
+        assert_eq!(run_git(checkout.path(), &["status", "--porcelain"]), status);
+        assert_eq!(
+            std::fs::read_to_string(checkout.path().join("README.md")).unwrap(),
+            "uncommitted owner work"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::plan(root.path(), checkout.path(), &base, "fresh", "run");
+        ws.create().unwrap();
+        assert!(run_git(&ws.path, &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(ws.path.join("README.md")).unwrap(),
+            "upstream advanced"
+        );
+        assert!(!ws.path.join("local.txt").exists());
+        assert!(!ws.path.join("untracked.txt").exists());
+        ws.remove().unwrap();
+        // A configured but unavailable remote must not silently reuse old main.
+        run_git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                checkout.path().join("missing.git").to_str().unwrap(),
+            ],
+        );
+        assert!(fresh_base(checkout.path())
+            .await
+            .unwrap_err()
+            .contains("current base unavailable"));
+        assert_eq!(run_git(checkout.path(), &["status", "--porcelain"]), status);
+    }
+
+    #[tokio::test]
+    async fn fresh_local_main_does_not_abort_someone_elses_merge() {
+        let repo = Repo::new();
+        run_git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("README.md"), "feature").unwrap();
+        commit_all(repo.path(), "feature");
+        run_git(repo.path(), &["checkout", "main"]);
+        std::fs::write(repo.path().join("README.md"), "main").unwrap();
+        let main = commit_all(repo.path(), "main");
+        assert!(!git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "merge",
+                "feature"
+            ]
+        )
+        .unwrap()
+        .status
+        .success());
+        let unmerged = run_git(repo.path(), &["ls-files", "--unmerged"]);
+        assert!(!unmerged.is_empty());
+        let merge_head = run_git(repo.path(), &["rev-parse", "MERGE_HEAD"]);
+        assert_eq!(fresh_base(repo.path()).await.unwrap(), main);
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::plan(root.path(), repo.path(), &main, "fresh", "run");
+        ws.create().unwrap();
+        assert!(run_git(&ws.path, &["status", "--porcelain"]).is_empty());
+        assert_eq!(run_git(repo.path(), &["ls-files", "--unmerged"]), unmerged);
+        assert_eq!(
+            run_git(repo.path(), &["rev-parse", "MERGE_HEAD"]),
+            merge_head
+        );
+        ws.remove().unwrap();
+    }
 
     /// A throwaway repository with one commit, and the git identity
     /// commits in it use.

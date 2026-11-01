@@ -226,7 +226,10 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Copy `pipe` into a buffer as it arrives, so what a run printed survives
 /// the run being ended. The task finishes at end of file.
-fn capture<R>(pipe: Option<R>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+fn capture<R>(
+    pipe: Option<R>,
+    activity: Arc<std::sync::atomic::AtomicU64>,
+) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -238,6 +241,7 @@ where
             let Some(mut pipe) = pipe else { return };
             let mut chunk = [0u8; 8192];
             while let Ok(n @ 1..) = pipe.read(&mut chunk).await {
+                activity.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 buf.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend_from_slice(&chunk[..n]);
@@ -548,6 +552,7 @@ impl ExternalConfig {
 /// The `claude_code` and `codex` worker kinds: an agent CLI run headless
 /// per brief.
 pub struct ExternalWorker {
+    activity: Mutex<HashMap<String, std::sync::Weak<std::sync::atomic::AtomicU64>>>,
     name: String,
     config: ExternalConfig,
     max_runtime: Option<Arc<rustykrab_providers::ClaudeMaxRuntime>>,
@@ -579,6 +584,7 @@ struct Transcript {
 impl ExternalWorker {
     pub fn new(name: impl Into<String>, config: ExternalConfig) -> ExternalWorker {
         ExternalWorker {
+            activity: Mutex::new(HashMap::new()),
             name: name.into(),
             max_runtime: config.require_max.then(|| {
                 Arc::new(
@@ -984,6 +990,7 @@ impl ExternalWorker {
         &self,
         mut cmd: tokio::process::Command,
         limit: Duration,
+        activity: Arc<std::sync::atomic::AtomicU64>,
     ) -> (
         Result<std::process::Output>,
         Option<std::process::Output>,
@@ -1004,8 +1011,8 @@ impl ExternalWorker {
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .map(|pid| self.groups.enter(pid));
-        let (stdout, mut stdout_task) = capture(child.stdout.take());
-        let (stderr, mut stderr_task) = capture(child.stderr.take());
+        let (stdout, mut stdout_task) = capture(child.stdout.take(), activity.clone());
+        let (stderr, mut stderr_task) = capture(child.stderr.take(), activity);
         let finished = tokio::time::timeout_at(deadline, async {
             let status = child.wait().await;
             let _ = (&mut stdout_task).await;
@@ -1223,6 +1230,16 @@ impl Worker for ExternalWorker {
         false
     }
 
+    /// Bytes observed from the child while this invocation is alive.
+    fn activity(&self, run: &str) -> Option<u64> {
+        self.activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run)
+            .and_then(std::sync::Weak::upgrade)
+            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Tokens and turns from the agent's own event stream, and the wall
     /// time of its process.
     fn usage(&self, run: &str) -> Option<RunUsage> {
@@ -1351,7 +1368,13 @@ impl Worker for ExternalWorker {
         let limit = self.config.timeout;
         let started = std::time::Instant::now();
         prune_files(&self.logs_root(), RUN_LOG_RETENTION);
-        let (executed, partial, interrupted) = self.execute(cmd, limit).await;
+        let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let mut counters = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+            counters.retain(|_, counter| counter.strong_count() > 0);
+            counters.insert(run_id.clone(), Arc::downgrade(&activity));
+        }
+        let (executed, partial, interrupted) = self.execute(cmd, limit, activity.clone()).await;
         let outcome = match executed {
             Ok(output) => {
                 self.append_log(&run_id, "start", &output, true);
@@ -2080,6 +2103,27 @@ mod tests {
     use rustykrab_control::worker::run_failure_input;
     use rustykrab_control::workspace::Workspace;
     use rustykrab_core::work::{Budget, ErrorClass, ErrorSubclass, WorkKind};
+
+    #[tokio::test]
+    async fn activity_is_observed_while_native_output_is_still_in_flight() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (bytes, task) = capture(Some(reader), activity.clone());
+        writer.write_all(b"native event\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while activity.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(activity.load(std::sync::atomic::Ordering::Relaxed), 13);
+        drop(writer);
+        task.await.unwrap();
+        assert_eq!(&*bytes.lock().unwrap(), b"native event\n");
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")

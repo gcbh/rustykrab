@@ -69,6 +69,7 @@ mod commit;
 mod credentials;
 mod discussion;
 mod dispatchability;
+mod execution_progress;
 mod filing;
 mod investigation;
 mod load;
@@ -266,21 +267,6 @@ pub fn default_cost_tier(kind: WorkerKind) -> u32 {
     }
 }
 
-/// The progress ledger's seam (plan step 7). Phase 1 has none: a lease
-/// past its TTL is the stall signal. A ledger that reports progress on a
-/// run renews its lease instead.
-pub trait ProgressLedger: Send + Sync {
-    fn progressed(&self, _item: &str, _since: DateTime<Utc>) -> bool {
-        false
-    }
-}
-
-/// No ledger: nothing counts as progress.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoLedger;
-
-impl ProgressLedger for NoLedger {}
-
 /// Work on a local model the controller does not run itself: an
 /// interactive turn, a credential wake (plan section 12.1). While a model
 /// is busy the controller leases no local worker on it, so a scheduled
@@ -435,6 +421,8 @@ struct Run {
     /// The run already handed in its result through `result_report`; what
     /// its task returns is ignored.
     reported: bool,
+    activity: Option<u64>,
+    merge_progress: Option<execution_progress::MergeProgress>,
 }
 
 /// A result waiting for the reconcile step: a report handed in through
@@ -504,7 +492,6 @@ pub struct Controller {
     clock: Arc<dyn Clock>,
     catalog: Arc<dyn ToolCatalog>,
     routing: Arc<dyn Routing>,
-    ledger: Arc<dyn ProgressLedger>,
     activity: Arc<dyn ModelActivity>,
     /// Where a credential question's page link waits for its notice
     /// (section 7). `None`: a credential question files no request.
@@ -521,7 +508,7 @@ pub struct Controller {
 impl Controller {
     /// A controller over a fixed set of workers (an in-memory registry), on
     /// the wall clock, with an empty catalog, cheapest-first routing and no
-    /// progress ledger.
+    /// external model-activity monitor.
     pub fn new(store: Store, workers: Vec<Arc<dyn Worker>>, config: ControllerConfig) -> Self {
         let recurrence = Recurrence::with_threshold(config.promote_threshold);
         Controller {
@@ -531,7 +518,6 @@ impl Controller {
             clock: Arc::new(SystemClock),
             catalog: Arc::new(StaticCatalog::default()),
             routing: Arc::new(CheapestFirst),
-            ledger: Arc::new(NoLedger),
             activity: Arc::new(NoActivity),
             links: None,
             loop_lock: tokio::sync::Mutex::new(()),
@@ -585,11 +571,6 @@ impl Controller {
 
     pub fn with_routing(mut self, routing: Arc<dyn Routing>) -> Self {
         self.routing = routing;
-        self
-    }
-
-    pub fn with_progress_ledger(mut self, ledger: Arc<dyn ProgressLedger>) -> Self {
-        self.ledger = ledger;
         self
     }
 
@@ -813,10 +794,13 @@ impl ControlHandle for Controller {
     async fn tick(&self) -> Result<TickReport, Error> {
         // Read/reconstruct expensive project history before taking the command
         // lock; a concurrent answer must not wait behind that background work.
-        let handoffs = if self.state().lock == Some(LockState::Waiting) {
-            Ok(None)
+        let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
+            (Ok(None), Ok(Default::default()))
         } else {
-            self.prepare_handoff_rechecks().await
+            tokio::join!(
+                self.prepare_handoff_rechecks(),
+                self.prepare_upstream_bases()
+            )
         };
         let _loop = self.loop_lock.lock().await;
         if self.state().lock == Some(LockState::Waiting) {
@@ -824,7 +808,7 @@ impl ControlHandle for Controller {
                 "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
             )));
         }
-        self.tick_locked(handoffs).await
+        self.tick_locked(handoffs, upstream).await
     }
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {

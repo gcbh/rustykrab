@@ -205,6 +205,15 @@ impl Worker for NativeWorker {
     async fn refresh(&self) -> bool {
         self.native.refresh().await
     }
+    fn activity(&self, run: &str) -> Option<u64> {
+        // Continued conversation IDs can have old host accounting when a new
+        // attempt uses the native path. A stale host counter must not mask
+        // actual native activity.
+        match (self.host.activity(run), self.native.activity(run)) {
+            (Some(host), Some(native)) => Some(host.saturating_add(native)),
+            (host, native) => host.or(native),
+        }
+    }
     fn usage(&self, run: &str) -> Option<RunUsage> {
         self.host.usage(run).or_else(|| self.native.usage(run))
     }

@@ -19,6 +19,60 @@ use rustykrab_projects::*;
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
+async fn slow_upstream_does_not_block_cancellation_or_start_cancelled_work() {
+    use crate::handle::ControlHandle;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let repo = Repo::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    crate::workspace::tests::run_git(repo.path(), &["remote", "add", "origin", &url]);
+    let root = tempfile::tempdir().unwrap();
+    let coder = Coder::new(WorkerKind::Codex, &repo);
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().into()),
+            ..Default::default()
+        },
+        vec![coder.clone()],
+    );
+    let id = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "cancel while fetching",
+            None,
+        ))
+        .await;
+    let command = async {
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        // Keep upstream waiting until the actual cancellation command returns.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h.ctl.cancel(&id, None, "user:owner"),
+        )
+        .await
+        .expect("upstream I/O must not hold the controller command lock")
+        .unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Fixture failure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    };
+    let (tick, ()) = tokio::join!(h.ctl.tick(), command);
+    tick.unwrap();
+    assert!(h.status(&id).await.is_closed());
+    assert!(coder.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn repaired_handoffs_resume_old_size_holds_and_integrate_verified_history() {
     let repo = Repo::new();
     let root = tempfile::tempdir().unwrap();
@@ -39,14 +93,17 @@ async fn repaired_handoffs_resume_old_size_holds_and_integrate_verified_history(
     let codex = Coder::new(WorkerKind::Codex, &repo);
     h.ctl =
         Controller::new(h.store().clone(), vec![codex.clone()], config).with_clock(h.clock.clone());
-    let next = h
-        .file_one(code(
-            &repo,
-            WorkerKind::Codex,
-            "continue",
-            Some(project.project.id),
-        ))
-        .await;
+    let mut continuation = code(
+        &repo,
+        WorkerKind::Codex,
+        "continue",
+        Some(project.project.id),
+    );
+    continuation.edges.push(rustykrab_core::work::DraftEdge {
+        kind: rustykrab_core::work::EdgeKind::Blocks,
+        depends_on: rustykrab_core::work::ItemRef::Id(first.clone()),
+    });
+    let next = h.file_one(continuation).await;
     h.ctl.hold_context(&h.store().work_get(&next).await.unwrap().unwrap(),
         "project context exceeds the handoff limit; narrow the execution slice before continuing".into()).await.unwrap();
     // Old releases could insert the same technical question more than once.
@@ -332,7 +389,7 @@ fn code(repo: &Repo, kind: WorkerKind, title: &str, project: Option<ProjectId>) 
     d
 }
 #[tokio::test]
-async fn claude_to_codex_rehydrates_archived_progress_after_a_fresh_controller() {
+async fn archived_project_history_is_context_not_an_implicit_code_dependency() {
     let repo = Repo::new();
     let root = tempfile::tempdir().unwrap();
     let original = head(repo.path()).unwrap();
@@ -416,21 +473,25 @@ async fn claude_to_codex_rehydrates_archived_progress_after_a_fresh_controller()
         .file_one(code(
             &repo,
             WorkerKind::Codex,
-            "continue",
+            "independent task",
             Some(project.project.id),
         ))
         .await;
     h.drain_settled().await;
     assert_eq!(h.status(&next).await, Status::Done);
     let received = codex.received.lock().unwrap()[0].clone();
-    assert_eq!(received.workspace.as_ref().unwrap().base, first_commit);
+    assert_eq!(received.workspace.as_ref().unwrap().base, original);
     let ctx = received.project_context.unwrap();
     assert_eq!(ctx.snapshot.revision.id, updated.revision.id);
     assert_eq!(
         ctx.snapshot.revision.nodes[&node].body,
         "Use CLI subscriptions; carry verified work"
     );
-    assert_eq!(ctx.base_sources, vec![first]);
+    assert!(ctx.base_sources.is_empty());
+    assert!(ctx
+        .work
+        .iter()
+        .any(|w| w.item == first && w.evidence.iter().any(|e| e.value == first_commit)));
     assert_eq!(head(repo.path()).unwrap(), original);
     let stored = reopened
         .work_evidence_list(&next)
@@ -446,7 +507,7 @@ async fn claude_to_codex_rehydrates_archived_progress_after_a_fresh_controller()
     );
     let monitor = reopened.work_monitor_snapshot(200, 50).await.unwrap();
     let observed = monitor.items.iter().find(|r| r.item.id == next).unwrap();
-    assert_eq!(observed.workspace.as_ref().unwrap()["base"], first_commit);
+    assert_eq!(observed.workspace.as_ref().unwrap()["base"], original);
     assert_eq!(
         observed.project_context.as_ref().unwrap()["base_sources"],
         serde_json::json!(ctx.base_sources)
