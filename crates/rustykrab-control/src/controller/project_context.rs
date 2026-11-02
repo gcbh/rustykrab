@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use chrono::{TimeDelta, Utc};
 use rustykrab_core::questions::QuestionKind;
 use rustykrab_core::questions::QuestionStatus;
-use rustykrab_core::work::{BlockedReason, Evidence, Status, WorkItem};
+use rustykrab_core::work::{
+    BlockedReason, CancelReason, Edge, EdgeKind, EventKind, Evidence, Status, WorkItem,
+};
 use rustykrab_core::Error;
 use rustykrab_projects::{ProjectId, ProjectSnapshot, ProjectStatus};
 use rustykrab_store::{QuestionRow, QuestionWrite, WorkOp};
@@ -27,6 +29,7 @@ pub(super) struct HandoffChecks {
     projects: BTreeMap<ProjectId, ProjectSnapshot>,
     passed: Vec<String>,
     conflicts: Vec<(String, MergeConflict)>,
+    obsolete_merges: Vec<(Edge, String)>,
 }
 
 fn technical(q: &QuestionRow) -> bool {
@@ -419,6 +422,7 @@ impl Controller {
             projects: BTreeMap::new(),
             passed: Vec::new(),
             conflicts: Vec::new(),
+            obsolete_merges: Vec::new(),
         };
         let mut contexts = BTreeMap::new();
         let mut upstream = super::tick::UpstreamBases::new();
@@ -462,6 +466,100 @@ impl Controller {
                 Err(why) => tracing::debug!(item = %id, %why, "project handoff remains unresolved"),
             }
         }
+        // Older controllers inserted a shared merge prerequisite while
+        // integrating unrelated project history. Revalidate each derived
+        // edge against today's base and the item's actual declared inputs.
+        for evidence in self
+            .store
+            .work_evidence_of_kind(super::merge_recovery::MERGE_RECOVERY)
+            .await?
+        {
+            if evidence.verified_by.as_deref() != Some(CONTROLLER) {
+                continue;
+            }
+            let recovery: super::merge_recovery::Recovery =
+                serde_json::from_str(&evidence.reference).map_err(|e| {
+                    Error::Internal(format!("invalid merge recovery provenance: {e}"))
+                })?;
+            let Some(item) = snap.item(&evidence.item) else {
+                continue;
+            };
+            if !matches!(item.status, Status::Queued | Status::Ready)
+                || snap.has_children(&item.id)
+                || item.inputs_from.contains(&recovery.repair)
+            {
+                continue;
+            }
+            let edge = Edge {
+                item: item.id.clone(),
+                depends_on: recovery.repair.clone(),
+                kind: EdgeKind::WaitsFor,
+            };
+            if !snap.edges().contains(&edge) {
+                continue;
+            }
+            // Retained owner discussion/decisions may intentionally require
+            // this dependency. Conservative provenance does not rely on clocks.
+            if self.store.work_events(&item.id).await?.iter().any(|e| {
+                (e.actor == "user"
+                    || e.actor.starts_with("user:")
+                    || e.actor.starts_with("policy:"))
+                    && matches!(
+                        e.kind,
+                        EventKind::Comment
+                            | EventKind::Decision
+                            | EventKind::Repoint
+                            | EventKind::Question
+                    )
+            }) {
+                continue;
+            }
+            let mut independent = snap.clone();
+            independent.remove_edge(&edge);
+            let checked = async {
+                let mut context = self
+                    .cached_project_context(&independent, item, &mut contexts)
+                    .await?;
+                let Some(ctx) = context.as_ref() else {
+                    return Ok(None);
+                };
+                if ctx.snapshot.project.id.to_string() != recovery.project {
+                    return Ok(None);
+                }
+                checks
+                    .projects
+                    .insert(ctx.snapshot.project.id, ctx.snapshot.clone());
+                let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
+                    return Ok(None);
+                };
+                if repo != recovery.conflict.repository {
+                    return Ok(None);
+                }
+                if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
+                    let base = crate::workspace::fresh_base(entry.key()).await;
+                    entry.insert(base);
+                }
+                let workspace = self
+                    .plan_workspace_at(
+                        item,
+                        "obsolete-merge-recheck",
+                        context.as_mut(),
+                        Some(&upstream),
+                    )
+                    .await
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                Self::check_execution_context(context.as_ref().unwrap())?;
+                Ok::<_, Error>(workspace.map(|ws| ws.base))
+            }
+            .await;
+            match checked {
+                Ok(Some(base)) => checks.obsolete_merges.push((edge, base)),
+                Ok(None) => {}
+                Err(why) => {
+                    tracing::debug!(item = %item.id, %why, "merge dependency remains required or unverified")
+                }
+            }
+        }
         Ok(Some(checks))
     }
 
@@ -485,6 +583,56 @@ impl Controller {
             }
         }
         let mut changed = Vec::new();
+        let mut repairs = std::collections::BTreeSet::new();
+        for (edge, base) in checks.obsolete_merges {
+            let Some(item) = batch.snap.item(&edge.item) else {
+                continue;
+            };
+            if !matches!(item.status, Status::Queued | Status::Ready)
+                || item.inputs_from.contains(&edge.depends_on)
+                || !batch.snap.edges().contains(&edge)
+            {
+                continue;
+            }
+            batch.snap.remove_edge(&edge);
+            batch.ops.push(WorkOp::RemoveEdge(edge.clone()));
+            batch.note(&edge.item, EventKind::Repoint, "controller", format!(
+                "Obsolete controller merge prerequisite {} removed: current inputs prepare successfully at {base}; original goal and owner holds retained", edge.depends_on));
+            changed.push(edge.item.clone());
+            repairs.insert(edge.depends_on);
+        }
+        for repair in repairs {
+            let Some(item) = batch.snap.item(&repair) else {
+                continue;
+            };
+            let needed = batch.snap.items().iter().any(|w| {
+                !w.status.is_closed()
+                    && (w.inputs_from.contains(&repair)
+                        || batch
+                            .snap
+                            .edges_held_by(&w.id)
+                            .any(|e| e.kind.is_ordering() && e.depends_on == repair))
+            });
+            let owner_question = waiting.iter().any(|q| {
+                q.item == repair
+                    && q.status == QuestionStatus::Open
+                    && (q.rule != "surfaced"
+                        || q.asked_by != CONTROLLER
+                        || q.kind != QuestionKind::Decision
+                        || q.answer_submission.as_ref().is_some_and(|s| {
+                            s.status == rustykrab_store::AnswerSubmissionStatus::Pending
+                        }))
+            });
+            if !needed
+                && item.held_by.is_none()
+                && !item.status.is_active()
+                && !item.status.is_closed()
+                && !owner_question
+            {
+                changed.extend(batch.close(&repair, Status::Cancelled(CancelReason::Cascade), CONTROLLER,
+                    "No open task requires this historical controller merge prerequisite; retained as obsolete recovery history"));
+            }
+        }
         for (id, conflict) in checks.conflicts {
             let Some(item) = batch.snap.item(&id).cloned() else {
                 continue;

@@ -537,3 +537,49 @@ No new budget, controller, persistence store or authority grant is introduced.
 The [verification record](../verification/self-healing-execution-2026-11-01.md)
 separates deterministic tests, real native execution, live baseline and rollout.
 This does not establish generic semantic progress assessment or live recovery.
+
+## Resumed loop escalation (2026-11-01)
+
+Read-only evidence from live v6.6.18 showed that owner resumption ran qwen-code
+for 1,283,923 ms and 1,975,759 recorded tokens, then surfaced model/loop. The
+historical planner-to-integrations switch had spent the only switch rung. The
+picker read routing floors only from successful switch records, so a later
+continuation could select another local worker despite the confirmed loop.
+
+A real-store regression fails on released base 3691f94 and passes when a surfaced
+loop's leased worker survives history reconstruction as an exclusion and upgrade
+floor. Tests retain the old switch count and complete the resumed objective after
+a controller restart; unavailable upgrades wait rather than repeating aliases.
+All old events remain. An explicit owner/delegated technical resumption begins
+a new finite recovery cycle, while routing and cumulative usage retain the full
+history. This fixes continuation routing; it does not add manager intervention,
+grant live retry authority or establish live repair effectiveness. The isolated native recovery fixture can now reproduce a
+spent historical switch followed by a surfaced loop, daemon restart and explicit
+owner resumption. Execution evidence is recorded separately from this design. The first native
+fixture exposed a further defect: the new executor’s report was rejected, but
+the earlier executor had already spent every repair rung, leaving no chance
+to correct the report. The bounded owner-resumption cycle addresses that
+failure without worker-authorized resets or deletion of failed evidence.
+
+The same investigation found 38 live WaitsFor edges still pointing at the old
+shared merge repair. Fresh-start selection alone could not release those leaves.
+Handoff rechecking now re-prepares each controller-proven dependency against
+current upstream and declared inputs, with event-head/revision binding. A real
+Git regression fails on released handoff code and passes when independent work
+starts on current main without running the obsolete repair. Explicit conflicting
+inputs and owner discussion retain their edge. An unneeded inactive unheld
+repair is cancelled as obsolete, preserving historical work and owner receipts.
+This is technical prerequisite revalidation, not a general semantic manager or
+proof that all live items are now satisfied.
+
+Verification of the candidate: the workspace suite passed 2,510 tests (39 ignored),
+Clippy passed, and architecture/environment/format checks passed. The isolated
+real RustyKrab-to-Codex fixture retained a historical spent switch and two repair
+rungs, surfaced the local loop, restarted the daemon, and accepted an explicit
+fixture-owner continuation. Two native runs resolved the merge: the first report
+was rejected, the new bounded cycle allowed correction, host Git verification
+accepted the repair, and the original operation then completed. An independent
+`cargo test --offline` of the verified merge passed. The shared checkout,
+historical usage, 18 owner answers and an unrelated consent hold were preserved;
+fixture processes stopped. This is executed fixture evidence on the candidate,
+not a deployment or verified completion of the live held work.

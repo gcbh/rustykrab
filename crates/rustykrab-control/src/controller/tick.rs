@@ -1444,7 +1444,8 @@ impl Controller {
     ) -> Result<Vec<WorkItemId>, Error> {
         let events = self.store.work_events(&item.id).await?;
         let mut state = ladder_from(&events, item);
-        let mut excluded = history(&events).excluded;
+        let hist = history(&events);
+        let mut excluded = hist.excluded.clone();
         excluded.insert(worker.to_string());
 
         // Recurrence counts items, not attempts: the same fingerprint on
@@ -1520,7 +1521,7 @@ impl Controller {
             .then(|| self.escalation_floor(worker, error.subclass == ErrorSubclass::Loop))
             .flatten()
             .into_iter()
-            .chain(history(&events).floor)
+            .chain(self.history_floor(&hist))
             .max();
         let class = self.class_of(item).await?;
         let ctx = LadderContext {
@@ -1973,6 +1974,23 @@ impl Controller {
                         && w.capabilities().models.iter().any(|m| models.contains(m)))
             })
             .map(|w| self.routing.cost_tier(w.as_ref()))
+            .max()
+    }
+
+    /// Owner-authorized resumption does not erase a surfaced loop. Keep its
+    /// routing consequence separately from the finite, already-spent ladder.
+    /// The same matcher is used for dispatch and demand/availability reads.
+    fn history_floor(&self, history: &super::load::History) -> Option<u32> {
+        history
+            .floor
+            .into_iter()
+            .chain(
+                history
+                    .failed
+                    .iter()
+                    .filter(|_| !history.looped.is_empty())
+                    .filter_map(|worker| self.escalation_floor(worker, true)),
+            )
             .max()
     }
 
@@ -2434,7 +2452,7 @@ impl Controller {
         let mut effective = item.clone();
         effective.required_tools = super::brief::effective_requirements(item, hist).required_tools;
         let item = &effective;
-        let (excluded, floor) = (&hist.excluded, hist.floor);
+        let (excluded, floor) = (&hist.excluded, self.history_floor(hist));
         let workers = self.registry.workers();
         workers
             .iter()

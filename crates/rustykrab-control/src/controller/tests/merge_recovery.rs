@@ -123,6 +123,7 @@ enum RepairMode {
     Resolve,
     OneParent,
     Noop,
+    Fresh,
 }
 struct RepairWorker {
     repo: String,
@@ -158,6 +159,9 @@ impl Worker for RepairWorker {
             let report = if brief.title.starts_with("Resolve shared Git conflict") {
                 assert!(parents.contains(&ws.base));
                 match mode {
+                    RepairMode::Fresh => {
+                        panic!("independent work must not replay an obsolete merge")
+                    }
                     RepairMode::Noop => ResultReport {
                         summary: "Claimed resolution without doing it".into(),
                         ..Default::default()
@@ -203,7 +207,11 @@ impl Worker for RepairWorker {
             } else {
                 assert_eq!(
                     fs::read_to_string(ws.path.join("permissions.txt")).unwrap(),
-                    "resolved project policy\n"
+                    if matches!(mode, RepairMode::Fresh) {
+                        "new tool policy\n"
+                    } else {
+                        "resolved project policy\n"
+                    }
                 );
                 let path = format!("{}.txt", brief.title);
                 fs::write(ws.path.join(&path), "original useful work completed").unwrap();
@@ -506,6 +514,115 @@ async fn independent_work_does_not_inherit_a_conflicting_project_branch() {
     );
     assert!(f.repairs().await.is_empty());
     ws.remove().unwrap();
+}
+
+async fn retain_legacy_merge_edge(f: &mut Fixture, original: &str) -> String {
+    let other = f
+        .worker
+        .parents
+        .iter()
+        .find(|p| **p != f.current)
+        .unwrap()
+        .clone();
+    let conflict = workspace::continuation_base_checked(&f.repo, &f.current, &[other]).unwrap_err();
+    let item = f.h.item(original).await;
+    f.h.ctl.hold_workspace(&item, conflict).await.unwrap();
+    f.repairs().await[0].clone()
+}
+
+#[tokio::test]
+async fn obsolete_controller_merge_gate_releases_independent_work_on_current_main() {
+    let mut f = Fixture::new(RepairMode::Fresh).await;
+    f.history.take();
+    let original = f.original("fresh-original").await;
+    let repair = retain_legacy_merge_edge(&mut f, &original).await;
+    let checks = f.h.ctl.prepare_handoff_rechecks().await.unwrap();
+    let waiting = f.h.ctl.waiting_questions().await.unwrap();
+    let mut batch = super::super::batch::Batch::new(f.h.ctl.load().await.unwrap(), Utc::now());
+    f.h.ctl
+        .recover_project_context_holds(&mut batch, &waiting, checks)
+        .await
+        .unwrap();
+    assert!(
+        !batch
+            .snap
+            .edges_held_by(&original)
+            .any(|e| e.depends_on == repair),
+        "obsolete technical gate still blocks independent work"
+    );
+    f.h.ctl
+        .commit(batch, &mut Default::default())
+        .await
+        .unwrap();
+    f.h.drain_settled().await;
+    assert_eq!(f.h.status(&original).await, Status::Done);
+    assert!(matches!(f.h.status(&repair).await, Status::Cancelled(_)));
+    assert!(f
+        .worker
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|b| !b.title.starts_with("Resolve shared Git conflict")));
+    let base = {
+        let briefs = f.worker.seen.lock().unwrap();
+        briefs
+            .iter()
+            .find(|b| b.item == original)
+            .unwrap()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .base
+            .clone()
+    };
+    assert_eq!(base, f.current);
+    assert_eq!(workspace::head(&f.repo).unwrap(), f.current);
+    assert!(f.h.events(&original).await.iter().any(|e| e
+        .reason
+        .as_deref()
+        .is_some_and(|s| s.contains("Obsolete controller merge prerequisite"))));
+}
+
+#[tokio::test]
+async fn required_merge_and_later_owner_direction_are_not_discarded() {
+    for (explicit, actor) in [
+        (false, "user:fixture"),
+        (false, "policy:fixture"),
+        (true, "user:fixture"),
+    ] {
+        let mut f = Fixture::new(RepairMode::Resolve).await;
+        if !explicit {
+            f.history.take();
+        }
+        let original = f.original("retained-original").await;
+        let repair = retain_legacy_merge_edge(&mut f, &original).await;
+        if !explicit {
+            ControlHandle::comment(
+                &f.h.ctl,
+                &original,
+                "Retain the integration dependency for owner review",
+                actor,
+            )
+            .await
+            .unwrap();
+        }
+        let checks = f.h.ctl.prepare_handoff_rechecks().await.unwrap();
+        let waiting = f.h.ctl.waiting_questions().await.unwrap();
+        let mut batch = super::super::batch::Batch::new(f.h.ctl.load().await.unwrap(), Utc::now());
+        f.h.ctl
+            .recover_project_context_holds(&mut batch, &waiting, checks)
+            .await
+            .unwrap();
+        assert!(batch
+            .snap
+            .edges_held_by(&original)
+            .any(|e| e.depends_on == repair));
+        assert!(!batch
+            .ops
+            .iter()
+            .any(|op| matches!(op, rustykrab_store::WorkOp::RemoveEdge(_))));
+    }
 }
 
 #[tokio::test]
