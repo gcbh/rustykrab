@@ -406,3 +406,14 @@ Seatbelt sandbox invocation. This complements its filesystem and network rules
 and the trusted host's existing process-group cleanup; it introduces no trait,
 worker role, dependency, table, command-name filter or authority grant. It does
 not isolate native adapters or permit signals across separate exec calls.
+
+## Native operational inactivity (base a5298a6)
+
+ExternalWorker retains its existing process/group, usage, report and cancellation
+seams. The spec's timeout_seconds bounds startup and then silence on captured
+stdout/stderr, rather than total native work duration. A private watch channel
+from the existing pipe readers carries the latest output time without polling
+or consuming the controller's activity counter. No new persisted state, worker
+role, permission, table or public trait is introduced. Peer deadlines and the
+local ExecTool call timeout are unchanged. Output activity is not semantic
+progress; normal report/Git verification remains required.

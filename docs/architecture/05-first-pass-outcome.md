@@ -645,3 +645,23 @@ host timeout/cancellation guard retains its process-group cleanup. This is
 verified candidate behavior on macOS, not a deployed repair or a complete
 process/container isolation claim. Native-worker deadlines, shared temporary
 space and useful completion of the original gateway goal remain separate.
+
+## Active native work cut off by a wall timer (2026-11-03)
+
+Gateway prerequisite runs 80c52236 and 0411ae6b reached the native adapter's
+1,800-second whole-process deadline while executing checks. The second retained
+commit e7a9fa34 shortly before its cutoff, but no accepted report followed;
+retrying started another workspace. These are observed execution failures, not
+proof that the Store implementation or original gateway feature is complete.
+
+The candidate uses the same configured duration for bounded startup and then
+output inactivity. Both stdout and stderr reset the deadline; silence still
+ends the group with a typed timeout and preserved partial output. Child exit
+kills its remaining group before readers drain, preventing inherited pipes
+from extending an already completed agent. An incomplete bounded drain is
+reported as failure. Three real subprocess regressions fail on a5298a6 and
+pass on the candidate: active execution beyond the old wall limit, silence
+after output, and a child retaining a completed agent's pipe. This is candidate
+fixture proof, not deployed recovery. Continuous output can prolong a run and
+does not prove useful work; validation, cancellation and finite controller
+recovery remain distinct. The local shell's 600-second call deadline is unchanged.
