@@ -49,11 +49,11 @@
 //! `process/<code>`, an unreadable final message `model/format`.
 //!
 //! **No turn budget.** A run is not capped in turns: the agent works until
-//! it returns its final message, in its own harness, and the wall limit
-//! (the worker's operational process timeout) is the
-//! only stop. A Claude Code cap (`--max-turns`, 30 a round) used to end runs
+//! it returns its final message in its own harness. The worker's operational
+//! timeout bounds process inactivity, not total execution time. Stdout or
+//! stderr bytes reset it; output is activity, not proof of useful progress. A Claude Code cap (`--max-turns`, 30 a round) used to end runs
 //! mid-work, resume them in rounds and finally ask for a contract; it
-//! limited nothing the wall limit did not, and cut work short.
+//! cut work short without establishing useful progress.
 //!
 //! **Its session log.** Everything each invocation printed (the agent's
 //! own JSON event stream: every message, tool call and tool result) is
@@ -220,8 +220,7 @@ impl Default for Retention {
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 
-/// How long a run its wall limit ended gets for its pipes to drain once its
-/// group is killed.
+/// How long a stopped process group gets for its output pipes to drain.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Copy `pipe` into a buffer as it arrives, so what a run printed survives
@@ -229,6 +228,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 fn capture<R>(
     pipe: Option<R>,
     activity: Arc<std::sync::atomic::AtomicU64>,
+    last_output: tokio::sync::watch::Sender<tokio::time::Instant>,
 ) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -242,6 +242,7 @@ where
             let mut chunk = [0u8; 8192];
             while let Ok(n @ 1..) = pipe.read(&mut chunk).await {
                 activity.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                last_output.send_replace(tokio::time::Instant::now());
                 buf.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend_from_slice(&chunk[..n]);
@@ -980,10 +981,10 @@ impl ExternalWorker {
     }
 
     /// Start `cmd` in a process group recorded in [`RunGroups`] and wait
-    /// for it, up to `limit`. Whatever it left running in its group is
-    /// killed when this returns. Its output is read as it arrives, so a run
-    /// its wall limit ended still hands back what it had printed (the
-    /// second value, only then). Also says whether daemon shutdown
+    /// for it while output arrives within `limit`. Starting is separately
+    /// bounded by the same limit. Its group is killed once the CLI exits or
+    /// times out, before draining output. A timeout retains partial output
+    /// (the second value, only then). Also says whether daemon shutdown
     /// ([`RunGroups::terminate_all`]) ended the group, which must be read
     /// before the group is let go.
     async fn execute(
@@ -996,8 +997,8 @@ impl ExternalWorker {
         Option<std::process::Output>,
         bool,
     ) {
-        // The wall limit counts from here, so a wait for a busy executable
-        // comes out of it rather than adding to it.
+        // Starting a busy executable is still bounded. Once it starts, the
+        // configured timeout measures silence, not the whole work duration.
         let deadline = tokio::time::Instant::now() + limit;
         let mut child = match rustykrab_providers::cli_process::spawn(&mut cmd, deadline).await {
             Ok(child) => child,
@@ -1011,15 +1012,30 @@ impl ExternalWorker {
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .map(|pid| self.groups.enter(pid));
-        let (stdout, mut stdout_task) = capture(child.stdout.take(), activity.clone());
-        let (stderr, mut stderr_task) = capture(child.stderr.take(), activity);
-        let finished = tokio::time::timeout_at(deadline, async {
-            let status = child.wait().await;
-            let _ = (&mut stdout_task).await;
-            let _ = (&mut stderr_task).await;
-            status
-        })
-        .await;
+        let (last_output, mut output_events) =
+            tokio::sync::watch::channel(tokio::time::Instant::now());
+        let (stdout, mut stdout_task) =
+            capture(child.stdout.take(), activity.clone(), last_output.clone());
+        let (stderr, mut stderr_task) = capture(child.stderr.take(), activity, last_output.clone());
+        let mut finished = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            loop {
+                let deadline = *output_events.borrow_and_update() + limit;
+                tokio::select! {
+                    biased;
+                    status = &mut wait => break Ok(status),
+                    // The local sender remains live for this entire wait.
+                    _ = output_events.changed() => {},
+                    _ = tokio::time::sleep_until(deadline) => {
+                        // A read racing the timer must not discard fresh output.
+                        if tokio::time::Instant::now() >= *output_events.borrow() + limit {
+                            break Err(());
+                        }
+                    }
+                }
+            }
+        };
         if finished.is_err() {
             let _ = child.start_kill();
         }
@@ -1027,6 +1043,20 @@ impl ExternalWorker {
         // Whatever the agent left running in its group goes with it, which
         // also closes the pipes it held.
         drop(group);
+        // Stop descendants before joining the readers: an exited CLI must not
+        // be kept alive by a background child retaining its output pipes.
+        let drain_timed_out = tokio::time::timeout(DRAIN_GRACE, async {
+            let _ = (&mut stdout_task).await;
+            let _ = (&mut stderr_task).await;
+        })
+        .await
+        .is_err();
+        stdout_task.abort();
+        stderr_task.abort();
+        if drain_timed_out {
+            finished = Err(());
+        }
+
         let taken = |buf: &Arc<Mutex<Vec<u8>>>| {
             std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()))
         };
@@ -1045,24 +1075,25 @@ impl ExternalWorker {
                 interrupted,
             ),
             Err(_) => {
-                // Let the readers drain what is still in the pipes, briefly.
-                let _ = tokio::time::timeout(DRAIN_GRACE, async {
-                    let _ = (&mut stdout_task).await;
-                    let _ = (&mut stderr_task).await;
-                })
-                .await;
-                stdout_task.abort();
-                stderr_task.abort();
                 let partial = child.wait().await.ok().map(|status| std::process::Output {
                     status,
                     stdout: taken(&stdout),
                     stderr: taken(&stderr),
                 });
-                let failure = Error::ToolExecution(rustykrab_core::ToolError::timeout(format!(
-                    "{}s process timeout before {} returned",
-                    limit.as_secs(),
-                    self.config.command.display()
-                )));
+                let why = if drain_timed_out {
+                    format!(
+                        "{}s output drain timeout after stopping {}",
+                        DRAIN_GRACE.as_secs(),
+                        self.config.command.display()
+                    )
+                } else {
+                    format!(
+                        "{}s process inactivity timeout before {} returned",
+                        limit.as_secs(),
+                        self.config.command.display()
+                    )
+                };
+                let failure = Error::ToolExecution(rustykrab_core::ToolError::timeout(why));
                 (Err(failure), partial, interrupted)
             }
         }
@@ -1380,7 +1411,7 @@ impl Worker for ExternalWorker {
                 self.append_log(&run_id, "start", &output, true);
                 self.read_output(&brief, &run_id, &output, &last)
             }
-            // Ended by its wall limit: record what it had spent, and keep
+            // Ended by its operational timeout: retain usage and keep
             // the timeout as the outcome.
             Err(e) => {
                 if let Some(partial) = &partial {
@@ -2104,12 +2135,93 @@ mod tests {
     use rustykrab_control::workspace::Workspace;
     use rustykrab_core::work::{Budget, ErrorClass, ErrorSubclass, WorkKind};
 
+    #[cfg(unix)]
+    fn process_fixture(script: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .kill_on_drop(true)
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_activity_extends_the_operational_timeout() {
+        let f = Fixture::new();
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("unused", "#!/bin/sh\n"));
+        for channel in ["stdout", "stderr"] {
+            let redirect = if channel == "stderr" { " >&2" } else { "" };
+            let cmd = process_fixture(&format!(
+                "for i in 1 2 3 4 5 6 7 8; do echo progress{redirect}; sleep 0.15; done; echo complete"
+            ));
+            let (result, partial, interrupted) = tokio::time::timeout(
+                Duration::from_secs(8),
+                worker.execute(cmd, Duration::from_millis(500), Arc::default()),
+            )
+            .await
+            .unwrap();
+            let output = result.unwrap_or_else(|e| panic!("active {channel} run timed out: {e}"));
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("complete"));
+            assert!(partial.is_none());
+            assert!(!interrupted);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_silence_after_activity_still_times_out_with_partial_output() {
+        let f = Fixture::new();
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("unused", "#!/bin/sh\n"));
+        let cmd = process_fixture("echo first; sleep 0.3; echo second >&2; sleep 30");
+        let started = tokio::time::Instant::now();
+        let (result, partial, _) = worker
+            .execute(cmd, Duration::from_millis(600), Arc::default())
+            .await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(850),
+            "last output resets the idle deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "silence must still stop the process"
+        );
+        let error = classify(
+            &run_failure_input(&result.unwrap_err()),
+            &Context::default(),
+        );
+        assert_eq!(error.subclass, ErrorSubclass::Timeout);
+        let partial = partial.expect("timeout retains captured output");
+        assert!(String::from_utf8_lossy(&partial.stdout).contains("first"));
+        assert!(String::from_utf8_lossy(&partial.stderr).contains("second"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_process_exit_cleans_up_descendants_before_draining_pipes() {
+        let f = Fixture::new();
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("unused", "#!/bin/sh\n"));
+        let cmd = process_fixture("sleep 30 & echo complete");
+        let (result, partial, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            worker.execute(cmd, Duration::from_secs(10), Arc::default()),
+        )
+        .await
+        .expect("a descendant holding stdout cannot outlive the completed agent");
+        assert!(result.unwrap().status.success());
+        assert!(partial.is_none());
+    }
+
     #[tokio::test]
     async fn activity_is_observed_while_native_output_is_still_in_flight() {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(64);
         let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (bytes, task) = capture(Some(reader), activity.clone());
+        let (last_output, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let (bytes, task) = capture(Some(reader), activity.clone(), last_output);
         writer.write_all(b"native event\n").await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while activity.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -2768,8 +2880,8 @@ wait
         assert!(!missing.healthy());
     }
 
-    /// Claude Code runs in its own harness without a turn cap: the wall
-    /// limit is the only stop, and the brief says nothing of rounds.
+    /// Claude Code runs in its own harness without a turn cap; the
+    /// operational inactivity guard remains, and the brief has no rounds.
     #[tokio::test]
     async fn a_claude_code_run_has_no_turn_cap() {
         let f = Fixture::new();

@@ -99,6 +99,8 @@ pub struct WorkerSpec {
     pub denied_tools: Vec<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Native CLI inactivity timeout (also bounds startup); peer workers
+    /// retain their total remote-operation deadline. Not a per-task budget.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     #[serde(default)]

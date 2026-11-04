@@ -607,3 +607,61 @@ merge patch demonstrated capability but lacked a final commit at the observation
 cutoff; it was not a single-factor causal experiment. Current execution and
 rollout evidence belong in the dated context recovery record. These mechanisms
 alone do not establish completion of live blocked work.
+
+## Local report correction before run completion (2026-11-03)
+
+Store prerequisite b5a36ac9 produced commit 95c31c1 with passing conversation,
+shared-fault, formatting and lint checks. An independent test of that retained
+commit also passed the previously failing fresh-accessor/cloned-Store scenario.
+The controller then correctly rejected the report's descriptive check string
+`cargo build -p rustykrab-store (no features) — EXIT 0`: it was not the command
+text recorded by the host. Because the report had already ended the run, this
+format correction discarded the workspace and escalated to another worker.
+This is a report-feedback failure, not proof that the code or tests failed.
+
+LocalWorker now applies the controller's unchanged matching rules before
+forwarding a report with observed commands. A mismatch remains an error, but
+the current model receives it and can submit a corrected report without
+re-executing completed work. The scripted local-worker regression exercises one
+real exec, the rejected description, and the corrected report in one run; a
+separate regression rejects model-forged command artifacts. Both fail with the
+base recording backend. Final controller verification and native-worker report
+handling remain in place. Candidate regressions do not establish deployment or
+completion of the live gateway goal.
+
+## Cross-worker signal isolation (2026-11-03)
+
+A provider worker selected a compiler PID belonging to a different native task
+and issued kill. That observation does not establish the signal's outcome or
+explain the native task's separately recorded 1,800-second process timeout.
+Independent tests on base a5298a6 do establish that a confined shell could
+successfully signal both an unconfined sentinel and a separately sandboxed job.
+The previous allow-default profile constrained files and network destinations
+but did not constrain signal targets.
+
+The candidate denies signals outside the same sandbox invocation. Both sentinel
+regressions now pass, while signalling one's own child remains possible. The
+host timeout/cancellation guard retains its process-group cleanup. This is
+verified candidate behavior on macOS, not a deployed repair or a complete
+process/container isolation claim. Native-worker deadlines, shared temporary
+space and useful completion of the original gateway goal remain separate.
+
+## Active native work cut off by a wall timer (2026-11-03)
+
+Gateway prerequisite runs 80c52236 and 0411ae6b reached the native adapter's
+1,800-second whole-process deadline while executing checks. The second retained
+commit e7a9fa34 shortly before its cutoff, but no accepted report followed;
+retrying started another workspace. These are observed execution failures, not
+proof that the Store implementation or original gateway feature is complete.
+
+The candidate uses the same configured duration for bounded startup and then
+output inactivity. Both stdout and stderr reset the deadline; silence still
+ends the group with a typed timeout and preserved partial output. Child exit
+kills its remaining group before readers drain, preventing inherited pipes
+from extending an already completed agent. An incomplete bounded drain is
+reported as failure. Three real subprocess regressions fail on a5298a6 and
+pass on the candidate: active execution beyond the old wall limit, silence
+after output, and a child retaining a completed agent's pipe. This is candidate
+fixture proof, not deployed recovery. Continuous output can prolong a run and
+does not prove useful work; validation, cancellation and finite controller
+recovery remain distinct. The local shell's 600-second call deadline is unchanged.

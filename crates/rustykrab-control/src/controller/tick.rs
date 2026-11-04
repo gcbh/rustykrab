@@ -24,7 +24,7 @@ use crate::handle::TickReport;
 use crate::investigate::{fix_fingerprint, RESOLUTION_WAIT};
 use crate::ladder::{self, Decision, LadderContext, LadderState, SurfaceReason};
 use crate::routing::{work_class, Judged, Verdict};
-use crate::worker::{run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
+use crate::worker::{check_claim_ran, run_failure_input, Brief, RunFailure, Worker, COMMAND_RUN};
 use crate::workspace::{self, CodeClaim, CodeVerdict, Workspace, WORKSPACE_EVIDENCE};
 
 use rustykrab_core::questions::QuestionKind;
@@ -169,116 +169,6 @@ pub(super) fn review_overreach(result: &rustykrab_core::work::ResultReport) -> V
     .into_iter()
     .filter_map(|(field, set)| set.then_some(field))
     .collect()
-}
-
-/// A claimed check as the verifier compares it: lower case, whitespace
-/// collapsed, with a trailing parenthetical annotation such as
-/// `(86 passed)` removed.
-fn claimed_check(check: &str) -> String {
-    let mut claim = collapse(check);
-    while claim.ends_with(')') {
-        let mut depth = 0usize;
-        let mut open = None;
-        for (i, ch) in claim.char_indices().rev() {
-            match ch {
-                ')' => depth += 1,
-                '(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        open = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match open {
-            // A claim that is nothing but a parenthetical is not stripped.
-            Some(i) if i > 0 => claim = claim[..i].trim_end().to_string(),
-            _ => break,
-        }
-    }
-    claim
-}
-
-/// Lower case, with every run of whitespace made one space.
-fn collapse(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-/// Whether a normalised claimed check ran in `command`: it equals one of
-/// the command's segments (split on `&&`, `||`, `;` and `|`, so a leading
-/// `cd <dir> &&` is its own segment), or it appears in the command as a
-/// whole command, which covers a shell wrapper such as `bash -lc '...'` and
-/// a claim that is itself compound. A whole appearance has to end where a
-/// command ends, so `cargo test` did not run inside `cargo test-foo`, nor
-/// `python3 x.py` inside `python3 x.py --fix`.
-fn check_ran_in(wanted: &str, command: &str) -> bool {
-    let command = collapse(command);
-    if command
-        .match_indices(wanted)
-        .any(|(i, _)| starts_command(&command[..i]) && ends_command(&command[i + wanted.len()..]))
-    {
-        return true;
-    }
-    command
-        .replace("&&", ";")
-        .replace("||", ";")
-        .replace('|', ";")
-        .split(';')
-        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').trim())
-        .any(|s| s == wanted)
-}
-
-/// Whether a command can start after `before`: at the start of the line, a
-/// word break, an opening quote or bracket, or a shell separator.
-fn starts_command(before: &str) -> bool {
-    before
-        .chars()
-        .next_back()
-        .is_none_or(|c| c.is_whitespace() || "'\"(;&|".contains(c))
-}
-
-/// Whether a command ends where `after` begins: at the end of the line, a
-/// closing quote or bracket, a shell separator, or a redirection such as
-/// `2>&1`. Another argument does not end it.
-fn ends_command(after: &str) -> bool {
-    let rest = after.trim_start();
-    let Some(first) = rest.chars().next() else {
-        return true;
-    };
-    if "'\")>;&|<".contains(first) {
-        return true;
-    }
-    // A numbered redirection (`2>&1`) is its own word, after a space.
-    rest.len() < after.len()
-        && rest
-            .trim_start_matches(|c: char| c.is_ascii_digit())
-            .starts_with(['>', '<'])
-}
-
-/// Whether a normalised claimed check ran among the recorded commands `ran`:
-/// the whole claim ran in one of them, or the claim is compound and each of
-/// its steps (split on the shell separators `&&` and `;` only, each step
-/// normalised as a claim of its own) ran in one of them. A claim joined by
-/// words, such as `... then re-check`, has no separator and is not split.
-fn claim_ran(wanted: &str, ran: &[String]) -> bool {
-    if ran.iter().any(|c| check_ran_in(wanted, c)) {
-        return true;
-    }
-    let steps: Vec<String> = wanted
-        .replace("&&", ";")
-        .split(';')
-        .map(claimed_check)
-        .filter(|s| !s.is_empty())
-        .collect();
-    !steps.is_empty()
-        && steps
-            .iter()
-            .all(|step| ran.iter().any(|c| check_ran_in(step, c)))
 }
 
 /// The class a failed tick reports: the variant of the error it returned.
@@ -1212,11 +1102,10 @@ impl Controller {
             .collect();
         if !ran.is_empty() {
             for check in &result.checks_run {
-                let wanted = claimed_check(check);
-                if wanted.is_empty() {
+                if check.trim().is_empty() {
                     continue;
                 }
-                if !claim_ran(&wanted, &ran) {
+                if !check_claim_ran(check, &ran) {
                     return Ok(Err((
                         VerifierVerdict::ClaimMismatch,
                         format!(
@@ -2548,152 +2437,5 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
         reported: false,
         activity: None,
         merge_progress: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{claim_ran, claimed_check};
-
-    fn verifies(claim: &str, commands: &[&str]) -> bool {
-        let ran: Vec<String> = commands.iter().map(|c| c.to_lowercase()).collect();
-        claim_ran(&claimed_check(claim), &ran)
-    }
-
-    #[test]
-    fn an_annotated_claim_verifies() {
-        assert_eq!(
-            claimed_check("  cargo test -p rustykrab-e2e --no-default-features (86 passed) "),
-            "cargo test -p rustykrab-e2e --no-default-features"
-        );
-        assert!(verifies(
-            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
-            &["cargo test -p rustykrab-e2e --no-default-features"],
-        ));
-    }
-
-    #[test]
-    fn a_check_inside_a_compound_command_verifies() {
-        let ran = [
-            "cd /tmp/wt && cargo fmt --all -- --check && cargo clippy --workspace --all-targets \
-             && cargo test -p rustykrab-e2e --no-default-features",
-        ];
-        assert!(verifies(
-            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
-            &ran,
-        ));
-        assert!(verifies("cargo fmt --all -- --check", &ran));
-        assert!(verifies("cargo clippy --workspace --all-targets", &ran));
-        assert!(verifies("echo done", &["cargo check || true; echo done"]));
-    }
-
-    #[test]
-    fn a_check_inside_a_piped_command_verifies() {
-        let ran = ["cargo test -p rustykrab-control --no-default-features 2>&1 | tail -20"];
-        assert!(verifies(
-            "cargo test -p rustykrab-control --no-default-features (312 passed)",
-            &ran,
-        ));
-        assert!(verifies("tail -20", &ran));
-    }
-
-    #[test]
-    fn a_check_that_never_ran_does_not_verify() {
-        let ran = [
-            "cd /tmp/wt && cargo fmt --all -- --check",
-            "cargo test -p rustykrab-control | tail -5",
-        ];
-        assert!(!verifies("cargo clippy --workspace --all-targets", &ran));
-        assert!(!verifies(
-            "cargo test -p rustykrab-e2e --no-default-features (86 passed)",
-            &ran,
-        ));
-        assert!(!verifies("(86 passed)", &ran));
-    }
-
-    #[test]
-    fn a_compound_claim_verifies_when_each_step_ran_on_its_own() {
-        let ran = [
-            "python3 scripts/check_architecture_docs.py --fix",
-            "python3 scripts/check_architecture_docs.py",
-        ];
-        assert!(verifies(
-            "python3 scripts/check_architecture_docs.py --fix && \
-             python3 scripts/check_architecture_docs.py",
-            &ran,
-        ));
-        assert!(verifies(
-            "cargo fmt --all (ok); python3 scripts/check_architecture_docs.py (OK)",
-            &[
-                "cargo fmt --all",
-                "bash -lc 'python3 scripts/check_architecture_docs.py'"
-            ],
-        ));
-        assert!(verifies("cargo clippy ;", &["cargo clippy"]));
-    }
-
-    #[test]
-    fn a_claim_that_ran_only_as_a_prefix_of_a_longer_command_does_not_verify() {
-        assert!(!verifies("cargo test", &["cargo test-foo"]));
-        assert!(!verifies(
-            "cargo test",
-            &["cd /repo && cargo test-foo --all"]
-        ));
-        assert!(!verifies(
-            "python3 scripts/check_architecture_docs.py",
-            &["python3 scripts/check_architecture_docs.py --fix"],
-        ));
-        assert!(!verifies(
-            "python3 scripts/check_architecture_docs.py",
-            &["bash -lc 'python3 scripts/check_architecture_docs.py --fix'"],
-        ));
-        assert!(!verifies(
-            "cargo test -p rustykrab",
-            &["cargo test -p rustykrab-control"]
-        ));
-        assert!(!verifies("argo test", &["cargo test"]));
-        // Ending at a separator, a quote or a redirection still counts.
-        assert!(verifies(
-            "python3 scripts/check_architecture_docs.py",
-            &["bash -lc 'python3 scripts/check_architecture_docs.py'"],
-        ));
-        assert!(verifies("cargo test", &["cargo test 2>&1 | tail -5"]));
-        assert!(verifies("cargo test", &["(cargo test)"]));
-    }
-
-    #[test]
-    fn a_compound_claim_fails_when_any_step_did_not_run() {
-        assert!(!verifies(
-            "python3 scripts/check_architecture_docs.py --fix && \
-             python3 scripts/check_architecture_docs.py",
-            &["python3 scripts/check_architecture_docs.py"],
-        ));
-        assert!(!verifies(
-            "cargo fmt --all; cargo clippy",
-            &["cargo fmt --all"]
-        ));
-        assert!(!verifies("&& ;", &["cargo fmt --all"]));
-    }
-
-    #[test]
-    fn a_claim_joined_by_words_is_not_split() {
-        let ran = [
-            "python3 scripts/check_architecture_docs.py --fix",
-            "python3 scripts/check_architecture_docs.py",
-        ];
-        assert!(!verifies(
-            "python3 scripts/check_architecture_docs.py --fix then re-check (OK)",
-            &ran,
-        ));
-        assert!(!verifies(
-            "python3 scripts/check_architecture_docs.py --fix and \
-             python3 scripts/check_architecture_docs.py",
-            &ran,
-        ));
-        // `||` and `|` are not separators a claim splits on.
-        assert!(!verifies(
-            "cargo fmt --all || cargo clippy",
-            &["cargo fmt --all", "cargo clippy"],
-        ));
     }
 }

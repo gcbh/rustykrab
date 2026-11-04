@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.21] - 2026-11-04
+
+- Repair worker reports, process isolation and native timeouts (#749)
+
 ## [6.6.20] - 2026-11-04
 
 - Preserve worker context and archive large observations (#745)
