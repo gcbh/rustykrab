@@ -493,6 +493,14 @@ pub(crate) fn transcripts(store: &Store, skills: Arc<SkillRegistry>) -> Arc<dyn 
 
 #[async_trait]
 impl RunTranscripts for JobTranscripts {
+    fn recall_store(&self) -> Option<Arc<rustykrab_core::recall::RecallStore>> {
+        Some(Arc::new(
+            rustykrab_core::recall::RecallStore::with_persistence(Arc::new(
+                self.store.recall_archive(),
+            )),
+        ))
+    }
+
     async fn save(&self, conversation: &Conversation) -> rustykrab_core::Result<()> {
         self.store.conversations().save(conversation).await
     }

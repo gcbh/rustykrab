@@ -785,7 +785,24 @@ impl OllamaProvider {
                 }
             }
         }
-        Ok(out)
+        // The runner persists ordinary accompanying text separately from its
+        // calls. Rejoin that one assistant turn on the wire, preserving the
+        // text in the prefix instead of replacing it with content:null.
+        let mut joined: Vec<OllamaMessage> = Vec::with_capacity(out.len());
+        for mut message in out {
+            if message.role == "assistant" && message.tool_calls.is_some() {
+                if let Some(previous) = joined.last_mut().filter(|previous| {
+                    previous.role == "assistant"
+                        && previous.tool_calls.is_none()
+                        && previous.images.is_none()
+                }) {
+                    previous.tool_calls = message.tool_calls.take();
+                    continue;
+                }
+            }
+            joined.push(message);
+        }
+        Ok(joined)
     }
 
     fn build_tools(tools: &[ToolSchema]) -> Vec<OllamaTool> {
@@ -851,7 +868,10 @@ impl OllamaProvider {
                         ..Default::default()
                     },
                     stop_reason: StopReason::ToolUse,
-                    text: None,
+                    text: msg
+                        .content
+                        .map(|text| Self::strip_thinking(&text))
+                        .filter(|text| !text.trim().is_empty()),
                 });
             }
         }
@@ -1408,6 +1428,9 @@ impl ModelProvider for OllamaProvider {
             }
         };
 
+        let accompanying_text = (!tool_calls.is_empty())
+            .then(|| Self::strip_thinking(&full_text))
+            .filter(|text| !text.trim().is_empty());
         let content = if !tool_calls.is_empty() {
             if tool_calls.len() == 1 {
                 MessageContent::ToolCall(tool_calls.into_iter().next().unwrap())
@@ -1435,7 +1458,7 @@ impl ModelProvider for OllamaProvider {
                 ..Default::default()
             },
             stop_reason,
-            text: None,
+            text: accompanying_text,
         };
 
         // Debug: dump response info when message text is empty
@@ -1951,6 +1974,12 @@ mod tests {
     /// Serves one `/api/chat` request on a loopback port and hands back the
     /// JSON body it was sent.
     async fn capture_one_chat() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+        capture_chat_response(r#"{"model":"m","message":{"role":"assistant","content":"- summary"},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":3}"#).await
+    }
+
+    async fn capture_chat_response(
+        reply: &'static str,
+    ) -> (String, tokio::task::JoinHandle<serde_json::Value>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1976,7 +2005,7 @@ mod tests {
                     }
                 }
             };
-            let reply = r#"{"model":"m","message":{"role":"assistant","content":"- summary"},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":3}"#;
+            let reply = format!("{reply}\n");
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
                 reply.len()
@@ -2418,6 +2447,58 @@ mod tests {
 
     fn parse_raw(v: serde_json::Value) -> Result<ModelResponse> {
         OllamaProvider::parse_response("test-model", serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn mixed_text_survives_persistence_and_the_next_wire_request() {
+        for count in [1, 2] {
+            let calls: Vec<_> = (0..count)
+                .map(|_| {
+                    serde_json::json!({
+                        "function":{"name":"exec","arguments":{"command":"git status"}}
+                    })
+                })
+                .collect();
+            let response = parse_raw(serde_json::json!({
+                "message":{"content":"<think>private</think>Preserve broad Bash; resolve, test and commit.","tool_calls":calls},
+                "prompt_eval_count":100,"eval_count":75,"done_reason":"stop"
+            })).unwrap();
+            let text = response
+                .text
+                .expect("ordinary accompanying content retained");
+            assert_eq!(text, "Preserve broad Bash; resolve, test and commit.");
+            let history = vec![
+                Message::stamped(Role::Assistant, MessageContent::Text(text.clone())),
+                response.message,
+            ];
+            let persisted: Vec<Message> =
+                serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+            let wire = OllamaProvider::build_messages(&persisted, false).unwrap();
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0].content.as_deref(), Some(text.as_str()));
+            assert_eq!(wire[0].tool_calls.as_ref().unwrap().len(), count);
+            assert!(!serde_json::to_string(&wire).unwrap().contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_mixed_text_is_returned_for_durable_history() {
+        let (url,served)=capture_chat_response(r#"{"model":"m","message":{"content":"Preserve the new policy.","tool_calls":[{"function":{"name":"exec","arguments":{"command":"git status"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":100,"eval_count":75}"#).await;
+        let provider = OllamaProvider::new("fixture").with_base_url(url);
+        let response = provider
+            .chat_stream(
+                &[Message::stamped(
+                    Role::User,
+                    MessageContent::Text("resolve".into()),
+                )],
+                &[],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        served.await.unwrap();
+        assert_eq!(response.text.as_deref(), Some("Preserve the new policy."));
+        assert_eq!(response.message.content.tool_calls().len(), 1);
     }
 
     /// The exact shape `qwen3.8:27b-mlx` returns when the prompt overruns

@@ -439,3 +439,12 @@ reuses project history within that preparation and applies only still-current
 results. Actual execution revalidates its own context before a lease. The
 existing work graph, question record and event ledger retain authority and
 durability; there is no additional scheduling queue or inference path.
+
+## Local context continuity (2026-11-03)
+
+Local execution separates the complete current assignment from retrievable
+frozen project history. Existing conversation recall holds full history and
+large observations; the prompt carries an index or preview only when a permitted
+reader exists. Ordinary assistant text survives calls and persistence. The
+provider, runner and store retain their responsibilities; no crate dependency
+or scheduler is added. These mechanisms do not replace Git result verification.

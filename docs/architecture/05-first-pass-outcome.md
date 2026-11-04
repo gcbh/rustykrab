@@ -583,3 +583,27 @@ accepted the repair, and the original operation then completed. An independent
 historical usage, 18 owner answers and an unrelated consent hold were preserved;
 fixture processes stopped. This is executed fixture evidence on the candidate,
 not a deployment or verified completion of the live held work.
+
+## Local context continuity repair (2026-11-03)
+
+Run 9524d230 on v6.6.18 began clean, initiated a merge, and repeated immutable
+source slices without editing. Its 27 successful requests grew from 36,252 to
+97,501 actual input tokens, below the configured 131,072-token window. No
+compaction was recorded. Original raw responses are unavailable. Two isolated
+release-code tests reproduced loss of ordinary text accompanying Ollama calls;
+the normal runner also ignored ModelResponse.text.
+
+The candidate retains that text through persistence and the next request, keeps
+the complete active assignment, indexes project history with exact recall, and
+projects large results only behind an available permitted reader. The 39-row
+stale-planning regression checks focused input and retrieval from SQLite via a
+fresh archive instance. It initially exposed an FK-ordering defect: archiving
+before saving the conversation parent lost durability. Saving the parent first
+addresses that failure. No owner hold, answer or Git acceptance is discarded.
+
+The earlier real-Qwen prototype combined text restoration and output bounds,
+used a focused brief and advertised 12 tools versus the original 19. Its tested
+merge patch demonstrated capability but lacked a final commit at the observation
+cutoff; it was not a single-factor causal experiment. Current execution and
+rollout evidence belong in the dated context recovery record. These mechanisms
+alone do not establish completion of live blocked work.

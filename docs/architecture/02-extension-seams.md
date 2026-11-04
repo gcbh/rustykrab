@@ -380,3 +380,12 @@ obsolete controller merge edges. Git/context checking stays outside the command
 lock; event-head and project-revision checks protect application. Required or
 ambiguous owner dependencies remain. This reuses graph removal, cancellation,
 question sweeping and ordinary dispatch rather than a separate incident queue.
+
+## Local context retrieval (2026-11-03)
+
+RunTranscripts adds a defaulted recall_store hook. JobTranscripts supplies the
+existing conversation store's RecallPersistence implementation; agent consumes
+the injected RecallStore. ModelResponse.text carries accompanying ordinary
+content and the shared runner persists it. Large-result projection requires an
+actual permitted recall reader. No new model trait, output store, dispatch path
+or authority seam is introduced.
