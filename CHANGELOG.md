@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.22] - 2026-11-04
+
+- Keep unrelated project ambiguity from blocking valid handoffs (#750)
+
 ## [6.6.21] - 2026-11-04
 
 - Repair worker reports, process isolation and native timeouts (#749)
