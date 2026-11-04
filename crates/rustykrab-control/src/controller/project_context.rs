@@ -75,18 +75,39 @@ fn eligible(snap: &Snapshot, item: &WorkItem, waiting: &[QuestionRow], worktrees
         && (Workspace::repo_of(&item.writable_resources).is_none() || worktrees)
 }
 
+// Unresolved attribution is metadata, not a storage failure. Strict callers
+// surface it; an unrelated unresolved binding cannot poison a valid handoff.
+enum ProjectSelection {
+    Resolved(Option<String>),
+    Unresolved(String),
+}
+
 impl Controller {
     pub(super) async fn project_id(
         &self,
         snap: &Snapshot,
         item: &WorkItem,
     ) -> Result<Option<String>, Error> {
+        match self.project_selection(snap, item).await? {
+            ProjectSelection::Resolved(id) => Ok(id),
+            ProjectSelection::Unresolved(why) => Err(Error::Internal(why)),
+        }
+    }
+
+    async fn project_selection(
+        &self,
+        snap: &Snapshot,
+        item: &WorkItem,
+    ) -> Result<ProjectSelection, Error> {
         let ancestors = snap.ancestors(&item.id);
-        let explicit =
-            binding(std::iter::once(item).chain(ancestors.iter().filter_map(|id| snap.item(id))))
-                .map_err(Error::Internal)?;
+        let explicit = match binding(
+            std::iter::once(item).chain(ancestors.iter().filter_map(|id| snap.item(id))),
+        ) {
+            Ok(id) => id,
+            Err(why) => return Ok(ProjectSelection::Unresolved(why)),
+        };
         if explicit.is_some() {
-            return Ok(explicit);
+            return Ok(ProjectSelection::Resolved(explicit));
         }
         // Only an exact repository path or canonical conversation match is automatic.
         // Multiple projects on one repository require an explicit `project` reference.
@@ -109,9 +130,9 @@ impl Controller {
             .map(|p| p.id.to_string())
             .collect();
         match matches.as_slice() {
-            [] => Ok(None),
-            [id] => Ok(Some(id.clone())),
-            _ => Err(Error::Internal(
+            [] => Ok(ProjectSelection::Resolved(None)),
+            [id] => Ok(ProjectSelection::Resolved(Some(id.clone()))),
+            _ => Ok(ProjectSelection::Unresolved(
                 "multiple projects match this work; name a project artifact reference".into(),
             )),
         }
@@ -149,11 +170,22 @@ impl Controller {
             let own = ctx.work.iter().find(|work| work.item == ev.item).cloned();
             members.insert(ev.item, (ctx.snapshot.project.id.to_string(), own));
         }
+        let execution_items = Self::execution_items(snap, item);
         let mut work = Vec::new();
         for row in snap.items() {
             let belongs = match members.get(&row.id) {
                 Some((project, _)) => project == &id,
-                None => self.project_id(snap, row).await?.as_deref() == Some(&id),
+                None => match self.project_selection(snap, row).await? {
+                    ProjectSelection::Resolved(project) => project.as_deref() == Some(&id),
+                    ProjectSelection::Unresolved(why) => {
+                        if execution_items.contains(&row.id) {
+                            return Err(Error::Internal(why));
+                        }
+                        tracing::debug!(item = %row.id, project = %id, reason = %why,
+                            "unresolved unrelated work omitted from project history");
+                        false
+                    }
+                },
             };
             if !belongs {
                 continue;
@@ -188,7 +220,6 @@ impl Controller {
             .into_iter()
             .filter(|q| ids.contains(q.item.as_str()))
             .collect();
-        let execution_items = Self::execution_items(snap, item);
         let context = ProjectContext {
             snapshot,
             work,
@@ -233,8 +264,25 @@ impl Controller {
             return Ok(None);
         };
         if let Some(context) = contexts.get(&project) {
+            let execution_items = Self::execution_items(snap, item);
+            for id in &execution_items {
+                if context.work.iter().any(|work| &work.item == id) {
+                    continue;
+                }
+                if let Some(row) = snap.item(id) {
+                    if matches!(
+                        self.project_selection(snap, row).await?,
+                        ProjectSelection::Unresolved(_)
+                    ) {
+                        // This row could be omitted as unrelated to the task that
+                        // populated the cache. Rebuild with this task's strict
+                        // slice, retaining trusted historical bindings as before.
+                        return self.project_context(snap, item).await;
+                    }
+                }
+            }
             let mut context = context.clone();
-            context.execution_items = Self::execution_items(snap, item);
+            context.execution_items = execution_items;
             return Ok(Some(context));
         }
         let context = self.project_context(snap, item).await?;

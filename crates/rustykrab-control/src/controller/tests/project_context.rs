@@ -560,6 +560,188 @@ async fn missing_or_ambiguous_project_does_not_start_a_worker() {
     assert!(coder.received.lock().unwrap().is_empty());
 }
 
+async fn second_project(h: &Harness, repo: &Repo) -> ProjectSnapshot {
+    let mut command = CreateProject::new(
+        "second-project",
+        ProjectId::new(),
+        "Other project",
+        RevisionAuthor::User,
+        Utc::now(),
+    );
+    command.repository_id = Some(repo.path().display().to_string());
+    h.store().projects().create(command).await.unwrap().snapshot
+}
+
+#[tokio::test]
+async fn unrelated_ambiguous_project_does_not_block_bound_handoff_recovery() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let coder = Coder::new(WorkerKind::Codex, &repo);
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().into()),
+            ..Default::default()
+        },
+        vec![coder.clone()],
+    );
+    let planning = project(&h, &repo).await;
+    second_project(&h, &repo).await;
+    let ambiguous = h
+        .file_one(code(&repo, WorkerKind::Codex, "unrelated", None))
+        .await;
+    let bound = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "correctly bound",
+            Some(planning.project.id),
+        ))
+        .await;
+    h.ctl
+        .hold_context(
+            &h.store().work_get(&bound).await.unwrap().unwrap(),
+            "multiple projects match this work; name a project artifact reference".into(),
+        )
+        .await
+        .unwrap();
+    h.drain_settled().await;
+    assert_eq!(h.status(&bound).await, Status::Done);
+    assert_eq!(
+        h.status(&ambiguous).await,
+        Status::Blocked(BlockedReason::NeedsDecision)
+    );
+    assert!(h
+        .store()
+        .work_get(&ambiguous)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_refs
+        .is_empty());
+    {
+        let briefs = coder.received.lock().unwrap();
+        assert_eq!(briefs.len(), 1);
+        assert_eq!(briefs[0].item, bound);
+        assert!(!briefs[0]
+            .project_context
+            .as_ref()
+            .unwrap()
+            .work
+            .iter()
+            .any(|w| w.item == ambiguous));
+    }
+    let questions = h.store().questions_list(&Default::default()).await.unwrap();
+    assert!(questions.iter().any(|q| q.item == ambiguous));
+    for q in questions {
+        assert!(q.answer.is_none(), "recovery must not invent owner intent");
+        if q.item == ambiguous {
+            assert_eq!(q.status, rustykrab_core::questions::QuestionStatus::Open);
+        }
+        if q.item == bound {
+            assert_eq!(
+                q.status,
+                rustykrab_core::questions::QuestionStatus::Obsolete
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unrelated_conflicting_project_refs_are_not_attributed_to_bound_work() {
+    let repo = Repo::new();
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![]);
+    let planning = project(&h, &repo).await;
+    let other = second_project(&h, &repo).await;
+    let mut conflict = code(
+        &repo,
+        WorkerKind::Codex,
+        "unrelated conflict",
+        Some(planning.project.id),
+    );
+    conflict.artifact_refs.push(ArtifactRef {
+        kind: "project".into(),
+        value: other.project.id.to_string(),
+    });
+    let conflict = h.file_one(conflict).await;
+    let bound = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "bound",
+            Some(planning.project.id),
+        ))
+        .await;
+    let snap = h.ctl.load().await.unwrap();
+    assert!(h
+        .ctl
+        .project_id(&snap, snap.item(&conflict).unwrap())
+        .await
+        .is_err());
+    let context = h
+        .ctl
+        .project_context(&snap, snap.item(&bound).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!context.work.iter().any(|w| w.item == conflict));
+    assert_eq!(context.snapshot.project.id, planning.project.id);
+}
+
+#[tokio::test]
+async fn ambiguous_execution_input_remains_an_error_on_cold_and_cached_handoffs() {
+    let repo = Repo::new();
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![]);
+    let planning = project(&h, &repo).await;
+    second_project(&h, &repo).await;
+    let ambiguous = h
+        .file_one(code(&repo, WorkerKind::Codex, "ambiguous input", None))
+        .await;
+    let independent = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "independent",
+            Some(planning.project.id),
+        ))
+        .await;
+    let mut dependent = code(
+        &repo,
+        WorkerKind::Codex,
+        "dependent",
+        Some(planning.project.id),
+    );
+    dependent
+        .inputs_from
+        .push(rustykrab_core::work::ItemRef::Id(ambiguous.clone()));
+    dependent.edges.push(rustykrab_core::work::DraftEdge {
+        kind: rustykrab_core::work::EdgeKind::Blocks,
+        depends_on: rustykrab_core::work::ItemRef::Id(ambiguous),
+    });
+    let dependent = h.file_one(dependent).await;
+    let snap = h.ctl.load().await.unwrap();
+    let mut cache = std::collections::BTreeMap::new();
+    h.ctl
+        .cached_project_context(&snap, snap.item(&independent).unwrap(), &mut cache)
+        .await
+        .unwrap();
+    let error = h
+        .ctl
+        .cached_project_context(&snap, snap.item(&dependent).unwrap(), &mut cache)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("multiple projects match"));
+    assert!(h
+        .ctl
+        .project_context(&snap, snap.item(&dependent).unwrap())
+        .await
+        .is_err());
+    assert_eq!(
+        cache.len(),
+        1,
+        "bad input must not corrupt another task's cached context"
+    );
+}
+
 struct Overclaims(Arc<Coder>);
 #[async_trait]
 impl Worker for Overclaims {

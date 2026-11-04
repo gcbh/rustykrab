@@ -417,3 +417,15 @@ or consuming the controller's activity counter. No new persisted state, worker
 role, permission, table or public trait is introduced. Peer deadlines and the
 local ExecTool call timeout are unchanged. Output activity is not semantic
 progress; normal report/Git verification remains required.
+
+## Project-history attribution isolation (base 97ecfd3)
+
+The existing controller/project_context seam distinguishes an unresolved project
+binding from a store error through a private selection enum. Current task
+resolution remains strict. Historical membership filtering may exclude an
+unresolved unrelated row without attributing it to either candidate project;
+actual execution inputs remain strict unless existing controller receipts
+establish their historical binding. Cached history cannot hide an unresolved
+input newly relevant to another execution slice: that path rebuilds context.
+No public trait, context schema, persistence table, role, permission grant or
+new queue is introduced. Operational storage errors still fail reconstruction.

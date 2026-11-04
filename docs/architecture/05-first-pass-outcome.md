@@ -665,3 +665,28 @@ after output, and a child retaining a completed agent's pipe. This is candidate
 fixture proof, not deployed recovery. Continuous output can prolong a run and
 does not prove useful work; validation, cancellation and finite controller
 recovery remain distinct. The local shell's 600-second call deadline is unchanged.
+
+## An unrelated project block stopped valid work (2026-11-04)
+
+Live verification after v6.6.21 found that the correctly bound gateway provider
+task could not lease. The active task and its ancestor explicitly named project
+11fb9a23, but project_context scanned every work row and propagated project_id
+ambiguity from unrelated repair 5a1441c8. That repair had no project reference
+and matched two projects sharing the repository. It was not in the active
+execution closure. The resulting question incorrectly asked the valid task to
+choose a project it already named.
+
+The candidate separates unresolved attribution from storage failures. Unrelated
+ambiguous or conflicting bindings are excluded from this project's history;
+their own questions stay open and no identity is guessed. Current work and
+actual inputs remain strict, including cache hits when another task's execution
+slice changes. The intermediate candidate without cache revalidation failed the
+new input regression; adding the strict rebuild closes that gap while retaining
+controller-verified historical bindings. Existing consent, pending-answer,
+archive and technical-recovery boundaries remain.
+
+Three real SQLite/Git regressions fail on released 97ecfd3 and pass on the
+candidate. They exercise recovery of the correctly bound operation, exclusion
+of unrelated conflicting references, and unresolved dependencies through cold
+and cached paths. This is candidate verification, not another deployment or
+proof that the live gateway implementation has completed.
