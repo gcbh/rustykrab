@@ -389,3 +389,12 @@ the injected RecallStore. ModelResponse.text carries accompanying ordinary
 content and the shared runner persists it. Large-result projection requires an
 actual permitted recall reader. No new model trait, output store, dispatch path
 or authority seam is introduced.
+
+## Correctable local check reports (2026-11-03)
+
+The existing command matcher now lives in `control::worker::check_claim_ran`.
+The controller and LocalWorker's recording WorkBackend use the same rules.
+Local check-description mismatches return through the existing result_report
+tool error while its conversation and workspace remain alive. No new trait,
+dependency, table, queue or admission bypass is introduced. A recorded command
+still establishes execution only; the transcript retains its exit outcome.
