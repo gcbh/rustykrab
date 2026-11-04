@@ -292,7 +292,9 @@ impl ExecTool {
 /// act outside it later or elsewhere: writes to the git directory's hooks
 /// and config (which git runs or reads outside the sandbox), connections to
 /// Docker's socket (host access), and connections to loopback `ports` (the
-/// daemon's API and the model server).
+/// daemon's API and the model server). Signals may target only processes in
+/// the same sandbox invocation, so one command can manage its children but
+/// cannot stop another worker's jobs or the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confinement {
     pub private: Vec<std::path::PathBuf>,
@@ -392,7 +394,9 @@ impl Confinement {
             .map(|p| quoted(&p))
             .collect();
         let mut profile = format!(
-            "(version 1)(allow default)(deny file-write*)\
+            "(version 1)(allow default)\
+             (deny signal)(allow signal (target same-sandbox))\
+             (deny file-write*)\
              (allow file-write* {} (subpath \"/private/tmp\") \
              (subpath \"/private/var/folders\") (subpath \"/dev\"))",
             own.join(" ")
@@ -1693,6 +1697,93 @@ mod error_typing_tests {
             out["stderr"].as_str().unwrap_or_default()
         );
         (out["exit_code"].as_i64().unwrap(), text)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_signal_an_unconfined_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peer = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = peer.id().unwrap();
+        let output = ExecTool::in_dir(dir.path())
+            .confined(Vec::new())
+            .execute(json!({"command": format!("kill -TERM {pid}")}))
+            .await
+            .unwrap();
+        let alive = peer.try_wait().unwrap().is_none();
+        let _ = peer.kill().await;
+        let _ = peer.wait().await;
+        assert_eq!(output["exit_code"], 1, "{output}");
+        assert!(alive, "another host job must survive: {output}");
+        assert!(
+            output["stderr"].as_str().unwrap().contains("permitted"),
+            "{output}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_signal_another_sandbox_job() {
+        let own = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert_other_sandbox_survives(own.path(), other.path()).await;
+        // Equal profiles must not turn separate calls into one signal domain.
+        assert_other_sandbox_survives(own.path(), own.path()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn assert_other_sandbox_survives(own: &std::path::Path, other: &std::path::Path) {
+        let pid_file = other.join("peer.pid");
+        let peer_tool = ExecTool::in_dir(other).confined(Vec::new());
+        let peer = tokio::spawn(async move {
+            peer_tool
+                .execute(json!({"command": "echo $$ > peer.pid; exec sleep 30"}))
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let pid = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                peer.abort();
+                let _ = peer.await;
+                panic!("sandbox peer did not start");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let result = ExecTool::in_dir(own)
+            .confined(Vec::new())
+            .execute(json!({"command": format!("kill -TERM {pid}")}))
+            .await;
+        let alive = !peer.is_finished();
+        peer.abort();
+        let _ = peer.await;
+        let output = result.unwrap();
+        assert_eq!(output["exit_code"], 1, "{output}");
+        assert!(alive, "another sandbox's job must survive: {output}");
+        assert!(
+            output["stderr"].as_str().unwrap().contains("permitted"),
+            "{output}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_can_signal_its_own_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = ExecTool::in_dir(dir.path())
+            .confined(Vec::new())
+            .execute(json!({"command": "sleep 30 & rk_owned_child=$!; kill -0 \"$rk_owned_child\" && kill -TERM \"$rk_owned_child\"; wait \"$rk_owned_child\"; rk_owned_status=$?; test \"$rk_owned_status\" -ge 128"}))
+            .await
+            .unwrap();
+        assert_eq!(output["exit_code"], 0, "{output}");
     }
 
     #[cfg(target_os = "macos")]

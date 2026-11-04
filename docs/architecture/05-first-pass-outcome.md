@@ -628,3 +628,20 @@ separate regression rejects model-forged command artifacts. Both fail with the
 base recording backend. Final controller verification and native-worker report
 handling remain in place. Candidate regressions do not establish deployment or
 completion of the live gateway goal.
+
+## Cross-worker signal isolation (2026-11-03)
+
+A provider worker selected a compiler PID belonging to a different native task
+and issued kill. That observation does not establish the signal's outcome or
+explain the native task's separately recorded 1,800-second process timeout.
+Independent tests on base a5298a6 do establish that a confined shell could
+successfully signal both an unconfined sentinel and a separately sandboxed job.
+The previous allow-default profile constrained files and network destinations
+but did not constrain signal targets.
+
+The candidate denies signals outside the same sandbox invocation. Both sentinel
+regressions now pass, while signalling one's own child remains possible. The
+host timeout/cancellation guard retains its process-group cleanup. This is
+verified candidate behavior on macOS, not a deployed repair or a complete
+process/container isolation claim. Native-worker deadlines, shared temporary
+space and useful completion of the original gateway goal remain separate.

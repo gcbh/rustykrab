@@ -398,3 +398,11 @@ Local check-description mismatches return through the existing result_report
 tool error while its conversation and workspace remain alive. No new trait,
 dependency, table, queue or admission bypass is introduced. A recorded command
 still establishes execution only; the transcript retains its exit outcome.
+
+## Confined command signals (base a5298a6)
+
+ExecTool's existing macOS Confinement profile limits signal targets to the same
+Seatbelt sandbox invocation. This complements its filesystem and network rules
+and the trusted host's existing process-group cleanup; it introduces no trait,
+worker role, dependency, table, command-name filter or authority grant. It does
+not isolate native adapters or permit signals across separate exec calls.
