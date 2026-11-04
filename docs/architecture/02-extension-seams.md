@@ -284,6 +284,11 @@ the full snapshot through a private per-run file, without a daemon-auth capabili
 Post-tasks remain WorkItemDraft records in ResultReport.discovered and use the
 ordinary graph validator and scheduler. No new trait or crate edge is introduced.
 
+Their existing inheritance path now distinguishes the exact source-item-only
+planning marker from inherited scope rules. An explicitly planning-only draft
+stays so; all other restrictions and normal approvals remain. Internal failure
+repairs use that same filing path. This adds no public seam or legacy-row rewrite.
+
 LocalWorker now fills the existing command_run artifact seam from host exec
 observations before report forwarding. It adds no callback trait or persistence
 table. The controller's existing claim matcher verifies recorded check execution;
