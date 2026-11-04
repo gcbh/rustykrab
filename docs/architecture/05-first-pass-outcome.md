@@ -607,3 +607,25 @@ merge patch demonstrated capability but lacked a final commit at the observation
 cutoff; it was not a single-factor causal experiment. Current execution and
 rollout evidence belong in the dated context recovery record. These mechanisms
 alone do not establish completion of live blocked work.
+
+
+## 2026-11-03: planning-phase instructions copied into implementation
+
+A live gateway task's objective explicitly rejected a planning-only restriction,
+yet its stored constraints contained `Plan only; no implementation in this item`.
+The same flag propagated through failure investigation into a task whose
+objective and acceptance required an implemented/replayed guard. The native
+worker correctly reported the contradiction instead of claiming implementation.
+`controller/filing.rs::inherit_from` copied every source constraint into both
+discovered and ladder-internal work. Better context could not make those
+inconsistent execution contracts coherent.
+
+New filings now keep that exact marker on its source item, while retaining an
+explicit marker supplied by the new draft, broader planning restrictions,
+repository scope and ordinary admission/approval gates. Two real-store
+regressions failed on the deployed base before the correction; the explicit
+child-planning case already passed. Added coverage also checks independent
+approval holds. There is no schema change or automatic rewrite of existing
+constraints, questions or holds. Legacy contradictory tasks still require an
+authorized correction/replacement. This prospective inheritance fix alone is
+not proof that those original tasks completed or that a repair is deployed.

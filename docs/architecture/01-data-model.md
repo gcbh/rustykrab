@@ -564,6 +564,12 @@ is the truth; `trigger_at` copies its `at(time)` instant for the timer sweep.
 Every time is RFC 3339 UTC with nanoseconds at a fixed width, so text order is
 time order and a round trip is exact.
 
+The constraint list remains JSON strings. New follow-up filing treats only the
+exact `Plan only; no implementation in this item` marker as local to its source
+item; the draft's own marker and other inherited restrictions remain. No old row
+is rewritten or inferred owner authorization recorded. Resulting constraints
+continue to participate in normal scope/approval and template matching.
+
 `priority` is the item's base priority. The scheduler derives effective urgency
 from unmet `blocks`/`waits_for` edges and parent gates on each pass: prerequisites
 inherit the highest priority of interested open work. Inherited urgency is the

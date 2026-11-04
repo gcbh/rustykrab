@@ -420,6 +420,13 @@ async fn discovered_drafts_file_under_the_parent_with_provenance_and_run() {
 async fn discovered_under_a_repo_item(
     found: Vec<WorkItemDraft>,
 ) -> (Harness, std::collections::HashMap<String, WorkItem>) {
+    discovered_under_constraints(found, vec!["Never push.".to_string()]).await
+}
+
+async fn discovered_under_constraints(
+    found: Vec<WorkItemDraft>,
+    constraints: Vec<String>,
+) -> (Harness, std::collections::HashMap<String, WorkItem>) {
     let h = Harness::new(&["pinch"]);
     h.script.push(
         "Add a status helper",
@@ -431,7 +438,7 @@ async fn discovered_under_a_repo_item(
     let mut x = draft("x", "Add a status helper");
     x.worker_kind = WorkerKind::Local;
     x.writable_resources = vec!["repo:/src/app".to_string(), "calendar:home".to_string()];
-    x.constraints = vec!["Never push.".to_string()];
+    x.constraints = constraints;
     let ids = h.file(plan(vec![draft("P", "Status page"), x])).await.ids;
     for _ in 0..3 {
         h.step().await;
@@ -484,6 +491,17 @@ async fn a_discovered_draft_naming_no_repo_inherits_the_filers_repo() {
 /// unclassified, so the ladder files an `internal` item for it; returns
 /// that item.
 async fn internal_item_for_a_failing_code_item(hold_discovered: bool) -> WorkItem {
+    internal_item_under_constraints(
+        hold_discovered,
+        vec!["Change only files under src/parser/.".to_string()],
+    )
+    .await
+}
+
+async fn internal_item_under_constraints(
+    hold_discovered: bool,
+    constraints: Vec<String>,
+) -> WorkItem {
     let mut config = ControllerConfig::default();
     config.approval.hold_discovered = hold_discovered;
     let h = Harness::with(config, StaticCatalog::default(), &["pinch"]);
@@ -494,7 +512,7 @@ async fn internal_item_for_a_failing_code_item(hold_discovered: bool) -> WorkIte
     let mut x = code_follow_up("x", "Port the parser");
     x.worker_kind = WorkerKind::Local;
     x.writable_resources = vec!["repo:/src/app".to_string(), "calendar:home".to_string()];
-    x.constraints = vec!["Change only files under src/parser/.".to_string()];
+    x.constraints = constraints;
     h.file_one(x).await;
     for _ in 0..3 {
         h.step().await;
@@ -758,6 +776,69 @@ async fn a_discovered_draft_inherits_the_filers_constraints_after_its_own() {
         kids["Wire the page"].constraints,
         vec!["Never push.".to_string()]
     );
+}
+
+#[tokio::test]
+async fn a_discovered_follow_up_keeps_item_local_planning_on_its_source() {
+    let local = "Plan only; no implementation in this item";
+    let broader =
+        "Plan only; no implementation in this item or any follow-up without owner approval";
+    let original = vec![local.into(), "Never push.".into(), broader.into()];
+    let (h, kids) = discovered_under_constraints(
+        vec![code_follow_up("f", "Implement the helper")],
+        original.clone(),
+    )
+    .await;
+    let follow_up = &kids["Implement the helper"];
+    assert_eq!(follow_up.constraints, vec!["Never push.", broader]);
+    assert_eq!(follow_up.writable_resources, vec!["repo:/src/app"]);
+    assert_eq!(
+        h.item(&kids["Add a status helper"].id).await.constraints,
+        original,
+        "the source's own planning restriction and history remain intact"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_item_local_planning_constraint_stays_on_the_follow_up() {
+    let local = "Plan only; no implementation in this item";
+    let mut follow_up = code_follow_up("f", "Review the helper design");
+    follow_up.constraints = vec![local.into()];
+    let (_, kids) =
+        discovered_under_constraints(vec![follow_up], vec![local.into(), "Never push.".into()])
+            .await;
+    assert_eq!(
+        kids["Review the helper design"].constraints,
+        vec![local, "Never push."],
+        "a draft can still explicitly make its own work planning-only"
+    );
+}
+
+#[tokio::test]
+async fn internal_repair_does_not_copy_item_local_planning_or_release_approval() {
+    for held in [false, true] {
+        let item = internal_item_under_constraints(
+            held,
+            vec![
+                "Plan only; no implementation in this item".into(),
+                "Change only files under src/parser/.".into(),
+            ],
+        )
+        .await;
+        assert!(!item
+            .constraints
+            .iter()
+            .any(|c| c == "Plan only; no implementation in this item"));
+        assert!(item
+            .constraints
+            .iter()
+            .any(|c| c == "Change only files under src/parser/."));
+        assert_eq!(item.writable_resources, vec!["repo:/src/app"]);
+        assert_eq!(item.held_by.is_some(), held);
+        if held {
+            assert!(matches!(item.status, Status::Blocked(_)));
+        }
+    }
 }
 
 #[tokio::test]
