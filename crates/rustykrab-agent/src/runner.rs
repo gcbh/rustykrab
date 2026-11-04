@@ -62,6 +62,10 @@ const RECALL_READ_TOOLS: &[&str] = &[
     "recall_sub_query",
 ];
 
+/// Larger observations remain in the session log and conversation archive;
+/// only an explicit, retrievable preview enters the active model context.
+const MAX_ACTIVE_TOOL_OUTPUT_BYTES: usize = 16_000;
+
 fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
@@ -1586,14 +1590,80 @@ impl AgentRunner {
     /// The callback fires on a borrow *before* the message is moved into
     /// the conversation, so no clone is needed — messages can carry large
     /// inline payloads (tool outputs, base64 image bytes).
-    fn push_message(&self, conv: &mut Conversation, message: Message) {
+    fn push_message(&self, conv: &mut Conversation, mut message: Message) {
         conv.updated_at = Utc::now();
         if let Some(ref cb) = self.on_message {
             cb(&message);
         }
+        self.project_large_tool_result(conv.id, &mut message);
         let estimate = Self::estimate_message_tokens(&message);
         conv.messages.push(message);
         self.note_pushed_message(conv, estimate);
+    }
+
+    fn project_large_tool_result(&self, conversation: Uuid, message: &mut Message) {
+        // Never hide evidence behind a tool this session cannot actually use.
+        let can_recall = self.tool_index.get("recall_peek").is_some()
+            && SESSION_TOOL_CONTEXT
+                .try_with(|ctx| ctx.capabilities.can_use_tool("recall_peek"))
+                .unwrap_or(false);
+        if !can_recall {
+            return;
+        }
+        let MessageContent::ToolResult(result) = &message.content else {
+            return;
+        };
+        let output = result.output.to_string();
+        if output.len() <= MAX_ACTIVE_TOOL_OUTPUT_BYTES {
+            return;
+        }
+        let archived = Self::render_message_for_archive(message);
+        let start = self
+            .recall
+            .get(conversation)
+            .map_or(0, |prior| prior.len() + 2);
+        self.recall.append(conversation, &archived);
+        let readers: Vec<_> = ["recall_info", "recall_peek", "recall_search"]
+            .into_iter()
+            .filter(|name| {
+                self.tool_index.get(name).is_some()
+                    && SESSION_TOOL_CONTEXT
+                        .try_with(|ctx| ctx.capabilities.can_use_tool(name))
+                        .unwrap_or(false)
+            })
+            .collect();
+        let callable = self.active_tools.make_callable(conversation, readers);
+        // JSON-encoding the preview escapes quotes/backslashes a second time.
+        // Reserve room for that expansion, retrieval metadata and the notice.
+        let mut end = MAX_ACTIVE_TOOL_OUTPUT_BYTES / 3;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut projected = serde_json::json!({
+            "truncated": true,
+            "original_bytes": output.len(),
+            "preview": &output[..end],
+            "recall": {"start": start, "end": start + archived.len()},
+            "guidance": "The complete result is retained in this conversation's recall archive and session log. Use recall_peek with the byte range above (in small slices), or recall_search for a specific symbol. Read and exec support focused inspections; do not repeat a whole-file dump."
+        });
+        if callable.binding == LateToolBinding::Append && !callable.newly.is_empty() {
+            projected["appended_tools"] = serde_json::json!(callable
+                .newly
+                .iter()
+                .filter_map(|name| self.tool_index.get(name).map(|tool| tool.schema()))
+                .collect::<Vec<_>>());
+        }
+        // Keep the shell verdict and progress warning directly visible.
+        for key in ["exit_code", "notice"] {
+            if let Some(value) = result.output.get(key) {
+                if value.to_string().len() < 1_000 {
+                    projected[key] = value.clone();
+                }
+            }
+        }
+        if let MessageContent::ToolResult(result) = &mut message.content {
+            result.output = projected;
+        }
     }
 
     /// Fold a just-pushed message's token estimate into the cached
@@ -2387,7 +2457,7 @@ impl AgentRunner {
                 message,
                 usage,
                 stop_reason,
-                ..
+                text,
             } = response?;
             malformed_replies = 0;
             let llm_elapsed = llm_start.elapsed();
@@ -2401,6 +2471,14 @@ impl AgentRunner {
                 "LLM call completed"
             );
 
+            if message.content.has_tool_calls() {
+                if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                    let mut accompanying =
+                        Message::stamped(Role::Assistant, MessageContent::Text(text));
+                    accompanying.created_at = message.created_at;
+                    self.push_message(conv, accompanying);
+                }
+            }
             self.push_message(conv, message);
             self.record_usage_anchor(conv, &usage);
             // Re-borrow the message we just moved into the conversation so
@@ -8561,6 +8639,129 @@ mod worker_run_tests {
             .rev()
             .find(|m| m.role == Role::Assistant && m.content.as_text().is_some())
             .and_then(|m| m.content.as_text())
+    }
+
+    #[tokio::test]
+    async fn accompanying_plan_reaches_the_next_request_and_saved_history() {
+        let plan = "Preserve the current policy, resolve both conflicts, test, then commit.";
+        let mut mixed = call("noop", serde_json::json!({}));
+        mixed.text = Some(plan.into());
+        let provider = Recording::new(vec![
+            mixed,
+            call("result_report", serde_json::json!({"summary":"Verified."})),
+        ]);
+        let (runner, session, mut conv, _) = worker(provider.clone(), AgentConfig::default());
+        WORK_RUN_CONTEXT
+            .scope(binding(), runner.run(&mut conv, &session))
+            .await
+            .unwrap();
+        let requests = provider.requests();
+        let input = &requests[1].0;
+        let at = input
+            .iter()
+            .position(|m| m.content.as_text() == Some(plan))
+            .expect("plan in next request");
+        assert!(input[at + 1].content.has_tool_calls());
+        assert!(matches!(
+            input[at + 2].content,
+            MessageContent::ToolResult(_)
+        ));
+        let stored: Conversation =
+            serde_json::from_str(&serde_json::to_string(&conv).unwrap()).unwrap();
+        assert_eq!(
+            stored
+                .messages
+                .iter()
+                .filter(|m| m.content.as_text() == Some(plan))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn large_results_keep_full_evidence_and_a_retrievable_prompt_preview() {
+        let provider = Recording::new(vec![]);
+        let (base, _, mut conv, _) = worker(provider.clone(), AgentConfig::default());
+        let mut tools = base.tools.clone();
+        tools.extend(crate::recall_tools(provider, Default::default()));
+        let observed = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let sink = observed.clone();
+        let runner = AgentRunner::new(base.provider.clone(), tools, Arc::new(NoSandbox))
+            .with_on_message(Arc::new(move |m| sink.lock().unwrap().push(m.clone())));
+        runner
+            .active_tools
+            .set_late_binding(conv.id, LateToolBinding::Append);
+        let schema_version = runner.active_tools.version(conv.id);
+        let full = format!("{}TAIL_REQUIRED_FOR_DIAGNOSIS", "é".repeat(40_000));
+        let result = Message::stamped(
+            Role::Tool,
+            MessageContent::ToolResult(ToolResult {
+                call_id: "large-diff".into(),
+                output: serde_json::json!({"stdout":full,"exit_code":1,"notice":"change approach"}),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        );
+        let session = Session::with_capabilities(
+            conv.id,
+            CapabilitySet::for_tools_permissive(&["recall_peek", "recall_search"]),
+        );
+        SESSION_TOOL_CONTEXT
+            .scope(runner.build_session_context(&session), async {
+                runner.push_message(&mut conv, result);
+            })
+            .await;
+        let MessageContent::ToolResult(projected) = &conv.messages.last().unwrap().content else {
+            panic!("tool result")
+        };
+        assert_eq!(projected.output["exit_code"], 1);
+        assert_eq!(projected.output["notice"], "change approach");
+        assert!(projected.output.to_string().len() < MAX_ACTIVE_TOOL_OUTPUT_BYTES);
+        assert_eq!(projected.output["truncated"], true);
+        assert_eq!(
+            runner.active_tools.version(conv.id),
+            schema_version,
+            "retrieval does not flush the fixed tool prefix"
+        );
+        assert!(projected.output["appended_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "recall_peek"));
+        let archive = runner.recall.get(conv.id).unwrap();
+        let start = projected.output["recall"]["start"].as_u64().unwrap() as usize;
+        let end = projected.output["recall"]["end"].as_u64().unwrap() as usize;
+        assert!(archive[start..end].contains("TAIL_REQUIRED_FOR_DIAGNOSIS"));
+        assert!(serde_json::to_string(&observed.lock().unwrap()[0])
+            .unwrap()
+            .contains("TAIL_REQUIRED_FOR_DIAGNOSIS"));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_recall_keeps_the_complete_result() {
+        let (runner, session, mut conv, _) = worker(Recording::new(vec![]), AgentConfig::default());
+        let full = "x".repeat(50_000);
+        SESSION_TOOL_CONTEXT
+            .scope(runner.build_session_context(&session), async {
+                runner.push_message(
+                    &mut conv,
+                    Message::stamped(
+                        Role::Tool,
+                        MessageContent::ToolResult(ToolResult {
+                            call_id: "no-reader".into(),
+                            output: serde_json::json!({"stdout":full}),
+                            is_error: false,
+                            images: Vec::new(),
+                        }),
+                    ),
+                );
+            })
+            .await;
+        let MessageContent::ToolResult(result) = &conv.messages.last().unwrap().content else {
+            panic!("result")
+        };
+        assert_eq!(result.output["stdout"].as_str().unwrap().len(), 50_000);
+        assert!(runner.recall.get(conv.id).is_none());
     }
 
     /// `result_report` is `task_complete`'s typed successor: a report the

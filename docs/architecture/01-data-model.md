@@ -1144,3 +1144,13 @@ event recording the checked base and reason. The old merge evidence and all
 execution history remain. An orphaned unheld repair can be cancelled; normal
 question sweeping retires its now-obsolete technical question. No answer or
 completion evidence is invented.
+
+## Local context continuity (2026-11-03)
+
+No schema is added. Existing message JSON may contain ordinary assistant text
+immediately before its call message. Existing recall_archive rows retain frozen
+project context and complete oversized observations; active ToolResult.output
+JSON carries a preview, original byte count and recall byte range. Call IDs
+remain. Raw session logs retain unprojected observations. The conversation
+parent is saved before archive insertion; durability uses existing best-effort
+RecallPersistence, not a second evidence ledger.

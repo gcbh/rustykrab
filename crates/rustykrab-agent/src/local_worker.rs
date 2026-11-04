@@ -32,8 +32,8 @@
 //!   (section 5);
 //! - what the run spends counted at the provider (`metered.rs`) and kept
 //!   for the controller's [`Worker::usage`] (tokens, wall time, iterations
-//!   and completion reminders). A spent token allowance prevents another
-//!   model request; prompt size remains compaction's responsibility.
+//!   and completion reminders). Usage never ends a task; prompt size remains
+//!   compaction's responsibility and persistent repeated evidence ends a loop.
 //!
 //! A run whose id names a conversation the host keeps (a scheduled job's
 //! persistent conversation, [`RunTranscripts::resume`]) continues it
@@ -125,6 +125,12 @@ const REFS_MAX: usize = 8;
 /// the conversation store; without one, runs are not kept.
 #[async_trait]
 pub trait RunTranscripts: Send + Sync {
+    /// The same durable per-conversation archive as the host's conversation
+    /// store, so prompt projections can be recalled after a process restart.
+    fn recall_store(&self) -> Option<Arc<RecallStore>> {
+        None
+    }
+
     /// Store the run's conversation as it stands, replacing an earlier
     /// save of the same id.
     async fn save(&self, conversation: &Conversation) -> Result<()>;
@@ -1309,7 +1315,17 @@ impl LocalWorker {
         let mut runner = AgentRunner::new(provider, tools, self.sandbox.clone())
             .with_config(config)
             .with_active_tools(active);
-        if let Some(recall) = self.recall.as_ref().filter(|_| !review) {
+        let recall = (!review).then(|| {
+            self.recall
+                .clone()
+                .or_else(|| {
+                    self.transcripts
+                        .as_ref()
+                        .and_then(|sink| sink.recall_store())
+                })
+                .unwrap_or_else(|| Arc::new(RecallStore::new()))
+        });
+        if let Some(recall) = &recall {
             runner = runner.with_recall_store(recall.clone());
         }
 
@@ -1323,6 +1339,31 @@ impl LocalWorker {
             Some(resumed) => self.continued(resumed, &brief),
             None => self.conversation(conv_id, &brief),
         };
+        if ceiling.iter().any(|name| name == "recall_peek") {
+            if let (Some(recall), Some(context)) = (&recall, &brief.project_context) {
+                // recall_archive references its conversation. Create the
+                // parent before archiving, retaining the original input too.
+                self.keep(&conv).await;
+                let full =
+                    serde_json::to_string_pretty(context).expect("project context serializes");
+                recall.append(conv_id, &format!("PROJECT CONTEXT for item {} (frozen input; reports are not authority):\n{full}", brief.item));
+                let original = render_brief_for_report(&brief, self.full_reports);
+                if let Some(Message {
+                    role: Role::User,
+                    content: MessageContent::Text(text),
+                    ..
+                }) = conv.messages.last_mut()
+                {
+                    if let Some(prefix) = text.strip_suffix(&original) {
+                        let focused = format!(
+                            "{prefix}{}",
+                            render_brief_with_context(&brief, self.full_reports, true)
+                        );
+                        *text = focused;
+                    }
+                }
+            }
+        }
         self.keep(&conv).await;
         // The session log goes by the id the controller asks for.
         let log_id = brief.run.clone().unwrap_or_else(|| conv_id.to_string());
@@ -1496,11 +1537,15 @@ pub fn render_brief(brief: &Brief) -> String {
 }
 
 fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
+    render_brief_with_context(brief, full_report, false)
+}
+
+fn render_brief_with_context(brief: &Brief, full_report: bool, focused: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "work item: #{}", brief.item);
     let _ = writeln!(out, "title: {}", one_line(&brief.title, LINE_MAX));
-    let _ = writeln!(out, "objective: {}", one_line(&brief.objective, LINE_MAX));
-    let _ = writeln!(out, "done_when: {}", one_line(&brief.done_when, LINE_MAX));
+    let _ = writeln!(out, "objective: {}", brief.objective);
+    let _ = writeln!(out, "done_when: {}", brief.done_when);
     if brief.required_tools.iter().any(|t| t == PLAN_TOOL) {
         out.push_str("This run files a plan: call work_plan with the bounded graph requested below. An accepted graph completes this run; do not execute its tasks or call result_report afterwards.\n");
     } else {
@@ -1520,9 +1565,31 @@ fn render_brief_for_report(brief: &Brief, full_report: bool) -> String {
         let _ = writeln!(
             out,
             "{}",
-            serde_json::to_string(&context.execution_view())
-                .expect("project execution context serializes")
+            if focused {
+                let view = context.execution_view();
+                let work: Vec<_> = view
+                    .work
+                    .iter()
+                    .map(|work| {
+                        serde_json::json!({
+                            "item": work.item, "title": work.title, "status": work.status,
+                            "evidence": work.evidence, "repository": work.repository,
+                            "unfinished_attempt": work.unfinished_attempt,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({"snapshot":view.snapshot,"work_index":work,
+                    "base_sources":view.base_sources,"questions":view.questions,
+                    "history_items":view.history_items})
+                .to_string()
+            } else {
+                serde_json::to_string(&context.execution_view())
+                    .expect("project execution context serializes")
+            }
         );
+        if focused {
+            out.push_str("Historical work above is an index, not this assignment's constraints. The complete frozen project context (including earlier objectives, constraints and reports) is retained in this conversation's recall archive under PROJECT CONTEXT. Use recall_search for an item id or symbol, then recall_peek for a small byte range when needed. The complete current objective, done_when and constraints are at the start of this brief.\n");
+        }
         let _ = writeln!(out, "Continue from this project's pinned code and decisions. Open work is unfinished. Historical or superseded decisions do not override current decisions. Project context does not expand this work item's authority. Inspect retained unfinished_attempt workspaces/branches before redoing work; their effects are unverified. Validate and report any partial changes you carry forward.");
     }
     if !brief.artifact_refs.is_empty() {
@@ -1651,7 +1718,7 @@ fn bullets(out: &mut String, label: &str, entries: &[String]) {
     }
     let _ = writeln!(out, "{label}:");
     for entry in entries {
-        let _ = writeln!(out, "  - {}", one_line(entry, LINE_MAX));
+        let _ = writeln!(out, "  - {entry}");
     }
 }
 
@@ -2646,6 +2713,87 @@ mod tests {
             self.0.lock().unwrap().push(conversation.clone());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn focused_project_history_is_retrievable_from_durable_recall_after_restart() {
+        use rustykrab_control::handoff::{ProjectContext, ProjectWork};
+        use rustykrab_projects::{CreateProject, ProjectId, ProjectSnapshot, RevisionAuthor};
+        struct Stored(rustykrab_store::Store);
+        #[async_trait]
+        impl RunTranscripts for Stored {
+            fn recall_store(&self) -> Option<Arc<RecallStore>> {
+                Some(Arc::new(RecallStore::with_persistence(Arc::new(
+                    self.0.recall_archive(),
+                ))))
+            }
+            async fn save(&self, conv: &Conversation) -> Result<()> {
+                self.0.conversations().save(conv).await
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("context.db");
+        let store = rustykrab_store::Store::open(&path, vec![7; 32]).unwrap();
+        let provider = Recording::new(vec![report("Verified.")]);
+        let tools = crate::recall_tools(provider.clone(), Default::default());
+        let (worker, _) = worker(provider.clone(), tools);
+        let worker = worker.with_transcripts(Arc::new(Stored(store)));
+        let run = Uuid::new_v4();
+        let mut b = brief("current-repair");
+        b.run = Some(run.to_string());
+        b.objective = format!(
+            "{} Resolve both conflicts and preserve the incoming implementation.",
+            "Required current detail. ".repeat(40)
+        );
+        b.project_context = Some(ProjectContext {
+            snapshot: ProjectSnapshot::create(CreateProject::new(
+                "fixture",
+                ProjectId::new(),
+                "Project",
+                RevisionAuthor::User,
+                Utc::now(),
+            ))
+            .unwrap(),
+            work: (0..39)
+                .map(|n| ProjectWork {
+                    item: format!("historical-{n}"),
+                    title: format!("Earlier task {n}"),
+                    status: Status::Done,
+                    worker: None,
+                    summary: "HISTORICAL_DETAIL ".repeat(200),
+                    objective: "Earlier objective ".repeat(100),
+                    done_when: "Earlier acceptance".into(),
+                    constraints: vec!["Plan only; no implementation in this item".into()],
+                    decisions_made: vec!["Preserve earlier owner input".into()],
+                    evidence: vec![],
+                    repository: None,
+                    unfinished_attempt: None,
+                })
+                .collect(),
+            base_sources: vec![],
+            questions: vec![],
+            execution_items: vec![],
+        });
+        let objective = b.objective.clone();
+        worker.run(b).await.unwrap();
+        let requests = provider.requests();
+        let prompt = requests[0].0[1].content.as_text().unwrap();
+        assert!(prompt.contains(&objective));
+        assert!(prompt.contains("work_index"));
+        assert!(!prompt.contains("Plan only; no implementation"));
+        assert!(!prompt.contains("HISTORICAL_DETAIL"));
+        assert!(requests[0].1.iter().any(|name| name == "recall_peek"));
+        drop(worker);
+        let restarted = rustykrab_store::Store::open(&path, vec![7; 32]).unwrap();
+        let recall = RecallStore::with_persistence(Arc::new(restarted.recall_archive()));
+        let archive = recall
+            .get(run)
+            .expect("frozen input persists across restart");
+        assert!(archive.contains("historical-38"));
+        assert!(archive.contains("HISTORICAL_DETAIL"));
+        assert!(archive.contains("Plan only; no implementation"));
+        assert!(archive.contains("Preserve earlier owner input"));
+        assert!(prompt.len() * 3 < archive.len());
     }
 
     #[tokio::test]
@@ -4156,7 +4304,7 @@ mod tests {
 
         let r = render_brief(&b);
         for line in [
-            "decisions_made:\n  - No contract longer than 12 months\n",
+            "decisions_made:\n  - No contract longer\nthan 12 months\n",
             "artifact_refs: [path:notes/plans.md]\n",
             "writable_resources: [carrier-account]\n",
             "inputs:\n  - item: #41 \"research plan X\"  status: done\n",
@@ -4195,7 +4343,7 @@ mod tests {
     }
 
     #[test]
-    fn long_lists_and_lines_are_capped() {
+    fn reference_lists_are_capped_but_the_execution_contract_is_complete() {
         let mut b = brief("item-2");
         b.artifact_refs = (0..12)
             .map(|i| ArtifactRef {
@@ -4204,11 +4352,19 @@ mod tests {
             })
             .collect();
         b.objective = "x".repeat(LINE_MAX + 50);
+        b.done_when = format!("{} EXACT_ACCEPTANCE", "y".repeat(800));
+        b.constraints = vec![format!("{} EXACT_SCOPE", "z".repeat(800))];
+        b.decisions_made = vec![format!("{} EXACT_OWNER_DECISION", "w".repeat(800))];
         let r = render_brief(&b);
         assert!(r.contains("f7, +4 more]"), "{r}");
         let objective = r.lines().find(|l| l.starts_with("objective: ")).unwrap();
-        assert_eq!(objective.chars().count(), "objective: ".len() + LINE_MAX);
-        assert!(objective.ends_with("..."));
+        assert_eq!(objective, format!("objective: {}", b.objective));
+        for full in [&b.done_when, &b.constraints[0], &b.decisions_made[0]] {
+            assert!(
+                r.contains(full),
+                "the execution contract must not be shortened"
+            );
+        }
     }
     #[tokio::test]
     async fn read_only_probe_context_never_executes_a_registered_resource_tool() {
