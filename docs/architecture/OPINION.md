@@ -37,6 +37,15 @@ artifacts; general semantic supervision and live original-goal effectiveness
 remain separate, unclosed findings. See the dated verification record for which
 regressions and model executions actually ran.
 
+The resumed-loop follow-up against v6.6.18 records a fresh failure after
+resumption: a legacy switch had spent the rung, and the picker retained no
+upgrade requirement from the later surfaced loop. The correction reconstructs
+that failure from durable events and applies it to authorized continuations.
+It also revalidates old controller merge gates against current upstream and
+explicit inputs before retaining them. Automatic manager intervention and live
+recovery remain unclosed. See
+[the outcome record](05-first-pass-outcome.md#resumed-loop-escalation-2026-11-01).
+
 *Second pass, against `main` at `fd1f1e2`. Static review — I read the code,
 the schema, the graph and the tests; I did not run the daemon. Where a claim
 is a measurement it says so; where it is taste it says that too. The first

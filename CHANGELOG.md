@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.19] - 2026-11-04
+
+- Recover stale merge gates and escalate resumed failures (#744)
+
 ## [6.6.18] - 2026-11-01
 
 - Start code work from fresh upstream and recover stalled execution (#743)

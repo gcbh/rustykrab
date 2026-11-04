@@ -10,7 +10,8 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use rustykrab_core::work::{
-    BlockedReason, EventKind, Rung, RungEvent, Status, Trigger, WorkEvent, WorkItem, WorkItemId,
+    BlockedReason, ErrorClass, ErrorSubclass, EventKind, Rung, RungEvent, Status, Trigger,
+    WorkEvent, WorkItem, WorkItemId,
 };
 use rustykrab_core::Error;
 use rustykrab_store::WorkFilter;
@@ -59,8 +60,45 @@ pub(super) fn decode_rung(event: &WorkEvent) -> Option<RungEvent> {
 
 /// An item's ladder from its events.
 pub(super) fn ladder_from(events: &[WorkEvent], item: &WorkItem) -> LadderState {
+    // An explicit owner/delegated answer to an exhausted technical recovery
+    // authorizes another bounded cycle. Worker reports, controller retries and
+    // policy stops cannot manufacture one. Full events still drive routing,
+    // evidence and usage; only this cycle's rung counters start here.
+    let start = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, event)| {
+            let authorized = event.actor == "user"
+                || event.actor.starts_with("user:")
+                || event.actor.starts_with("policy:");
+            if !authorized
+                || event.kind != EventKind::Transition
+                || event.to != Some(Status::Queued)
+                || !matches!(
+                    event.from,
+                    Some(Status::Blocked(
+                        BlockedReason::NeedsDecision | BlockedReason::VerificationFailed
+                    ))
+                )
+                || !event
+                    .reason
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("answered question "))
+            {
+                return None;
+            }
+            let last = events[..index].iter().rev().find_map(decode_rung)?;
+            (last.rung == Rung::Surface
+                && last.error.as_ref().is_some_and(|e| {
+                    matches!(e.class, ErrorClass::Model | ErrorClass::Verification)
+                        || e.subclass == ErrorSubclass::Timeout
+                }))
+            .then_some(index + 1)
+        })
+        .unwrap_or(0);
     LadderState {
-        history: events.iter().filter_map(decode_rung).collect(),
+        history: events[start..].iter().filter_map(decode_rung).collect(),
         budgets: item.budget.rungs,
     }
 }
@@ -79,6 +117,14 @@ pub(super) struct History {
     /// Set once a failed verification escalated the item: leases go only
     /// to workers above this cost tier.
     pub floor: Option<u32>,
+    /// A surfaced loop still requires a genuinely different executor after
+    /// an authorized resume, even when an older switch spent the rung. The
+    /// dispatcher derives its tier floor from these registered workers.
+    pub looped: HashSet<String>,
+    /// Executors with a model, verification or timeout failure at a loop
+    /// escalation. Freeze that set there so a later executor may still correct
+    /// its own rejected report within the authorized recovery cycle.
+    pub failed: HashSet<String>,
     /// Tools the next lease's worker must have in its tool ceiling: the
     /// item was routed away from a native coding agent that cannot host
     /// them ([`ROUTED_FOR`]).
@@ -88,6 +134,7 @@ pub(super) struct History {
 pub(super) fn history(events: &[WorkEvent]) -> History {
     let mut out = History::default();
     let mut last_worker: Option<String> = None;
+    let mut failed = HashSet::new();
     for event in events {
         match event.kind {
             EventKind::Lease => {
@@ -103,6 +150,27 @@ pub(super) fn history(events: &[WorkEvent]) -> History {
                 let Some(rung) = decode_rung(event) else {
                     continue;
                 };
+                if rung.error.as_ref().is_some_and(|e| {
+                    matches!(e.class, ErrorClass::Model | ErrorClass::Verification)
+                        || e.subclass == ErrorSubclass::Timeout
+                }) {
+                    if let Some(worker) = &last_worker {
+                        failed.insert(worker.clone());
+                    }
+                }
+                if (rung.rung == Rung::Surface
+                    || (rung.rung == Rung::SwitchWorker && rung.outcome.starts_with(SWITCHED)))
+                    && rung
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.subclass == ErrorSubclass::Loop)
+                {
+                    if let Some(worker) = &last_worker {
+                        out.looped.insert(worker.clone());
+                        out.excluded.insert(worker.clone());
+                    }
+                    out.failed.extend(failed.iter().cloned());
+                }
                 if rung.rung == Rung::SwitchWorker && rung.outcome.starts_with(SWITCHED) {
                     if let Some(w) = &last_worker {
                         out.excluded.insert(w.clone());
@@ -146,6 +214,9 @@ pub(super) fn history(events: &[WorkEvent]) -> History {
             }
             _ => {}
         }
+    }
+    if !out.looped.is_empty() {
+        out.excluded.extend(out.failed.iter().cloned());
     }
     out
 }

@@ -36,8 +36,12 @@ def main():
     parser.add_argument('--expect', choices=['self_correct', 'stalled', 'native_recovery'], default='self_correct')
     parser.add_argument('--native-codex-command', type=Path)
     parser.add_argument('--native-codex-home', type=Path)
+    parser.add_argument('--resume-exhausted-switch', action='store_true',
+        help='Native mode: retain a spent historical switch, surface the loop, restart, then explicitly resume')
     args = parser.parse_args()
     native = args.expect == 'native_recovery'
+    if args.resume_exhausted_switch and not native:
+        parser.error('--resume-exhausted-switch requires native_recovery')
     if native and (not args.native_codex_command or not args.native_codex_home):
         parser.error('native_recovery requires explicit Codex command and authenticated home')
     binary = args.binary.resolve(strict=True)
@@ -138,6 +142,21 @@ def main():
                 if repair:
                     repair_calls += 1
                     assert 'Plan, implement and verify this repair yourself' in text, 'independent repair contract absent'
+                    if args.resume_exhausted_switch and k == 0:
+                        # Only the isolated fixture database is seeded. Insert
+                        # old controller history before this run's lease time,
+                        # so the later real loop has already spent its switch.
+                        with sqlite3.connect(data / 'db/store.db') as seeded:
+                            repair_id = seeded.execute("SELECT id FROM work_items WHERE title LIKE 'Resolve shared Git conflict %'").fetchone()[0]
+                            at = '2020-01-01T00:00:00Z'
+                            rung = {'rung': 'switch_worker', 'at': at, 'error': None,
+                                'outcome': 'switched from retired-planner'}
+                            seeded.execute('INSERT INTO work_item_events(item,at,kind,actor,reason) VALUES(?,?,?,?,?)',
+                                (repair_id, at, 'rung', 'controller', json.dumps(rung)))
+                            for _ in range(2):
+                                rung = {'rung': 'repair', 'at': at, 'error': None, 'outcome': 'historical repair already attempted'}
+                                seeded.execute('INSERT INTO work_item_events(item,at,kind,actor,reason) VALUES(?,?,?,?,?)',
+                                    (repair_id, at, 'rung', 'controller', json.dumps(rung)))
                 else:
                     original_calls += 1
                 if 'Continuing without new evidence will end this attempt' in text:
@@ -231,7 +250,9 @@ def main():
 
     receipt = {'binary': str(binary), 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
         'fixture': str(fixture), 'model_service_used': False, 'live_gateway_contacted': False,
-        'expect': args.expect, 'real_native_model_requested': native, 'parents': [current, old], 'expectation_met': False}
+        'expect': args.expect, 'real_native_model_requested': native,
+        'resume_exhausted_switch': args.resume_exhausted_switch,
+        'parents': [current, old], 'expectation_met': False}
     try:
         receipt['version'] = start()
         if native:
@@ -296,16 +317,38 @@ def main():
             evidence = [dict(r) for r in db.execute('SELECT item,kind,ref AS reference,verified_by FROM work_item_evidence')]
             events = [dict(r) for r in db.execute('SELECT item,kind,actor,reason FROM work_item_events')]
             questions = [dict(row) for row in db.execute("SELECT id,item,status,answer,answered_by FROM questions WHERE id IN ('fixture-budget-question','fixture-consent-question')")]
+            surfaced = [dict(row) for row in db.execute("SELECT id,item FROM questions WHERE rule='surfaced' AND status='open'")]
             usage = [dict(row) for row in db.execute('SELECT item,run,worker,tokens,wall_ms,iterations FROM work_spend')]
             db.close()
             state = next(i for i in items if i['id'] == original)
-            if state['status'] == 'done' or args.expect in ('stalled', 'native_recovery') and any(i['title'].startswith('Resolve shared Git conflict') and i['status'] == 'blocked' for i in items):
+            if state['status'] == 'done':
                 break
+            if args.expect in ('stalled', 'native_recovery') and any(i['title'].startswith('Resolve shared Git conflict') and i['status'] == 'blocked' for i in items):
+                if args.resume_exhausted_switch:
+                    if not receipt.get('resumed_question'):
+                        assert not any(u['worker'] == 'native-recovery' for u in usage), 'native ran before authorized resume'
+                        question = next(q for q in surfaced if q['item'] != original)
+                        receipt['resumed_question'] = question['id']
+                        receipt['surfaced_before_resume'] = True
+                        stop()
+                        log.close()
+                        receipt['version_after_loop_restart'] = start()
+                        api('/api/questions/' + question['id'] + '/answer', {'answer': 'Continue the retained repair with the failure evidence'})
+                    elif any(q['id'] != receipt['resumed_question'] and q['item'] != original for q in surfaced):
+                        break
+                else:
+                    break
             time.sleep(.3)
         receipt.update(items=items, questions=questions, usage=usage, evidence=evidence, events=events, wire_errors=errors, model_calls=len(wire), commits=commits, repair_calls=repair_calls, original_calls=original_calls, warnings_seen=warnings_seen)
         repairs = {json.loads(e['reference'])['repair'] for e in evidence if e['kind'] == 'merge_recovery' and e['verified_by'] == 'controller'}
         receipt['repair_ids'] = sorted(repairs)
         receipt['model_service_used'] = any(u['worker'] == 'native-recovery' and u['tokens'] > 0 for u in usage)
+        if args.resume_exhausted_switch:
+            assert receipt.get('surfaced_before_resume') and receipt.get('resumed_question')
+            assert repair_calls == 15, 'resumption repeated the failed local executor'
+            switches = [e for e in events if e['kind'] == 'rung' and json.loads(e['reason']).get('rung') == 'switch_worker']
+            assert len(switches) == 1, 'resumption changed the finite historical switch count'
+            receipt['spent_switch_retained'] = True
         receipt['repository_unchanged'] = git('rev-parse', 'HEAD') == current and git('status', '--porcelain') == '' and not (repo / 'original-result.txt').exists()
         verified = [e for e in evidence if e['kind'] == 'commit' and e['verified_by'] == 'git' and e['item'] != historical]
         if native:
@@ -316,7 +359,8 @@ def main():
             git('merge-base', '--is-ancestor', current, repair_commit)
             assert git('show', repair_commit + ':policy.txt') == 'new policy'
             assert any(e['actor'] == 'worker:native-recovery' and e['kind'] == 'lease' and e['item'] in repairs for e in events), 'native worker never received repair'
-            assert any('escalating above tier' in (e['reason'] or '') for e in events), 'escalation not recorded'
+            if not args.resume_exhausted_switch:
+                assert any('escalating above tier' in (e['reason'] or '') for e in events), 'escalation not recorded'
             assert len(list(data.glob('worktrees/*/partial.txt'))) >= 1, 'failed local partial work was lost'
             receipt['native_repair_commit'] = repair_commit
             assert receipt['model_service_used'], 'no observed native model usage'

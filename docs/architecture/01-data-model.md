@@ -1125,3 +1125,22 @@ let original goals wait without inheriting cancellation of a failed repair.
 Evidence outlives live-row compaction, retaining deduplication and verified
 continuation history. Allocation retires only synthetic technical questions;
 independent owner decisions and pending answer receipts keep their semantics.
+
+## Surfaced loop history on explicit resume (2026-11-01)
+
+No schema change: `work_item_events` already records the lease's worker and the
+subsequent Surface rung's typed loop error. Controller history reconstructs that
+worker as excluded and derives an upgrade floor from the current registry. An
+owner/delegated answer resuming an exhausted technical Surface stop starts a
+new finite recovery cycle, derived from the authorized question-answer
+transition. Prior rung records, routing failures and cumulative usage remain.
+Workers, defaults and controller retries cannot create cycles; policy stops
+remain stops. Independent approval holds retain their prior semantics.
+
+Retained controller merge dependencies are revalidated through existing event,
+project, evidence and edge records. Successful preparation without a derived
+WaitsFor edge permits its removal through WorkOp::RemoveEdge, with a Repoint
+event recording the checked base and reason. The old merge evidence and all
+execution history remain. An orphaned unheld repair can be cancelled; normal
+question sweeping retires its now-obsolete technical question. No answer or
+completion evidence is invented.

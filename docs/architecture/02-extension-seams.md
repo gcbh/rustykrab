@@ -362,3 +362,21 @@ per repository for one scheduling pass. Dispatch rechecks current work and scope
 a repository first appearing during reconciliation waits until the next pass.
 A stalled loopback Git remote regression verifies cancellation completes while
 the fetch is still pending and cancelled work never reaches the worker.
+
+## Retaining escalation after owner resumption (2026-11-01)
+
+A surfaced model loop now carries routing consequences through the existing
+controller history and picker, including after restart and when a legacy switch
+is already spent. This is shared by dispatch and dispatchability observation.
+An authorized continuation selects above the failed registered model's tier;
+absent qualifying capacity leaves work waiting. No new manager tool, mutation
+API, recovery rung or background loop is introduced. The existing explicit
+owner/delegated technical-answer transition is also the boundary of a new finite
+ladder cycle; it resets no usage or routing history, and a worker cannot create
+that authorization.
+
+The existing HandoffChecks preparation/apply seam additionally carries proven
+obsolete controller merge edges. Git/context checking stays outside the command
+lock; event-head and project-revision checks protect application. Required or
+ambiguous owner dependencies remain. This reuses graph removal, cancellation,
+question sweeping and ordinary dispatch rather than a separate incident queue.
