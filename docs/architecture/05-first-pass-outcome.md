@@ -607,3 +607,20 @@ merge patch demonstrated capability but lacked a final commit at the observation
 cutoff; it was not a single-factor causal experiment. Current execution and
 rollout evidence belong in the dated context recovery record. These mechanisms
 alone do not establish completion of live blocked work.
+
+## Cross-worker signal isolation (2026-11-03)
+
+A provider worker selected a compiler PID belonging to a different native task
+and issued kill. That observation does not establish the signal's outcome or
+explain the native task's separately recorded 1,800-second process timeout.
+Independent tests on base a5298a6 do establish that a confined shell could
+successfully signal both an unconfined sentinel and a separately sandboxed job.
+The previous allow-default profile constrained files and network destinations
+but did not constrain signal targets.
+
+The candidate denies signals outside the same sandbox invocation. Both sentinel
+regressions now pass, while signalling one's own child remains possible. The
+host timeout/cancellation guard retains its process-group cleanup. This is
+verified candidate behavior on macOS, not a deployed repair or a complete
+process/container isolation claim. Native-worker deadlines, shared temporary
+space and useful completion of the original gateway goal remain separate.

@@ -389,3 +389,11 @@ the injected RecallStore. ModelResponse.text carries accompanying ordinary
 content and the shared runner persists it. Large-result projection requires an
 actual permitted recall reader. No new model trait, output store, dispatch path
 or authority seam is introduced.
+
+## Confined command signals (base a5298a6)
+
+ExecTool's existing macOS Confinement profile limits signal targets to the same
+Seatbelt sandbox invocation. This complements its filesystem and network rules
+and the trusted host's existing process-group cleanup; it introduces no trait,
+worker role, dependency, table, command-name filter or authority grant. It does
+not isolate native adapters or permit signals across separate exec calls.
