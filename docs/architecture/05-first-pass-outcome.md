@@ -607,3 +607,24 @@ merge patch demonstrated capability but lacked a final commit at the observation
 cutoff; it was not a single-factor causal experiment. Current execution and
 rollout evidence belong in the dated context recovery record. These mechanisms
 alone do not establish completion of live blocked work.
+
+## Local report correction before run completion (2026-11-03)
+
+Store prerequisite b5a36ac9 produced commit 95c31c1 with passing conversation,
+shared-fault, formatting and lint checks. An independent test of that retained
+commit also passed the previously failing fresh-accessor/cloned-Store scenario.
+The controller then correctly rejected the report's descriptive check string
+`cargo build -p rustykrab-store (no features) — EXIT 0`: it was not the command
+text recorded by the host. Because the report had already ended the run, this
+format correction discarded the workspace and escalated to another worker.
+This is a report-feedback failure, not proof that the code or tests failed.
+
+LocalWorker now applies the controller's unchanged matching rules before
+forwarding a report with observed commands. A mismatch remains an error, but
+the current model receives it and can submit a corrected report without
+re-executing completed work. The scripted local-worker regression exercises one
+real exec, the rejected description, and the corrected report in one run; a
+separate regression rejects model-forged command artifacts. Both fail with the
+base recording backend. Final controller verification and native-worker report
+handling remain in place. Candidate regressions do not establish deployment or
+completion of the live gateway goal.

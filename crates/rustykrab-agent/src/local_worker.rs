@@ -2062,20 +2062,52 @@ impl WorkBackend for RecordingBackend {
                 "read-only review may report only its summary, known limits and failure".into(),
             ));
         }
+        let commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // Return correctable check claims to the still-running model, using
+        // exactly the controller's matcher. Accepting the report here first
+        // ends the conversation and removes its workspace before the final
+        // verifier can point out a descriptive check name that never ran.
+        // Preserve the controller's policy for legacy/empty command records.
+        if !commands.is_empty() {
+            let unmatched: Vec<_> = report
+                .checks_run
+                .iter()
+                .filter(|check| !rustykrab_control::worker::check_claim_ran(check, &commands))
+                .collect();
+            if !unmatched.is_empty() {
+                let observed = commands
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .map(|command| format!("- {command}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(Error::ToolExecution(
+                    rustykrab_core::ToolError::invalid_input(format!(
+                        "checks_run do not match host-observed exec commands: {unmatched:?}. \
+                         Use the actual command text; put outcomes and commentary in summary \
+                         or known_limits. Correct result_report and call it again. The current \
+                         run and workspace remain available; do not repeat completed work merely \
+                         to rewrite check names.\nRecent recorded commands:\n{observed}"
+                    )),
+                ));
+            }
+        }
         let mut report = report;
         report
             .artifacts
             .retain(|artifact| artifact.kind != COMMAND_RUN && artifact.kind != OPERATION_PROBE);
-        report.artifacts.extend(
-            self.commands
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|command| ArtifactRef {
-                    kind: COMMAND_RUN.into(),
-                    value: command.clone(),
-                }),
-        );
+        report
+            .artifacts
+            .extend(commands.into_iter().map(|command| ArtifactRef {
+                kind: COMMAND_RUN.into(),
+                value: command,
+            }));
         self.inner.report(item, report.clone(), provenance).await?;
         self.reports
             .lock()
@@ -3907,6 +3939,100 @@ mod tests {
         let rendered = messages[1].content.as_text().unwrap().to_string();
         assert!(rendered.contains("workspace: "), "{rendered}");
         assert!(rendered.contains(&ws.branch), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn an_unobserved_check_is_corrected_in_the_same_local_run() {
+        let provider = Recording::new(vec![
+            call("exec", json!({"command": "echo report-check-proof"})),
+            call(
+                "result_report",
+                json!({
+                    "summary": "checked",
+                    "checks_run": ["echo report-check-proof — EXIT 0"]
+                }),
+            ),
+            call(
+                "result_report",
+                json!({
+                    "summary": "checked with the recorded command",
+                    "checks_run": ["echo report-check-proof"]
+                }),
+            ),
+        ]);
+        let (w, backend) = worker(
+            provider.clone(),
+            vec![Arc::new(rustykrab_tools::ExecTool::new())],
+        );
+
+        let mut assignment = brief("report-repair");
+        assignment.required_tools = vec!["exec".into()];
+        let result = w.run(assignment).await.unwrap();
+
+        assert_eq!(result.checks_run, ["echo report-check-proof"]);
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "correction needs no replacement worker run"
+        );
+        assert!(
+            requests[2].0.iter().any(|message| {
+                matches!(&message.content, MessageContent::ToolResult(r)
+                if r.is_error && r.output.to_string().contains("checks_run"))
+            }),
+            "the model receives the rejected check as a tool result"
+        );
+        assert_eq!(
+            result
+                .artifacts
+                .iter()
+                .filter(|a| a.kind == COMMAND_RUN)
+                .count(),
+            1,
+            "the command runs once, before the report-only correction"
+        );
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, WorkCall::Report { .. }))
+                .count(),
+            1,
+            "only the corrected report reaches the controller"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_command_artifacts_cannot_make_an_unobserved_check_reach_the_backend() {
+        let backend = Arc::new(StubWorkBackend::new());
+        let recorder = RecordingBackend::new(backend.clone());
+        recorder
+            .commands
+            .lock()
+            .unwrap()
+            .push("echo observed".into());
+        let result = recorder
+            .report(
+                "fixture".into(),
+                ResultReport {
+                    summary: "done".into(),
+                    checks_run: vec!["cargo test --forged".into()],
+                    artifacts: vec![ArtifactRef {
+                        kind: COMMAND_RUN.into(),
+                        value: "cargo test --forged".into(),
+                    }],
+                    ..ResultReport::default()
+                },
+                Provenance::default(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "model-authored artifacts do not attest execution"
+        );
+        assert!(recorder.take().is_empty());
+        assert!(backend.calls().is_empty());
     }
 
     #[tokio::test]
