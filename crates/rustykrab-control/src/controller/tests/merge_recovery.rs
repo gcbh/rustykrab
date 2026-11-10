@@ -585,6 +585,89 @@ async fn obsolete_controller_merge_gate_releases_independent_work_on_current_mai
 }
 
 #[tokio::test]
+async fn obsolete_reused_merge_gate_releases_only_the_independent_waiter() {
+    use rustykrab_core::work::{Edge, EdgeKind};
+    use rustykrab_store::WorkOp;
+
+    let mut f = Fixture::new(RepairMode::Fresh).await;
+    let first = f.original("first waiter").await;
+    let repair = retain_legacy_merge_edge(&mut f, &first).await;
+    let dependent = f.original("requires conflicting input").await;
+    assert_eq!(retain_legacy_merge_edge(&mut f, &dependent).await, repair);
+
+    f.history.take();
+    let independent = f.original("independent later waiter").await;
+    let owner_directed = f.original("owner-directed waiter").await;
+    for id in [&independent, &owner_directed] {
+        assert_eq!(retain_legacy_merge_edge(&mut f, id).await, repair);
+    }
+    ControlHandle::comment(
+        &f.h.ctl,
+        &owner_directed,
+        "Keep this dependency for my review",
+        "user:fixture",
+    )
+    .await
+    .unwrap();
+    let unproven = f.original("edge without controller provenance").await;
+    f.h.store()
+        .work_apply(vec![WorkOp::AddEdge(Edge {
+            item: unproven.clone(),
+            kind: EdgeKind::WaitsFor,
+            depends_on: repair.clone(),
+        })])
+        .await
+        .unwrap();
+
+    // The only conflict receipt belongs to the first waiter, which has
+    // stopped. The shared repair is still open and unavailable to the rest.
+    let receipts =
+        f.h.store()
+            .work_evidence_of_kind(super::super::merge_recovery::MERGE_RECOVERY)
+            .await
+            .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].item, first);
+    ControlHandle::cancel(&f.h.ctl, &first, None, "user:fixture")
+        .await
+        .unwrap();
+    f.h.store()
+        .work_transition(
+            &repair,
+            None,
+            Status::Blocked(BlockedReason::VerificationFailed),
+            "controller",
+            Some("fixture repair failed verification"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    f.h.drain_settled().await;
+    assert_eq!(f.h.status(&independent).await, Status::Done);
+    let snap = f.h.ctl.load().await.unwrap();
+    for id in [&dependent, &owner_directed, &unproven] {
+        assert_eq!(f.h.status(id).await, Status::Queued);
+        assert!(snap
+            .edges_held_by(id)
+            .any(|edge| edge.kind == EdgeKind::WaitsFor && edge.depends_on == repair));
+    }
+    assert!(!snap
+        .edges_held_by(&independent)
+        .any(|edge| edge.depends_on == repair));
+    assert_eq!(
+        f.h.status(&repair).await,
+        Status::Blocked(BlockedReason::VerificationFailed)
+    );
+    let briefs = f.worker.seen.lock().unwrap();
+    assert_eq!(briefs.len(), 1);
+    assert_eq!(briefs[0].item, independent);
+    assert_eq!(briefs[0].workspace.as_ref().unwrap().base, f.current);
+}
+
+#[tokio::test]
 async fn required_merge_and_later_owner_direction_are_not_discarded() {
     for (explicit, actor) in [
         (false, "user:fixture"),

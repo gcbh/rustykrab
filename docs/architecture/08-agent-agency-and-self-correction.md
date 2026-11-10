@@ -25,16 +25,17 @@ original goal, lower effort from the owner, or better recovery from a fault.
 
 ## Make action feasible
 
-Give each execution a coherent authorized workspace and working tools to read,
-edit, test and inspect its work. Avoid repeated permission requests for routine
-actions already inside that scope. Match real tools, effects, resources,
-account capacity and access before leasing. Report the exact missing input,
-access, dependency or capacity when no executor fits.
+Give each task an authorized workspace and tools to read, edit, test and inspect.
+Match operations, effects, resources, account capacity and access before leasing.
+Report the exact missing input, access, dependency or capacity.
 
-Prefer explicit operations for controller dispatch, integration and service
-management. A prose recipe cannot implement a host operation. Skill discovery,
-installation and catalog membership prove availability of instructions; they
-do not prove the requested operation works on its intended executor.
+Use explicit host operations for dispatch, integration and services. Skill
+discovery and installation prove instruction availability. Verify the operation
+on its intended executor.
+
+Enable coding in any task, including browsing. Provision clean scratch or a
+worktree on demand for any accessible repository, including unregistered ones.
+Use the project's toolchain and record the commit and checks.
 
 Permit concurrent isolated worktrees and disjoint work. Serialize actual shared
 writes and integration. Temporary worktree paths must not turn one approved

@@ -690,3 +690,21 @@ candidate. They exercise recovery of the correctly bound operation, exclusion
 of unrelated conflicting references, and unresolved dependencies through cold
 and cached paths. This is candidate verification, not another deployment or
 proof that the live gateway implementation has completed.
+
+## Rechecking later waiters on a shared repair
+
+At deployed base `176dfa9`, a shared repair held 37 direct WaitsFor edges.
+Its one controller conflict receipt belonged to the first waiter, which no
+longer held the edge. Every current waiter had a controller transition naming
+the repair, but the stale-edge recheck used the receipt's originating item as
+its only candidate. Independent work could remain queued before workspace
+preparation even though it could run on current upstream.
+
+The controller now enumerates the repair's live WaitsFor edges. It uses the
+existing receipt for the first waiter and matching controller transition
+history for later waiters. The same fresh-base, event-head, project-revision
+and owner-direction checks apply before removing any edge. The real Git/SQLite
+regression reproduces the stalled later waiter on the deployed source. With
+the correction, independent work completes in an isolated worktree while
+a real conflicting input, owner-directed dependency and unproven wait stay
+queued. Live release and original-goal recovery still require observation.
