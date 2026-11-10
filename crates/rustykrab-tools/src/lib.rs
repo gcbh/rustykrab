@@ -20,6 +20,7 @@ mod write;
 mod code_execution;
 mod exec;
 mod process;
+mod scratch_exec;
 
 // Web tools
 mod web_fetch;
@@ -139,6 +140,7 @@ pub use write::WriteTool;
 pub use code_execution::CodeExecutionTool;
 pub use exec::{Confinement, ExecTool, MAX_TIMEOUT_SECS as EXEC_MAX_TIMEOUT_SECS};
 pub use process::ProcessTool;
+pub use scratch_exec::ScratchExecTool;
 
 // Web
 pub use web_fetch::WebFetchTool;

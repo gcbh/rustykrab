@@ -33,9 +33,10 @@ Use explicit host operations for dispatch, integration and services. Skill
 discovery and installation prove instruction availability. Verify the operation
 on its intended executor.
 
-Enable coding in any task, including browsing. Provision clean scratch or a
-worktree on demand for any accessible repository, including unregistered ones.
-Use the project's toolchain and record the commit and checks.
+Use code in any task, including browsing, and to clear blockers. Open clean
+scratch or an isolated checkout of any accessible repo on demand. Build and
+test with its toolchain, then submit the commit for review when authorized.
+Verify the remote result.
 
 Permit concurrent isolated worktrees and disjoint work. Serialize actual shared
 writes and integration. Temporary worktree paths must not turn one approved

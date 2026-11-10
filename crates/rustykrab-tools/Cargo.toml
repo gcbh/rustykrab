@@ -41,5 +41,4 @@ libc.workspace = true
 # default features pulled in to keep the dependency footprint small.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-[dev-dependencies]
 tempfile = "3"

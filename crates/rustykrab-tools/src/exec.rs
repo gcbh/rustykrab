@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use rustykrab_core::types::ToolSchema;
 use rustykrab_core::{Result, SandboxRequirements, Tool, ToolError};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -198,16 +199,22 @@ const ALLOWED_COMMANDS: &[&str] = &[
 pub struct ExecTool {
     dir: Option<std::path::PathBuf>,
     confinement: Option<Confinement>,
+    scratch: Option<PathBuf>,
 }
 
 /// macOS's sandbox runner (Seatbelt).
 const SANDBOX: &str = "/usr/bin/sandbox-exec";
+
+pub(crate) fn seatbelt_available() -> bool {
+    cfg!(target_os = "macos") && Path::new(SANDBOX).is_file()
+}
 
 impl ExecTool {
     pub fn new() -> Self {
         Self {
             dir: None,
             confinement: None,
+            scratch: None,
         }
     }
 
@@ -216,7 +223,14 @@ impl ExecTool {
         Self {
             dir: Some(dir.into()),
             confinement: None,
+            scratch: None,
         }
+    }
+
+    pub(crate) fn in_scratch(scratch: &Path, protected_root: &Path) -> Self {
+        let mut exec = Self::in_dir(scratch.join("work")).confined(vec![protected_root.into()]);
+        exec.scratch = Some(scratch.into());
+        exec
     }
 
     /// The directory and confinement a command runs under, when it runs in
@@ -225,7 +239,7 @@ impl ExecTool {
         let (Some(dir), Some(confinement)) = (&self.dir, &self.confinement) else {
             return None;
         };
-        if !cfg!(target_os = "macos") || !std::path::Path::new(SANDBOX).exists() {
+        if !seatbelt_available() {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 tracing::warn!(
@@ -244,7 +258,14 @@ impl ExecTool {
             return tokio::process::Command::new("sh");
         };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
-        sandboxed.arg("-p").arg(confinement.profile(dir)).arg("sh");
+        let (profile, shell) = match &self.scratch {
+            Some(scratch) => (
+                crate::scratch_exec::profile(scratch, &confinement.private),
+                "/bin/sh",
+            ),
+            None => (confinement.profile(dir), "sh"),
+        };
+        sandboxed.arg("-p").arg(profile).arg(shell);
         sandboxed
     }
 
@@ -474,7 +495,7 @@ impl Default for ExecTool {
 /// command's isolated HOME. Resolve relative host configuration before binding
 /// the command to a different worktree. Cargo configuration/credentials and
 /// other ambient environment variables are deliberately not forwarded.
-fn rustup_home() -> Option<std::path::PathBuf> {
+pub(crate) fn rustup_home() -> Option<PathBuf> {
     let home = std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -1138,6 +1159,12 @@ impl Tool for ExecTool {
             rustykrab_core::Error::ToolExecution(ToolError::invalid_input("missing command"))
         })?;
 
+        if self.scratch.is_some() && !seatbelt_available() {
+            return Err(rustykrab_core::Error::ToolExecution(
+                ToolError::permission_denied("isolated scratch execution requires macOS Seatbelt"),
+            ));
+        }
+
         // In the sandbox, the sandbox is the boundary and any program runs;
         // unsandboxed, the allowlist still decides. Forced removal is refused
         // either way.
@@ -1177,6 +1204,11 @@ impl Tool for ExecTool {
             // Use installed toolchains; an ordinary Cargo invocation must not
             // implicitly download into the operator's shared Rustup store.
             .env("RUSTUP_AUTO_INSTALL", "0");
+        if let Some(scratch) = &self.scratch {
+            process
+                .env("HOME", scratch.join("home"))
+                .env("TMPDIR", scratch.join("tmp"));
+        }
         if let Some(home) = rustup_home() {
             process.env("RUSTUP_HOME", home);
         }

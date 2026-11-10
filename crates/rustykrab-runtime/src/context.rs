@@ -31,6 +31,8 @@ pub struct AgentContext {
     pub work_manager: bool,
     pub store: Store,
     pub tools: Vec<Arc<dyn rustykrab_core::Tool>>,
+    /// Host-owned data root beneath which ordinary turns may open a scratch workspace.
+    pub scratch_data_dir: Option<std::path::PathBuf>,
     pub provider: Arc<dyn ModelProvider>,
     /// Model used to decide what an inbound message is worth remembering.
     ///
@@ -110,6 +112,7 @@ impl AgentContext {
             work_manager: false,
             store,
             tools,
+            scratch_data_dir: None,
             provider,
             sandbox: Arc::new(ProcessSandbox::new()),
             harness_profile: HarnessProfile::default(),

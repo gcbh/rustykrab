@@ -1119,3 +1119,8 @@ notice. Projection requires a registered, permitted recall_peek. The callback
 and session log receive the complete result first; IDs, images, error state and
 host attestation remain. The progress ledger still sees raw results. Small
 duplicates are not deduplicated, and fingerprint novelty is not goal progress.
+
+## Timeout for scratch execution
+
+The runner gives `scratch_exec` the same per-call cap as `exec`. This keeps
+the dispatch deadline above the command's own timeout for long builds.

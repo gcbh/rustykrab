@@ -11,6 +11,7 @@ rustykrab-store.workspace = true
 rustykrab-agent.workspace = true
 rustykrab-memory.workspace = true
 rustykrab-skills.workspace = true
+rustykrab-tools.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -19,6 +20,3 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-rustykrab-tools.workspace = true

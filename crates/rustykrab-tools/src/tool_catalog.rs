@@ -180,7 +180,7 @@ pub(crate) fn categorize(name: &str) -> Category {
     Category::Named(match name {
         "tools_list" | "tools_load" => "meta",
         "read" | "write" | "edit" | "apply_patch" => "filesystem",
-        "exec" | "process" | "code_execution" => "runtime",
+        "exec" | "scratch_exec" | "process" | "code_execution" => "runtime",
         "web_fetch" | "web_search" | "x_search" | "http_request" | "http_session" | "browser" => {
             "web"
         }

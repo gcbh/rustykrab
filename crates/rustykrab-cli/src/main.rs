@@ -1959,6 +1959,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&memory_backend),
         )))
         .with_credential_page_policy(rustykrab_gateway::PageIdentityPolicy::from_env());
+    state.agent.scratch_data_dir = Some(data_dir.clone());
     if let Ok(origin) = std::env::var("RUSTYKRAB_TAILNET_AUTH_ORIGIN") {
         if !state.origin_policy.is_allowed(&origin) {
             anyhow::bail!("Tailnet auth origin must also be in RUSTYKRAB_ALLOWED_ORIGINS");

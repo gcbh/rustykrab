@@ -505,6 +505,8 @@ pub(crate) fn available_tool_names(state: &AppState) -> Vec<&str> {
 /// for this node. Withholding these here means the node's own operator
 /// decides that, not the sentence that arrived over the network.
 const ALWAYS_DENIED: &[&str] = &[
+    // Provisioned by the conversational runtime outside this advertised ceiling.
+    "scratch_exec",
     "credential_read",
     "credential_write",
     "credential_request",

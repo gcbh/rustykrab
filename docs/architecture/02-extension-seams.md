@@ -210,7 +210,9 @@ Worth naming, because a review that only lists problems misrepresents the code:
   of the model's schema list; `sandbox_requirements()` replaces hardcoded
   name allowlists with declared capabilities; `blocks_turn()` encodes a subtle
   and real distinction (stopped-early vs stopped-because-blocked) that most
-  agent loops get wrong.
+  agent loops get wrong. `ScratchExecTool` uses the same contract with one
+  instance per turn. Availability requires Seatbelt, and the instance owns
+  its temporary workspace through the last tool call.
 - **`ModelProvider` defaults are correctly chosen.** `context_limit`,
   `supports_vision`, `requires_paired_tool_results`, `chat_with_ctx`,
   `chat_with_choice`, `accepts_undeclared_tool_calls` and `check_model` all
