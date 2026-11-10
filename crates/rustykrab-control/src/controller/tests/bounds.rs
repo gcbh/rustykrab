@@ -640,9 +640,9 @@ async fn a_new_repair_generation_restarts_the_count_and_the_item_resumes() {
             .push(GAUGE, report(failure(ErrorSubclass::Unclassified, RAW)));
     }
     let x = h.file_one(gauge(b)).await;
-    // Hold the investigation until its script is in place: the tick that
-    // trips the breaker would otherwise lease it at once.
-    step_until(&h, 40, || async { h.script.briefs_for(GAUGE).len() == 4 }).await;
+    // Pause dispatch after the fourth lease, before reconciling its failure.
+    // The worker can start after the tick returns, so its brief is too late.
+    step_until(&h, 40, || async { attempts(&h, &x).await.len() == 4 }).await;
     h.ctl.set_draining(true);
     step_until(&h, 10, || async { improve_outcome(&h, &x).await.is_some() }).await;
     let fix = h.of_kind(WorkKind::Internal).await.pop().unwrap();
