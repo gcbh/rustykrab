@@ -30,7 +30,7 @@ pub fn tool_timeout_secs(tool_name: &str) -> Option<u64> {
         // Shell exec bounds each command itself (120 s unless the call asks
         // for up to 600). A 30 s cap here cut every build and test run off
         // whatever the call asked for; it now sits just above the tool's.
-        "exec" => Some(rustykrab_tools::EXEC_MAX_TIMEOUT_SECS + 5),
+        "exec" | "scratch_exec" => Some(rustykrab_tools::EXEC_MAX_TIMEOUT_SECS + 5),
         _ => None,
     }
 }

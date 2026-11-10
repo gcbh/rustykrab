@@ -24,9 +24,11 @@ use rustykrab_agent::{
 use rustykrab_core::capability::{Capability, CapabilitySet};
 use rustykrab_core::session::Session;
 use rustykrab_core::types::{Conversation, Message, MessageContent, Role};
+use rustykrab_core::Tool;
 use rustykrab_memory::types::{ConversationTurn, LifecycleStage, TurnMetadata};
 use rustykrab_memory::MemorySystem;
 use rustykrab_skills::SystemPromptBuilder;
+use rustykrab_tools::ScratchExecTool;
 
 /// Optional knobs for an agent run. Most callers (HTTP, channels) use
 /// `RunOptions::default()`; the cron scheduler uses these to inject a
@@ -114,6 +116,7 @@ async fn build_and_inject_system_prompt(
     conv: &mut Conversation,
     profile: &HarnessProfile,
     options: &RunOptions,
+    has_scratch: bool,
 ) {
     // 1. Build the minimal system prompt.
     //
@@ -201,6 +204,13 @@ async fn build_and_inject_system_prompt(
          forbidden, do not invent a call to it.",
     );
 
+    if has_scratch {
+        system_prompt.push_str(
+            "\n\nUse scratch_exec when writing and running code can advance this turn, including \
+             during browsing. Find it with tools_list if its schema is not loaded. Its files \
+             are private to this turn. Return the observed result before the turn ends.",
+        );
+    }
     if ctx.work_manager {
         system_prompt.push_str(WORK_MANAGER_PROMPT);
     }
@@ -410,15 +420,32 @@ async fn prepare_agent(
     let profile = ctx.profile_for(user_content).await;
     tracing::info!(profile = %profile.name, "harness profile selected");
 
-    build_and_inject_system_prompt(ctx, conv, &profile, options).await;
+    let permitted = |name: &str| !options.denied_tools.iter().any(|denied| denied == name);
+    let mut tools = ctx.tools.clone();
+    let scratch = ctx
+        .scratch_data_dir
+        .clone()
+        .map(ScratchExecTool::new)
+        .filter(|scratch| {
+            scratch.available()
+                && permitted(scratch.name())
+                && permitted("exec")
+                && tools
+                    .iter()
+                    .any(|tool| tool.name() == "exec" && tool.available())
+                && tools.iter().all(|tool| tool.name() != scratch.name())
+        });
+    let has_scratch = scratch.is_some();
+    if let Some(scratch) = scratch {
+        tools.push(Arc::new(scratch));
+    }
+    build_and_inject_system_prompt(ctx, conv, &profile, options, has_scratch).await;
 
     // Create an ephemeral session with capabilities for available registered tools.
-    let tool_names: Vec<&str> = ctx
-        .tools
+    let tool_names: Vec<&str> = tools
         .iter()
-        .filter(|t| t.available())
+        .filter(|t| t.available() && permitted(t.name()))
         .map(|t| t.name())
-        .filter(|name| !options.denied_tools.iter().any(|denied| denied == name))
         .collect();
     tracing::debug!(
         tool_count = tool_names.len(),
@@ -435,7 +462,7 @@ async fn prepare_agent(
         agent_config.max_iterations = cap;
     }
 
-    let mut runner = AgentRunner::new(ctx.provider.clone(), ctx.tools.clone(), ctx.sandbox.clone())
+    let mut runner = AgentRunner::new(ctx.provider.clone(), tools, ctx.sandbox.clone())
         .with_config(agent_config)
         .with_active_tools(ctx.active_tools.clone())
         .with_recall_store(ctx.recall.clone())
@@ -1151,5 +1178,131 @@ mod work_manager_tests {
             drop(ctx);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FixtureBrowser;
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl Tool for FixtureBrowser {
+        fn name(&self) -> &str {
+            "browser"
+        }
+        fn description(&self) -> &str {
+            "Read the inert page fixture"
+        }
+        fn schema(&self) -> ToolSchema {
+            Named("browser", true).schema()
+        }
+        async fn execute(&self, _: Value) -> rustykrab_core::Result<Value> {
+            Ok(json!({"page_values": [12, 30]}))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct ScratchTurn(AtomicUsize);
+    #[cfg(target_os = "macos")]
+    #[async_trait]
+    impl ModelProvider for ScratchTurn {
+        fn name(&self) -> &str {
+            "scripted-browsing-turn"
+        }
+
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _: &[ToolSchema],
+        ) -> rustykrab_core::Result<ModelResponse> {
+            let step = self.0.fetch_add(1, Ordering::SeqCst);
+            let (name, arguments) = match step {
+                0 => ("tools_load", json!({"names":["browser"]})),
+                1 => ("browser", json!({})),
+                2 => {
+                    let MessageContent::ToolResult(result) = &messages.last().unwrap().content
+                    else {
+                        panic!("expected the page values");
+                    };
+                    assert_eq!(result.output["page_values"], json!([12, 30]));
+                    ("tools_load", json!({"names":["scratch_exec"]}))
+                }
+                3 => (
+                    "scratch_exec",
+                    json!({"command":"printf 'int main(void) { return 12 + 30; }' > answer.c"}),
+                ),
+                4 => (
+                    "scratch_exec",
+                    json!({"command":"/usr/bin/cc answer.c -o answer && ./answer"}),
+                ),
+                5 => {
+                    let MessageContent::ToolResult(result) = &messages.last().unwrap().content
+                    else {
+                        panic!("expected the command result");
+                    };
+                    assert_eq!(result.output["exit_code"], 42, "{}", result.output);
+                    (
+                        "task_complete",
+                        json!({"summary":"The page values total 42."}),
+                    )
+                }
+                _ => panic!("unexpected inference step {step}"),
+            };
+            Ok(ModelResponse {
+                message: Message::stamped(
+                    Role::Assistant,
+                    MessageContent::ToolCall(ToolCall {
+                        id: format!("scratch-{step}"),
+                        name: name.into(),
+                        arguments,
+                    }),
+                ),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                text: None,
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_browsing_turn_can_write_and_run_code_in_its_own_scratch() {
+        let dir = std::env::temp_dir().join(format!("rk-scratch-test-{}", Uuid::new_v4()));
+        let store = rustykrab_store::Store::open(&dir, vec![7; 32]).unwrap();
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ToolsLoadTool::new()),
+            Arc::new(TaskCompleteTool::new()),
+            Arc::new(Named("exec", true)),
+            Arc::new(FixtureBrowser),
+        ];
+        let provider = Arc::new(ScratchTurn(AtomicUsize::new(0)));
+        let mut ctx = AgentContext::new(store, tools, provider.clone());
+        ctx.scratch_data_dir = Some(dir.clone());
+        ctx.harness_profile.late_tool_binding = Some(LateToolBinding::Rerender);
+        let request = "Read the page and use code to total its values.";
+        let mut conv = conversation(vec![Message::stamped(
+            Role::User,
+            MessageContent::Text(request.into()),
+        )]);
+
+        let options = RunOptions {
+            denied_tools: vec!["exec".into()],
+            ..RunOptions::default()
+        };
+        let (_, denied) = prepare_agent(&ctx, &mut conv, request, &options)
+            .await
+            .unwrap();
+        assert!(!denied.capabilities.can_use_tool("scratch_exec"));
+        assert!(!dir.join("turn-scratch").exists());
+
+        let answer = run_agent(&ctx, &mut conv, request, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(provider.0.load(Ordering::SeqCst), 6);
+        assert_eq!(answer.content.as_text(), Some("The page values total 42."));
+        assert_eq!(
+            std::fs::read_dir(dir.join("turn-scratch")).unwrap().count(),
+            0
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

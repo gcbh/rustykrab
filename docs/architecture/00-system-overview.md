@@ -39,7 +39,7 @@ rustykrab-core        (no internal deps — the contract layer)
    rustykrab-agent   (core, tools, control, skills, providers)
         ^
         |
-   rustykrab-runtime (core, store, agent, memory, skills)   <-- NEW
+   rustykrab-runtime (core, store, agent, memory, skills, tools)
         ^      ^
         |      |
         |      +-- rustykrab-gateway  (+ channels, control)
@@ -448,3 +448,11 @@ large observations; the prompt carries an index or preview only when a permitted
 reader exists. Ordinary assistant text survives calls and persistence. The
 provider, runner and store retain their responsibilities; no crate dependency
 or scheduler is added. These mechanisms do not replace Git result verification.
+
+## Scratch execution in conversational turns
+
+The daemon supplies its data root to the shared runtime. For a macOS turn that
+already has shell authority, the runtime can offer `scratch_exec` alongside
+browsing tools. It lazily opens a per-turn workspace under a separate Seatbelt
+profile with no network access. Native workers and controller-owned worktrees
+use their existing execution paths.
