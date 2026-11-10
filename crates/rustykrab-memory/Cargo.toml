@@ -22,7 +22,7 @@ hex.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 regex = "1"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
 # Pinned to 5.8.0 — the last fastembed release pinning ort =2.0.0-rc.10,
 # which is both glibc-2.35 / Ubuntu 22.04 compatible and still served
 # from the active cdn.pyke.io. fastembed 5.8.1 already bumped to ort

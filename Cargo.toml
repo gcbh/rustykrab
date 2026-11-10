@@ -21,7 +21,7 @@ members = [
 [workspace.package]
 version = "6.6.22"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/gcbh/rustycrab"
 

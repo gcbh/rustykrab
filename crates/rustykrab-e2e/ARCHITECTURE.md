@@ -10,6 +10,9 @@ Run with `scripts/e2e.sh`.
 
 ## Responsibility
 
+The harness reads fixture databases using the same bundled SQLite version as
+the daemon.
+
 The context suite joins real `tools_load` output to the next actor request's
 offered schemas, and rejects phantom active/loaded names. A deterministic HTTP
 and Telegram case forces this transition with a missing seeded memory tool;

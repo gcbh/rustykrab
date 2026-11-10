@@ -946,6 +946,16 @@ connection contention. It costs:
 SQLite `ATTACH` would restore cross-database joins without merging the files,
 which is the cheap middle path if the file separation is genuinely wanted.
 
+## SQLite engine
+
+The store, memory and E2E crates use bundled SQLite from `libsqlite3-sys`
+0.39.1 through `rusqlite` 0.41. This upgrades the engine for
+[RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
+and sets the workspace's declared Rust minimum to 1.89. The bindings retain
+checked conversions for unsigned counters and the existing statement cache.
+The existing database schemas and migration entry points apply to the upgraded
+engine.
+
 ## Concurrency
 
 Every `store.db` access goes through

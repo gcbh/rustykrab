@@ -9,7 +9,7 @@ license.workspace = true
 rustykrab-core.workspace = true
 rustykrab-projects.workspace = true
 async-trait.workspace = true
-rusqlite = { version = "0.34", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache", "fallible_uint", "backup"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
