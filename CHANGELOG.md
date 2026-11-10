@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.23] - 2026-11-10
+
+- Recheck all waiters on a shared Git repair (#751)
+
 ## [6.6.22] - 2026-11-04
 
 - Keep unrelated project ambiguity from blocking valid handoffs (#750)

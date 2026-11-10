@@ -16,6 +16,8 @@ Own `memory.db` and everything about agent memory: verbatim storage, four-way
 parallel retrieval with rank fusion, and a value-driven lifecycle that bounds
 the working set.
 
+Memory uses the same bundled SQLite and `rusqlite` version as the store.
+
 ## Module map
 
 | Module | Lines | Role |

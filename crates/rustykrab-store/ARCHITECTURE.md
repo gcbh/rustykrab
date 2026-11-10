@@ -21,6 +21,8 @@ named workers with their routing records and class default tiers, and its
 Phase 6 records (review facets, proposals and the records they cite, the
 computed expectation metrics, and which issue each item is projected to). It also persists questions and standing judgment.
 
+Store uses bundled SQLite through `rusqlite` 0.41 with the backup feature.
+
 ## Shape
 
 `Store` is a handle-factory, not a god object. It holds the connection, the

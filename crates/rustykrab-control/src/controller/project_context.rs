@@ -529,82 +529,100 @@ impl Controller {
                 serde_json::from_str(&evidence.reference).map_err(|e| {
                     Error::Internal(format!("invalid merge recovery provenance: {e}"))
                 })?;
-            let Some(item) = snap.item(&evidence.item) else {
-                continue;
-            };
-            if !matches!(item.status, Status::Queued | Status::Ready)
-                || snap.has_children(&item.id)
-                || item.inputs_from.contains(&recovery.repair)
+            // The receipt belongs to the first waiter. Reused repairs keep the
+            // same receipt, but the controller records a queued transition on
+            // each later waiter in the same batch as its edge.
+            let wait_reason = format!("Waiting for shared Git repair {}; ", recovery.repair);
+            for edge in snap
+                .edges_naming(&recovery.repair)
+                .filter(|edge| edge.kind == EdgeKind::WaitsFor)
             {
-                continue;
-            }
-            let edge = Edge {
-                item: item.id.clone(),
-                depends_on: recovery.repair.clone(),
-                kind: EdgeKind::WaitsFor,
-            };
-            if !snap.edges().contains(&edge) {
-                continue;
-            }
-            // Retained owner discussion/decisions may intentionally require
-            // this dependency. Conservative provenance does not rely on clocks.
-            if self.store.work_events(&item.id).await?.iter().any(|e| {
-                (e.actor == "user"
-                    || e.actor.starts_with("user:")
-                    || e.actor.starts_with("policy:"))
-                    && matches!(
-                        e.kind,
-                        EventKind::Comment
-                            | EventKind::Decision
-                            | EventKind::Repoint
-                            | EventKind::Question
-                    )
-            }) {
-                continue;
-            }
-            let mut independent = snap.clone();
-            independent.remove_edge(&edge);
-            let checked = async {
-                let mut context = self
-                    .cached_project_context(&independent, item, &mut contexts)
-                    .await?;
-                let Some(ctx) = context.as_ref() else {
-                    return Ok(None);
+                let Some(item) = snap.item(&edge.item) else {
+                    continue;
                 };
-                if ctx.snapshot.project.id.to_string() != recovery.project {
-                    return Ok(None);
+                if !matches!(item.status, Status::Queued | Status::Ready)
+                    || snap.has_children(&item.id)
+                    || item.inputs_from.contains(&recovery.repair)
+                {
+                    continue;
                 }
-                checks
-                    .projects
-                    .insert(ctx.snapshot.project.id, ctx.snapshot.clone());
-                let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
-                    return Ok(None);
-                };
-                if repo != recovery.conflict.repository {
-                    return Ok(None);
+                let events = self.store.work_events(&item.id).await?;
+                if item.id != evidence.item
+                    && !events
+                        .iter()
+                        .rev()
+                        .take_while(|e| e.kind != EventKind::Repoint)
+                        .any(|e| {
+                            e.actor == CONTROLLER
+                                && e.kind == EventKind::Transition
+                                && e.to == Some(Status::Queued)
+                                && e.reason
+                                    .as_deref()
+                                    .is_some_and(|r| r.starts_with(&wait_reason))
+                        })
+                {
+                    continue;
                 }
-                if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
-                    let base = crate::workspace::fresh_base(entry.key()).await;
-                    entry.insert(base);
+                // Retained owner discussion/decisions may intentionally require
+                // this dependency. Conservative provenance does not rely on clocks.
+                if events.iter().any(|e| {
+                    (e.actor == "user"
+                        || e.actor.starts_with("user:")
+                        || e.actor.starts_with("policy:"))
+                        && matches!(
+                            e.kind,
+                            EventKind::Comment
+                                | EventKind::Decision
+                                | EventKind::Repoint
+                                | EventKind::Question
+                        )
+                }) {
+                    continue;
                 }
-                let workspace = self
-                    .plan_workspace_at(
-                        item,
-                        "obsolete-merge-recheck",
-                        context.as_mut(),
-                        Some(&upstream),
-                    )
-                    .await
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-                Self::check_execution_context(context.as_ref().unwrap())?;
-                Ok::<_, Error>(workspace.map(|ws| ws.base))
-            }
-            .await;
-            match checked {
-                Ok(Some(base)) => checks.obsolete_merges.push((edge, base)),
-                Ok(None) => {}
-                Err(why) => {
-                    tracing::debug!(item = %item.id, %why, "merge dependency remains required or unverified")
+                let mut independent = snap.clone();
+                independent.remove_edge(edge);
+                let checked = async {
+                    let mut context = self
+                        .cached_project_context(&independent, item, &mut contexts)
+                        .await?;
+                    let Some(ctx) = context.as_ref() else {
+                        return Ok(None);
+                    };
+                    if ctx.snapshot.project.id.to_string() != recovery.project {
+                        return Ok(None);
+                    }
+                    checks
+                        .projects
+                        .insert(ctx.snapshot.project.id, ctx.snapshot.clone());
+                    let Some(repo) = Workspace::repo_of(&item.writable_resources) else {
+                        return Ok(None);
+                    };
+                    if repo != recovery.conflict.repository {
+                        return Ok(None);
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
+                        let base = crate::workspace::fresh_base(entry.key()).await;
+                        entry.insert(base);
+                    }
+                    let workspace = self
+                        .plan_workspace_at(
+                            item,
+                            "obsolete-merge-recheck",
+                            context.as_mut(),
+                            Some(&upstream),
+                        )
+                        .await
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    Self::check_execution_context(context.as_ref().unwrap())?;
+                    Ok::<_, Error>(workspace.map(|ws| ws.base))
+                }
+                .await;
+                match checked {
+                    Ok(Some(base)) => checks.obsolete_merges.push((edge.clone(), base)),
+                    Ok(None) => {}
+                    Err(why) => {
+                        tracing::debug!(item = %item.id, %why, "merge dependency remains required or unverified")
+                    }
                 }
             }
         }

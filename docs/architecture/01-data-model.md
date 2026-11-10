@@ -946,6 +946,16 @@ connection contention. It costs:
 SQLite `ATTACH` would restore cross-database joins without merging the files,
 which is the cheap middle path if the file separation is genuinely wanted.
 
+## SQLite engine
+
+The store, memory and E2E crates use bundled SQLite from `libsqlite3-sys`
+0.39.1 through `rusqlite` 0.41. This upgrades the engine for
+[RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html)
+and sets the workspace's declared Rust minimum to 1.89. The bindings retain
+checked conversions for unsigned counters and the existing statement cache.
+The existing database schemas and migration entry points apply to the upgraded
+engine.
+
 ## Concurrency
 
 Every `store.db` access goes through
@@ -1122,6 +1132,10 @@ project id, repository, observed parents, conflicting paths and Git diagnostic.
 artifacts; reports cannot write this kind. Existing `internal` work rows own
 repair budgets, leases, events and verified commit evidence. `waits_for` edges
 let original goals wait without inheriting cancellation of a failed repair.
+Reusing a repair retains the original conflict receipt. A controller transition
+to Queued naming the repair is written with each additional wait edge. The
+handoff recheck uses that event with the original receipt to identify later
+derived edges, preserving unproven edges and owner direction.
 Evidence outlives live-row compaction, retaining deduplication and verified
 continuation history. Allocation retires only synthetic technical questions;
 independent owner decisions and pending answer receipts keep their semantics.
