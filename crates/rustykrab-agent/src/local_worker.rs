@@ -313,6 +313,9 @@ pub struct LocalWorker {
     /// `rustykrab_tools::Confinement` always keeps out of reach.
     private_paths: Vec<std::path::PathBuf>,
     private_ports: Vec<u16>,
+    /// Where worktree runs keep Cargo's build output, one directory per
+    /// repository under it ([`LocalWorker::with_build_cache`]).
+    build_cache: Option<std::path::PathBuf>,
     readable_files: Vec<std::path::PathBuf>,
     last_run: Mutex<Option<LocalRun>>,
     /// Spend per run id, for [`Worker::usage`].
@@ -502,6 +505,7 @@ impl LocalWorker {
             repository_shell: false,
             result_report_reminder: None,
             private_paths: Vec::new(),
+            build_cache: None,
             private_ports: Vec::new(),
             readable_files: Vec::new(),
             last_run: Mutex::new(None),
@@ -547,6 +551,14 @@ impl LocalWorker {
     /// its secrets file is.
     pub fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.private_paths.extend(paths);
+        self
+    }
+
+    /// Build a worktree run's Cargo projects into `<root>/<repository>`
+    /// (`rustykrab_tools::ExecTool::with_build_cache`), shared by every
+    /// run of that repository, instead of a `target/` per worktree.
+    pub fn with_build_cache(mut self, root: std::path::PathBuf) -> Self {
+        self.build_cache = Some(root);
         self
     }
 
@@ -1187,12 +1199,17 @@ impl Worker for LocalWorker {
         let completed = result.as_ref().is_ok_and(|report| {
             report.blocked.is_none() && report.error.is_none() && report.questions.is_empty()
         });
-        if let Some(ws) = brief.workspace.filter(|_| completed) {
-            if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()))
-            {
-                tracing::warn!(worker = %self.name, %why, "worktree not removed");
+        if let Some(ws) = brief.workspace {
+            if completed {
+                if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                {
+                    tracing::warn!(worker = %self.name, %why, "worktree not removed");
+                }
+            } else {
+                // Kept for diagnosis: its source and branch, not its build.
+                let _ = tokio::task::spawn_blocking(move || ws.drop_build_output()).await;
             }
         }
         result
@@ -1231,27 +1248,31 @@ impl LocalWorker {
         // A run in a worktree works there and nowhere else: its shell and
         // its file tools are bound to that directory, where the host's own
         // are bound to the daemon's workspace.
-        tools.extend(host_tools.into_iter().map(|t| {
-            match &workdir {
-                Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
-                Some(dir) => {
-                    match t.name() {
-                        "exec" => Arc::new(
-                            rustykrab_tools::ExecTool::in_dir(dir.clone())
-                                .confined(self.private_paths.clone())
-                                .deny_local_ports(self.private_ports.clone()),
-                        ) as Arc<dyn Tool>,
-                        "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone()))
-                            as Arc<dyn Tool>,
-                        "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone()))
-                            as Arc<dyn Tool>,
-                        "write" => Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone()))
-                            as Arc<dyn Tool>,
-                        _ => t,
+        tools.extend(host_tools.into_iter().map(|t| match &workdir {
+            Some(_) if exact_files && ["read", "edit", "write"].contains(&t.name()) => t,
+            Some(dir) => match t.name() {
+                "exec" => {
+                    let mut exec = rustykrab_tools::ExecTool::in_dir(dir.clone())
+                        .confined(self.private_paths.clone())
+                        .deny_local_ports(self.private_ports.clone());
+                    if let Some(cache) = self
+                        .build_cache
+                        .as_deref()
+                        .zip(brief.workspace.as_ref())
+                        .and_then(|(root, ws)| ws.build_cache(root))
+                    {
+                        exec = exec.with_build_cache(cache);
                     }
+                    Arc::new(exec) as Arc<dyn Tool>
                 }
-                None => t,
-            }
+                "read" => Arc::new(rustykrab_tools::ReadTool::in_dir(dir.clone())) as Arc<dyn Tool>,
+                "edit" => Arc::new(rustykrab_tools::EditTool::in_dir(dir.clone())) as Arc<dyn Tool>,
+                "write" => {
+                    Arc::new(rustykrab_tools::WriteTool::in_dir(dir.clone())) as Arc<dyn Tool>
+                }
+                _ => t,
+            },
+            None => t,
         }));
         if review {
             tools.retain(|tool| tool.name() == "result_report");

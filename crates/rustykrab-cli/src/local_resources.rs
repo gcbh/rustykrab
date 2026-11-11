@@ -92,6 +92,24 @@ impl Config {
     }
 }
 
+/// Whether the daemon's own provider is a local Ollama server on this
+/// machine, where the local-resources server always is (`validate`).
+/// `base_url` is `OLLAMA_BASE_URL`; unset means Ollama's loopback default.
+pub(crate) fn provider_on_this_machine(provider: &str, base_url: Option<&str>) -> bool {
+    if provider != "ollama" {
+        return false;
+    }
+    let Some(raw) = base_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    reqwest::Url::parse(raw).is_ok_and(|url| {
+        matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0")
+        )
+    })
+}
+
 /// The local coding worker's toolset, modelled on Claude Code's default
 /// working tools (the owner's decision of 2026-10-13): a shell, file read,
 /// edit and write, web fetch and search, and a task list. In a worktree
@@ -144,6 +162,12 @@ impl CodingWorker {
     /// Keep each run's session log in `dir` (`LocalWorker::with_run_logs`).
     pub(crate) fn with_run_logs(mut self, dir: PathBuf) -> Self {
         self.worker = self.worker.with_run_logs(dir);
+        self
+    }
+    /// Share one Cargo build directory per repository across runs
+    /// (`LocalWorker::with_build_cache`).
+    pub(crate) fn with_build_cache(mut self, root: std::path::PathBuf) -> Self {
+        self.worker = self.worker.with_build_cache(root);
         self
     }
     /// Keep `paths` out of the worker's shell (`LocalWorker::with_private_paths`).
@@ -229,6 +253,24 @@ mod tests {
             context_tokens: None,
             repositories: vec![],
         }
+    }
+    #[test]
+    fn a_local_ollama_provider_shares_the_machine_with_local_resources() {
+        assert!(provider_on_this_machine("ollama", None));
+        assert!(provider_on_this_machine(
+            "ollama",
+            Some("http://127.0.0.1:11434")
+        ));
+        assert!(provider_on_this_machine(
+            "ollama",
+            Some("http://localhost:11434/")
+        ));
+        assert!(!provider_on_this_machine(
+            "ollama",
+            Some("http://mac.tailnet:11434")
+        ));
+        assert!(!provider_on_this_machine("claude-cli", None));
+        assert!(!provider_on_this_machine("anthropic", None));
     }
     #[test]
     fn rejects_remote_or_credentialed_local_endpoints() {

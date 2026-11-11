@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.24] - 2026-11-11
+
+- Serialise local sessions, share a build cache across runs, and match checks by command (#753)
+
 ## [6.6.23] - 2026-11-10
 
 - Recheck all waiters on a shared Git repair (#751)

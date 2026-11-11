@@ -850,6 +850,15 @@ impl ExternalWorker {
             .artifact_refs
             .iter()
             .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
+        // A worktree run builds into its repository's shared cache, not a
+        // `target/` of its own that compiles every dependency again. A
+        // review writes nothing, a build included.
+        let build_cache = brief
+            .workspace
+            .as_ref()
+            .filter(|_| !review)
+            .and_then(|ws| ws.build_cache(&c.data_dir.join(workspace::BUILD_CACHE_DIR)))
+            .filter(|cache| std::fs::create_dir_all(cache.join("target")).is_ok());
         match c.kind {
             WorkerKind::Codex => {
                 if c.require_chatgpt {
@@ -887,6 +896,11 @@ impl ExternalWorker {
                 if build {
                     cmd.arg("--add-dir").arg(&c.skills_dir);
                 }
+                // Codex's `--add-dir` makes a directory writable: what a
+                // build into the shared cache needs.
+                if let Some(cache) = &build_cache {
+                    cmd.arg("--add-dir").arg(cache);
+                }
                 // An investigation's inputs (its bundle, the session logs,
                 // the failed runs' kept worktrees, the daemon's source) are
                 // named in the brief and need no flag here: Codex's sandbox
@@ -912,6 +926,9 @@ impl ExternalWorker {
                 }
                 if build {
                     cmd.arg("--add-dir").arg(&c.skills_dir);
+                }
+                if let Some(cache) = &build_cache {
+                    cmd.arg("--add-dir").arg(cache);
                 }
                 // A fix item reads outside its worktree: its investigation
                 // bundle, the failed runs' session logs and kept worktrees,
@@ -977,6 +994,9 @@ impl ExternalWorker {
         }
         cmd.env("RUSTYKRAB_DATA_DIR", &c.data_dir)
             .env("RUSTYKRAB_SKILLS_DIR", &c.skills_dir);
+        if let Some(cache) = &build_cache {
+            cmd.env("CARGO_TARGET_DIR", cache.join("target"));
+        }
         cmd
     }
 
@@ -1474,6 +1494,12 @@ impl Worker for ExternalWorker {
         // without (an interrupted one included) keeps it for diagnosis
         // unless policy says otherwise.
         let keep = outcome.is_err() && matches!(self.config.retention, Retention::KeepFailed(_));
+        if keep {
+            // Kept for diagnosis: its source and branch, not its build.
+            if let Some(ws) = workspace.clone() {
+                let _ = tokio::task::spawn_blocking(move || ws.drop_build_output()).await;
+            }
+        }
         if !keep {
             let _ = std::fs::remove_dir_all(&context_dir);
             match workspace {
@@ -2569,6 +2595,49 @@ contract="Done. {\\\"summary\\\":\\\"added status\\\",\\\"changed_paths\\\":[\\\
 echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":4,\"total_cost_usd\":0.0125,\"usage\":{\"input_tokens\":100,\"output_tokens\":20},\"result\":\"$contract\"}"
 "#;
 
+    /// A stand-in that builds, then fails: it records where Cargo was told
+    /// to build and leaves a `target/` of its own in the worktree.
+    const BUILDS_THEN_FAILS: &str = r#"#!/bin/sh
+printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/args.txt"
+printf '%s' "$CARGO_TARGET_DIR" > "$RUSTYKRAB_DATA_DIR/target-dir.txt"
+echo built > "$CARGO_TARGET_DIR/artifact"
+mkdir -p target/debug && echo tag > target/CACHEDIR.TAG && echo big > target/debug/bin
+mkdir -p notes && echo keep > notes/target
+exit 3
+"#;
+
+    #[tokio::test]
+    async fn a_worktree_run_builds_into_the_shared_cache_and_a_kept_one_drops_its_target() {
+        let f = Fixture::new();
+        let mut worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", BUILDS_THEN_FAILS));
+        worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+        let ws = f.workspace();
+        assert!(worker.run(brief(Some(ws.clone()))).await.is_err());
+
+        // One cache per repository under the data directory, writable by
+        // the agent and where Cargo builds.
+        let cache = ws
+            .build_cache(&f.data.path().join(workspace::BUILD_CACHE_DIR))
+            .unwrap();
+        let told = std::fs::read_to_string(f.data.path().join("target-dir.txt")).unwrap();
+        assert_eq!(Path::new(&told), cache.join("target"));
+        assert!(cache.join("target/artifact").is_file());
+        let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            lines
+                .windows(2)
+                .any(|pair| pair[0] == "--add-dir" && Path::new(pair[1]) == cache),
+            "{args}"
+        );
+        // The failed run's worktree is kept for diagnosis, without the
+        // build output Cargo marked as its own.
+        assert!(ws.path.join("src/lib.rs").is_file());
+        assert!(ws.path.join("notes/target").is_file());
+        assert!(!ws.path.join("target").exists());
+        let _ = ws.remove();
+    }
+
     #[tokio::test]
     async fn claude_code_runs_in_its_worktree_and_returns_the_attested_contract() {
         let f = Fixture::new();
@@ -3194,20 +3263,25 @@ exit 9
 
         worker.run(b).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        let want: Vec<String> = kit
-            .read_dirs
-            .iter()
-            .map(|d| d.display().to_string())
+        // The worktree's build cache first, then the kit's directories.
+        let cache = f
+            .workspace()
+            .build_cache(&f.data.path().join(workspace::BUILD_CACHE_DIR))
+            .unwrap()
+            .display()
+            .to_string();
+        let want: Vec<String> = std::iter::once(cache.clone())
+            .chain(kit.read_dirs.iter().map(|d| d.display().to_string()))
             .collect();
         assert_eq!(added_dirs(&args), want, "{args}");
         // Its toolset is what every Claude Code worker gets: nothing gated.
         assert!(args.contains(&allowed_list(&[])), "{args}");
 
-        // Without a kit, nothing outside the worktree is added.
+        // Without a kit, only the build cache is added.
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
         worker.run(brief(Some(f.workspace()))).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert!(added_dirs(&args).is_empty(), "{args}");
+        assert_eq!(added_dirs(&args), [cache], "{args}");
     }
 
     /// Codex reads the whole disk from inside its sandbox, and its
