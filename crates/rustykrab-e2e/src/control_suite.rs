@@ -2302,8 +2302,15 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
         !added.iter().any(|dir| !std::path::Path::new(dir).exists()),
         "the investigator was offered a directory that does not exist: {added:?}"
     );
+    // Beside those, only where its worktree builds: the repository's
+    // shared build cache.
+    let build_cache = ctx.data_dir.join("build-cache");
     ensure!(
-        added.len() == 2 && !args.contains("--tools"),
+        added.len() == 3
+            && added
+                .iter()
+                .any(|dir| std::path::Path::new(dir).parent() == Some(build_cache.as_path()))
+            && !args.contains("--tools"),
         "nothing else was added and its toolset is untouched: {args}"
     );
     ensure!(
