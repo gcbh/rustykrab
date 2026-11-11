@@ -152,6 +152,27 @@ pub(super) fn read_only_review(item: &WorkItem) -> bool {
         .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
 }
 
+/// Whether a done claim on `item` that left its repository unchanged
+/// ([`CodeVerdict::Unchanged`]) shows nothing: a `code` item (other than a
+/// read-only review) whose report names no check it ran. A `code` item
+/// exists to change its repository, so with no commit and no checks the
+/// report is only words, as when a run's last model call broke and its
+/// trailing text was taken for a report. Inspection and analysis items of
+/// other kinds (`task`, `research`, ...) with a `repo:` resource, fix
+/// items (`internal`, which park as a conclusion when nothing landed), and
+/// a `code` report that names checks it ran ("already fixed; the tests
+/// pass") still record `repository_unchanged` and may close.
+pub(super) fn unchanged_code_claim(
+    item: &WorkItem,
+    result: &rustykrab_core::work::ResultReport,
+) -> bool {
+    item.kind == WorkKind::Code
+        && !read_only_review(item)
+        && result.commit.is_none()
+        && result.changed_paths.is_empty()
+        && result.checks_run.iter().all(|c| c.trim().is_empty())
+}
+
 /// The fields of a read-only review's report that carry authority a review
 /// does not have: follow-up work, questions, artifacts (a classifier rule
 /// among them), a commit, changed paths, checks it says ran, or a block.
@@ -1056,6 +1077,16 @@ impl Controller {
                     .await
                     .map_err(|e| Error::Internal(format!("verification task failed: {e}")))?;
                     match verdict {
+                        Ok(CodeVerdict::Unchanged { .. }) if unchanged_code_claim(item, result) => {
+                            return Ok(Err((
+                                VerifierVerdict::Incomplete,
+                                "a code item's report claims done, but its repository is \
+                                 unchanged (no commit on its branch, no changed paths) and it \
+                                 names no check that was run: nothing shows the work was done \
+                                 or that none was needed"
+                                    .to_string(),
+                            )))
+                        }
                         Ok(CodeVerdict::Unchanged { base }) => {
                             proofs.push(("repository_unchanged".into(), base, Some(BY_GIT.into())));
                         }
@@ -1940,7 +1971,7 @@ impl Controller {
                 (i.writable_resources.clone(), isolated)
             })
             .collect();
-        let (mut load, mut models) = self.load_by_worker();
+        let (mut load, mut occupied) = self.load_by_worker();
         for item in ready {
             // A newly filed repository not observed during preparation waits
             // for the next pass. Never perform remote I/O under the command lock.
@@ -1964,7 +1995,7 @@ impl Controller {
                 WorkKind::Capability => self.capability_mode(&item.id).await?,
                 _ => None,
             };
-            let Some(worker) = self.pick(&item, &hist, &load, &models, &busy) else {
+            let Some(worker) = self.pick(&item, &hist, &load, &occupied, &busy) else {
                 // No eligible/free resource: keep the ready item queued.
                 // No attempt has started, so spend no failure/retry budget.
                 continue;
@@ -2116,9 +2147,9 @@ impl Controller {
             }
             busy.push((item.writable_resources.clone(), isolated_repo));
             *load.entry(name).or_default() += 1;
-            if self.config.serialise_local && worker.kind() == WorkerKind::Local {
-                models.extend(worker.capabilities().models);
-            }
+            // A second ready item in this pass must not be leased into the
+            // slot or model this run now holds.
+            self.occupy(worker.as_ref(), &mut occupied);
             report.leased.push(item.id);
         }
         Ok(())
@@ -2288,12 +2319,14 @@ impl Controller {
         Ok(Some(Workspace::plan(&root, &repo, &base, &item.id, run)))
     }
 
-    /// Live runs and capability probes per worker, and the models local
-    /// runs and probes occupy.
-    pub(super) fn load_by_worker(&self) -> (HashMap<String, usize>, HashSet<String>) {
+    /// Live runs and capability probes per worker, and what they occupy:
+    /// the models serialised local runs and probes hold, and every
+    /// exclusive resource slot ([`Worker::resource_slot`]) any of them
+    /// waits on.
+    pub(super) fn load_by_worker(&self) -> (HashMap<String, usize>, Occupied) {
         let state = self.state();
         let mut load: HashMap<String, usize> = HashMap::new();
-        let mut models: HashSet<String> = HashSet::new();
+        let mut occupied = Occupied::default();
         let busy = state
             .runs
             .values()
@@ -2302,26 +2335,46 @@ impl Controller {
         for (worker, n) in busy {
             *load.entry(worker.clone()).or_default() += n;
             if let Some(w) = self.worker(worker) {
-                if self.config.serialise_local && w.kind() == WorkerKind::Local {
-                    models.extend(w.capabilities().models);
-                }
+                self.occupy(w.as_ref(), &mut occupied);
             }
         }
-        (load, models)
+        (load, occupied)
     }
 
-    /// Whether `worker` could take one more run or probe now: under its
-    /// capacity, and for a serialised local worker its model free (12.1).
-    pub(super) fn has_free_slot(&self, worker: &dyn Worker) -> bool {
-        let (load, models) = self.load_by_worker();
-        load.get(worker.name()).copied().unwrap_or(0) < self.capacity(worker)
-            && !(self.config.serialise_local
+    /// Record what a run or probe on `worker` holds: its resource slot,
+    /// and for a serialised local worker its models (12.1).
+    pub(super) fn occupy(&self, worker: &dyn Worker, occupied: &mut Occupied) {
+        if let Some(slot) = worker.resource_slot() {
+            occupied.slots.insert(slot);
+        }
+        if self.config.serialise_local && worker.kind() == WorkerKind::Local {
+            occupied.models.extend(worker.capabilities().models);
+        }
+    }
+
+    /// Whether something `worker` needs is held: its resource slot by
+    /// another run or probe, or for a serialised local worker its model,
+    /// by a run or by work outside the controller.
+    fn is_occupied(&self, worker: &dyn Worker, occupied: &Occupied) -> bool {
+        worker
+            .resource_slot()
+            .is_some_and(|slot| occupied.slots.contains(&slot))
+            || self.config.serialise_local
                 && worker.kind() == WorkerKind::Local
                 && worker
                     .capabilities()
                     .models
                     .iter()
-                    .any(|model| models.contains(model) || self.activity.busy(model)))
+                    .any(|model| occupied.models.contains(model) || self.activity.busy(model))
+    }
+
+    /// Whether `worker` could take one more run or probe now: under its
+    /// capacity, its resource slot free, and for a serialised local worker
+    /// its model free (12.1).
+    pub(super) fn has_free_slot(&self, worker: &dyn Worker) -> bool {
+        let (load, occupied) = self.load_by_worker();
+        load.get(worker.name()).copied().unwrap_or(0) < self.capacity(worker)
+            && !self.is_occupied(worker, &occupied)
     }
 
     /// Pick the cheapest compatible resource with available capacity. A
@@ -2333,7 +2386,7 @@ impl Controller {
         item: &WorkItem,
         hist: &super::load::History,
         load: &HashMap<String, usize>,
-        models: &HashSet<String>,
+        occupied: &Occupied,
         busy: &[(Vec<String>, Option<String>)],
     ) -> Option<Arc<dyn Worker>> {
         // The worker's accepts/coverage sees precisely the tool requirements
@@ -2369,12 +2422,7 @@ impl Controller {
                     })
                     && floor.is_none_or(|f| self.routing.cost_tier(w.as_ref()) > f)
                     && load.get(w.name()).copied().unwrap_or(0) < self.capacity(w.as_ref())
-                    && !(self.config.serialise_local
-                        && w.kind() == WorkerKind::Local
-                        && w.capabilities()
-                            .models
-                            .iter()
-                            .any(|model| models.contains(model) || self.activity.busy(model)))
+                    && !self.is_occupied(w.as_ref(), occupied)
             })
             .map(|(i, w)| (self.routing.cost_tier(w.as_ref()), i, w))
             .min_by_key(|(tier, index, _)| (*tier, *index))
@@ -2406,6 +2454,17 @@ impl Controller {
         report.archived.extend(ids);
         Ok(())
     }
+}
+
+/// What live runs and probes hold that another worker may also need
+/// ([`Controller::load_by_worker`]): the models serialised local workers
+/// advertise (12.1), and the keys of the exclusive resource slots their
+/// executors wait on ([`Worker::resource_slot`]). Model labels alone miss
+/// two workers that name one model differently but share its slot.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Occupied {
+    pub(super) models: HashSet<String>,
+    pub(super) slots: HashSet<String>,
 }
 
 /// Start `worker` on `brief` under tokio, with the run binding the work

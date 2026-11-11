@@ -1,6 +1,7 @@
 //! Restricted host integrations with subscription CLI or local Ollama inference. Tool calls are
 //! attested by this adapter; a model-written claim cannot satisfy execution.
 use async_trait::async_trait;
+use rustykrab_agent::ResourceSlot;
 use rustykrab_agent::{LocalWorker, ProcessSandbox, RunTranscripts};
 use rustykrab_control::worker::{Brief, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::model::ModelProvider;
@@ -19,7 +20,7 @@ use rustykrab_tools::work_backend::{
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 pub(crate) const FLAG: &str = "RUSTYKRAB_INTEGRATION_WORKER";
@@ -363,7 +364,7 @@ impl IntegrationWorker {
         tools: Vec<Arc<dyn Tool>>,
         backend: Arc<dyn rustykrab_tools::WorkBackend>,
         transcripts: Arc<dyn RunTranscripts>,
-        slot: Arc<Semaphore>,
+        slot: ResourceSlot,
     ) -> Result<Self> {
         Self::general(
             name,
@@ -397,7 +398,7 @@ impl IntegrationWorker {
         tools: Vec<Arc<dyn Tool>>,
         backend: Arc<dyn rustykrab_tools::WorkBackend>,
         transcripts: Arc<dyn RunTranscripts>,
-        slot: Arc<Semaphore>,
+        slot: ResourceSlot,
         repositories: &[String],
         integrations: bool,
     ) -> Result<Self> {
@@ -577,6 +578,9 @@ impl Worker for IntegrationWorker {
     }
     fn isolates_worktree(&self) -> bool {
         self.worker.isolates_worktree()
+    }
+    fn resource_slot(&self) -> Option<String> {
+        self.worker.resource_slot()
     }
 
     fn healthy(&self) -> bool {
@@ -960,7 +964,7 @@ mod tests {
                 })],
                 backend.clone(),
                 Arc::new(DiscardTranscripts),
-                Arc::new(Semaphore::new(1)),
+                ResourceSlot::private(),
             )
             .unwrap();
             assert_eq!(worker.name(), "fixture-integrations");
@@ -1125,7 +1129,7 @@ mod tests {
             vec![],
             Arc::new(StubWorkBackend::new()),
             Arc::new(DiscardTranscripts),
-            Arc::new(Semaphore::new(1)),
+            ResourceSlot::private(),
         )
         .unwrap();
         let action = RegisteredAction::ToolCallable {
@@ -1254,7 +1258,7 @@ mod tests {
                 vec![inventory.clone()],
                 Arc::new(StubWorkBackend::new()),
                 Arc::new(DiscardTranscripts),
-                Arc::new(Semaphore::new(1)),
+                ResourceSlot::private(),
                 &[],
                 false,
             )

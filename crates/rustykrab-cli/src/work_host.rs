@@ -87,22 +87,25 @@ pub(crate) fn add_work_tools(
 /// turn the runtime runs holds a run guard on the activity tracker (a
 /// channel or web turn, a credential wake, a delegated task), and the
 /// local worker's own runs do not. While any is in flight the controller
-/// leases no local worker on that model.
+/// leases no local worker on that model. A worker names the provider's
+/// model by the provider's name ("ollama", the local worker) or by its
+/// local model tag (the planner and integrations workers), so either is
+/// the daemon's model.
 pub(crate) struct TurnActivity {
     tracker: ActivityTracker,
-    model: String,
+    models: Vec<String>,
 }
 
 impl ModelActivity for TurnActivity {
     fn busy(&self, model: &str) -> bool {
-        model == self.model && self.tracker.runs_in_flight() > 0
+        self.models.iter().any(|m| m == model) && self.tracker.runs_in_flight() > 0
     }
 }
 
-pub(crate) fn turn_activity(tracker: ActivityTracker, model: &str) -> Arc<dyn ModelActivity> {
+pub(crate) fn turn_activity(tracker: ActivityTracker, models: &[&str]) -> Arc<dyn ModelActivity> {
     Arc::new(TurnActivity {
         tracker,
-        model: model.to_string(),
+        models: models.iter().map(|m| m.to_string()).collect(),
     })
 }
 

@@ -358,7 +358,8 @@ compact and out-of-bound content is rejected rather than truncated.
 
 The opt-in CLI local-resource configuration adds an independent Ollama provider
 for coding and restricted integrations. Manager/planner inference retains its
-configured provider. Local roles share one model slot, scoped tools and existing
+configured provider. Local roles share one model slot (whose key each reports as
+`Worker::resource_slot`, so dispatch leases one of them at a time), scoped tools and existing
 worktree/attestation verification. The existing cost-tier router prefers them
 and escalates failures to compatible retained CLI resources. This adds no
 crate dependency, scheduler, channel owner or durable work ledger.
@@ -404,7 +405,12 @@ same controller. No second scheduler, credential store or durable ledger is adde
 Repository scope permits inspection without edits. When no Git changes are
 claimed, a clean worktree at its starting commit records `repository_unchanged`
 evidence rather than requiring an invented commit. Unreported edits and false
-commit/path claims still fail verification.
+commit/path claims still fail verification. A `code` item exists to change its
+repository, so its done claim with an unchanged repository must name a check it
+ran; with none it fails as `verification/incomplete`. A local repository run
+that ends on text without `result_report` fails and keeps its worktree, and a
+model reply whose stream broke after it began is a provider error, not an
+answer.
 
 ## Concurrent bounded work (base 5bc3309)
 

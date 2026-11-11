@@ -1,5 +1,6 @@
 //! Operator-owned local inference resources, independent of the chat provider.
 use async_trait::async_trait;
+use rustykrab_agent::ResourceSlot;
 use rustykrab_agent::RunTranscripts;
 use rustykrab_control::worker::{Brief, RunUsage, Worker, WorkerCapabilities};
 use rustykrab_core::model::ModelProvider;
@@ -12,7 +13,6 @@ use rustykrab_core::{Result, Tool};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::Semaphore;
 
 const CONFIG_ENV: &str = "RUSTYKRAB_LOCAL_RESOURCES";
 pub(crate) const CODE_NAME: &str = "qwen-code";
@@ -110,6 +110,27 @@ pub(crate) fn provider_on_this_machine(provider: &str, base_url: Option<&str>) -
     })
 }
 
+/// The key of the daemon's own model slot, which its local worker, the
+/// planner, the integrations worker and peers' delegated runs wait on.
+pub(crate) const DAEMON_MODEL_SLOT: &str = "model:daemon";
+/// The key of the local-resources workers' slot when it is not the
+/// daemon's ([`local_resources_slot`]).
+pub(crate) const LOCAL_RESOURCES_SLOT: &str = "model:local-resources";
+
+/// The slot the local-resources workers wait on. When the daemon's own
+/// provider is a local server on this machine ([`provider_on_this_machine`])
+/// both sets of workers load into the same memory, where two sessions at
+/// once evict each other's prompt cache and push the model into swap, so
+/// they share `daemon`, key included: the controller then leases one item
+/// at a time across all of them. Otherwise they get a slot of their own.
+pub(crate) fn local_resources_slot(shares_machine: bool, daemon: &ResourceSlot) -> ResourceSlot {
+    if shares_machine {
+        daemon.clone()
+    } else {
+        ResourceSlot::shared(LOCAL_RESOURCES_SLOT)
+    }
+}
+
 /// The local coding worker's toolset, modelled on Claude Code's default
 /// working tools (the owner's decision of 2026-10-13): a shell, file read,
 /// edit and write, web fetch and search, and a task list. In a worktree
@@ -137,7 +158,7 @@ impl CodingWorker {
         tools: Vec<Arc<dyn Tool>>,
         backend: Arc<dyn rustykrab_tools::WorkBackend>,
         transcripts: Arc<dyn RunTranscripts>,
-        slot: Arc<Semaphore>,
+        slot: ResourceSlot,
     ) -> Self {
         let repositories: Vec<String> = config
             .repositories
@@ -197,6 +218,9 @@ impl Worker for CodingWorker {
     }
     fn isolates_worktree(&self) -> bool {
         self.worker.isolates_worktree()
+    }
+    fn resource_slot(&self) -> Option<String> {
+        self.worker.resource_slot()
     }
 
     fn healthy(&self) -> bool {
@@ -327,6 +351,52 @@ mod tests {
             Ok(())
         }
     }
+    /// When the daemon's provider is Ollama on this machine, the
+    /// local-resources workers wait on the daemon's model slot and tell the
+    /// controller the same key as the daemon's planner, so it never leases
+    /// one while the other holds the slot; otherwise their slot is their own.
+    #[test]
+    fn local_resources_workers_share_the_daemons_slot_key_only_on_this_machine() {
+        let daemon = ResourceSlot::shared(DAEMON_MODEL_SLOT);
+        let mut c = config("http://127.0.0.1:11434");
+        c.repositories = vec![PathBuf::from("/fixture")];
+        let planner = crate::integrations::IntegrationWorker::general(
+            "planner",
+            None,
+            Arc::new(NoModel),
+            vec![],
+            Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
+            Arc::new(Discard),
+            daemon.clone(),
+            &[],
+            false,
+        )
+        .unwrap();
+        for (base_url, shared) in [
+            (None, true),
+            (Some("http://127.0.0.1:11434"), true),
+            (Some("http://mac.tailnet:11434"), false),
+        ] {
+            let slot = local_resources_slot(provider_on_this_machine("ollama", base_url), &daemon);
+            assert_eq!(slot.same_as(&daemon), shared, "{base_url:?}");
+            let code = CodingWorker::new(
+                &c,
+                Arc::new(NoModel),
+                vec![],
+                Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
+                Arc::new(Discard),
+                slot,
+            );
+            let (code_key, planner_key) = (code.resource_slot(), planner.resource_slot());
+            assert_eq!(planner_key.as_deref(), Some(DAEMON_MODEL_SLOT));
+            assert!(code_key.is_some(), "{base_url:?}");
+            assert_eq!(code_key == planner_key, shared, "{base_url:?}");
+        }
+        let hosted = local_resources_slot(provider_on_this_machine("claude-cli", None), &daemon);
+        assert_eq!(hosted.key(), Some(LOCAL_RESOURCES_SLOT));
+        assert!(!hosted.same_as(&daemon));
+    }
+
     /// The local coding worker's toolset is a shell plus the file, web and
     /// task-list tools the host has, not the shell alone.
     /// The production wrapper hands probes to its local worker: a scope, an
@@ -348,7 +418,7 @@ mod tests {
             host,
             Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
             Arc::new(Discard),
-            Arc::new(Semaphore::new(1)),
+            ResourceSlot::private(),
         );
         assert_ne!(
             worker.access_profile(),
@@ -447,7 +517,7 @@ mod tests {
             host,
             Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
             Arc::new(Discard),
-            Arc::new(Semaphore::new(1)),
+            ResourceSlot::private(),
         );
         let tools = worker.capabilities().tools;
         for tool in ["exec", "read", "edit", "write", "todo_write", "todo_read"] {
@@ -471,7 +541,7 @@ mod tests {
             vec![],
             Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
             Arc::new(Discard),
-            Arc::new(Semaphore::new(1)),
+            ResourceSlot::private(),
         )
         .with_run_logs(dir.path().to_path_buf());
         assert_eq!(worker.run_log("run-1"), None, "no log before a run");
@@ -490,7 +560,7 @@ mod tests {
             vec![],
             Arc::new(rustykrab_tools::work_backend::StubWorkBackend::new()),
             Arc::new(Discard),
-            Arc::new(Semaphore::new(1)),
+            ResourceSlot::private(),
         );
         assert_eq!(worker.capabilities().models, vec!["qwen3.8:27b-mlx"]);
         assert_eq!(

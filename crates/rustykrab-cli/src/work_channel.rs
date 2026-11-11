@@ -489,7 +489,7 @@ pub fn planner_worker(
     tools: Vec<Arc<dyn rustykrab_core::Tool>>,
     backend: Arc<dyn rustykrab_tools::WorkBackend>,
     transcripts: Arc<dyn rustykrab_agent::RunTranscripts>,
-    slot: Arc<tokio::sync::Semaphore>,
+    slot: rustykrab_agent::ResourceSlot,
     run_logs: std::path::PathBuf,
 ) -> Arc<dyn rustykrab_control::worker::Worker> {
     Arc::new(

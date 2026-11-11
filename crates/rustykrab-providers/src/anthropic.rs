@@ -669,8 +669,21 @@ impl AnthropicProvider {
                         pending_tool_calls = tool_input_bufs.len(),
                         last_event_type = %current_event_type,
                         buffer_len = buffer.len(),
-                        "stream read error mid-stream, returning partial response"
+                        "stream read error mid-stream"
                     );
+                    // Once the model has begun its reply, the partial reply
+                    // is not its answer: a caller that took it for a
+                    // finished turn would end a run on half a sentence. A
+                    // transient provider error lets the caller retry.
+                    if !full_text.is_empty() || !tool_calls.is_empty() || !tool_meta.is_empty() {
+                        return Err(Error::ModelProvider(format!(
+                            "Anthropic stream for model {} broke mid-response after {bytes_received} \
+                             bytes ({} characters of text): stream read error: {e}; the partial \
+                             reply was discarded",
+                            self.model,
+                            full_text.len()
+                        )));
+                    }
                     stream_interrupted = true;
                     break;
                 }
@@ -780,7 +793,7 @@ impl AnthropicProvider {
                 completed_tool_calls = tool_calls.len(),
                 discarded_partial_tool_calls = tool_input_bufs.len(),
                 text_len = full_text.len(),
-                "stream interrupted — returning partial Anthropic response"
+                "stream interrupted before any content — returning the empty response"
             );
             // Discard any in-progress tool calls that never received a
             // `content_block_stop` event (their JSON is incomplete and

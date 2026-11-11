@@ -25,6 +25,8 @@ use crate::workspace::REPO_PREFIX;
 enum Claim {
     /// Inspection with no repository edits or Git claims.
     Inspection,
+    /// No edits or Git claims, but a check it says it ran.
+    CheckedNoChange,
     /// The commit it made and the path it changed.
     Honest,
     /// A path it did not change.
@@ -115,6 +117,11 @@ impl Worker for Coder {
                 report.summary = "Inspected the repository without edits".into();
                 return Ok(report);
             }
+            if claim == Claim::CheckedNoChange {
+                report.summary = "The helper is already correct; no change needed".into();
+                report.checks_run = vec!["cargo test".into()];
+                return Ok(report);
+            }
             if claim != Claim::NoSuchCommit {
                 std::fs::write(ws.path.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
                 if claim == Claim::KeepsItsOwnTracker {
@@ -201,6 +208,46 @@ async fn a_repository_analysis_task_completes_without_inventing_a_commit() {
         .any(|e| e.kind == "repository_unchanged" && e.verified_by.as_deref() == Some("git")));
     assert!(!evidence.iter().any(|e| e.kind == "commit"));
     assert_eq!(run_git(repo.path(), &["status", "--short"]), "");
+}
+
+/// A `code` item exists to change its repository: a done claim that left
+/// it unchanged and names no check is not done (item f26aee16 closed done
+/// on a report made up from a broken reply's trailing text). The same
+/// report that names a check it ran ("already correct; tests pass") may
+/// still close.
+#[tokio::test]
+async fn a_code_item_that_changed_nothing_and_checked_nothing_is_not_done() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let inspector = Coder::new("inspector", WorkerKind::Local, &repo, Claim::Inspection);
+    let h = Harness::with_fleet(config(&root), vec![inspector.clone()]);
+    let mut d = code_draft("Fix the helper", &repo, WorkerKind::Any);
+    d.budget = Some(crate::controller::tests::no_rungs());
+    let id = h.file_one(d).await;
+    h.drain().await;
+    assert_ne!(h.status(&id).await, Status::Done);
+    let error = crate::ladder::last_error(&h.events(&id).await).expect("a failure");
+    assert_eq!(
+        error.subclass,
+        rustykrab_core::work::ErrorSubclass::Incomplete
+    );
+    assert!(error.detail.contains("unchanged"), "{}", error.detail);
+    let evidence = h.store().work_evidence_list(&id).await.unwrap();
+    assert!(!evidence.iter().any(|e| e.kind == "repository_unchanged"));
+
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let checker = Coder::new("checker", WorkerKind::Local, &repo, Claim::CheckedNoChange);
+    let h = Harness::with_fleet(config(&root), vec![checker]);
+    let id = h
+        .file_one(code_draft("Fix the helper", &repo, WorkerKind::Any))
+        .await;
+    h.drain().await;
+    assert_eq!(h.status(&id).await, Status::Done);
+    let evidence = h.store().work_evidence_list(&id).await.unwrap();
+    assert!(evidence
+        .iter()
+        .any(|e| e.kind == "repository_unchanged" && e.verified_by.as_deref() == Some("git")));
 }
 
 #[tokio::test]

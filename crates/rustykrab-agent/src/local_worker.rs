@@ -198,6 +198,48 @@ pub struct LocalRun {
     pub reported: bool,
 }
 
+/// An exclusive resource local runs wait on before they start (a local
+/// model's KV slot, plan section 12.1), and the key the controller knows
+/// it by ([`Worker::resource_slot`]). Clones share the one permit, so every
+/// worker built with a clone runs one item at a time with the others, and
+/// the controller, seeing the same key, leases none of them while another
+/// holds it: a run queued behind the permit shows no activity until it
+/// starts, and would otherwise be declared stalled.
+#[derive(Clone, Debug)]
+pub struct ResourceSlot {
+    key: Option<String>,
+    permits: Arc<Semaphore>,
+}
+
+impl ResourceSlot {
+    /// A slot several workers share, known to the controller as `key`.
+    pub fn shared(key: impl Into<String>) -> Self {
+        Self {
+            key: Some(key.into()),
+            permits: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    /// A slot of one worker's own, which nothing else waits on: its
+    /// [`Worker::concurrency`] already says all there is.
+    pub fn private() -> Self {
+        Self {
+            key: None,
+            permits: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    /// The key the controller knows this slot by; `None` when private.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// Whether `self` and `other` are the one slot (clones of each other).
+    pub fn same_as(&self, other: &ResourceSlot) -> bool {
+        Arc::ptr_eq(&self.permits, &other.permits)
+    }
+}
+
 /// The local runs in flight in this process, so the daemon can end them on
 /// its way down: the in-process counterpart of
 /// [`crate::external_worker::RunGroups`]. Each [`LocalWorker`] run joins
@@ -298,8 +340,9 @@ pub struct LocalWorker {
     run_logs: Option<std::path::PathBuf>,
     late: Option<Arc<dyn LateTools>>,
     /// The KV slot runs wait for. Local work is serialised per model
-    /// (plan section 12.1), so workers on one model share one.
-    slot: Arc<Semaphore>,
+    /// (plan section 12.1), so workers on one model share one, and its key
+    /// is this worker's [`Worker::resource_slot`].
+    slot: ResourceSlot,
     /// The set its runs join, so shutdown can interrupt them.
     runs: Arc<LocalRuns>,
     /// Steps in a row without new evidence before a run has stalled
@@ -443,7 +486,7 @@ impl LocalWorker {
         let entry = self.runs.enter();
         let observe = async {
             let slot = tokio::select! {
-                slot = self.slot.acquire() => slot,
+                slot = self.slot.permits.acquire() => slot,
                 _ = entry.interrupted() => return unobserved("local worker probe was interrupted"),
             };
             let Ok(_slot) = slot else {
@@ -498,7 +541,7 @@ impl LocalWorker {
             transcripts: None,
             run_logs: None,
             late: None,
-            slot: Arc::new(Semaphore::new(1)),
+            slot: ResourceSlot::private(),
             runs: LocalRuns::global(),
             stall_steps: DEFAULT_STALL_STEPS,
             full_reports: false,
@@ -592,8 +635,9 @@ impl LocalWorker {
     }
 
     /// Wait on `slot` instead of a slot of its own, so several local
-    /// workers on one model never run at once.
-    pub fn with_slot(mut self, slot: Arc<Semaphore>) -> Self {
+    /// workers on one model never run at once; its key tells the
+    /// controller so ([`Worker::resource_slot`]).
+    pub fn with_slot(mut self, slot: ResourceSlot) -> Self {
         self.slot = slot;
         self
     }
@@ -988,6 +1032,12 @@ impl Worker for LocalWorker {
         1
     }
 
+    /// The key of the slot shared with other workers, if any
+    /// ([`LocalWorker::with_slot`]).
+    fn resource_slot(&self) -> Option<String> {
+        self.slot.key().map(str::to_string)
+    }
+
     /// A local worker is as available as the daemon it runs in, unless its
     /// provider's server said at the last [`Worker::refresh`] that the
     /// model does not exist: then no item could run, and none is leased.
@@ -1149,7 +1199,7 @@ impl Worker for LocalWorker {
         }
         let entry = self.runs.enter();
         let _slot = tokio::select! {
-            slot = self.slot.acquire() => {
+            slot = self.slot.permits.acquire() => {
                 slot.map_err(|_| Error::Internal("local worker slot closed".into()))?
             }
             e = entry.interrupted() => return Err(e),
@@ -1472,7 +1522,23 @@ impl LocalWorker {
         // A run that stopped on text gave its answer (feather's rule): the
         // text is the report, filed through the backend `result_report`
         // uses, so attestation and the controller see it the same way.
-        if matches!(ended, Ok(())) && !tracer.iteration_limit_reached() && !tracer.ended_by_tool() {
+        // Not for repository work (a worktree, or a `repo:` resource) other
+        // than a read-only review: its result is the change it made, which
+        // only the model's own report names, and a report made up from
+        // trailing text reads as "completed", so the worktree holding an
+        // uncommitted edit would be removed before anything checked it.
+        // Such a run ends as a failure below and keeps its worktree.
+        let repository_run = !review
+            && (brief.workspace.is_some()
+                || brief
+                    .writable_resources
+                    .iter()
+                    .any(|r| r.starts_with(rustykrab_control::workspace::REPO_PREFIX)));
+        if matches!(ended, Ok(()))
+            && !repository_run
+            && !tracer.iteration_limit_reached()
+            && !tracer.ended_by_tool()
+        {
             if let Some(text) = last_assistant_text(&conv) {
                 let provenance = Provenance {
                     conversation_id: Some(conv_id.to_string()),
@@ -1490,6 +1556,15 @@ impl LocalWorker {
         }
         let failure = match ended {
             Err(e) => return Err(e),
+            Ok(()) if repository_run && last_assistant_text(&conv).is_some() => RunFailure::Model {
+                problem: ProviderProblem::Empty,
+                detail: format!(
+                    "the model stopped with text and no result_report; repository \
+                     work is reported only by result_report, so its worktree is kept \
+                     ({} reminders)",
+                    stats.reminders
+                ),
+            },
             Ok(()) => RunFailure::Model {
                 problem: ProviderProblem::Empty,
                 detail: format!(
@@ -2573,7 +2648,7 @@ mod tests {
             },
         );
         request.deadline = Duration::from_millis(20);
-        let held = worker.slot.acquire().await.unwrap();
+        let held = worker.slot.permits.acquire().await.unwrap();
         assert_eq!(
             worker.observe_probe(&request).await.outcome,
             ProbeOutcome::Unobserved
@@ -2586,7 +2661,7 @@ mod tests {
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
-            worker.slot.available_permits(),
+            worker.slot.permits.available_permits(),
             1,
             "timed-out observation releases the resource slot"
         );
@@ -3960,6 +4035,92 @@ mod tests {
         let rendered = messages[1].content.as_text().unwrap().to_string();
         assert!(rendered.contains("workspace: "), "{rendered}");
         assert!(rendered.contains(&ws.branch), "{rendered}");
+    }
+
+    /// A repository run that edits and then ends on text, never calling
+    /// `result_report`, is no completed report: it fails as an empty model
+    /// result and its worktree, with the uncommitted edit, stays for the
+    /// next attempt (item f26aee16 was closed done this way and its edit
+    /// removed). A run without a repository still takes its text.
+    #[tokio::test]
+    async fn a_repository_run_that_ends_on_text_fails_and_keeps_its_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--initial-branch=main"]);
+        std::fs::write(repo.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "init",
+            ],
+        );
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        let root = tempfile::tempdir().unwrap();
+        let ws = rustykrab_control::workspace::Workspace::plan(
+            root.path(),
+            repo.path(),
+            &base,
+            "item-18",
+            "run-18",
+        );
+        for full_reports in [false, true] {
+            let provider = Recording::new(vec![
+                call(
+                    "exec",
+                    json!({ "command": "echo '// half done' >> lib.rs" }),
+                ),
+                text("I updated lib.rs and will now run the tests"),
+            ]);
+            let (w, backend) = worker(
+                provider.clone(),
+                vec![Arc::new(rustykrab_tools::ExecTool::new())],
+            );
+            let w = w.with_result_report_reminder(false);
+            let w = if full_reports {
+                w.with_full_reports()
+            } else {
+                w
+            };
+            let mut b = brief("item-18");
+            b.kind = WorkKind::Code;
+            b.required_tools = vec!["exec".into()];
+            b.writable_resources = vec![format!("repo:{}", repo.path().display())];
+            b.workspace = Some(ws.clone());
+
+            let err = w.run(b).await.unwrap_err();
+            assert_eq!(
+                classified(&err),
+                (ErrorClass::Model, ErrorSubclass::Empty),
+                "{err}"
+            );
+            assert!(err.to_string().contains("worktree is kept"), "{err}");
+            assert!(
+                !backend
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, WorkCall::Report { .. })),
+                "no report is filed from the text"
+            );
+            assert!(ws.path.exists(), "the worktree is kept");
+            let edited = std::fs::read_to_string(ws.path.join("lib.rs")).unwrap();
+            assert!(edited.contains("half done"), "the uncommitted edit is kept");
+            assert_eq!(ws.tip().unwrap(), Some(base.clone()), "nothing committed");
+        }
+
+        // The same text from a run with no repository is still its answer.
+        let provider = Recording::new(vec![text("Plan B is cheapest.")]);
+        let (w, _) = worker(provider, Vec::new());
+        let w = w.with_result_report_reminder(false).with_full_reports();
+        let report = w.run(brief("item-19")).await.unwrap();
+        assert_eq!(report.summary, "Plan B is cheapest.");
     }
 
     #[tokio::test]

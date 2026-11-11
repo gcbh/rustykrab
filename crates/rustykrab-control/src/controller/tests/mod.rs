@@ -22,6 +22,7 @@ mod project_context;
 mod proof;
 mod questions;
 mod resolution;
+mod resource_slots;
 mod review;
 mod review_guard;
 mod scenarios;

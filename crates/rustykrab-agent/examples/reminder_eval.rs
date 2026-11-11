@@ -135,7 +135,7 @@ async fn main() -> Res<()> {
             .await,
     );
     let tools = host_tools(provider.clone());
-    let slot = Arc::new(tokio::sync::Semaphore::new(1));
+    let slot = rustykrab_agent::ResourceSlot::shared("model:eval");
     let done = recorded(&args.out.join("runs.jsonl"));
 
     for rep in args.rep_start..args.rep_start + args.reps {
@@ -298,7 +298,7 @@ async fn run_one(
     attempt: u32,
     provider: Arc<dyn ModelProvider>,
     tools: Vec<Arc<dyn Tool>>,
-    slot: Arc<tokio::sync::Semaphore>,
+    slot: rustykrab_agent::ResourceSlot,
 ) -> Res<Value> {
     let arm = if remind { "on" } else { "off" };
     let label = format!("{task}-{arm}-r{rep}-a{attempt}");

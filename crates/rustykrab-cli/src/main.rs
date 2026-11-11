@@ -1586,9 +1586,11 @@ async fn main() -> anyhow::Result<()> {
         integrations: integrations::enabled(),
         private_ports: vec![port],
     });
-    // One KV slot per model (plan 12.1): the local worker and the runs of
-    // a peer's briefs on this node (peers.rs) wait on the same one.
-    let model_slot = Arc::new(tokio::sync::Semaphore::new(1));
+    // One KV slot per model (plan 12.1): the local worker, the planner, the
+    // integrations worker and the runs of a peer's briefs on this node
+    // (peers.rs) wait on the same one, and its key tells the controller,
+    // which then leases one of them at a time.
+    let model_slot = rustykrab_agent::ResourceSlot::shared(local_resources::DAEMON_MODEL_SLOT);
     // RUSTYKRAB_LOCAL_WORKER=off: a daemon with no local model registers no
     // local worker, so routing never leases an item to one (fleet.rs).
     let local_worker_on = fleet::local_worker_enabled();
@@ -1689,7 +1691,10 @@ async fn main() -> anyhow::Result<()> {
             .with_catalog(fleet.catalog(control_catalog.clone()))
             .with_activity(work_host::turn_activity(
                 activity_tracker.clone(),
-                provider.name(),
+                &[provider.name()]
+                    .into_iter()
+                    .chain(provider.local_model_tag())
+                    .collect::<Vec<_>>(),
             )),
     );
     fleet.start(local_worker).await?;
@@ -1701,7 +1706,9 @@ async fn main() -> anyhow::Result<()> {
                     Arc::new(
                         integrations::IntegrationWorker::general(
                             "planner",
-                            None,
+                            // The model it runs, not the provider's name:
+                            // `None` falls back to "ollama".
+                            provider.local_model_tag().map(str::to_string),
                             provider.clone(),
                             tools.clone(),
                             deferred_work_backend.clone(),
@@ -1738,7 +1745,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(
                     integrations::IntegrationWorker::general(
                         "integrations",
-                        None,
+                        provider.local_model_tag().map(str::to_string),
                         provider.clone(),
                         tools.clone(),
                         deferred_work_backend.clone() as Arc<dyn rustykrab_tools::WorkBackend>,
@@ -1761,21 +1768,18 @@ async fn main() -> anyhow::Result<()> {
         let local_provider = config.provider().await;
         // The local-resources server is always on this machine. When the
         // daemon's own provider is a local server here too, both sets of
-        // workers load into the same memory: two sessions at once evict
-        // each other's prompt cache and push the model into swap. They
-        // then wait on one slot. A hosted or remote provider keeps the
-        // local workers on a slot of their own.
-        let local_slot = if local_resources::provider_on_this_machine(
+        // workers share one slot (`local_resources_slot`); a hosted or
+        // remote provider keeps the local workers on a slot of their own.
+        let shares_machine = local_resources::provider_on_this_machine(
             provider.name(),
             std::env::var("OLLAMA_BASE_URL").ok().as_deref(),
-        ) {
+        );
+        if shares_machine {
             tracing::info!(
                 "local-resources workers share the model slot: one local session at a time"
             );
-            model_slot.clone()
-        } else {
-            Arc::new(tokio::sync::Semaphore::new(1))
-        };
+        }
+        let local_slot = local_resources::local_resources_slot(shares_machine, &model_slot);
         fleet
             .registry
             .register(
