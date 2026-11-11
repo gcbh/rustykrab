@@ -1895,8 +1895,12 @@ mod error_typing_tests {
     async fn a_shell_without_a_directory_has_no_build_cache() {
         let cache = tempfile::tempdir().unwrap();
         let tool = ExecTool::new().with_build_cache(cache.path().join("c"));
-        let (code, text) = run_in(&tool, "printf %s \"${CARGO_TARGET_DIR:-unset}\"").await;
-        assert_eq!((code, text.as_str()), (0, "unset"));
+        let out = tool
+            .execute(json!({ "command": "printf %s \"${CARGO_TARGET_DIR:-unset}\"" }))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
+        assert_eq!(out["stdout"], "unset");
         assert!(!cache.path().join("c").exists());
     }
 
