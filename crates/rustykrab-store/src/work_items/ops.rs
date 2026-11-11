@@ -658,6 +658,42 @@ pub(super) fn evidence_of(conn: &Connection, item: &str) -> Result<Vec<Evidence>
     )
 }
 
+/// An item's evidence except one kind, oldest first: lets a reader that
+/// never looks at a bulky kind (recorded project contexts) skip its bytes.
+pub(super) fn evidence_of_except(
+    conn: &Connection,
+    item: &str,
+    kind: &str,
+) -> Result<Vec<Evidence>, WorkStoreError> {
+    collect(
+        conn,
+        &format!(
+            "SELECT {EVIDENCE_COLUMNS} FROM work_item_evidence
+              WHERE item = ?1 AND kind != ?2 ORDER BY at, id"
+        ),
+        params![item, kind],
+        evidence_from_row,
+    )
+}
+
+/// Evidence of one kind with a row id above `after`, in row order, each
+/// with its id. Evidence is append-only, so the id is a cursor.
+pub(super) fn evidence_of_kind_after(
+    conn: &Connection,
+    kind: &str,
+    after: i64,
+) -> Result<Vec<(i64, Evidence)>, WorkStoreError> {
+    collect(
+        conn,
+        &format!(
+            "SELECT id, {EVIDENCE_COLUMNS} FROM work_item_evidence
+              WHERE kind = ?1 AND id > ?2 ORDER BY id"
+        ),
+        params![kind, after],
+        |row| Ok((row.get::<_, i64>("id")?, evidence_from_row(row)?)),
+    )
+}
+
 pub(super) fn evidence_of_kind(
     conn: &Connection,
     kind: &str,

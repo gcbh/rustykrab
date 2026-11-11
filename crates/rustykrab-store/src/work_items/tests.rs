@@ -1091,6 +1091,67 @@ async fn evidence_is_found_by_kind_across_items() {
 }
 
 #[tokio::test]
+async fn evidence_reads_can_skip_a_kind_or_resume_after_a_row() {
+    let store = seeded(
+        vec![item("a", Status::Done), item("b", Status::Running)],
+        vec![],
+    )
+    .await;
+    let evidence = |item: &str, kind: &str, reference: &str, secs: i64| Evidence {
+        item: item.into(),
+        kind: kind.into(),
+        reference: reference.into(),
+        hash: None,
+        verified_by: Some("controller".into()),
+        at: at(secs),
+    };
+    for ev in [
+        evidence("a", "project_context", "first context", 1),
+        evidence("a", "summary", "did it", 2),
+        evidence("b", "project_context", "second context", 3),
+        evidence("a", "project_context", "third context", 4),
+    ] {
+        store.work_evidence_add(ev).await.unwrap();
+    }
+    // Everything but the bulky kind, in the usual order.
+    let rest = store
+        .work_evidence_list_except("a", "project_context")
+        .await
+        .unwrap();
+    assert_eq!(
+        rest.iter()
+            .map(|e| e.reference.as_str())
+            .collect::<Vec<_>>(),
+        ["did it"]
+    );
+    // An id cursor: all rows of the kind, then only those after a seen row.
+    let all = store
+        .work_evidence_of_kind_after("project_context", 0)
+        .await
+        .unwrap();
+    let refs = |rows: &[(i64, Evidence)]| {
+        rows.iter()
+            .map(|(_, e)| e.reference.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refs(&all),
+        ["first context", "second context", "third context"]
+    );
+    assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+    let later = store
+        .work_evidence_of_kind_after("project_context", all[1].0)
+        .await
+        .unwrap();
+    assert_eq!(refs(&later), ["third context"]);
+    assert!(store
+        .work_evidence_of_kind_after("project_context", all[2].0)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn an_ended_lease_keeps_its_inputs_in_the_history() {
     let store = seeded(vec![item("a", Status::Ready)], vec![]).await;
     let input = InputRef {

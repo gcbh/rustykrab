@@ -500,6 +500,9 @@ pub struct Controller {
     /// cancel. Never held while a worker runs.
     loop_lock: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// Controller-recorded project bindings read so far
+    /// ([`project_context::RecordedBindings`]).
+    recorded_bindings: tokio::sync::Mutex<project_context::RecordedBindings>,
     /// Set on the way down ([`ControlHandle::set_draining`]): ticks lease
     /// nothing new.
     draining: AtomicBool,
@@ -544,6 +547,7 @@ impl Controller {
                 judgment: None,
                 source: None,
             }),
+            recorded_bindings: tokio::sync::Mutex::new(Default::default()),
             draining: AtomicBool::new(false),
         }
     }
