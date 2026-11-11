@@ -524,6 +524,12 @@ impl IntegrationWorker {
         self.worker = self.worker.with_run_logs(dir);
         self
     }
+    /// Share one Cargo build directory per repository across runs
+    /// (`LocalWorker::with_build_cache`).
+    pub(crate) fn with_build_cache(mut self, root: std::path::PathBuf) -> Self {
+        self.worker = self.worker.with_build_cache(root);
+        self
+    }
     /// Keep `paths` out of the worker's shell (`LocalWorker::with_private_paths`).
     pub(crate) fn with_private_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.worker = self.worker.with_private_paths(paths);

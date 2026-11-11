@@ -1595,6 +1595,9 @@ async fn main() -> anyhow::Result<()> {
     // Every worker's session logs go in one place (`<data dir>/run-logs`),
     // so an investigation opens any failed run as a file.
     let run_logs_dir = data_dir.join(rustykrab_agent::external_worker::RUN_LOGS_DIR);
+    // Cargo's build output for worktree runs, one directory per repository,
+    // so a run in a fresh worktree does not compile every dependency again.
+    let build_cache_dir = data_dir.join(rustykrab_control::workspace::BUILD_CACHE_DIR);
     let local_worker: Option<Arc<dyn rustykrab_control::worker::Worker>> = if local_worker_on {
         Some(Arc::new(
             rustykrab_agent::LocalWorker::new(
@@ -1608,6 +1611,7 @@ async fn main() -> anyhow::Result<()> {
             .with_transcripts(scheduled_work::transcripts(&store, skill_registry.clone()))
             .with_run_logs(run_logs_dir.clone())
             .with_private_paths(vec![data_dir.clone()])
+            .with_build_cache(build_cache_dir.clone())
             .with_private_ports(vec![port])
             .with_late_tools(fleet.skills.clone())
             .with_slot(model_slot.clone()),
@@ -1708,6 +1712,7 @@ async fn main() -> anyhow::Result<()> {
                         )?
                         .with_run_logs(run_logs_dir.clone())
                         .with_private_paths(vec![data_dir.clone()])
+                        .with_build_cache(build_cache_dir.clone())
                         .with_private_ports(vec![port]),
                     ) as Arc<dyn rustykrab_control::worker::Worker>
                 } else {
@@ -1744,6 +1749,7 @@ async fn main() -> anyhow::Result<()> {
                     )?
                     .with_run_logs(run_logs_dir.clone())
                     .with_private_paths(vec![data_dir.clone()])
+                    .with_build_cache(build_cache_dir.clone())
                     .with_private_ports(vec![port]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
@@ -1753,7 +1759,23 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(config) = &local_resources {
         let local_provider = config.provider().await;
-        let local_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        // The local-resources server is always on this machine. When the
+        // daemon's own provider is a local server here too, both sets of
+        // workers load into the same memory: two sessions at once evict
+        // each other's prompt cache and push the model into swap. They
+        // then wait on one slot. A hosted or remote provider keeps the
+        // local workers on a slot of their own.
+        let local_slot = if local_resources::provider_on_this_machine(
+            provider.name(),
+            std::env::var("OLLAMA_BASE_URL").ok().as_deref(),
+        ) {
+            tracing::info!(
+                "local-resources workers share the model slot: one local session at a time"
+            );
+            model_slot.clone()
+        } else {
+            Arc::new(tokio::sync::Semaphore::new(1))
+        };
         fleet
             .registry
             .register(
@@ -1768,6 +1790,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .with_run_logs(run_logs_dir.clone())
                     .with_private_paths(vec![data_dir.clone()])
+                    .with_build_cache(build_cache_dir.clone())
                     .with_private_ports(vec![port]),
                 ),
                 serde_json::json!({"role":"general-agent", "resource_slot":true}),
@@ -1792,6 +1815,7 @@ async fn main() -> anyhow::Result<()> {
                         )?
                         .with_run_logs(run_logs_dir.clone())
                         .with_private_paths(vec![data_dir.clone()])
+                        .with_build_cache(build_cache_dir.clone())
                         .with_private_ports(vec![port]),
                     ),
                     serde_json::json!({"role":"general-agent", "resource_slot":true}),

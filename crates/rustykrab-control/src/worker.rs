@@ -151,7 +151,16 @@ pub const COMMAND_RUN: &str = "command_run";
 /// Callers retain their policy for legacy workers with no command records.
 pub fn check_claim_ran(check: &str, commands: &[String]) -> bool {
     let wanted = claimed_check(check);
-    wanted.is_empty() || claim_ran(&wanted, commands)
+    if wanted.is_empty() || claim_ran(&wanted, commands) {
+        return true;
+    }
+    // A claim of several lines is a script: each line a step of its own.
+    let lines: Vec<String> = check
+        .lines()
+        .map(claimed_check)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.len() > 1 && lines.iter().all(|line| claim_ran(line, commands))
 }
 
 /// A claimed check as the verifier compares it: lower case, whitespace
@@ -192,14 +201,34 @@ fn collapse(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Whether a normalised claimed check ran in `command`: it equals one of
-/// the command's segments (split on `&&`, `||`, `;` and `|`, so a leading
-/// `cd <dir> &&` is its own segment), or it appears in the command as a
-/// whole command, which covers a shell wrapper such as `bash -lc '...'` and
-/// a claim that is itself compound. A whole appearance has to end where a
-/// command ends, so `cargo test` did not run inside `cargo test-foo`, nor
-/// `python3 x.py` inside `python3 x.py --fix`.
+/// Whether a normalised claimed check ran in `command`: in the command as
+/// a whole ([`check_ran_in_line`]), or, when the command is a script of
+/// several lines, in one of its lines, each a command of its own.
 fn check_ran_in(wanted: &str, command: &str) -> bool {
+    if check_ran_in_line(wanted, command) {
+        return true;
+    }
+    let mut lines = command.lines().filter(|l| !l.trim().is_empty());
+    let (first, second) = (lines.next(), lines.next());
+    second.is_some()
+        && first
+            .into_iter()
+            .chain(second)
+            .chain(lines)
+            .any(|line| check_ran_in_line(wanted, line))
+}
+
+/// Whether a normalised claimed check ran in one line of a command: it
+/// equals one of the line's segments (split on `&&`, `||`, `;` and `|`, so
+/// a leading `cd <dir> &&` is its own segment), or it appears in the line
+/// as a whole command, which covers a shell wrapper such as `bash -lc
+/// '...'` and a claim that is itself compound. A whole appearance has to
+/// end where a command ends, so `cargo test` did not run inside `cargo
+/// test-foo`, nor `python3 x.py` inside `python3 x.py --fix`. Failing
+/// those, a segment is the claimed check when the two are the same command
+/// once each is [`bare`]: `TMPDIR=/tmp cargo test > a.log 2>&1` ran where
+/// `cargo test > b.log 2>&1` was recorded.
+fn check_ran_in_line(wanted: &str, command: &str) -> bool {
     let command = collapse(command);
     if command
         .match_indices(wanted)
@@ -207,13 +236,66 @@ fn check_ran_in(wanted: &str, command: &str) -> bool {
     {
         return true;
     }
-    command
+    let segments: Vec<String> = command
         .replace("&&", ";")
         .replace("||", ";")
+        .replace(">&", "\u{1}")
+        .replace("<&", "\u{2}")
         .replace('|', ";")
         .split(';')
-        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').trim())
-        .any(|s| s == wanted)
+        .map(|s| {
+            s.replace('\u{1}', ">&")
+                .replace('\u{2}', "<&")
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .trim()
+                .to_string()
+        })
+        .collect();
+    if segments.iter().any(|s| s == wanted) {
+        return true;
+    }
+    let bare_wanted = bare(wanted);
+    !bare_wanted.is_empty() && segments.iter().any(|s| bare(s) == bare_wanted)
+}
+
+/// A command without what does not change which check it is: leading
+/// environment assignments (`TMPDIR=/private/tmp`) and redirections with
+/// their targets (`> build.log`, `2>&1`). A worker names a different log
+/// file or temporary directory in its report than the one it ran with;
+/// the check that ran is the same.
+fn bare(command: &str) -> String {
+    let mut words = command.split_whitespace().peekable();
+    while words.peek().is_some_and(|w| is_assignment(w)) {
+        words.next();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    while let Some(word) = words.next() {
+        let op = word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if !op.starts_with(['>', '<']) || op.starts_with("<(") {
+            kept.push(word);
+            continue;
+        }
+        // `>`, `>>` or `2>` alone: the next word is its target.
+        if op.trim_start_matches(['>', '<', '|']).is_empty() {
+            words.next();
+        }
+    }
+    kept.join(" ")
+}
+
+/// A simple `NAME=value` word: a plain name, and a value that is not the
+/// first word of a longer quoted or substituted one.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, value)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && !value.contains(['(', '`'])
+        && value.matches('"').count() % 2 == 0
+        && value.matches('\'').count() % 2 == 0
 }
 
 /// Whether a command can start after `before`: at the start of the line, a
@@ -981,6 +1063,67 @@ mod command_claim_tests {
             &["cargo fmt --all"]
         ));
         assert!(!verifies("&& ;", &["cargo fmt --all"]));
+    }
+
+    #[test]
+    fn a_check_on_its_own_line_of_a_script_verifies() {
+        // work item a73889c0: `git diff --quiet` ran, on a line of its own.
+        let ran = ["git log -1 --format='%H %P %s' 2038a1e\n\
+                    git diff 2038a1e^ 2038a1e --stat\n\
+                    git diff --quiet\n\
+                    git status --porcelain"];
+        assert!(verifies("git diff --quiet", &ran));
+        assert!(verifies("git status --porcelain", &ran));
+        // A line is still a whole command: no prefix of it ran.
+        assert!(!verifies("git diff", &ran));
+    }
+
+    #[test]
+    fn a_claim_of_several_lines_verifies_when_each_line_ran() {
+        let ran: Vec<String> = ["cargo fmt --all -- --check", "cargo clippy --workspace"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert!(super::check_claim_ran(
+            "cargo fmt --all -- --check\ncargo clippy --workspace",
+            &ran
+        ));
+        assert!(!super::check_claim_ran(
+            "cargo fmt --all -- --check\ncargo test --workspace",
+            &ran
+        ));
+    }
+
+    #[test]
+    fn a_check_verifies_whatever_its_environment_and_log_file() {
+        // work item e8402ec7: the report named another log file and a
+        // temporary directory the recorded command did not set.
+        let ran = ["cargo test --workspace > /private/tmp/e0613cdf-tests.log 2>&1"];
+        assert!(verifies(
+            "TMPDIR=/private/tmp cargo test --workspace > /private/tmp/7e443aed-tests.log 2>&1",
+            &ran,
+        ));
+        assert!(verifies(
+            "cargo clippy --workspace --all-targets",
+            &[
+                "cd /wt && CARGO_BUILD_JOBS=4 TMPDIR=/private/tmp cargo clippy --workspace \
+               --all-targets >> clippy.log 2>&1; echo $?"
+            ],
+        ));
+        assert!(verifies(
+            "TMPDIR=/private/tmp cargo test -p rustykrab-control 2> err.log",
+            &["cargo test -p rustykrab-control"],
+        ));
+        // The command itself still has to be the same one.
+        assert!(!verifies(
+            "TMPDIR=/private/tmp cargo test --workspace > a.log 2>&1",
+            &["cargo test -p rustykrab-control > a.log 2>&1"],
+        ));
+        assert!(!verifies(
+            "cargo test --workspace > a.log",
+            &["cargo test --workspace --no-run > a.log"],
+        ));
+        assert!(!verifies("TMPDIR=/tmp", &["TMPDIR=/tmp cargo test"]));
     }
 
     #[test]

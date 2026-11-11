@@ -198,6 +198,9 @@ const ALLOWED_COMMANDS: &[&str] = &[
 pub struct ExecTool {
     dir: Option<std::path::PathBuf>,
     confinement: Option<Confinement>,
+    /// Where Cargo builds go instead of the directory's own `target/`
+    /// (see [`ExecTool::with_build_cache`]).
+    build_cache: Option<std::path::PathBuf>,
 }
 
 /// macOS's sandbox runner (Seatbelt).
@@ -208,6 +211,7 @@ impl ExecTool {
         Self {
             dir: None,
             confinement: None,
+            build_cache: None,
         }
     }
 
@@ -216,7 +220,31 @@ impl ExecTool {
         Self {
             dir: Some(dir.into()),
             confinement: None,
+            build_cache: None,
         }
+    }
+
+    /// Build Cargo projects into `cache/target` rather than a `target/`
+    /// of the directory's own, and let the confined shell write there.
+    /// Every run of a repository is a fresh worktree; with a target
+    /// directory each, every run compiles all dependencies from nothing
+    /// (minutes, past this tool's time limit) and keeps gigabytes of
+    /// output. One directory per repository keeps the dependencies built
+    /// across runs, and Cargo's lock on it runs one build at a time. Only
+    /// for an instance with a directory; the directory is created.
+    pub fn with_build_cache(mut self, cache: impl Into<std::path::PathBuf>) -> Self {
+        let cache = cache.into();
+        if self.dir.is_some() && cache.is_absolute() {
+            match std::fs::create_dir_all(cache.join("target")) {
+                Ok(()) => self.build_cache = Some(cache),
+                Err(e) => tracing::warn!(
+                    cache = %cache.display(),
+                    error = %e,
+                    "build cache unavailable; builds use the directory's own target"
+                ),
+            }
+        }
+        self
     }
 
     /// The directory and confinement a command runs under, when it runs in
@@ -244,7 +272,10 @@ impl ExecTool {
             return tokio::process::Command::new("sh");
         };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
-        sandboxed.arg("-p").arg(confinement.profile(dir)).arg("sh");
+        sandboxed
+            .arg("-p")
+            .arg(confinement.profile(dir, self.build_cache.as_deref()))
+            .arg("sh");
         sandboxed
     }
 
@@ -350,7 +381,7 @@ impl Confinement {
     /// The Seatbelt profile for commands run in `dir`. Paths are resolved,
     /// since the sandbox matches real paths (`/tmp` is `/private/tmp`);
     /// a private path that does not exist is left out.
-    fn profile(&self, dir: &std::path::Path) -> String {
+    fn profile(&self, dir: &std::path::Path, build_cache: Option<&std::path::Path>) -> String {
         let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         let quoted = |p: &std::path::Path| {
             let s = p
@@ -371,6 +402,11 @@ impl Confinement {
         if let Some(common) = git_common_dir(&dir) {
             own.push(common.clone());
             git_dirs.push(common);
+        }
+        // The build cache is the run's to read and write, as its own
+        // `target/` would be.
+        if let Some(cache) = build_cache {
+            own.push(real(cache).unwrap_or_else(|| cache.to_path_buf()));
         }
         // Git resolves every directory component even when the worktree itself
         // is readable. A private ancestor (the daemon's data directory) must
@@ -1180,6 +1216,9 @@ impl Tool for ExecTool {
         if let Some(home) = rustup_home() {
             process.env("RUSTUP_HOME", home);
         }
+        if let Some(cache) = &self.build_cache {
+            process.env("CARGO_TARGET_DIR", cache.join("target"));
+        }
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
         }
@@ -1820,6 +1859,45 @@ mod error_typing_tests {
         let (code, text) = run_in(&tool, "cat ../../../service.json").await;
         assert_ne!(code, 0);
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_builds_into_its_shared_cache_inside_private_data() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("service.json"), "s3cret").unwrap();
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(&work).unwrap();
+        let cache = data.path().join("build-cache/source");
+        let tool = ExecTool::in_dir(&work)
+            .confined(vec![data.path().to_path_buf()])
+            .with_build_cache(&cache);
+        let target = std::fs::canonicalize(cache.join("target")).unwrap();
+        let (code, text) = run_in(
+            &tool,
+            "echo built > \"$CARGO_TARGET_DIR/artifact\" && cat \"$CARGO_TARGET_DIR/artifact\" \
+             && printf %s \"$CARGO_TARGET_DIR\"",
+        )
+        .await;
+        assert_eq!(code, 0, "{text}");
+        assert!(text.starts_with("built\n"), "{text}");
+        assert_eq!(
+            std::fs::canonicalize(text.trim_start_matches("built\n")).unwrap(),
+            target
+        );
+        // The cache opens nothing else in the private directory.
+        let (code, text) = run_in(&tool, "cat ../../service.json").await;
+        assert_ne!(code, 0);
+        assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_shell_without_a_directory_has_no_build_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let tool = ExecTool::new().with_build_cache(cache.path().join("c"));
+        let (code, text) = run_in(&tool, "printf %s \"${CARGO_TARGET_DIR:-unset}\"").await;
+        assert_eq!((code, text.as_str()), (0, "unset"));
+        assert!(!cache.path().join("c").exists());
     }
 
     #[cfg(target_os = "macos")]

@@ -90,6 +90,13 @@ pub(crate) fn shared_resources<'a>(
         .collect()
 }
 
+/// Under the daemon's data directory: Cargo's build output for worktree
+/// runs, one directory per repository ([`Workspace::build_cache`]). A
+/// fresh worktree with a `target/` of its own compiles every dependency
+/// again; a shared one keeps them built across runs, and Cargo's lock on
+/// it runs one build at a time.
+pub const BUILD_CACHE_DIR: &str = "build-cache";
+
 /// One run's isolated checkout of a repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
@@ -174,6 +181,25 @@ impl Workspace {
             &["worktree", "add", "-B", &self.branch, &path, &self.base],
         )?;
         require(out, "git worktree add")
+    }
+
+    /// This repository's build cache under `root` (the daemon's
+    /// [`BUILD_CACHE_DIR`]): named for the repository's directory, so
+    /// every run of it shares one and two repositories never do.
+    pub fn build_cache(&self, root: &Path) -> Option<PathBuf> {
+        Some(root.join(self.repo.file_name()?))
+    }
+
+    /// Delete the worktree's own Cargo `target/`, when a kept worktree
+    /// has one. What a failed run is kept for is its source and its
+    /// branch; its build output is gigabytes that any rebuild reproduces.
+    /// Only a directory Cargo marked as its own (`CACHEDIR.TAG`) is
+    /// removed. Returns whether one was.
+    pub fn drop_build_output(&self) -> bool {
+        let target = self.path.join("target");
+        target.join("CACHEDIR.TAG").is_file()
+            && !target.is_symlink()
+            && std::fs::remove_dir_all(&target).is_ok()
     }
 
     /// Remove the worktree directory and git's record of it. The branch
@@ -1264,6 +1290,28 @@ pub(crate) mod tests {
         assert!(
             !marker.exists(),
             "repository merge driver must never execute"
+        );
+        ws.remove().unwrap();
+    }
+
+    #[test]
+    fn only_a_cargo_target_is_dropped_from_a_kept_worktree() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        ws.create().unwrap();
+        // A directory named `target` that Cargo did not mark stays.
+        std::fs::create_dir_all(ws.path.join("target/notes")).unwrap();
+        assert!(!ws.drop_build_output());
+        assert!(ws.path.join("target/notes").is_dir());
+        std::fs::write(ws.path.join("target/CACHEDIR.TAG"), "Signature: x\n").unwrap();
+        assert!(ws.drop_build_output());
+        assert!(!ws.path.join("target").exists());
+        assert!(ws.path.join("src/lib.rs").is_file());
+        assert!(!ws.drop_build_output());
+        assert_eq!(
+            ws.build_cache(Path::new("/data/build-cache")),
+            Some(Path::new("/data/build-cache").join(repo.path().file_name().unwrap()))
         );
         ws.remove().unwrap();
     }
