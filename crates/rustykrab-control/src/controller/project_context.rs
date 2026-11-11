@@ -1,7 +1,7 @@
 //! Reconstruct context independently of a Claude/Codex session or its transcript.
 use std::collections::BTreeMap;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rustykrab_core::questions::QuestionKind;
 use rustykrab_core::questions::QuestionStatus;
 use rustykrab_core::work::{
@@ -75,6 +75,26 @@ fn eligible(snap: &Snapshot, item: &WorkItem, waiting: &[QuestionRow], worktrees
         && (Workspace::repo_of(&item.writable_resources).is_none() || worktrees)
 }
 
+/// Each item's latest controller-recorded project binding, read
+/// incrementally. Every dispatch and hold records the whole reconstructed
+/// context as evidence, so re-reading them all on each reconstruction grew
+/// with attempts times project size (hundreds of MB, held under the store's
+/// one connection). Evidence is append-only, so only rows past `after` are
+/// read; the latest row per item by `(at, id)` wins, as a full ordered scan
+/// would choose.
+#[derive(Default)]
+pub(super) struct RecordedBindings {
+    after: i64,
+    members: BTreeMap<String, RecordedBinding>,
+}
+
+struct RecordedBinding {
+    at: DateTime<Utc>,
+    id: i64,
+    project: String,
+    own: Option<ProjectWork>,
+}
+
 // Unresolved attribution is metadata, not a storage failure. Strict callers
 // surface it; an unrelated unresolved binding cannot poison a valid handoff.
 enum ProjectSelection {
@@ -138,6 +158,46 @@ impl Controller {
         }
     }
 
+    /// Item -> (project, its own recorded work) from every controller
+    /// project-context record. An unreadable record is an error on every
+    /// call until it is fixed: the cursor never passes it.
+    async fn recorded_bindings(
+        &self,
+    ) -> Result<BTreeMap<String, (String, Option<ProjectWork>)>, Error> {
+        let mut index = self.recorded_bindings.lock().await;
+        let rows = self
+            .store
+            .work_evidence_of_kind_after(PROJECT_CONTEXT, index.after)
+            .await?;
+        for (id, ev) in rows {
+            if ev.verified_by.as_deref() == Some(CONTROLLER) {
+                let ctx: ProjectContext = serde_json::from_str(&ev.reference).map_err(|e| {
+                    Error::Internal(format!("invalid recorded project context: {e}"))
+                })?;
+                let newer = index
+                    .members
+                    .get(&ev.item)
+                    .is_none_or(|seen| (seen.at, seen.id) <= (ev.at, id));
+                if newer {
+                    let own = ctx.work.iter().find(|work| work.item == ev.item).cloned();
+                    let binding = RecordedBinding {
+                        at: ev.at,
+                        id,
+                        project: ctx.snapshot.project.id.to_string(),
+                        own,
+                    };
+                    index.members.insert(ev.item, binding);
+                }
+            }
+            index.after = id;
+        }
+        Ok(index
+            .members
+            .iter()
+            .map(|(item, b)| (item.clone(), (b.project.clone(), b.own.clone())))
+            .collect())
+    }
+
     pub(super) async fn project_context(
         &self,
         snap: &Snapshot,
@@ -158,18 +218,9 @@ impl Controller {
         if snapshot.project.status != ProjectStatus::Active {
             return Err(Error::Internal(format!("project {id} is not active")));
         }
-        let mut members = BTreeMap::new();
         // Context evidence and work history outlive work-row compaction. Only the
         // controller can establish a historical binding; model artifacts cannot.
-        for ev in self.store.work_evidence_of_kind(PROJECT_CONTEXT).await? {
-            if ev.verified_by.as_deref() != Some(CONTROLLER) {
-                continue;
-            }
-            let ctx: ProjectContext = serde_json::from_str(&ev.reference)
-                .map_err(|e| Error::Internal(format!("invalid recorded project context: {e}")))?;
-            let own = ctx.work.iter().find(|work| work.item == ev.item).cloned();
-            members.insert(ev.item, (ctx.snapshot.project.id.to_string(), own));
-        }
+        let mut members = self.recorded_bindings().await?;
         let execution_items = Self::execution_items(snap, item);
         let mut work = Vec::new();
         for row in snap.items() {
@@ -315,7 +366,12 @@ impl Controller {
         archived_worker: Option<String>,
         previous: Option<&ProjectWork>,
     ) -> Result<ProjectWork, Error> {
-        let evidence = self.store.work_evidence_list(item).await?;
+        // Recorded project contexts are this reconstruction's own output, up
+        // to hundreds of KB each and never read here: skip their bytes.
+        let evidence = self
+            .store
+            .work_evidence_list_except(item, PROJECT_CONTEXT)
+            .await?;
         let summary = evidence
             .iter()
             .rev()

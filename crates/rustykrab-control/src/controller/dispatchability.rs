@@ -49,7 +49,7 @@ impl Controller {
             return Ok(None);
         }
         let snap = self.load().await?;
-        let (load, models) = self.load_by_worker();
+        let (load, occupied) = self.load_by_worker();
         let isolated: std::collections::HashMap<_, _> = self
             .state()
             .runs
@@ -122,7 +122,7 @@ impl Controller {
             } else {
                 let events = self.store.work_events(&item.id).await?;
                 let history = history(&events);
-                if self.pick(item, &history, &load, &models, &busy).is_some() {
+                if self.pick(item, &history, &load, &occupied, &busy).is_some() {
                     dispatchable += 1;
                     None
                 } else {

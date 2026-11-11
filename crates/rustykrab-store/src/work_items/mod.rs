@@ -789,6 +789,30 @@ impl Store {
             .await
     }
 
+    /// An item's evidence other than `kind`, oldest first. Live or archived.
+    pub async fn work_evidence_list_except(
+        &self,
+        item: &str,
+        kind: &str,
+    ) -> Result<Vec<Evidence>, WorkStoreError> {
+        let (item, kind) = (item.to_string(), kind.to_string());
+        self.work_call(move |conn| ops::evidence_of_except(conn, &item, &kind))
+            .await
+    }
+
+    /// Evidence of one kind recorded after row `after`, in row order, each
+    /// with its row id: an incremental read for a caller that keeps what
+    /// it has already seen. Evidence rows are never updated or deleted.
+    pub async fn work_evidence_of_kind_after(
+        &self,
+        kind: &str,
+        after: i64,
+    ) -> Result<Vec<(i64, Evidence)>, WorkStoreError> {
+        let kind = kind.to_string();
+        self.work_call(move |conn| ops::evidence_of_kind_after(conn, &kind, after))
+            .await
+    }
+
     /// Every item's evidence of one kind, oldest first, live or archived:
     /// how the controller re-reads what landed as data rather than status,
     /// such as the classifier rules `internal` items add (section 9).

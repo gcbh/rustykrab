@@ -375,6 +375,16 @@ pub trait Worker: Send + Sync {
     fn concurrency(&self) -> usize {
         1
     }
+    /// The key of an exclusive resource this worker's runs and probes wait
+    /// on before they start (a local model's KV slot shared by several
+    /// workers). Workers with the same key run one item at a time between
+    /// them: the controller leases none of them while another holds it,
+    /// because a run queued behind the resource can show no activity and
+    /// would be declared stalled. `None`: nothing shared beyond
+    /// [`Worker::concurrency`]. Wrappers must delegate to the executor.
+    fn resource_slot(&self) -> Option<String> {
+        None
+    }
     fn healthy(&self) -> bool {
         true
     }

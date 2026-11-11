@@ -36,7 +36,6 @@ use rustykrab_core::{AgentDefinition, Error, Result, Tool, ToolError};
 use rustykrab_tools::work_backend::{
     Principal, Provenance, StatusQuery, ToolState, WorkBackend, WorkStatusView,
 };
-use tokio::sync::Semaphore;
 
 use crate::local_worker::{LateTools, LocalWorker, RunTranscripts};
 use crate::sandbox::Sandbox;
@@ -51,7 +50,7 @@ pub struct DelegatedRuns {
     backend: Arc<DelegationBackend>,
     transcripts: Option<Arc<dyn RunTranscripts>>,
     late: Option<Arc<dyn LateTools>>,
-    slot: Option<Arc<Semaphore>>,
+    slot: Option<crate::ResourceSlot>,
     machine: Option<String>,
     writable_resources: Vec<String>,
 }
@@ -96,7 +95,7 @@ impl DelegatedRuns {
 
     /// Wait on the node's model slot, shared with its own local worker, so
     /// delegated and local work never share one KV slot (plan 12.1).
-    pub fn with_slot(mut self, slot: Arc<Semaphore>) -> Self {
+    pub fn with_slot(mut self, slot: crate::ResourceSlot) -> Self {
         self.slot = Some(slot);
         self
     }

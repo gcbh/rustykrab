@@ -31,7 +31,6 @@ use rustykrab_core::model::ModelProvider;
 use rustykrab_core::types::Conversation;
 use rustykrab_core::{AgentDefinition, Tool};
 use rustykrab_store::Store;
-use tokio::sync::Semaphore;
 
 /// How often the registry asks its workers where they stand. A peer
 /// re-reads its node's advertisement at most every 30 s while the node
@@ -133,7 +132,7 @@ pub(crate) struct NodeParts {
     pub store: Store,
     pub late: Arc<dyn LateTools>,
     /// The local worker's model slot, shared.
-    pub slot: Arc<Semaphore>,
+    pub slot: rustykrab_agent::ResourceSlot,
 }
 
 /// How this daemon runs a peer's structured brief, for the gateway's task

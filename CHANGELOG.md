@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.26] - 2026-11-11
+
+- Read project-context receipts incrementally, lease one item per shared model slot, and never close a run that did not report (#755)
+
 ## [6.6.25] - 2026-11-11
 
 - docs: verification is part of the work, with an independent subagent run and a list of behavioral changes (#754)

@@ -281,13 +281,15 @@ async fn a_notice_is_marked_delivered_only_once_it_is_sent() {
 #[test]
 fn an_interactive_turn_makes_the_daemons_model_busy() {
     let tracker = ActivityTracker::new();
-    let activity = turn_activity(tracker.clone(), "ollama");
+    let activity = turn_activity(tracker.clone(), &["ollama", "qwen3.8:27b-mlx"]);
     assert!(!activity.busy("ollama"));
     let turn = tracker.begin_run(Uuid::new_v4());
     assert!(activity.busy("ollama"));
+    assert!(activity.busy("qwen3.8:27b-mlx"), "the provider's model tag");
     assert!(!activity.busy("another-model"));
     drop(turn);
     assert!(!activity.busy("ollama"));
+    assert!(!activity.busy("qwen3.8:27b-mlx"));
 }
 
 #[test]

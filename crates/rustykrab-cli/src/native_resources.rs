@@ -89,7 +89,9 @@ impl NativeWorker {
             tools.tools,
             tools.backend,
             tools.transcripts,
-            Arc::new(tokio::sync::Semaphore::new(1)),
+            // The host half waits on a slot of its own: native runs do not
+            // take it, so it is no resource the controller must share out.
+            rustykrab_agent::ResourceSlot::private(),
             &config.repos,
             tools.integrations,
         )
@@ -192,6 +194,11 @@ impl Worker for NativeWorker {
 
     fn concurrency(&self) -> usize {
         self.native.concurrency()
+    }
+    fn resource_slot(&self) -> Option<String> {
+        self.native
+            .resource_slot()
+            .or_else(|| self.host.resource_slot())
     }
     fn healthy(&self) -> bool {
         self.native.healthy()

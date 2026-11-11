@@ -1072,3 +1072,99 @@ async fn cached_project_history_keeps_each_tasks_own_execution_slice() {
             .unwrap()
     );
 }
+
+/// Recorded bindings are read incrementally: a controller that already
+/// reconstructed a project still sees history recorded after that, once the
+/// recorded item has been compacted out of the live rows.
+#[tokio::test]
+async fn one_controller_keeps_history_recorded_after_its_first_reconstruction() {
+    let repo = Repo::new();
+    let root = tempfile::tempdir().unwrap();
+    let claude = Coder::new(WorkerKind::ClaudeCode, &repo);
+    let h = Harness::with_fleet(
+        ControllerConfig {
+            worktree_root: Some(root.path().to_owned()),
+            ..Default::default()
+        },
+        vec![claude.clone()],
+    );
+    let project = project(&h, &repo).await;
+    let first = h
+        .file_one(code(&repo, WorkerKind::ClaudeCode, "first", None))
+        .await;
+    h.drain_settled().await;
+    assert_eq!(h.status(&first).await, Status::Done);
+    let first_commit = h
+        .store()
+        .work_evidence_list(&first)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "commit")
+        .unwrap()
+        .reference;
+    h.store()
+        .work_archive_compact(
+            std::slice::from_ref(&first),
+            Utc::now() + TimeDelta::days(8),
+        )
+        .await
+        .unwrap();
+    assert!(h.store().work_get(&first).await.unwrap().is_none());
+    // The same controller (no reopen): only its recorded binding links the
+    // archived item to the project now.
+    let next = h
+        .file_one(code(
+            &repo,
+            WorkerKind::ClaudeCode,
+            "independent task",
+            Some(project.project.id),
+        ))
+        .await;
+    h.drain_settled().await;
+    assert_eq!(h.status(&next).await, Status::Done);
+    let received = claude.received.lock().unwrap()[1].clone();
+    let ctx = received.project_context.unwrap();
+    assert!(ctx
+        .work
+        .iter()
+        .any(|w| w.item == first && w.evidence.iter().any(|e| e.value == first_commit)));
+}
+
+/// An unreadable controller record stays an error on every reconstruction:
+/// the incremental cursor never moves past it.
+#[tokio::test]
+async fn an_unreadable_recorded_context_fails_every_reconstruction() {
+    let repo = Repo::new();
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![]);
+    let planning = project(&h, &repo).await;
+    let id = h
+        .file_one(code(
+            &repo,
+            WorkerKind::Codex,
+            "bound",
+            Some(planning.project.id),
+        ))
+        .await;
+    let snap = h.ctl.load().await.unwrap();
+    let item = snap.item(&id).unwrap();
+    assert!(h.ctl.project_context(&snap, item).await.unwrap().is_some());
+    h.store()
+        .work_evidence_add(rustykrab_core::work::Evidence {
+            item: id.clone(),
+            kind: PROJECT_CONTEXT.into(),
+            reference: "not a context".into(),
+            hash: None,
+            verified_by: Some("controller".into()),
+            at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let err = h.ctl.project_context(&snap, item).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid recorded project context"),
+            "{err}"
+        );
+    }
+}

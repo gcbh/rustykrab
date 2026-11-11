@@ -1343,35 +1343,65 @@ impl ModelProvider for OllamaProvider {
         let mut prompt_eval_count: u32 = 0;
         let mut eval_count: u32 = 0;
         let mut done_reason: Option<String> = None;
+        // Ollama's last chunk says `done`; a stream that ends without it
+        // was cut off.
+        let mut saw_done = false;
+        let mut flushed = false;
 
         let mut response = resp;
         let mut chunks_received: u64 = 0;
         let mut bytes_received: u64 = 0;
         let stream_start = std::time::Instant::now();
         loop {
-            let chunk = match response.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break, // stream finished normally
-                Err(e) => {
+            let read = match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    chunks_received += 1;
+                    bytes_received += chunk.len() as u64;
+                    buffer.push_chunk(&chunk);
+                    Ok(())
+                }
+                Ok(None) if saw_done => break, // stream finished normally
+                // A last line sent without its newline is still read.
+                Ok(None) if !flushed && buffer.len() > 0 => {
+                    flushed = true;
+                    buffer.push_chunk(b"\n");
+                    Ok(())
+                }
+                Ok(None) => Err("the stream ended before Ollama's final chunk".to_string()),
+                Err(e) => Err(format!("stream read error: {e}")),
+            };
+            match read {
+                Ok(()) => {}
+                Err(why) => {
                     let elapsed = stream_start.elapsed();
                     tracing::warn!(
-                        error = %e,
-                        error_debug = ?e,
+                        error = %why,
                         model = %self.model,
                         base_url = %self.base_url,
                         chunks_received,
                         bytes_received,
                         elapsed_ms = elapsed.as_millis() as u64,
                         accumulated_text_len = full_text.len(),
+                        tool_calls = tool_calls.len(),
                         buffer_len = buffer.len(),
-                        "stream read error mid-stream, returning partial response"
+                        "Ollama stream broke mid-response"
                     );
-                    break;
+                    // Nothing generated yet: the empty-generation path below
+                    // types it, as before. Once the model has said something,
+                    // the partial reply is not an answer: a run that took it
+                    // as its last word would end on half a sentence (or half
+                    // a tool call) as if the model had finished.
+                    if full_text.is_empty() && tool_calls.is_empty() {
+                        break;
+                    }
+                    return Err(stream_cut_error(
+                        &self.model,
+                        &why,
+                        full_text.len(),
+                        bytes_received,
+                    ));
                 }
-            };
-            chunks_received += 1;
-            bytes_received += chunk.len() as u64;
-            buffer.push_chunk(&chunk);
+            }
 
             while let Some(line) = buffer.next_line() {
                 let line = line.trim();
@@ -1403,6 +1433,7 @@ impl ModelProvider for OllamaProvider {
                 }
 
                 if stream_chunk.done {
+                    saw_done = true;
                     prompt_eval_count = stream_chunk.prompt_eval_count.unwrap_or(0);
                     eval_count = stream_chunk.eval_count.unwrap_or(0);
                     done_reason = stream_chunk.done_reason;
@@ -1490,6 +1521,17 @@ impl ModelProvider for OllamaProvider {
         on_event(StreamEvent::Done(response.clone()));
         Ok(response)
     }
+}
+
+/// A streamed reply that broke after the model had begun it: a provider
+/// failure (`model provider error`, transient), never a finished turn, so
+/// the caller does not take the partial text for the model's answer and
+/// the controller's ladder retries it like any other upstream fault.
+fn stream_cut_error(model: &str, why: &str, text_len: usize, bytes: u64) -> Error {
+    Error::ModelProvider(format!(
+        "Ollama stream for model {model} broke mid-response after {bytes} bytes \
+         ({text_len} characters of text): {why}; the partial reply was discarded"
+    ))
 }
 
 // --- Ollama API wire types (private) ---
@@ -2499,6 +2541,110 @@ mod tests {
         served.await.unwrap();
         assert_eq!(response.text.as_deref(), Some("Preserve the new policy."));
         assert_eq!(response.message.content.tool_calls().len(), 1);
+    }
+
+    /// Serve one HTTP response written as `raw` (head and body), then close
+    /// the connection, whatever the head promised.
+    async fn serve_raw(raw: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 65536];
+            let mut seen = Vec::new();
+            // Read the request head and body before answering.
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length: usize = text[..split]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            socket.write_all(raw.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            // Dropped: the connection closes here.
+        });
+        url
+    }
+
+    fn ask(text: &str) -> Vec<Message> {
+        vec![Message::stamped(
+            Role::User,
+            MessageContent::Text(text.into()),
+        )]
+    }
+
+    /// A stream that breaks after the model began its reply is a provider
+    /// error, not a finished turn ending on the partial text (item
+    /// f26aee16 closed done on half an answer this way).
+    #[tokio::test]
+    async fn a_stream_cut_mid_response_is_an_error_not_a_normal_end() {
+        let body =
+            "{\"message\":{\"content\":\"I edited src/lib.rs and will now\"},\"done\":false}\n";
+        // The head promises far more than is sent: the body is cut off.
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len() + 4096
+        );
+        let provider = OllamaProvider::new("fixture").with_base_url(serve_raw(raw).await);
+        let err = provider
+            .chat_stream(&ask("fix it"), &[], &|_| {})
+            .await
+            .expect_err("a cut stream must not read as the model's answer");
+        assert!(matches!(err, Error::ModelProvider(_)), "{err:?}");
+        assert!(err.to_string().contains("mid-response"), "{err}");
+        assert!(err.kind().retryable(), "transient, for the ladder to retry");
+
+        // A connection that closes cleanly before Ollama's final `done`
+        // chunk was cut off just the same.
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n{body}"
+        );
+        let provider = OllamaProvider::new("fixture").with_base_url(serve_raw(raw).await);
+        let err = provider
+            .chat_stream(&ask("fix it"), &[], &|_| {})
+            .await
+            .expect_err("no final chunk: cut off");
+        assert!(matches!(err, Error::ModelProvider(_)), "{err:?}");
+    }
+
+    /// A stream that breaks before the model said anything keeps its old
+    /// typing (an empty generation), and a complete stream whose last line
+    /// lacks its newline still ends normally.
+    #[tokio::test]
+    async fn a_stream_cut_before_content_or_ending_without_a_newline_keeps_its_old_meaning() {
+        let raw = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n".to_string();
+        let provider = OllamaProvider::new("fixture").with_base_url(serve_raw(raw).await);
+        let err = provider
+            .chat_stream(&ask("fix it"), &[], &|_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ModelEmptyResponse(_)), "{err:?}");
+
+        let body = "{\"message\":{\"content\":\"All \"},\"done\":false}\n{\"message\":{\"content\":\"done.\"},\"done\":true,\"done_reason\":\"stop\",\"eval_count\":3}";
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let provider = OllamaProvider::new("fixture").with_base_url(serve_raw(raw).await);
+        let response = provider
+            .chat_stream(&ask("fix it"), &[], &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(response.message.content.as_text(), Some("All done."));
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
     }
 
     /// The exact shape `qwen3.8:27b-mlx` returns when the prompt overruns
