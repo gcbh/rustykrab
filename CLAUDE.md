@@ -12,6 +12,14 @@ the actual executor/build, and retain failed hypotheses and regression cases.
 The design records intended behavior; it does not claim all requirements are
 built or grant new permissions.
 
+## Verification is part of the work
+
+A change is done only when your own verification on the real daemon build, an independent
+run by a fresh-context subagent you started unasked, and its findings fixed or reported
+all exist. The PR lists every behavioral change and shows, before and after, anything a
+person would see. The rules are in [AGENTS.md](AGENTS.md), "Verification is part of the
+work". Never offer verification as a follow-up.
+
 ## Pre-commit checks
 
 Run these before every commit. CI enforces them on PRs to `main`.
