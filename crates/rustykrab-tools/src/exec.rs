@@ -13,6 +13,29 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// The longest a call may ask for. The runner's own limit on an exec call
 /// sits just above it, so the command's limit is the one that applies.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// The shortest limit a command that runs Cargo gets, whatever it asks for.
+/// A build stopped after a few seconds finishes nothing worth keeping, and a
+/// model that picked 15 s relaunched one 156 times in a live run.
+pub const MIN_CARGO_TIMEOUT_SECS: u64 = 120;
+
+/// The Cargo home every worker's builds share, beside the repositories'
+/// build caches under the daemon's build-cache directory: one copy of each
+/// downloaded dependency's sources and registry index for every worker, kept
+/// across reboots. A Cargo home under the isolated `/tmp` HOME was wiped on
+/// reboot, and re-extracted sources carry new modification times, which
+/// invalidate every dependency already built in the shared target directory.
+pub const SHARED_CARGO_HOME: &str = "cargo-home";
+
+/// Rustc jobs one Cargo build may run on this machine. Without a limit each
+/// build ran as many as the machine has cores, beside a local model that
+/// holds most of its memory.
+pub const CARGO_BUILD_JOBS: &str = "6";
+
+/// The shared Cargo home for a repository's build cache `cache`
+/// (`<data>/build-cache/<repo>`): `<data>/build-cache/cargo-home`.
+pub fn shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
+    cache.parent().map(|root| root.join(SHARED_CARGO_HOME))
+}
 
 // Dropping wait_with_output kills only the direct child. A timed-out shell can
 // otherwise leave its actual command running after the observation is gone.
@@ -201,6 +224,8 @@ pub struct ExecTool {
     /// Where Cargo builds go instead of the directory's own `target/`
     /// (see [`ExecTool::with_build_cache`]).
     build_cache: Option<std::path::PathBuf>,
+    /// The Cargo home shared beside the build cache ([`shared_cargo_home`]).
+    cargo_home: Option<std::path::PathBuf>,
 }
 
 /// macOS's sandbox runner (Seatbelt).
@@ -212,6 +237,7 @@ impl ExecTool {
             dir: None,
             confinement: None,
             build_cache: None,
+            cargo_home: None,
         }
     }
 
@@ -221,6 +247,7 @@ impl ExecTool {
             dir: Some(dir.into()),
             confinement: None,
             build_cache: None,
+            cargo_home: None,
         }
     }
 
@@ -232,16 +259,32 @@ impl ExecTool {
     /// output. One directory per repository keeps the dependencies built
     /// across runs, and Cargo's lock on it runs one build at a time. Only
     /// for an instance with a directory; the directory is created.
+    ///
+    /// Cargo also gets the persistent Cargo home shared by every worker
+    /// ([`shared_cargo_home`], created here and writable in the sandbox)
+    /// and at most [`CARGO_BUILD_JOBS`] jobs.
     pub fn with_build_cache(mut self, cache: impl Into<std::path::PathBuf>) -> Self {
         let cache = cache.into();
         if self.dir.is_some() && cache.is_absolute() {
             match std::fs::create_dir_all(cache.join("target")) {
-                Ok(()) => self.build_cache = Some(cache),
+                Ok(()) => self.build_cache = Some(cache.clone()),
                 Err(e) => tracing::warn!(
                     cache = %cache.display(),
                     error = %e,
                     "build cache unavailable; builds use the directory's own target"
                 ),
+            }
+        }
+        if self.build_cache.is_some() {
+            if let Some(home) = shared_cargo_home(&cache) {
+                match std::fs::create_dir_all(&home) {
+                    Ok(()) => self.cargo_home = Some(home),
+                    Err(e) => tracing::warn!(
+                        cargo_home = %home.display(),
+                        error = %e,
+                        "shared Cargo home unavailable; Cargo uses the isolated home's"
+                    ),
+                }
             }
         }
         self
@@ -272,9 +315,15 @@ impl ExecTool {
             return tokio::process::Command::new("sh");
         };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
+        let writable: Vec<&std::path::Path> = self
+            .build_cache
+            .iter()
+            .chain(&self.cargo_home)
+            .map(|p| p.as_path())
+            .collect();
         sandboxed
             .arg("-p")
-            .arg(confinement.profile(dir, self.build_cache.as_deref()))
+            .arg(confinement.profile(dir, &writable))
             .arg("sh");
         sandboxed
     }
@@ -381,7 +430,7 @@ impl Confinement {
     /// The Seatbelt profile for commands run in `dir`. Paths are resolved,
     /// since the sandbox matches real paths (`/tmp` is `/private/tmp`);
     /// a private path that does not exist is left out.
-    fn profile(&self, dir: &std::path::Path, build_cache: Option<&std::path::Path>) -> String {
+    fn profile(&self, dir: &std::path::Path, build_dirs: &[&std::path::Path]) -> String {
         let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         let quoted = |p: &std::path::Path| {
             let s = p
@@ -403,10 +452,10 @@ impl Confinement {
             own.push(common.clone());
             git_dirs.push(common);
         }
-        // The build cache is the run's to read and write, as its own
-        // `target/` would be.
-        if let Some(cache) = build_cache {
-            own.push(real(cache).unwrap_or_else(|| cache.to_path_buf()));
+        // The build cache and the shared Cargo home are the run's to read
+        // and write, as its own `target/` and Cargo home would be.
+        for build_dir in build_dirs {
+            own.push(real(build_dir).unwrap_or_else(|| build_dir.to_path_buf()));
         }
         // Git resolves every directory component even when the worktree itself
         // is readable. A private ancestor (the daemon's data directory) must
@@ -510,7 +559,8 @@ impl Default for ExecTool {
 /// command's isolated HOME. Resolve relative host configuration before binding
 /// the command to a different worktree. Cargo configuration/credentials and
 /// other ambient environment variables are deliberately not forwarded.
-fn rustup_home() -> Option<std::path::PathBuf> {
+/// External workers get the same location beside the shared Cargo home.
+pub fn rustup_home() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -521,6 +571,19 @@ fn rustup_home() -> Option<std::path::PathBuf> {
     } else {
         std::env::current_dir().ok().map(|cwd| cwd.join(home))
     }
+}
+
+/// The `bin/` of the Cargo home the daemon's user has (`$CARGO_HOME`, else
+/// `~/.cargo`), when it exists: where Rustup's proxies and installed Cargo
+/// subcommands live. A worker given the shared Cargo home keeps finding
+/// them on its PATH. Nothing else of that home (its configuration or
+/// credentials) is used.
+pub fn host_cargo_bin() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo")))?;
+    let bin = home.join("bin");
+    (bin.is_absolute() && bin.is_dir()).then_some(bin)
 }
 
 fn truncate_output(s: String) -> String {
@@ -566,6 +629,145 @@ fn forced_removal_nested(command: &str, depth: usize) -> std::result::Result<(),
         }
     }
     Ok(())
+}
+
+/// Refuse a command that runs work in the background with a control `&`
+/// (`sleep 30 &`, `nohup cargo test > log & disown`), wherever it does: in
+/// any segment or inside a substitution. Every process the command starts
+/// is killed when the call returns, so the work can never survive it, and a
+/// backgrounded process holding the output open makes the call wait for its
+/// whole time limit anyway. `&&`, redirections (`2>&1`, `&>file`) and a
+/// quoted `&` are not backgrounding, and jobs the same command then `wait`s
+/// for (`a & b & wait`) finish inside the call.
+fn refuse_background(command: &str) -> std::result::Result<(), String> {
+    background_nested(command, 0)
+}
+
+fn background_nested(command: &str, depth: usize) -> std::result::Result<(), String> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return Err("command substitutions nest too deeply".into());
+    }
+    let (command, inner) = substitutions(command)?;
+    for body in &inner {
+        background_nested(body, depth + 1)?;
+    }
+    let (segments, background) = scan_segments(&command)?;
+    let waits = segments.iter().any(|s| segment_program(s) == Some("wait"));
+    if background && !waits {
+        return Err(
+            "running work in the background (a control `&`, as with `nohup … &` or `disown`) \
+             is refused: every process this command starts is killed when the call returns, so \
+             background work can never survive it and its output is lost. Run the command in \
+             the foreground and raise timeout_secs (up to 600) if it needs longer; a cargo \
+             build or test keeps the steps it finished, so running it again continues where \
+             it stopped."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether any command the line runs, in any segment or substitution, is
+/// Cargo (past assignments, redirects, the shell's own words and wrappers
+/// such as `env` or `nohup`). A line that cannot be parsed is not one.
+fn runs_cargo(command: &str) -> bool {
+    fn nested(command: &str, depth: usize) -> bool {
+        if depth > MAX_SUBSTITUTION_DEPTH {
+            return false;
+        }
+        let Ok((command, inner)) = substitutions(command) else {
+            return false;
+        };
+        inner.iter().any(|body| nested(body, depth + 1))
+            || command_segments(&command)
+                .unwrap_or_default()
+                .into_iter()
+                .any(|segment| segment_program(segment) == Some("cargo"))
+    }
+    nested(command, 0)
+}
+
+/// The name of the program a segment runs, past assignments, redirects and
+/// their targets, the shell's own words and wrappers with their flags.
+fn segment_program(segment: &str) -> Option<&str> {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let mut i = 0;
+    let mut target_next = false;
+    while i < tokens.len() {
+        let token = tokens[i]
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        i += 1;
+        if std::mem::take(&mut target_next) {
+            continue;
+        }
+        if let Some(needs_target) = redirect(token) {
+            target_next = needs_target;
+            continue;
+        }
+        if token.is_empty()
+            || (token.contains('=') && !token.starts_with('='))
+            || SHELL_WORDS.contains(&token)
+        {
+            continue;
+        }
+        let name = token.rsplit('/').next().unwrap_or(token);
+        if WRAPPERS.contains(&name) {
+            while i < tokens.len()
+                && (tokens[i].starts_with('-')
+                    || tokens[i].contains('=')
+                    || (matches!(name, "timeout" | "nice")
+                        && tokens[i].chars().next().is_some_and(|c| c.is_ascii_digit())))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(name);
+    }
+    None
+}
+
+/// The time limit a call gets: what it asks for (or the default), at most
+/// [`MAX_TIMEOUT_SECS`], and at least [`MIN_CARGO_TIMEOUT_SECS`] when the
+/// command runs Cargo.
+fn resolve_timeout(requested: Option<u64>, cargo: bool) -> u64 {
+    let secs = requested
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .min(MAX_TIMEOUT_SECS);
+    if cargo {
+        secs.max(MIN_CARGO_TIMEOUT_SECS)
+    } else {
+        secs
+    }
+}
+
+/// What a timed-out call tells the model: that its processes were stopped,
+/// that backgrounding cannot outlive the call, and for Cargo, that the work
+/// already done is kept and how to continue it.
+fn timeout_message(secs: u64, cargo: bool, shared_cache: bool) -> String {
+    let background = "Background processes (`&`, `nohup`, `disown`) are killed when the call \
+                      returns, so backgrounding cannot make a command outlive it.";
+    if cargo {
+        let kept = if shared_cache {
+            "in the shared build cache"
+        } else {
+            "in the target directory"
+        };
+        format!(
+            "command timed out after {secs}s and was stopped. Cargo keeps the build steps it \
+             finished {kept}, so nothing done so far is lost: run the same command again in \
+             the foreground with timeout_secs=600 and it continues where it stopped. \
+             {background}"
+        )
+    } else {
+        format!(
+            "command timed out after {secs}s and was stopped. {background} Run it in the \
+             foreground with a larger timeout_secs (up to {MAX_TIMEOUT_SECS}), or narrow the \
+             work."
+        )
+    }
 }
 
 /// Programs that run the command that follows them.
@@ -875,6 +1077,13 @@ fn heredoc_body(
 /// boundary, and a here-document's body (`<<EOF` … `EOF`) is the input of
 /// its command, not commands of its own.
 fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
+    scan_segments(command).map(|(segments, _)| segments)
+}
+
+/// [`command_segments`], and whether any boundary was a control `&` that
+/// runs the command before it in the background: a lone `&`, not either
+/// half of `&&`, not part of a redirect, and not bash's `|&`.
+fn scan_segments(command: &str) -> std::result::Result<(Vec<&str>, bool), String> {
     #[derive(Clone, Copy)]
     enum Quote {
         Single,
@@ -882,6 +1091,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
     }
     let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut segments = Vec::new();
+    let mut background = false;
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
@@ -920,6 +1130,9 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                     continue;
                 }
                 '|' | ';' | '&' => {
+                    if ch == '&' && !matches!(prev, Some('&' | '|' | ';')) && next != Some('&') {
+                        background = true;
+                    }
                     segments.push(&command[start..index]);
                     start = index + ch.len_utf8();
                 }
@@ -932,7 +1145,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                         loop {
                             let Some(&(line_start, _)) = chars.get(i + 1) else {
                                 // Unterminated: the rest is input, not commands.
-                                return Ok(segments);
+                                return Ok((segments, background));
                             };
                             let line_end = command[line_start..]
                                 .find('\n')
@@ -965,7 +1178,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
         return Err("command contains an unterminated quote".into());
     }
     segments.push(&command[start..]);
-    Ok(segments)
+    Ok((segments, background))
 }
 
 /// Read a here-document's delimiter word starting at `chars[at]` (just past
@@ -1161,7 +1374,7 @@ impl Tool for ExecTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 120, max: 600). Raise it for a long build or test run."
+                        "description": "Timeout in seconds (default: 120, max: 600; a cargo command gets at least 120). Raise it for a long build or test run: processes run in the background are killed when the call returns."
                     }
                 },
                 "required": ["command"]
@@ -1177,21 +1390,22 @@ impl Tool for ExecTool {
         // In the sandbox, the sandbox is the boundary and any program runs;
         // unsandboxed, the allowlist still decides. Forced removal is refused
         // either way.
+        // Backgrounded work never outlives the call, so it is refused too.
         let checked = if self.sandbox().is_some() {
             refuse_forced_removal(command)
         } else {
             validate_command(command).and_then(|()| refuse_forced_removal(command))
         };
-        checked.map_err(|e| {
-            rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
-                "command rejected: {e}"
-            )))
-        })?;
+        checked
+            .and_then(|()| refuse_background(command))
+            .map_err(|e| {
+                rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
+                    "command rejected: {e}"
+                )))
+            })?;
 
-        let timeout_secs = args["timeout_secs"]
-            .as_u64()
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS);
+        let cargo = runs_cargo(command);
+        let timeout_secs = resolve_timeout(args["timeout_secs"].as_u64(), cargo);
 
         // Inherit the user's PATH so tools installed via homebrew, cargo,
         // pip, nvm, etc. are available. Fall back to a sensible default.
@@ -1217,7 +1431,12 @@ impl Tool for ExecTool {
             process.env("RUSTUP_HOME", home);
         }
         if let Some(cache) = &self.build_cache {
-            process.env("CARGO_TARGET_DIR", cache.join("target"));
+            process
+                .env("CARGO_TARGET_DIR", cache.join("target"))
+                .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
+        }
+        if let Some(home) = &self.cargo_home {
+            process.env("CARGO_HOME", home);
         }
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
@@ -1234,8 +1453,10 @@ impl Tool for ExecTool {
         let output = timeout(Duration::from_secs(timeout_secs), future)
             .await
             .map_err(|_| {
-                rustykrab_core::Error::ToolExecution(ToolError::timeout(format!(
-                    "command timed out after {timeout_secs}s"
+                rustykrab_core::Error::ToolExecution(ToolError::timeout(timeout_message(
+                    timeout_secs,
+                    cargo,
+                    self.build_cache.is_some(),
                 )))
             })?
             .map_err(|e| {
@@ -1414,6 +1635,217 @@ mod environment_tests {
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod background_and_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn backgrounded_work_is_refused_with_why_and_what_to_do() {
+        for command in [
+            "sleep 30 & echo x",
+            "sleep 30 &",
+            "nohup cargo test > test.log 2>&1 & disown",
+            "cd sub && cargo build &",
+            "(cargo test &)",
+            "echo $(sleep 5 & echo started)",
+            "cargo test 2>&1 & echo launched",
+        ] {
+            let error = refuse_background(command).unwrap_err();
+            assert!(
+                error.contains("background")
+                    && error.contains("killed when the call returns")
+                    && error.contains("foreground")
+                    && error.contains("timeout_secs"),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn and_lists_redirections_quotes_and_waited_jobs_are_not_backgrounding() {
+        for command in [
+            "a && b",
+            "cargo test 2>&1",
+            "cargo build &> build.log",
+            "cargo build >& build.log",
+            "echo 'a & b'",
+            "echo \"a & b\"",
+            r"echo a \& b",
+            "make || echo failed",
+            "sleep 1 & sleep 2 & wait",
+            "cat <<'EOF'\nrun & later\nEOF",
+        ] {
+            refuse_background(command).unwrap_or_else(|e| panic!("{command}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backgrounding_command_is_refused_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = ExecTool::in_dir(dir.path())
+            .execute(json!({"command": "touch ran & echo x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), rustykrab_core::ToolErrorKind::InvalidInput);
+        assert!(error.to_string().contains("background"), "{error}");
+        assert!(!dir.path().join("ran").exists(), "the command ran");
+    }
+
+    #[test]
+    fn commands_that_run_cargo_are_recognised_wherever_cargo_runs() {
+        for command in [
+            "cargo test",
+            "cd crates/x && cargo test -p x",
+            "RUSTFLAGS=-Dwarnings cargo build",
+            "timeout 300 cargo test",
+            "env CARGO_TERM_COLOR=never /usr/bin/cargo check",
+            "echo $(cargo metadata --format-version 1)",
+            "nohup cargo test > log",
+        ] {
+            assert!(runs_cargo(command), "{command}");
+        }
+        for command in ["echo cargo", "grep cargo Cargo.toml", "ls target", "make"] {
+            assert!(!runs_cargo(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_cargo_command_gets_at_least_the_cargo_minimum() {
+        assert_eq!(resolve_timeout(Some(5), true), MIN_CARGO_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout(Some(15), true), 120);
+        assert_eq!(resolve_timeout(Some(300), true), 300);
+        assert_eq!(resolve_timeout(Some(5000), true), MAX_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout(None, true), DEFAULT_TIMEOUT_SECS);
+        // Other commands keep what they ask for.
+        assert_eq!(resolve_timeout(Some(5), false), 5);
+        assert_eq!(resolve_timeout(Some(0), false), 0);
+        assert_eq!(resolve_timeout(Some(5000), false), MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_cargo_timeout_says_the_work_is_kept_and_how_to_continue() {
+        let message = timeout_message(
+            resolve_timeout(Some(5), runs_cargo("cargo test")),
+            true,
+            true,
+        );
+        for wanted in [
+            "timed out after 120s",
+            "shared build cache",
+            "run the same command again in the foreground with timeout_secs=600",
+            "Background processes",
+            "killed when the call returns",
+        ] {
+            assert!(message.contains(wanted), "{wanted:?} missing: {message}");
+        }
+        let message = timeout_message(30, false, true);
+        assert!(
+            message.contains("killed when the call returns"),
+            "{message}"
+        );
+        assert!(!message.contains("build cache"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_is_told_backgrounding_cannot_outlive_the_call() {
+        let error = ExecTool::new()
+            .execute(json!({"command": "sleep 1", "timeout_secs": 0}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), rustykrab_core::ToolErrorKind::Timeout);
+        let message = error.to_string();
+        assert!(message.contains("timed out after 0s"), "{message}");
+        assert!(
+            message.contains("killed when the call returns"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn builds_share_a_persistent_cargo_home_beside_the_cache_with_limited_jobs() {
+        let data = tempfile::tempdir().unwrap();
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(&work).unwrap();
+        let cache = data.path().join("build-cache/source");
+        let tool = ExecTool::in_dir(&work).with_build_cache(&cache);
+        let out = tool.execute(json!({"command": "env"})).await.unwrap();
+        assert_eq!(out["exit_code"], 0, "{out}");
+        let vars: std::collections::BTreeMap<_, _> = out["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let home = vars.get("CARGO_HOME").expect("CARGO_HOME is set");
+        let shared = data.path().join("build-cache").join(SHARED_CARGO_HOME);
+        assert_eq!(std::path::Path::new(home), shared);
+        assert!(shared.is_dir(), "the shared Cargo home is created");
+        assert!(
+            !home.starts_with(vars.get("HOME").unwrap()),
+            "Cargo's home is not under the isolated, temporary HOME: {home}"
+        );
+        assert_eq!(vars.get("CARGO_BUILD_JOBS"), Some(&CARGO_BUILD_JOBS));
+        assert_eq!(
+            vars.get("CARGO_TARGET_DIR").map(std::path::Path::new),
+            Some(cache.join("target").as_path())
+        );
+    }
+
+    /// Opt-in, with the host's real Cargo and network: two worktrees of one
+    /// repository build through `exec`, and the second compiles none of the
+    /// dependencies the first fetched into the shared Cargo home and built.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
+    async fn real_cargo_reuses_the_shared_home_and_cache_across_worktrees() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let mut outputs = Vec::new();
+        for run in ["run-1", "run-2"] {
+            let work = data.path().join("worktrees").join(run);
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::write(
+                work.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nitoa = \"=1.0.11\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                work.join("src/lib.rs"),
+                "pub fn f() -> String { itoa::Buffer::new().format(1).into() }\n",
+            )
+            .unwrap();
+            let tool = ExecTool::in_dir(&work).with_build_cache(&cache);
+            let out = tool
+                .execute(json!({"command": "cargo build 2>&1", "timeout_secs": 600}))
+                .await
+                .unwrap();
+            assert_eq!(out["exit_code"], 0, "{out}");
+            outputs.push(out["stdout"].as_str().unwrap().to_string());
+        }
+        println!("REAL_SHARED_HOME_RECEIPT {}", json!({"builds": outputs}));
+        assert!(outputs[0].contains("Compiling itoa"), "{}", outputs[0]);
+        assert!(!outputs[1].contains("Compiling itoa"), "{}", outputs[1]);
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(
+            home.join("registry").is_dir(),
+            "sources live in the shared home"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_without_a_build_cache_sets_no_cargo_home_or_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = ExecTool::in_dir(dir.path())
+            .execute(json!({"command": "printf '%s/%s' \"${CARGO_HOME:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\""}))
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"], "unset/unset");
     }
 }
 
@@ -1885,6 +2317,18 @@ mod error_typing_tests {
             std::fs::canonicalize(text.trim_start_matches("built\n")).unwrap(),
             target
         );
+        // So does the Cargo home every worker shares, beside the cache.
+        let (code, text) = run_in(
+            &tool,
+            "mkdir -p \"$CARGO_HOME/registry\" && echo fetched > \"$CARGO_HOME/registry/entry\" \
+             && cat \"$CARGO_HOME/registry/entry\"",
+        )
+        .await;
+        assert_eq!((code, text.as_str()), (0, "fetched\n"));
+        assert!(data
+            .path()
+            .join("build-cache/cargo-home/registry/entry")
+            .is_file());
         // The cache opens nothing else in the private directory.
         let (code, text) = run_in(&tool, "cat ../../service.json").await;
         assert_ne!(code, 0);

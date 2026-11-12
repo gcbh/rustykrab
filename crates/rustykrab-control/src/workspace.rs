@@ -232,6 +232,22 @@ impl Workspace {
         matches!(self.tip(), Ok(Some(tip)) if tip != self.base)
     }
 
+    /// Whether the worktree holds changes no commit has: modified, staged
+    /// or untracked files git does not ignore. A worktree git cannot read
+    /// counts as holding some, so it is kept rather than removed.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        if !self.path.exists() {
+            return false;
+        }
+        match git(
+            &self.path,
+            &["status", "--porcelain", "--untracked-files=all"],
+        ) {
+            Ok(out) if out.status.success() => !out.stdout.iter().all(u8::is_ascii_whitespace),
+            _ => true,
+        }
+    }
+
     /// A claimed path as a path relative to the repository root: trimmed,
     /// without a leading `./`, and without the worktree's own prefix when
     /// the worker named it absolutely.
@@ -1007,10 +1023,15 @@ pub(crate) mod tests {
         ws.create().unwrap();
         assert!(ws.path.join("src/lib.rs").exists());
         assert!(!ws.has_commits());
+        assert!(!ws.has_uncommitted_changes());
 
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+        assert!(ws.has_uncommitted_changes(), "a modified file");
         let commit = commit_all(&ws.path, "change");
         assert!(ws.has_commits());
+        assert!(!ws.has_uncommitted_changes());
+        std::fs::write(ws.path.join("new.txt"), "untracked\n").unwrap();
+        assert!(ws.has_uncommitted_changes(), "an untracked file");
         ws.remove().unwrap();
         assert!(!ws.path.exists(), "the worktree directory goes");
         assert_eq!(ws.tip().unwrap().as_deref(), Some(commit.as_str()));

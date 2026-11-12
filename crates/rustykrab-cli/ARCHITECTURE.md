@@ -896,7 +896,8 @@ stalled. With a hosted or remote provider they keep a slot of their own
 provider's local model tag (`ModelProvider::local_model_tag`) rather than the
 provider's name, and the interactive-turn busy signal (`work_host::TurnActivity`)
 answers for either. The same workers build into
-`<data dir>/build-cache` (`with_build_cache`).
+`<data dir>/build-cache` (`with_build_cache`), with the Cargo home every worker
+shares at `<data dir>/build-cache/cargo-home` and `CARGO_BUILD_JOBS=6`.
 Every local agent the daemon builds (the general local worker, the planner
 slot, `qwen-code`, both integration slots, and the host half of a native
 subscription resource) is given `<data dir>/run-logs` (`with_run_logs`), and

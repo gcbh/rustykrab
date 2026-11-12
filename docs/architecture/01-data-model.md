@@ -689,7 +689,9 @@ stored in them: `run-logs/<run id>.jsonl` (every run's session log, 30 days)
 and `investigations/<item>-<run>/` (a fix item's bundle for one run, 30 days).
 `build-cache/<repository>/` is also there and recorded nowhere: Cargo's
 build output for that repository's worktree runs, shared across them and
-safe to delete whenever no run is building.
+safe to delete whenever no run is building. So is `build-cache/cargo-home/`,
+the Cargo home every worker's builds share (downloaded registry index and
+sources, no credentials), equally safe to delete when nothing is building.
 
 **Aging is lossy by design.** `work_item_archive` takes one line per
 compacted closed item, written in the transaction that deletes its
