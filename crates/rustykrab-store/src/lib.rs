@@ -1339,8 +1339,9 @@ impl Store {
     /// their read and their write.
     ///
     /// An in-memory store (tests) has no file to open twice, and a store
-    /// whose file cannot be reopened logs that once and falls back: both
-    /// return a handle on the shared connection, as before.
+    /// whose file cannot be reopened logs a warning and falls back, trying
+    /// the open again on the next call: both return a handle on the shared
+    /// connection, as before.
     pub fn observer(&self) -> Store {
         let mut observer = self.clone();
         observer.conn = self.observer_conn();

@@ -1698,3 +1698,39 @@ async fn items_with_an_artifact_kind_are_found_by_the_parsed_ref() {
         ["tagged"]
     );
 }
+
+/// Between calls the observer holds no read transaction, so it never pins
+/// the WAL: after a snapshot and a list through it, a TRUNCATE checkpoint
+/// from another connection completes and empties the WAL file. A write
+/// transaction open on another connection does not block it either; it
+/// reads the last committed state, and sees the commit once made.
+#[tokio::test]
+async fn the_observer_never_pins_the_wal_or_waits_for_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), vec![7u8; 32]).unwrap();
+    store
+        .work_insert_graph(&[item("a", Status::Queued)], &[], None)
+        .await
+        .unwrap();
+    let observer = store.observer();
+    observer.work_monitor_snapshot(500, 50).await.unwrap();
+    observer.work_list(&Default::default()).await.unwrap();
+    let other = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+    let busy: i64 = other
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(busy, 0);
+    let wal = std::fs::metadata(dir.path().join("store.db-wal")).unwrap();
+    assert_eq!(wal.len(), 0);
+    other
+        .execute_batch("BEGIN IMMEDIATE; UPDATE work_items SET priority = 9 WHERE id = 'a';")
+        .unwrap();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), observer.work_get("a"))
+        .await
+        .expect("a reader does not wait for a writer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.priority, 0);
+    other.execute_batch("COMMIT").unwrap();
+    assert_eq!(observer.work_get("a").await.unwrap().unwrap().priority, 9);
+}
