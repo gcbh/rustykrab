@@ -4325,6 +4325,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

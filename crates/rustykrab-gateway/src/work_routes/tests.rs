@@ -88,6 +88,9 @@ struct StubControl {
     calls: Mutex<Vec<Call>>,
     /// What `loop_status` answers; `None` for a controller no loop drives.
     status: Mutex<Option<LoopStatus>>,
+    /// A cancel waits for this before it records itself, as the
+    /// controller's waits for its loop; a test holds it to stall cancels.
+    cancel_gate: tokio::sync::Mutex<()>,
 }
 
 impl StubControl {
@@ -206,6 +209,7 @@ impl ControlHandle for StubControl {
         reason: Option<String>,
         actor: &str,
     ) -> Result<Vec<WorkItemId>, Error> {
+        let _open = self.cancel_gate.lock().await;
         self.record(Call::Cancel {
             item: item.into(),
             reason,
@@ -523,6 +527,7 @@ async fn harness_with(with_control: bool) -> Harness {
         store: store.clone(),
         calls: Mutex::default(),
         status: Mutex::default(),
+        cancel_gate: tokio::sync::Mutex::new(()),
     });
     let mut state = AppState::new(
         store.clone(),
@@ -795,6 +800,62 @@ async fn a_rejected_plan_returns_422_with_every_failed_check() {
                 origin: None,
             },
         ]
+    );
+}
+
+/// A cancel waits for the control loop, which a slow tick can hold for
+/// minutes. A client that stops waiting (its request future is dropped)
+/// must not take the cancel with it: it completes once the loop is free.
+#[tokio::test]
+async fn a_cancel_whose_request_is_dropped_still_completes() {
+    use tower::ServiceExt;
+    let h = harness().await;
+    let mut state = AppState::new(
+        h.store.clone(),
+        vec![],
+        Arc::new(UnusedProvider),
+        TOKEN.into(),
+    );
+    state = state.with_control(h.control.clone());
+    let app = crate::router(state);
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/work/p/cancel")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("origin", "http://127.0.0.1:4000")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            4000,
+        ))));
+
+    let gate = h.control.cancel_gate.lock().await;
+    let gave_up =
+        tokio::time::timeout(std::time::Duration::from_millis(200), app.oneshot(request)).await;
+    assert!(
+        gave_up.is_err(),
+        "the cancel waits for the loop: {gave_up:?}"
+    );
+    assert!(h.control.calls().is_empty(), "still waiting for the loop");
+    drop(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.control.calls().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned cancel never completed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        h.control.calls(),
+        [Call::Cancel {
+            item: "p".into(),
+            reason: None,
+            actor: "user:master".into(),
+        }]
     );
 }
 

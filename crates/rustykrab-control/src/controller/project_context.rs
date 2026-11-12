@@ -102,13 +102,30 @@ enum ProjectSelection {
     Unresolved(String),
 }
 
+/// The projects one reconstruction matches its items against, listed once,
+/// when the first item without an explicit binding needs them. A
+/// reconstruction walks every item in the store; listing per item made it
+/// one project query per item (hundreds per pass).
+#[derive(Default)]
+pub(super) struct ProjectList(Option<Vec<rustykrab_projects::Project>>);
+
 impl Controller {
     pub(super) async fn project_id(
         &self,
         snap: &Snapshot,
         item: &WorkItem,
     ) -> Result<Option<String>, Error> {
-        match self.project_selection(snap, item).await? {
+        self.project_id_in(snap, item, &mut ProjectList::default())
+            .await
+    }
+
+    async fn project_id_in(
+        &self,
+        snap: &Snapshot,
+        item: &WorkItem,
+        projects: &mut ProjectList,
+    ) -> Result<Option<String>, Error> {
+        match self.project_selection(snap, item, projects).await? {
             ProjectSelection::Resolved(id) => Ok(id),
             ProjectSelection::Unresolved(why) => Err(Error::Internal(why)),
         }
@@ -118,6 +135,7 @@ impl Controller {
         &self,
         snap: &Snapshot,
         item: &WorkItem,
+        projects: &mut ProjectList,
     ) -> Result<ProjectSelection, Error> {
         let ancestors = snap.ancestors(&item.id);
         let explicit = match binding(
@@ -132,12 +150,16 @@ impl Controller {
         // Only an exact repository path or canonical conversation match is automatic.
         // Multiple projects on one repository require an explicit `project` reference.
         let repo = Workspace::repo_of(&item.writable_resources);
-        let matches: Vec<_> = self
-            .store
-            .projects()
-            .list()
-            .await?
-            .into_iter()
+        if projects.0.is_none() {
+            #[cfg(test)]
+            self.project_lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            projects.0 = Some(self.store.projects().list().await?);
+        }
+        let matches: Vec<_> = projects
+            .0
+            .iter()
+            .flatten()
             .filter(|p| p.created_at <= item.created_at)
             .filter(|p| {
                 repo.as_ref()
@@ -203,7 +225,17 @@ impl Controller {
         snap: &Snapshot,
         item: &WorkItem,
     ) -> Result<Option<ProjectContext>, Error> {
-        let Some(id) = self.project_id(snap, item).await? else {
+        self.project_context_in(snap, item, &mut ProjectList::default())
+            .await
+    }
+
+    async fn project_context_in(
+        &self,
+        snap: &Snapshot,
+        item: &WorkItem,
+        projects: &mut ProjectList,
+    ) -> Result<Option<ProjectContext>, Error> {
+        let Some(id) = self.project_id_in(snap, item, projects).await? else {
             return Ok(None);
         };
         let project_id = id
@@ -226,7 +258,7 @@ impl Controller {
         for row in snap.items() {
             let belongs = match members.get(&row.id) {
                 Some((project, _)) => project == &id,
-                None => match self.project_selection(snap, row).await? {
+                None => match self.project_selection(snap, row, projects).await? {
                     ProjectSelection::Resolved(project) => project.as_deref() == Some(&id),
                     ProjectSelection::Unresolved(why) => {
                         if execution_items.contains(&row.id) {
@@ -311,7 +343,8 @@ impl Controller {
         item: &WorkItem,
         contexts: &mut BTreeMap<String, ProjectContext>,
     ) -> Result<Option<ProjectContext>, Error> {
-        let Some(project) = self.project_id(snap, item).await? else {
+        let mut projects = ProjectList::default();
+        let Some(project) = self.project_id_in(snap, item, &mut projects).await? else {
             return Ok(None);
         };
         if let Some(context) = contexts.get(&project) {
@@ -322,13 +355,13 @@ impl Controller {
                 }
                 if let Some(row) = snap.item(id) {
                     if matches!(
-                        self.project_selection(snap, row).await?,
+                        self.project_selection(snap, row, &mut projects).await?,
                         ProjectSelection::Unresolved(_)
                     ) {
                         // This row could be omitted as unrelated to the task that
                         // populated the cache. Rebuild with this task's strict
                         // slice, retaining trusted historical bindings as before.
-                        return self.project_context(snap, item).await;
+                        return self.project_context_in(snap, item, &mut projects).await;
                     }
                 }
             }
@@ -336,7 +369,7 @@ impl Controller {
             context.execution_items = execution_items;
             return Ok(Some(context));
         }
-        let context = self.project_context(snap, item).await?;
+        let context = self.project_context_in(snap, item, &mut projects).await?;
         if let Some(context) = &context {
             contexts.insert(project, context.clone());
         }
@@ -551,7 +584,7 @@ impl Controller {
                 }
                 if let Some(repo) = Workspace::repo_of(&item.writable_resources) {
                     if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
-                        let base = crate::workspace::fresh_base(entry.key()).await;
+                        let base = self.upstream_base(entry.key()).await;
                         entry.insert(base);
                     }
                 }
@@ -657,7 +690,7 @@ impl Controller {
                         return Ok(None);
                     }
                     if let std::collections::hash_map::Entry::Vacant(entry) = upstream.entry(repo) {
-                        let base = crate::workspace::fresh_base(entry.key()).await;
+                        let base = self.upstream_base(entry.key()).await;
                         entry.insert(base);
                     }
                     let workspace = self

@@ -67,28 +67,25 @@ impl Controller {
                     run.run_id.clone(),
                     run.worker.clone(),
                     run.merge_progress.clone(),
+                    run.liveness.clone(),
                 )
             })
             .collect();
         let mut stalled = HashMap::new();
-        for (id, run_id, worker, goal) in runs {
+        for (id, run_id, worker, goal, liveness) in runs {
             // Only actual adapter observations renew liveness. A model-written
             // transcript, a queued item, or a living process is insufficient.
+            // The run's heartbeat task (`liveness.rs`) reads the same counter
+            // between ticks; whichever sees a change first writes its one
+            // heartbeat, and the TTL counts from the change either way.
             let activity = self.worker(&worker).and_then(|w| w.activity(&run_id));
-            let renewed = {
-                let mut state = self.state();
-                state.runs.get_mut(&id).is_some_and(|run| {
-                    if activity.is_some_and(|n| n > 0) && activity != run.activity {
-                        run.activity = activity;
-                        run.since = now;
-                        true
-                    } else {
-                        false
-                    }
-                })
-            };
-            if renewed {
+            if liveness.observe(activity, now) {
                 self.store.work_lease_heartbeat(&id).await?;
+            }
+            if let Some(changed) = liveness.changed() {
+                if let Some(run) = self.state().runs.get_mut(&id) {
+                    run.since = run.since.max(changed);
+                }
             }
             let Some(mut goal) = goal else { continue };
             if goal.observed.is_none_or(|at| now - at >= cadence) {

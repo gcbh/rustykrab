@@ -507,6 +507,7 @@ work_item_events(id AUTOINC, item, at, kind, from_status, from_reason,
    INDEX idx_work_item_events_item (item, at)
 work_item_evidence(id AUTOINC, item, kind, ref, hash, verified_by, at)
    INDEX idx_work_item_evidence_item (item)
+   INDEX idx_work_item_evidence_kind (kind, id)
 leases(item PK REFERENCES work_items(id) ON DELETE CASCADE,
        worker, since, ttl_seconds, heartbeat_at, inputs JSON)
 work_lease_history(id AUTOINC, item, worker, since, ttl_seconds,

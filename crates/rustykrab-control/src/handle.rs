@@ -78,6 +78,25 @@ pub struct LoopStatus {
     /// reconcile what finishes.
     #[serde(default)]
     pub draining: bool,
+    /// When the tick in progress started, on the controller's clock; `None`
+    /// between ticks. An old value with `last_tick` not moving is a tick
+    /// stuck in `tick_phase`.
+    #[serde(default)]
+    pub tick_started: Option<DateTime<Utc>>,
+    /// The phase the tick in progress is in (`prepare`, `loop_lock`,
+    /// `answers`, `sweep`, `observe_execution`, `reconcile`, `lease`,
+    /// `age`); `None` between ticks.
+    #[serde(default)]
+    pub tick_phase: Option<String>,
+    /// How long the last tick that ended took, completed or failed, in
+    /// milliseconds; `None` before the first.
+    #[serde(default)]
+    pub last_tick_ms: Option<u64>,
+    /// That tick's slowest phase and how long it spent in it.
+    #[serde(default)]
+    pub last_tick_slowest_phase: Option<String>,
+    #[serde(default)]
+    pub last_tick_slowest_phase_ms: Option<u64>,
 }
 
 /// The loop's hold on its data directory's `controller.lock`

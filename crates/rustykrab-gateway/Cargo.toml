@@ -42,3 +42,5 @@ rustykrab-tools.workspace = true
 # Drive the real router with a connection from another machine, which a
 # loopback listener cannot produce.
 tower = { version = "0.5", features = ["util"] }
+# Capture the request log in the logging middleware's tests.
+tracing-subscriber.workspace = true

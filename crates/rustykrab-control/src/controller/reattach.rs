@@ -22,7 +22,6 @@ use rustykrab_core::Error;
 use super::batch::Batch;
 use super::brief::{brief_for, RUN};
 use super::load::history;
-use super::tick::spawn;
 use super::Controller;
 
 impl Controller {
@@ -145,7 +144,7 @@ impl Controller {
         let merge_progress = self
             .merge_progress_for(item, brief.workspace.as_ref())
             .await?;
-        let mut run = spawn(worker, brief, self.clock.now());
+        let mut run = self.spawn_run(worker, brief);
         run.merge_progress = merge_progress;
         self.state().runs.insert(item.id.clone(), run);
         Ok(true)
