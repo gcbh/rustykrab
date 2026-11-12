@@ -282,6 +282,30 @@ pub(super) fn list_items(
     )
 }
 
+/// Live items, closed included, carrying an artifact ref of `kind`, oldest
+/// first. `instr` narrows the rows before they are parsed; the parsed refs
+/// decide, so a title or another ref merely containing the text does not
+/// count.
+pub(super) fn items_with_artifact_kind(
+    conn: &Connection,
+    kind: &str,
+) -> Result<Vec<WorkItem>, WorkStoreError> {
+    let needle = serde_json::to_string(kind)?;
+    let items = collect(
+        conn,
+        &format!(
+            "SELECT {ITEM_COLUMNS} FROM work_items WHERE instr(artifact_refs, ?1) > 0 \
+             ORDER BY created_at, id"
+        ),
+        params![needle],
+        item_from_row,
+    )?;
+    Ok(items
+        .into_iter()
+        .filter(|i| i.artifact_refs.iter().any(|r| r.kind == kind))
+        .collect())
+}
+
 // ── plans ──────────────────────────────────────────────────────────────
 
 pub(super) fn insert_plan(conn: &Connection, plan: &WorkPlanRow) -> Result<(), WorkStoreError> {
@@ -610,16 +634,17 @@ pub(super) fn events_last_id(conn: &Connection) -> Result<i64, WorkStoreError> {
     )?)
 }
 
+/// Searched through `idx_work_item_events_at`, which also yields the rows in
+/// `at` order.
+pub(super) fn events_since_sql() -> String {
+    format!("SELECT {EVENT_COLUMNS} FROM work_item_events WHERE at >= ?1 ORDER BY at, id")
+}
+
 pub(super) fn events_since(
     conn: &Connection,
     at: DateTime<Utc>,
 ) -> Result<Vec<WorkEvent>, WorkStoreError> {
-    collect(
-        conn,
-        &format!("SELECT {EVENT_COLUMNS} FROM work_item_events WHERE at >= ?1 ORDER BY at, id"),
-        params![ts(&at)],
-        event_from_row,
-    )
+    collect(conn, &events_since_sql(), params![ts(&at)], event_from_row)
 }
 
 // ── evidence ───────────────────────────────────────────────────────────

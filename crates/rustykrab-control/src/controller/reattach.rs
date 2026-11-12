@@ -46,7 +46,7 @@ impl Controller {
         };
         let mut out = Vec::new();
         for item in orphans {
-            match self.reattach_one(&item).await {
+            match self.reattach_one(&item, b.snap.ancestors(&item.id)).await {
                 Ok(true) => out.push(item.id),
                 Ok(false) => {}
                 Err(e) => {
@@ -57,7 +57,11 @@ impl Controller {
         out
     }
 
-    async fn reattach_one(&self, item: &WorkItem) -> Result<bool, Error> {
+    async fn reattach_one(
+        &self,
+        item: &WorkItem,
+        ancestors: Vec<WorkItemId>,
+    ) -> Result<bool, Error> {
         let Some(lease) = self.store.work_lease_get(&item.id).await? else {
             return Ok(false);
         };
@@ -146,6 +150,7 @@ impl Controller {
             .await?;
         let mut run = self.spawn_run(worker, brief);
         run.merge_progress = merge_progress;
+        run.ancestors = ancestors;
         self.state().runs.insert(item.id.clone(), run);
         Ok(true)
     }

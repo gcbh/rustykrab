@@ -505,9 +505,12 @@ work_item_events(id AUTOINC, item, at, kind, from_status, from_reason,
                  to_status, to_reason, actor, reason, upstream, origin,
                  evidence_ref)
    INDEX idx_work_item_events_item (item, at)
+   INDEX idx_work_item_events_at   (at)               -- events_since windows
 work_item_evidence(id AUTOINC, item, kind, ref, hash, verified_by, at)
    INDEX idx_work_item_evidence_item (item)
    INDEX idx_work_item_evidence_kind (kind, id)
+   INDEX idx_work_item_evidence_item_verified (item, verified_by)
+                                                      -- monitor counts, no row read
 leases(item PK REFERENCES work_items(id) ON DELETE CASCADE,
        worker, since, ttl_seconds, heartbeat_at, inputs JSON)
 work_lease_history(id AUTOINC, item, worker, since, ttl_seconds,
@@ -972,10 +975,27 @@ Every `store.db` access goes through
 `with_conn(&Arc<Mutex<rusqlite::Connection>>, f)` — **one connection behind one
 std mutex**, so all reads and writes across every repository handle and the
 `work_*` methods serialise.
-WAL mode is enabled but its concurrent-reader benefit is unreachable. On a
-single-user daemon this is defensible and simple, and should be stated as a
-deliberate choice; a small connection pool (writer + N readers) would remove the
-ceiling if it ever matters.
+WAL mode is enabled; two read-only connections claim its concurrent-reader
+benefit: `Store::outcomes_reader` for the dream analysis pass, and
+`Store::observer`, shared by every observation read (the work monitor
+snapshot, the overseer's recovery check, dreaming's reads, `/api/monitor`).
+Before the observer, a monitor snapshot read and parsed every displayed item's
+latest recorded project context (tens of MB of JSON) inside one transaction on
+the shared connection, every 15 seconds from the overseer, and the controller's
+ticks, lease heartbeats and cancels queued behind it. There is still exactly
+one writer: a second writing connection would make the shared connection's
+deferred read-then-write transactions fail with `SQLITE_BUSY` whenever it
+committed between their read and their write (see the store's
+`ARCHITECTURE.md`).
+
+`work_item_evidence.ref` holds recorded project contexts of up to hundreds of
+KB, and `verified_by` and `hash` are stored after it, so any query that reads
+either from the table walks the row's overflow pages.
+`idx_work_item_evidence_item_verified` answers the monitor's per-item counts
+from the index alone. Since this change a lease records the complete project
+context only on an item's first lease per project revision (per controller
+process); repeats record the execution slice (`ProjectContext::execution_slice`,
+bounded by the 128 KB prompt limit). Existing rows are untouched.
 
 **Resolved since the first pass.** Every lock on the connection now recovers
 from poisoning rather than propagating the panic. That took two passes:

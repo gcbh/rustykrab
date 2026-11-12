@@ -106,6 +106,9 @@ pub struct Store {
     /// Where the database lives, so a background reader can open its own
     /// connection instead of queueing behind live traffic on this one.
     db_path: PathBuf,
+    /// The read-only connection [`Store::observer`] hands out, opened on
+    /// first use and shared by every clone of this handle.
+    observer: Arc<std::sync::OnceLock<Arc<Mutex<rusqlite::Connection>>>>,
 }
 
 impl Store {
@@ -148,6 +151,7 @@ impl Store {
             pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
             duplicate_window_ms: payment_request::DEFAULT_DUPLICATE_WINDOW_MS,
             db_path,
+            observer: Arc::default(),
         })
     }
 
@@ -711,6 +715,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_work_item_events_item
                 ON work_item_events (item, at);
 
+            -- `events_since`: the 24-hour window the automatic-start check
+            -- and the recurrence rebuild read. Without it each read scans
+            -- the whole log and sorts it.
+            CREATE INDEX IF NOT EXISTS idx_work_item_events_at
+                ON work_item_events (at);
+
             -- Pointers, never bodies. Outlives compaction like the events.
             CREATE TABLE IF NOT EXISTS work_item_evidence (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -724,6 +734,15 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_work_item_evidence_item
                 ON work_item_evidence (item);
+
+            -- The monitor's per-item evidence counts. `verified_by` is
+            -- stored after `ref`, which runs to hundreds of KB for a
+            -- recorded project context, so reading it from the table walks
+            -- every overflow page of the row; from this index the count
+            -- reads no row at all. Building it on an existing store reads
+            -- the table once.
+            CREATE INDEX IF NOT EXISTS idx_work_item_evidence_item_verified
+                ON work_item_evidence (item, verified_by);
 
             -- Evidence of one kind across every item (merge recoveries,
             -- recorded project contexts, learned rules), read on every
@@ -1304,6 +1323,82 @@ impl Store {
         Ok(OutcomeStore::new_read_only(Arc::new(Mutex::new(conn))))
     }
 
+    /// This store over a read-only connection of its own, for observation:
+    /// the work monitor, the overseer's recovery check, dreaming's reads,
+    /// `/api/monitor`. A long read there no longer holds the connection the
+    /// controller writes through; WAL lets the two proceed together, and
+    /// each statement or transaction on the observer reads one consistent
+    /// committed state.
+    ///
+    /// The connection is opened `SQLITE_OPEN_READ_ONLY` on first use and
+    /// shared by every observer of this store, so observers queue only
+    /// behind one another. A write through the returned handle fails with
+    /// SQLite's read-only error; it never becomes a second writer, which
+    /// would make the main connection's deferred read-then-write
+    /// transactions fail with `SQLITE_BUSY` whenever it committed between
+    /// their read and their write.
+    ///
+    /// An in-memory store (tests) has no file to open twice, and a store
+    /// whose file cannot be reopened logs a warning and falls back, trying
+    /// the open again on the next call: both return a handle on the shared
+    /// connection, as before.
+    pub fn observer(&self) -> Store {
+        let mut observer = self.clone();
+        observer.conn = self.observer_conn();
+        observer
+    }
+
+    fn observer_conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
+        if self.db_path == Path::new(":memory:") {
+            return Arc::clone(&self.conn);
+        }
+        if let Some(conn) = self.observer.get() {
+            return Arc::clone(conn);
+        }
+        let opened = rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .and_then(|conn| {
+            // Per-connection settings; `journal_mode` belongs to the file
+            // and is already WAL from `open`.
+            conn.execute_batch(
+                "PRAGMA busy_timeout = 5000;
+                 PRAGMA cache_size = -16384;
+                 PRAGMA mmap_size = 268435456;
+                 PRAGMA temp_store = MEMORY;",
+            )?;
+            Ok(conn)
+        });
+        match opened {
+            Ok(conn) => Arc::clone(self.observer.get_or_init(|| Arc::new(Mutex::new(conn)))),
+            Err(e) => {
+                tracing::warn!(error = %e, "observer connection not opened; observing through the shared connection");
+                Arc::clone(&self.conn)
+            }
+        }
+    }
+
+    /// Test seam: hold the shared connection's lock, as a long statement
+    /// on it would, until the returned guard is dropped. Every caller of
+    /// the shared connection waits meanwhile; observers do not.
+    #[doc(hidden)]
+    pub fn hold_shared_connection(&self) -> ConnectionHold {
+        let conn = Arc::clone(&self.conn);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = held_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let _ = held_rx.recv();
+        ConnectionHold {
+            release: Some(release_tx),
+            thread: Some(thread),
+        }
+    }
+
     /// Return a handle for durable conversational-project planning.
     pub fn projects(&self) -> ProjectStore {
         ProjectStore::new(Arc::clone(&self.conn))
@@ -1335,6 +1430,23 @@ impl Store {
                 .map_err(|e| Error::Storage(e.to_string()))
         })
         .await
+    }
+}
+
+/// The shared connection held by [`Store::hold_shared_connection`];
+/// released on drop.
+#[doc(hidden)]
+pub struct ConnectionHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ConnectionHold {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -1526,6 +1638,7 @@ impl Store {
             pay_cooldown: payment_request::DEFAULT_PAY_COOLDOWN,
             duplicate_window_ms: payment_request::DEFAULT_DUPLICATE_WINDOW_MS,
             db_path: PathBuf::from(":memory:"),
+            observer: Arc::default(),
         }
     }
 }
@@ -1823,6 +1936,56 @@ mod tests {
         Store::run_migrations(&conn).unwrap();
         assert_eq!(count(&conn, index), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM work_item_evidence"), 2);
+    }
+
+    /// A store whose evidence and event tables predate the monitor's count
+    /// index and the event-time index gets both on open, idempotently, and
+    /// keeps every row: the migration only adds indexes.
+    #[test]
+    fn upgrading_adds_the_observation_indexes_and_keeps_every_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_item_evidence (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 item        TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 ref         TEXT NOT NULL,
+                 hash        TEXT,
+                 verified_by TEXT,
+                 at          TEXT NOT NULL
+             );
+             CREATE TABLE work_item_events (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 item         TEXT NOT NULL,
+                 at           TEXT NOT NULL,
+                 kind         TEXT NOT NULL,
+                 from_status  TEXT,
+                 from_reason  TEXT,
+                 to_status    TEXT,
+                 to_reason    TEXT,
+                 actor        TEXT NOT NULL,
+                 reason       TEXT,
+                 upstream     TEXT,
+                 origin       TEXT,
+                 evidence_ref TEXT
+             );
+             INSERT INTO work_item_evidence (item, kind, ref, verified_by, at)
+             VALUES ('a', 'project_context', '{}', 'controller', '2026-11-01T00:00:00Z'),
+                    ('a', 'summary', 'done', NULL, '2026-11-01T00:00:01Z');
+             INSERT INTO work_item_events (item, at, kind, actor)
+             VALUES ('a', '2026-11-01T00:00:00Z', 'comment', 'user');",
+        )
+        .unwrap();
+        let indexes = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                        AND name IN ('idx_work_item_evidence_item_verified',
+                                     'idx_work_item_events_at')";
+        assert_eq!(count(&conn, indexes), 0);
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, indexes), 2);
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, indexes), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM work_item_evidence"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM work_item_events"), 1);
     }
 
     #[test]

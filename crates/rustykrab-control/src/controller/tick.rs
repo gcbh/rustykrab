@@ -2177,8 +2177,24 @@ impl Controller {
                     at: Utc::now(),
                 });
             }
+            // The item's first lease on a project revision (since this
+            // controller started) records the complete context; a repeat
+            // records its execution slice, the part the run's prompt shows.
+            // An item leased dozens of times on one revision otherwise
+            // stored the whole project history each time.
+            let full_context = brief
+                .project_context
+                .as_ref()
+                .map(|context| (item.id.clone(), context.snapshot.revision.id.to_string()));
             if let Some(context) = &brief.project_context {
-                lease_evidence.push(Self::context_evidence(&item.id, context)?);
+                let first = full_context
+                    .as_ref()
+                    .is_some_and(|key| !self.recorded_full_contexts().contains(key));
+                lease_evidence.push(if first {
+                    Self::context_evidence(&item.id, context)?
+                } else {
+                    Self::context_evidence(&item.id, &context.execution_slice())?
+                });
             }
             if let Some(ws) = &brief.workspace {
                 lease_evidence.push(rustykrab_core::work::Evidence {
@@ -2208,9 +2224,13 @@ impl Controller {
                 tracing::warn!(item = %item.id, error = %e, "lease refused");
                 continue;
             }
+            if let Some(key) = full_context {
+                self.recorded_full_contexts().insert(key);
+            }
             let name = worker.name().to_string();
             let mut run = self.spawn_run(worker.clone(), brief);
             run.merge_progress = merge_progress;
+            run.ancestors = snap.ancestors(&item.id);
             let isolated_repo = run.isolated_repo.clone();
             occupied.build |= run.builds;
             self.state().runs.insert(item.id.clone(), run);
@@ -2628,5 +2648,6 @@ fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
         liveness: Default::default(),
         _heartbeat: super::liveness::HeartbeatGuard::none(),
         merge_progress: None,
+        ancestors: Vec::new(),
     }
 }

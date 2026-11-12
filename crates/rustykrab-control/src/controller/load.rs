@@ -231,6 +231,9 @@ impl Controller {
     /// Every live row and every edge with an open end, with released
     /// approval holds cleared and fired non-time triggers marked.
     pub(super) async fn load(&self) -> Result<Snapshot, Error> {
+        #[cfg(test)]
+        self.loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.ensure_spent().await?;
         let mut items = self
             .store

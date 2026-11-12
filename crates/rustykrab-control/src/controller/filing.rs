@@ -37,7 +37,7 @@ use super::batch::Batch;
 use super::load::approval_marker;
 use super::notice::{short, Cause};
 use super::questions::NewQuestion;
-use super::{Controller, Finished};
+use super::{Controller, Finished, State};
 
 /// One line per failed check, for events and ladder outcomes.
 pub(super) fn describe_rejection(r: &Rejection) -> String {
@@ -1206,50 +1206,73 @@ impl Controller {
     /// (`commit.rs`, `apply_in_memory`), drop any result they handed in, and
     /// mark the subtree so the tick neither leases it, nor returns it to
     /// `ready` when its lease lapses, nor judges a stopped run as a
-    /// failure. Reads the store, never the lock; an unreadable store stops
-    /// nothing here and the cancel stops the runs under the lock as before.
+    /// failure.
+    ///
+    /// The runs are stopped from memory first: the item's own run and every
+    /// run that recorded the item among its ancestors when it started. That
+    /// reads neither the lock nor the store, so a store connection busy with
+    /// a slow tick's work cannot delay it. Only then is the store read, to
+    /// mark the rest of the open subtree (items with no run here); an
+    /// unreadable store marks nothing more, and the cancel records the rest
+    /// under the lock as before.
     pub(super) async fn stop_for_cancel(&self, item: &str) -> CancelStop<'_> {
-        let mut ids: Vec<WorkItemId> = match self.load().await {
-            Ok(snap) if snap.contains(item) => {
-                let mut ids = vec![item.to_string()];
-                ids.extend(
-                    snap.descendants(item)
-                        .into_iter()
-                        .filter(|d| snap.status(d).is_some_and(|s| !s.is_closed())),
-                );
-                ids
-            }
-            _ => Vec::new(),
+        let mut stop = CancelStop {
+            controller: self,
+            marked: Vec::new(),
+            stopped: Vec::new(),
         };
-        ids.sort();
-        ids.dedup();
-        let mut stopped = Vec::new();
         {
             let mut state = self.state();
-            for id in &ids {
-                state.cancelling.insert(id.clone());
-                if let Some(run) = state.runs.remove(id) {
-                    run.handle.abort();
-                    if let Some(worker) = self.worker(&run.worker) {
-                        worker.stop(&run.run_id);
-                    }
-                    stopped.push((id.clone(), run));
-                }
-                state.finished.remove(id);
+            let under: Vec<WorkItemId> = state
+                .runs
+                .iter()
+                .filter(|(id, run)| id.as_str() == item || run.ancestors.iter().any(|a| a == item))
+                .map(|(id, _)| id.clone())
+                .collect();
+            self.mark_cancelling(&mut state, &mut stop, item);
+            for id in &under {
+                self.mark_cancelling(&mut state, &mut stop, id);
             }
         }
-        if !stopped.is_empty() {
+        if !stop.stopped.is_empty() {
             tracing::info!(
                 item = %item,
-                runs = stopped.len(),
-                "cancel stopped runs before waiting for the control loop"
+                runs = stop.stopped.len(),
+                "cancel stopped runs before reading the store or waiting for the control loop"
             );
         }
-        CancelStop {
-            controller: self,
-            marked: ids,
-            stopped,
+        if let Ok(snap) = self.load().await {
+            if snap.contains(item) {
+                let open: Vec<WorkItemId> = snap
+                    .descendants(item)
+                    .into_iter()
+                    .filter(|d| snap.status(d).is_some_and(|s| !s.is_closed()))
+                    .collect();
+                let mut state = self.state();
+                for id in &open {
+                    self.mark_cancelling(&mut state, &mut stop, id);
+                }
+            }
         }
+        stop
+    }
+
+    /// Mark `id` as being cancelled, stopping its run here if it has one.
+    /// Idempotent.
+    fn mark_cancelling(&self, state: &mut State, stop: &mut CancelStop<'_>, id: &str) {
+        if stop.marked.iter().any(|m| m == id) {
+            return;
+        }
+        stop.marked.push(id.to_string());
+        state.cancelling.insert(id.to_string());
+        if let Some(run) = state.runs.remove(id) {
+            run.handle.abort();
+            if let Some(worker) = self.worker(&run.worker) {
+                worker.stop(&run.run_id);
+            }
+            stop.stopped.push((id.to_string(), run));
+        }
+        state.finished.remove(id);
     }
 
     /// After the cancel was recorded (or refused): record the stopped

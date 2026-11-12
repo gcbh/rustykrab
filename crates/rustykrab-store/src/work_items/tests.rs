@@ -1539,3 +1539,198 @@ async fn a_failed_start_batch_rolls_back_its_human_preference() {
         .unwrap();
     assert_eq!(store.judgment_list(true).await.unwrap().len(), 1);
 }
+
+// ── observation cost ───────────────────────────────────────────────────
+
+fn plan_of(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(["x"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The monitor's evidence counts read the `(item, verified_by)` index and
+/// no table row: `verified_by` sits after `ref`, so reading it from the
+/// table walks a project context's every overflow page. The 24-hour event
+/// window is searched by `at` and needs no sort.
+#[test]
+fn evidence_counts_and_the_event_window_are_answered_from_indexes() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    Store::run_migrations(&conn).unwrap();
+    let plan = plan_of(&conn, monitor::EVIDENCE_COUNTS);
+    assert!(
+        plan.iter()
+            .any(|s| s.contains("COVERING INDEX idx_work_item_evidence_item_verified")),
+        "{plan:?}"
+    );
+    let plan = plan_of(&conn, &ops::events_since_sql());
+    assert!(
+        plan.iter().any(|s| s.contains("idx_work_item_events_at")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|s| s.contains("TEMP B-TREE")), "{plan:?}");
+    assert!(
+        !plan.iter().any(|s| s == "SCAN work_item_events"),
+        "{plan:?}"
+    );
+}
+
+fn context_row(item: &str, reference: String) -> Evidence {
+    Evidence {
+        item: item.into(),
+        kind: "project_context".into(),
+        reference,
+        hash: Some("rev".into()),
+        verified_by: Some("controller".into()),
+        at: Utc::now(),
+    }
+}
+
+/// A snapshot over items carrying ~800 KB recorded contexts reads and
+/// parses the context only of the item with a live lease. The other
+/// items' contexts are malformed JSON: had the snapshot parsed one, it
+/// would have failed. It stays well under a generous time bound and runs
+/// while the shared connection is held, on the observer connection.
+#[tokio::test]
+async fn the_monitor_reads_only_live_runs_contexts_and_not_through_the_shared_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), vec![7u8; 32]).unwrap();
+    let items: Vec<_> = (0..24)
+        .map(|n| item(&format!("i{n:02}"), Status::Ready))
+        .collect();
+    store.work_insert_graph(&items, &[], None).await.unwrap();
+    store
+        .work_lease_acquire("i00", "pinch", 90, vec![])
+        .await
+        .unwrap();
+    let pad = "p".repeat(800_000);
+    for it in &items {
+        let reference = if it.id == "i00" {
+            serde_json::json!({ "base_sources": ["a"], "pad": pad }).to_string()
+        } else {
+            format!("{{\"unparsed\": \"{pad}")
+        };
+        for _ in 0..2 {
+            store
+                .work_evidence_add(context_row(&it.id, reference.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    let hold = store.hold_shared_connection();
+    let began = std::time::Instant::now();
+    let snap = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        store.work_monitor_snapshot(500, 10),
+    )
+    .await
+    .expect("the snapshot does not wait for the shared connection")
+    .unwrap();
+    let took = began.elapsed();
+    drop(hold);
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    assert_eq!(snap.items.len(), 24);
+    for row in &snap.items {
+        assert_eq!(row.evidence_count, 2);
+        assert_eq!(row.verified_evidence_count, 2);
+        if row.item.id == "i00" {
+            assert_eq!(
+                row.project_context.as_ref().unwrap()["base_sources"],
+                serde_json::json!(["a"])
+            );
+        } else {
+            assert!(row.project_context.is_none(), "{}", row.item.id);
+        }
+    }
+}
+
+/// The observer is read-only: a write through it fails and changes
+/// nothing, so it can never become a second writer.
+#[tokio::test]
+async fn the_observer_cannot_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), vec![7u8; 32]).unwrap();
+    store
+        .work_insert_graph(&[item("a", Status::Queued)], &[], None)
+        .await
+        .unwrap();
+    let observer = store.observer();
+    assert!(observer
+        .work_transition_many(&[to("a", Status::Ready)])
+        .await
+        .is_err());
+    assert_eq!(
+        observer.work_get("a").await.unwrap().unwrap().status,
+        Status::Queued
+    );
+    // It sees what the shared connection commits afterwards.
+    store
+        .work_transition_many(&[to("a", Status::Ready)])
+        .await
+        .unwrap();
+    assert_eq!(
+        observer.work_get("a").await.unwrap().unwrap().status,
+        Status::Ready
+    );
+}
+
+#[tokio::test]
+async fn items_with_an_artifact_kind_are_found_by_the_parsed_ref() {
+    let mut tagged = item("tagged", Status::Done);
+    tagged.artifact_refs = vec![ArtifactRef {
+        kind: "service_action".into(),
+        value: "{}".into(),
+    }];
+    let mut mention = item("mention", Status::Queued);
+    mention.artifact_refs = vec![ArtifactRef {
+        kind: "note".into(),
+        value: "\"service_action\"".into(),
+    }];
+    let store = seeded(vec![tagged, mention, item("plain", Status::Queued)], vec![]).await;
+    let found = store
+        .work_items_with_artifact_kind("service_action")
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["tagged"]
+    );
+}
+
+/// Between calls the observer holds no read transaction, so it never pins
+/// the WAL: after a snapshot and a list through it, a TRUNCATE checkpoint
+/// from another connection completes and empties the WAL file. A write
+/// transaction open on another connection does not block it either; it
+/// reads the last committed state, and sees the commit once made.
+#[tokio::test]
+async fn the_observer_never_pins_the_wal_or_waits_for_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), vec![7u8; 32]).unwrap();
+    store
+        .work_insert_graph(&[item("a", Status::Queued)], &[], None)
+        .await
+        .unwrap();
+    let observer = store.observer();
+    observer.work_monitor_snapshot(500, 50).await.unwrap();
+    observer.work_list(&Default::default()).await.unwrap();
+    let other = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+    let busy: i64 = other
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(busy, 0);
+    let wal = std::fs::metadata(dir.path().join("store.db-wal")).unwrap();
+    assert_eq!(wal.len(), 0);
+    other
+        .execute_batch("BEGIN IMMEDIATE; UPDATE work_items SET priority = 9 WHERE id = 'a';")
+        .unwrap();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), observer.work_get("a"))
+        .await
+        .expect("a reader does not wait for a writer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.priority, 0);
+    other.execute_batch("COMMIT").unwrap();
+    assert_eq!(observer.work_get("a").await.unwrap().unwrap().priority, 9);
+}

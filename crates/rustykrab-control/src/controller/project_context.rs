@@ -119,7 +119,7 @@ impl Controller {
             .await
     }
 
-    async fn project_id_in(
+    pub(super) async fn project_id_in(
         &self,
         snap: &Snapshot,
         item: &WorkItem,
@@ -183,7 +183,7 @@ impl Controller {
     /// Item -> (project, its own recorded work) from every controller
     /// project-context record. An unreadable record is an error on every
     /// call until it is fixed: the cursor never passes it.
-    async fn recorded_bindings(
+    pub(super) async fn recorded_bindings(
         &self,
     ) -> Result<BTreeMap<String, (String, Option<ProjectWork>)>, Error> {
         let mut index = self.recorded_bindings.lock().await;
@@ -309,6 +309,7 @@ impl Controller {
             base_sources: Vec::new(),
             questions,
             execution_items,
+            history_items: None,
         };
         Ok(Some(context))
     }

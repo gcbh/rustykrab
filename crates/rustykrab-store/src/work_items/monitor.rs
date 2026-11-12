@@ -1,5 +1,12 @@
-//! Bounded, read-only observations of work in one SQLite read transaction.
+//! Bounded, read-only observations of work in one SQLite read transaction,
+//! on the store's observer connection ([`Store::observer`]), so a snapshot
+//! never holds the connection the controller writes through.
 //! Aggregate counts cover every durable row, independent of the display limits.
+//!
+//! What it reads per displayed item is bounded: counts come from indexes,
+//! and the recorded project context (up to hundreds of KB of JSON per row)
+//! is read and parsed only for an item that holds a live lease, the run it
+//! was supplied to.
 use super::{ops, rows, Spend, Store, WorkStoreError};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -17,7 +24,9 @@ pub struct MonitorItem {
     pub spend: Spend,
     pub evidence_count: u64,
     pub verified_evidence_count: u64,
-    /// Exact context supplied to the latest run; never a newly generated handoff.
+    /// Exact context supplied to the item's live run; never a newly
+    /// generated handoff. `None` for an item without a live lease: reading
+    /// every displayed item's context cost tens of MB of JSON a snapshot.
     #[serde(default)]
     pub project_context: Option<serde_json::Value>,
     #[serde(default)]
@@ -50,6 +59,12 @@ pub struct WorkMonitorSnapshot {
     pub oldest_pending_notice: Option<DateTime<Utc>>,
 }
 
+/// An item's evidence rows and how many carry a verifier label, answered
+/// from `idx_work_item_evidence_item_verified` alone.
+pub(super) const EVIDENCE_COUNTS: &str =
+    "SELECT COUNT(*), COALESCE(SUM(verified_by IS NOT NULL), 0)
+     FROM work_item_evidence WHERE item = ?1";
+
 fn count(conn: &Connection, sql: &str) -> Result<u64, WorkStoreError> {
     Ok(conn.query_row(sql, [], |row| row.get(0))?)
 }
@@ -68,7 +83,8 @@ impl Store {
     ) -> Result<WorkMonitorSnapshot, WorkStoreError> {
         let item_limit = item_limit.clamp(1, 500);
         let event_limit = event_limit.clamp(1, 200);
-        self.work_tx(move |conn| {
+        let observer = self.observer();
+        observer.work_tx(move |conn| {
             // Prioritize live runs and blocked work over completed history.
             let mut stmt = conn.prepare(&format!(
                 "SELECT {} FROM work_items ORDER BY
@@ -99,12 +115,13 @@ impl Store {
                     params![item.id], |r| r.get(0)
                 )?;
                 let (evidence_count, verified_evidence_count) = conn.query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(verified_by IS NOT NULL), 0)
-                     FROM work_item_evidence WHERE item = ?1",
-                    params![item.id], |r| Ok((r.get(0)?, r.get(1)?))
+                    EVIDENCE_COUNTS, params![item.id], |r| Ok((r.get(0)?, r.get(1)?))
                 )?;
                 let spend = ops::spend_of(conn, &item.id)?;
-                let project_context = latest_json(conn, &item.id, "project_context", Some("controller"))?;
+                let project_context = match &lease {
+                    Some(_) => latest_json(conn, &item.id, "project_context", Some("controller"))?,
+                    None => None,
+                };
                 let workspace = latest_json(conn, &item.id, "workspace", None)?;
                 items.push(MonitorItem {
                     item, lease, last_worker, last_activity: last_time.as_deref().and_then(rows::parse_ts),

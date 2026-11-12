@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.30] - 2026-11-12
+
+- Keep observation reads, template checks, cancels and heartbeats off the controller's store connection (#759)
+
 ## [6.6.29] - 2026-11-12
 
 - Give each worker its own build directory and one build at a time beside a local model (#758)

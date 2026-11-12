@@ -332,7 +332,7 @@
       if (attempts) card.append(node('p', attempts + ' unfinished attempt records available for inspection in context evidence.'));
       $('projectRows').append(card);
     }
-    if (!handoffs.length) $('projectRows').append(node('p', 'No project handoff recorded for the displayed work.', 'empty'));
+    if (!handoffs.length) $('projectRows').append(node('p', 'No run in progress carries a project handoff.', 'empty'));
     $('agentCount').textContent = num(reply.workers.length) + ' registered';
     $('agents').replaceChildren();
     if (!reply.workers.length) $('agents').append(node('p', 'No registered agents observed.', 'card empty'));

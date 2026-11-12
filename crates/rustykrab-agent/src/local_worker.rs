@@ -2951,6 +2951,7 @@ mod tests {
             base_sources: vec![],
             questions: vec![],
             execution_items: vec![],
+            history_items: None,
         });
         let objective = b.objective.clone();
         worker.run(b).await.unwrap();

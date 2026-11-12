@@ -456,3 +456,76 @@ async fn a_repeated_cancel_names_only_items_under_the_one_asked_for() {
         vec![parent]
     );
 }
+
+/// A cancel stops the run from memory: with `loop_lock` held by a tick and
+/// the store's shared connection held by a long statement, the run is
+/// stopped at once, its own and one under a cancelled ancestor alike.
+#[tokio::test]
+async fn cancel_stops_the_run_while_the_store_and_the_loop_are_both_busy() {
+    let (h, worker, id) = running().await;
+    let run_id = worker.runs.lock().unwrap()[0].clone();
+    let held = h.ctl.loop_lock.lock().await;
+    let store_busy = h.store().hold_shared_connection();
+    let mut cancel = pin!(ControlHandle::cancel(
+        &h.ctl,
+        &id,
+        Some("not needed".into()),
+        "user:master"
+    ));
+    tokio::select! {
+        _ = &mut cancel => panic!("the cancel records under loop_lock"),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert_eq!(*worker.stopped.lock().unwrap(), vec![run_id]);
+    assert!(h.ctl.running().is_empty(), "stopped before any store read");
+    drop(store_busy);
+    drop(held);
+    cancel.await.expect("cancel");
+    assert!(matches!(h.status(&id).await, Status::Cancelled(_)));
+}
+
+#[tokio::test]
+async fn cancelling_an_ancestor_stops_the_run_from_memory() {
+    let (h, worker, id) = running().await;
+    let run_id = worker.runs.lock().unwrap()[0].clone();
+    h.ctl.state().runs.get_mut(&id).unwrap().ancestors = vec!["parent".into(), "root".into()];
+    let held = h.ctl.loop_lock.lock().await;
+    let store_busy = h.store().hold_shared_connection();
+    let mut cancel = pin!(ControlHandle::cancel(&h.ctl, "root", None, "user:master"));
+    tokio::select! {
+        _ = &mut cancel => panic!("the cancel records under loop_lock"),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert_eq!(*worker.stopped.lock().unwrap(), vec![run_id]);
+    assert!(h.ctl.state().cancelling.contains(&id));
+    drop(store_busy);
+    drop(held);
+    // "root" is not a real item: the cancel is refused, and the marks lift.
+    assert!(cancel.await.is_err());
+    assert!(h.ctl.state().cancelling.is_empty());
+}
+
+/// With the shared connection held, a heartbeat write waits, but the
+/// heartbeat loop does not: it still ends with its run. (Before, the loop
+/// awaited the write and stayed stuck until the connection was free.)
+#[tokio::test]
+async fn the_heartbeat_loop_never_waits_on_a_busy_store() {
+    let (h, worker, id) = running().await;
+    let store_busy = h.store().hold_shared_connection();
+    worker.pulse.store(1, Ordering::SeqCst);
+    // Several intervals (250 ms each) with activity while the write waits.
+    for n in 2..6 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        worker.pulse.store(n, Ordering::SeqCst);
+    }
+    h.ctl.state().runs[&id].handle.abort();
+    wait_until("the heartbeat task ends with its run", || {
+        h.ctl.state().runs[&id]
+            ._heartbeat
+            .0
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+    })
+    .await;
+    drop(store_busy);
+}

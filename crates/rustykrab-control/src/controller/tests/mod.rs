@@ -10,6 +10,7 @@ mod build_slot;
 mod capability_recovery;
 mod checks;
 mod closeout;
+mod contention_bench;
 mod dispatchability;
 mod drain;
 mod investigation;

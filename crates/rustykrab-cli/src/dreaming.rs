@@ -129,10 +129,11 @@ impl Dreaming {
     }
 
     pub async fn view(&self) -> Result<DreamingView, Error> {
-        let reviews = self.store.dream_reviews_recent(1000).await?;
-        let proposals = self.store.proposals_list().await?;
+        let store = self.store.observer();
+        let reviews = store.dream_reviews_recent(1000).await?;
+        let proposals = store.proposals_list().await?;
         let scoped: BTreeSet<_> = self.config.projects.iter().collect();
-        let projects = self.store.projects().list().await?;
+        let projects = store.projects().list().await?;
         let mut metrics = DreamMetaMetrics {
             reviews: reviews.len(),
             eligible_projects: projects
@@ -171,7 +172,7 @@ impl Dreaming {
             .filter(|p| p.filed_by == "dreaming:project")
         {
             metrics.proposal_count += 1;
-            let events = self.store.work_events(&p.item).await?;
+            let events = store.work_events(&p.item).await?;
             let review = events
                 .iter()
                 .rev()
@@ -212,28 +213,26 @@ impl Dreaming {
             metrics.improvement_rate =
                 Some(metrics.improved_outcomes as f64 / metrics.measured_outcomes as f64);
         }
-        let spend = self.store.work_spend_totals().await?;
+        let spend = store.work_spend_totals().await?;
         for id in items {
             if let Some(s) = spend.get(id) {
                 metrics.tokens = metrics.tokens.saturating_add(s.tokens);
                 metrics.wall_seconds = metrics.wall_seconds.saturating_add(s.wall_ms / 1000);
             }
         }
-        let last_evaluation = self
-            .store
+        let last_evaluation = store
             .expectation_metrics_latest()
             .await?
             .iter()
             .map(|m| m.computed_at)
             .max();
-        let last_analysis = self
-            .store
+        let last_analysis = store
             .dream_reports()
             .recent(1)
             .await?
             .first()
             .map(|r| r.generated_at);
-        let outcome_records = self.store.outcomes().count().await?;
+        let outcome_records = store.outcomes().count().await?;
         if outcome_records == 0 {
             metrics
                 .warnings
@@ -423,10 +422,10 @@ impl Dreaming {
         self.store.dream_review_save(&mut review).await
     }
     async fn freeze(&self, project_id: &str) -> Result<ReviewInput, Error> {
+        let store = self.store.observer();
         let captured_at = Utc::now();
         let id = project_id.parse().map_err(err)?;
-        let snapshot = self
-            .store
+        let snapshot = store
             .projects()
             .get(&id)
             .await?
@@ -502,14 +501,13 @@ impl Dreaming {
                 omissions.push("Project repository is not an absolute local path.".into());
             }
         }
-        let work = self
-            .store
+        let work = store
             .work_list(&WorkFilter {
                 include_closed: true,
                 ..Default::default()
             })
             .await?;
-        let edges = self.store.work_edges_all_open().await?;
+        let edges = store.work_edges_all_open().await?;
         let snap = rustykrab_control::graph::Snapshot::new(work, edges);
         let mut matching = project_members(&snap, project_id);
         // Old waiting work needs visibility before completed history. A fresh
@@ -576,7 +574,8 @@ impl Dreaming {
         snap: &rustykrab_control::graph::Snapshot,
         project_id: &str,
     ) -> Result<ReviewEvidence, Error> {
-        let monitor = self.store.work_monitor_snapshot(500, 80).await?;
+        let store = self.store.observer();
+        let monitor = store.work_monitor_snapshot(500, 80).await?;
         let members = project_members(snap, project_id);
         let ids: BTreeSet<_> = members.iter().map(|w| w.id.as_str()).collect();
         let mut states: BTreeMap<&str, usize> = BTreeMap::new();
@@ -618,7 +617,7 @@ impl Dreaming {
                 }));
                 json!({"cursor":e.cursor,"item":e.event.item,"at":e.event.at,"kind":e.event.kind,"from":e.event.from,"to":e.event.to,"failure":failure})
             }).collect();
-        let workers = self.store.workers().list().await?;
+        let workers = store.workers().list().await?;
         let worker_rows: Vec<_> = workers.iter().take(12).map(|w| {
             let tools = w.capabilities.get("tools").and_then(serde_json::Value::as_array);
             let names: Vec<_> = tools.into_iter().flatten().filter_map(serde_json::Value::as_str).take(16).map(|s|clip(s,128)).collect();
