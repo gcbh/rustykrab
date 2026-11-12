@@ -422,6 +422,10 @@ case "$prompt" in
     mkdir -p "$cap"
     printf '%s\n' "$prompt" > "$cap/brief.txt"
     printf '%s\n' "$@" > "$cap/args.txt"
+    {
+      printf '%s\n' "$TMPDIR"
+      if [ -d "$TMPDIR" ] && : > "$TMPDIR/e2e-probe"; then echo writable; fi
+    } > "$cap/tmpdir.txt"
     git rev-parse HEAD > "$cap/head.txt" 2>&1
     {
       echo '$ pwd'; pwd

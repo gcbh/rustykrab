@@ -2442,17 +2442,18 @@ impl Controller {
     }
 
     /// Whether `item` waits for the machine's build slot
-    /// ([`ControllerConfig::serialise_builds`]): it would build (a `code`
-    /// item with a repository workspace, not a read-only review) and
-    /// another building run holds the slot. It stays `ready`, as an item
-    /// waits for a busy worker: no attempt starts, so nothing is spent,
-    /// stalled or failed.
+    /// ([`ControllerConfig::serialise_builds`]): its run would build (it
+    /// would get a writable repository workspace, the condition under
+    /// which [`Self::plan_workspace_at`] plans one, and it is not a
+    /// read-only review), whatever its kind, and another building run holds
+    /// the slot. It stays `ready`, as an item waits for a busy worker: no
+    /// attempt starts, so nothing is spent, stalled or failed.
     pub(super) fn waits_for_build(&self, item: &WorkItem, occupied: &Occupied) -> bool {
         self.config.serialise_builds
             && occupied.build
             && self.config.worktree_root.is_some()
             && Workspace::repo_of(&item.writable_resources).is_some()
-            && builds(item.kind, &item.artifact_refs)
+            && !read_only_review(item)
     }
 
     /// Record what a run or probe on `worker` holds: its resource slot,
@@ -2583,11 +2584,17 @@ pub(super) struct Occupied {
     pub(super) build: bool,
 }
 
-/// Whether work of `kind` with these references builds when it runs in a
-/// repository workspace: a `code` item, unless it is a read-only review.
-fn builds(kind: WorkKind, refs: &[rustykrab_core::work::ArtifactRef]) -> bool {
-    kind == WorkKind::Code
-        && !refs
+/// Whether a run on `brief` builds: it has a repository workspace (a
+/// worktree, and with it a build directory of its worker's) and is not a
+/// read-only review, which the adapters give no build directory and a
+/// read-only sandbox. The item's kind does not decide it: items filed
+/// through the API or chat are stored as `task` whatever their draft said
+/// (`WorkItemDraft::kind`), and on 12 November 2026 two such items built
+/// side by side beside a resident model although builds were serialised.
+fn builds(brief: &Brief) -> bool {
+    brief.workspace.is_some()
+        && !brief
+            .artifact_refs
             .iter()
             .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
 }
@@ -2621,7 +2628,7 @@ impl Controller {
 fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
     let run_id = brief.run.clone().unwrap_or_default();
-    let builds = brief.workspace.is_some() && builds(brief.kind, &brief.artifact_refs);
+    let builds = builds(&brief);
     let isolated_repo = if worker.isolates_worktree() {
         brief
             .workspace

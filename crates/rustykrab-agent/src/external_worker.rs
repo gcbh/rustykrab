@@ -1069,12 +1069,16 @@ impl ExternalWorker {
     }
 
     /// The process for one run.
+    ///
+    /// `tmp` is the run's own temporary directory ([`RunTmp`]): writable in
+    /// its sandbox (`--add-dir`) and its `TMPDIR`, `TMP` and `TEMP`.
     fn command(
         &self,
         prompt: &str,
         dir: &Path,
         brief: &Brief,
         last: &Path,
+        tmp: Option<&Path>,
     ) -> tokio::process::Command {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
@@ -1151,6 +1155,9 @@ impl ExternalWorker {
                 if let Some(home) = &cargo_home {
                     cmd.arg("--add-dir").arg(home);
                 }
+                if let Some(tmp) = tmp {
+                    cmd.arg("--add-dir").arg(tmp);
+                }
                 // An investigation's inputs (its bundle, the session logs,
                 // the failed runs' kept worktrees, the daemon's source) are
                 // named in the brief and need no flag here: Codex's sandbox
@@ -1182,6 +1189,9 @@ impl ExternalWorker {
                 }
                 if let Some(home) = &cargo_home {
                     cmd.arg("--add-dir").arg(home);
+                }
+                if let Some(tmp) = tmp {
+                    cmd.arg("--add-dir").arg(tmp);
                 }
                 // A fix item reads outside its worktree: its investigation
                 // bundle, the failed runs' session logs and kept worktrees,
@@ -1262,6 +1272,16 @@ impl ExternalWorker {
             }
             if let Some(path) = std::env::var_os("PATH") {
                 cmd.env("PATH", rustykrab_tools::path_with_host_cargo_bin(&path));
+            }
+        }
+        // Last, so neither the inherited environment nor a runtime's
+        // isolation replaces it: the daemon's own temporary directory (a
+        // per-user `/var/folders/...` one on macOS) is not one the agent's
+        // sandbox lets it write, and clang, `cc` and build scripts (`ring`,
+        // `aws-lc-sys`) failed to create their temporary files there.
+        if let Some(tmp) = tmp {
+            for name in TMP_ENV {
+                cmd.env(name, tmp);
             }
         }
         cmd
@@ -1707,7 +1727,30 @@ impl Worker for ExternalWorker {
             short(&run_id),
             uuid::Uuid::new_v4()
         ));
-        let cmd = self.command(&prompt, &dir, &brief, &last);
+        // The run's own temporary directory, beside its context files and
+        // removed when the run ends however it ends. A read-only review
+        // writes nothing, temporary files included.
+        let review = brief
+            .artifact_refs
+            .iter()
+            .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
+        let tmp = if review {
+            None
+        } else {
+            Some(RunTmp::create(&context_dir).map_err(|e| {
+                process_failure(
+                    None,
+                    &format!("cannot create a temporary directory for the run: {e}"),
+                )
+            })?)
+        };
+        let cmd = self.command(
+            &prompt,
+            &dir,
+            &brief,
+            &last,
+            tmp.as_ref().map(|t| t.0.as_path()),
+        );
         // The host process/transport timeout is operational, never a task estimate.
         let limit = self.config.timeout;
         let started = std::time::Instant::now();
@@ -1922,6 +1965,40 @@ fn attest(report: &mut ResultReport, commands: &[String]) {
         if !report.artifacts.contains(&r) {
             report.artifacts.push(r);
         }
+    }
+}
+
+/// What C compilers, `cc` and build scripts consult for a temporary
+/// directory: `TMPDIR` on Unix, `TMP` and `TEMP` elsewhere and in some
+/// tools' fallbacks.
+const TMP_ENV: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
+
+/// An external run's own temporary directory, `tmp-<uuid>` under the run's
+/// directory of this worker's (`workers/<name>/runs/<run>`), given to the
+/// agent's sandbox as writable and as its `TMPDIR`. Removed when dropped:
+/// when the run ends, completed, failed, cancelled or interrupted. A
+/// directory a crash left behind goes with the run's directory under the
+/// retention window.
+struct RunTmp(PathBuf);
+
+impl RunTmp {
+    fn create(run_dir: &Path) -> std::io::Result<Self> {
+        let path = run_dir.join(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RunTmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -2785,6 +2862,69 @@ mod tests {
         }
     }
 
+    /// 12 November 2026: Codex's first `cargo test` failed (exit 101) because
+    /// clang could not create temporary files for `ring` / `aws-lc-sys`
+    /// in a directory its sandbox does not allow. Each external run gets a
+    /// temporary directory of its own: it exists while the agent runs, its
+    /// sandbox may write it (`--add-dir`), it is the agent's `TMPDIR`,
+    /// `TMP` and `TEMP`, and it is gone when the run ends.
+    #[tokio::test]
+    async fn an_external_run_gets_a_writable_temporary_directory_of_its_own() {
+        let f = Fixture::new();
+        let script = r#"#!/bin/sh
+out="$RUSTYKRAB_DATA_DIR/tmp-observed.txt"
+{
+  printf 'TMPDIR=%s\n' "$TMPDIR"
+  printf 'TMP=%s\n' "$TMP"
+  printf 'TEMP=%s\n' "$TEMP"
+  if [ -d "$TMPDIR" ] && : > "$TMPDIR/probe"; then echo writable; fi
+  printf '%s\n' "$@"
+} > "$out"
+contract='{"summary":"Looked at the temporary directory"}'
+escaped=$(printf '%s' "$contract" | sed 's/"/\\"/g')
+for a in "$@"; do
+  if [ "$a" = exec ]; then
+    printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n' "$escaped"
+    exit 0
+  fi
+done
+printf '{"type":"result","subtype":"success","result":"%s"}\n' "$escaped"
+"#;
+        for kind in [WorkerKind::ClaudeCode, WorkerKind::Codex] {
+            let worker = f.worker(kind, f.agent("tmp-cli", script));
+            let mut b = brief(Some(f.workspace()));
+            b.kind = WorkKind::Task;
+            let result = worker.run(b).await.unwrap();
+            assert_eq!(
+                result.summary, "Looked at the temporary directory",
+                "{kind:?}"
+            );
+            let observed = std::fs::read_to_string(f.data.path().join("tmp-observed.txt")).unwrap();
+            let lines: Vec<&str> = observed.lines().collect();
+            let tmp = lines[0].strip_prefix("TMPDIR=").unwrap().to_string();
+            assert!(!tmp.is_empty(), "{kind:?}: {observed}");
+            let tmp = PathBuf::from(tmp);
+            assert_eq!(
+                tmp.parent(),
+                Some(worker.runs_root().join("run1").as_path()),
+                "{kind:?}: the run's own directory"
+            );
+            assert_eq!(lines[1], format!("TMP={}", tmp.display()), "{kind:?}");
+            assert_eq!(lines[2], format!("TEMP={}", tmp.display()), "{kind:?}");
+            assert_eq!(lines[3], "writable", "{kind:?}: {observed}");
+            let added: Vec<&str> = lines
+                .windows(2)
+                .filter(|pair| pair[0] == "--add-dir")
+                .map(|pair| pair[1])
+                .collect();
+            assert!(
+                added.contains(&tmp.display().to_string().as_str()),
+                "{kind:?}: {added:?}"
+            );
+            assert!(!tmp.exists(), "{kind:?}: removed with the run");
+        }
+    }
+
     #[tokio::test]
     async fn native_workers_inspect_full_history_without_inlining_it_into_the_prompt() {
         use rustykrab_control::handoff::{ProjectContext, ProjectWork};
@@ -2910,7 +3050,13 @@ else:
             "pinch",
             ExternalConfig::from_spec(&spec, data.path()).unwrap(),
         );
-        let cmd = worker.command("go", data.path(), &brief(None), &data.path().join("last"));
+        let cmd = worker.command(
+            "go",
+            data.path(),
+            &brief(None),
+            &data.path().join("last"),
+            None,
+        );
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -3892,7 +4038,13 @@ exit 9
                 ExternalConfig::from_spec(spec, data.path()).unwrap(),
             );
             worker
-                .command("go", data.path(), &brief(None), &data.path().join("last"))
+                .command(
+                    "go",
+                    data.path(),
+                    &brief(None),
+                    &data.path().join("last"),
+                    None,
+                )
                 .as_std()
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -4059,6 +4211,25 @@ exit 9
             .collect()
     }
 
+    /// The run's own temporary directory among the `--add-dir`s of `args`:
+    /// `tmp-<id>` under `worker`'s directory for run `run-1`.
+    fn run_tmp(worker: &ExternalWorker, args: &str) -> String {
+        let runs = worker.runs_root().join("run1");
+        let found: Vec<String> = added_dirs(args)
+            .into_iter()
+            .filter(|dir| {
+                let dir = Path::new(dir);
+                dir.parent() == Some(runs.as_path())
+                    && dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("tmp-"))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "one temporary directory: {args}");
+        found[0].clone()
+    }
+
     #[tokio::test]
     async fn a_fix_item_on_claude_code_can_read_its_kit_and_is_told_where_it_is() {
         let f = Fixture::new();
@@ -4113,7 +4284,8 @@ exit 9
             .display()
             .to_string();
         let cache = cache.display().to_string();
-        let want: Vec<String> = [cache.clone(), cargo_home.clone()]
+        let tmp = run_tmp(&worker, &args);
+        let want: Vec<String> = [cache.clone(), cargo_home.clone(), tmp]
             .into_iter()
             .chain(kit.read_dirs.iter().map(|d| d.display().to_string()))
             .collect();
@@ -4121,16 +4293,19 @@ exit 9
         // Its toolset is what every Claude Code worker gets: nothing gated.
         assert!(args.contains(&allowed_list(&[])), "{args}");
 
-        // Without a kit, only the build cache and the Cargo home are added.
+        // Without a kit, only the build cache, the Cargo home and the run's
+        // temporary directory are added.
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
         worker.run(brief(Some(f.workspace()))).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert_eq!(added_dirs(&args), [cache, cargo_home], "{args}");
+        let tmp = run_tmp(&worker, &args);
+        assert_eq!(added_dirs(&args), [cache, cargo_home, tmp], "{args}");
     }
 
     /// Codex reads the whole disk from inside its sandbox, and its
     /// `--add-dir` makes a directory writable: a kit is named in the brief
-    /// and given no flag.
+    /// and given no flag. The only writable directory it is given is the
+    /// run's own temporary one.
     #[tokio::test]
     async fn a_fix_item_on_codex_is_told_where_its_kit_is_and_given_no_writable_directory() {
         let f = Fixture::new();
@@ -4153,7 +4328,7 @@ printf '{"summary":"looked"}' > "$out"
         b.investigation = Some(kit.clone());
         worker.run(b).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert!(added_dirs(&args).is_empty(), "{args}");
+        assert_eq!(added_dirs(&args), [run_tmp(&worker, &args)], "{args}");
         assert!(args.contains(&kit.bundle.display().to_string()), "{args}");
         assert!(
             args.contains("readable outside your working directory"),
@@ -4675,7 +4850,13 @@ else:
         for kind in [WorkerKind::Codex, WorkerKind::ClaudeCode] {
             let mut worker = f.worker(kind, cli.clone());
             worker.config.require_chatgpt = kind == WorkerKind::Codex;
-            let command = worker.command("review", f.data.path(), &b, &f.data.path().join("last"));
+            let command = worker.command(
+                "review",
+                f.data.path(),
+                &b,
+                &f.data.path().join("last"),
+                None,
+            );
             let args: Vec<_> = command
                 .as_std()
                 .get_args()

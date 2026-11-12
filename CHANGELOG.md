@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.31] - 2026-11-12
+
+- Serialise builds by workspace, give external runs a TMPDIR, keep local leases alive during long tool calls (#760)
+
 ## [6.6.30] - 2026-11-12
 
 - Keep observation reads, template checks, cancels and heartbeats off the controller's store connection (#759)

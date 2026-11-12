@@ -318,9 +318,9 @@ pub struct ControllerConfig {
     /// 12.1: at most one running item per local worker, and per local
     /// model, so scheduled and interactive work never share a KV slot.
     pub serialise_local: bool,
-    /// One building run at a time on this machine: a `code` item with a
-    /// repository workspace is not leased while another such item's run is
-    /// live, whichever workers would run them (`tick.rs`,
+    /// One building run at a time on this machine: an item whose run gets a
+    /// writable repository workspace (any kind but a read-only review) is
+    /// not leased while another such run is live, whichever workers would run them (`tick.rs`,
     /// [`Controller::waits_for_build`]). The daemon sets it when a worker's
     /// model runs on this machine, the same condition that shares the
     /// local model slot: two workspace builds beside a resident local model
@@ -420,8 +420,9 @@ struct Run {
     worker: String,
     /// Repository resource isolated by this run; other writes remain exclusive.
     isolated_repo: Option<String>,
-    /// Whether the run builds: a `code` item in a repository workspace,
-    /// not a read-only review ([`ControllerConfig::serialise_builds`]).
+    /// Whether the run builds: it has a repository workspace and is not a
+    /// read-only review, whatever its item's kind
+    /// ([`ControllerConfig::serialise_builds`]).
     builds: bool,
     /// The id the controller gave the run (the brief's `run`), which the
     /// worker's [`Worker::usage`] answers for.
