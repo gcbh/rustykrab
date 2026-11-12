@@ -98,6 +98,7 @@ use rustykrab_control::worker::{
 use rustykrab_control::workspace::{self, REPO_PREFIX};
 use rustykrab_core::work::{ArtifactRef, ResultReport, WorkerKind};
 use rustykrab_core::{Error, Result};
+use rustykrab_tools::{RUN_TMP_ID_LEN, RUN_TMP_PREFIX};
 use serde_json::Value;
 
 /// Characters of an agent's stderr kept in a failure.
@@ -1990,9 +1991,6 @@ fn run_tmp_root() -> PathBuf {
     }
 }
 
-/// The name prefix of a run's temporary directory under [`run_tmp_root`].
-const RUN_TMP_PREFIX: &str = "rk-";
-
 /// An external run's own temporary directory, `rk-<12 hex>` under
 /// [`run_tmp_root`] (`/private/tmp` on macOS, `/tmp` on other Unix), given
 /// to the agent's sandbox as writable (`--add-dir`) and as its `TMPDIR`.
@@ -2005,6 +2003,12 @@ const RUN_TMP_PREFIX: &str = "rk-";
 /// interrupted (removing a symlink put in its place removes only the link).
 /// A directory a crash left behind is left to the system's own cleaning of
 /// its temporary directory.
+///
+/// Its name (`rustykrab_tools::RUN_TMP_PREFIX` and `RUN_TMP_ID_LEN` hex
+/// digits) is shared with `rustykrab_tools::Confinement`, whose Seatbelt
+/// profile keeps local runs' confined shells out of every such directory:
+/// they may write the rest of `/private/tmp`, and this user's mode 0700
+/// does not keep out processes of the same user.
 struct RunTmp(PathBuf);
 
 impl RunTmp {
@@ -2020,7 +2024,7 @@ impl RunTmp {
         let mut last = None;
         for _ in 0..Self::ATTEMPTS {
             let id = uuid::Uuid::new_v4().simple().to_string();
-            let path = root.join(format!("{RUN_TMP_PREFIX}{}", &id[..12]));
+            let path = root.join(format!("{RUN_TMP_PREFIX}{}", &id[..RUN_TMP_ID_LEN]));
             // Not recursive: `mkdir` itself fails if anything, a symlink
             // included, is already at the path.
             let mut builder = std::fs::DirBuilder::new();
@@ -4278,7 +4282,9 @@ exit 9
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_prefix(RUN_TMP_PREFIX))
-                .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+                .is_some_and(|id| {
+                    id.len() == RUN_TMP_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())
+                })
     }
 
     /// The longest a run's temporary directory may be: leaves 64 of macOS's
