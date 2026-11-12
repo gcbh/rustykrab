@@ -37,20 +37,48 @@ pub fn shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> 
     cache.parent().map(|root| root.join(SHARED_CARGO_HOME))
 }
 
-/// Files in a Cargo home that would change how every later build runs
-/// (configuration: `rustc-wrapper`, source replacement, runners, aliases) or
-/// hold registry tokens. The shared home is for what Cargo downloads; none
-/// of these belongs in it, since one run could otherwise set them for every
-/// worker's builds.
-pub const CARGO_HOME_CONTROL_FILES: [&str; 4] =
-    ["config", "config.toml", "credentials", "credentials.toml"];
+/// Entries in a Cargo home that would change how every later build runs
+/// (configuration: `rustc-wrapper`, source replacement, runners, aliases;
+/// `bin/`, where Cargo looks for `cargo-<name>` subcommands before the
+/// PATH) or hold registry tokens. The shared home is for what Cargo
+/// downloads; none of these belongs in it, since one run could otherwise
+/// set them for every worker's builds.
+pub const CARGO_HOME_CONTROL_FILES: [&str; 5] = [
+    "config",
+    "config.toml",
+    "credentials",
+    "credentials.toml",
+    "bin",
+];
 
-/// The shared Cargo home for `cache` ([`shared_cargo_home`]), created, and
-/// without any of [`CARGO_HOME_CONTROL_FILES`] an earlier run left there.
-/// Called as each run starts, for local and external workers alike.
+/// The directories of the shared Cargo home a build writes: downloaded
+/// registry indexes, crate archives and their extracted sources, and git
+/// dependencies. Created by [`prepare_shared_cargo_home`]; the only
+/// directories of that home a confined shell may write.
+pub const CARGO_HOME_DOWNLOAD_DIRS: [&str; 2] = ["registry", "git"];
+
+/// The files at the top of the shared Cargo home a build writes: Cargo's
+/// package-cache locks and its global cache tracker (an SQLite database
+/// with its journal files). The only files there a confined shell may write.
+pub const CARGO_HOME_LOCK_FILES: [&str; 6] = [
+    ".package-cache",
+    ".package-cache-mutate",
+    ".global-cache",
+    ".global-cache-journal",
+    ".global-cache-wal",
+    ".global-cache-shm",
+];
+
+/// The shared Cargo home for `cache` ([`shared_cargo_home`]), created with
+/// its [`CARGO_HOME_DOWNLOAD_DIRS`], and without any of
+/// [`CARGO_HOME_CONTROL_FILES`] an earlier run left there. Called as each
+/// run starts, for local and external workers alike.
 pub fn prepare_shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
     let home = shared_cargo_home(cache)?;
-    if let Err(e) = std::fs::create_dir_all(&home) {
+    if let Err(e) = CARGO_HOME_DOWNLOAD_DIRS
+        .iter()
+        .try_for_each(|dir| std::fs::create_dir_all(home.join(dir)))
+    {
         tracing::warn!(
             cargo_home = %home.display(),
             error = %e,
@@ -71,7 +99,7 @@ pub fn prepare_shared_cargo_home(cache: &std::path::Path) -> Option<std::path::P
         match removed {
             Ok(()) => tracing::warn!(
                 path = %path.display(),
-                "removed a Cargo configuration or credentials file from the shared Cargo home"
+                "removed a Cargo configuration, credentials or bin entry from the shared Cargo home"
             ),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot clear the shared Cargo home");
@@ -351,21 +379,13 @@ impl ExecTool {
             return tokio::process::Command::new("sh");
         };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
-        let writable: Vec<&std::path::Path> = self
-            .build_cache
-            .iter()
-            .chain(&self.cargo_home)
-            .map(|p| p.as_path())
-            .collect();
-        // Writable, but not its configuration or credentials files.
-        let protected: Vec<std::path::PathBuf> = self
-            .cargo_home
-            .iter()
-            .flat_map(|home| CARGO_HOME_CONTROL_FILES.map(|name| home.join(name)))
-            .collect();
+        // The build cache, and of the shared Cargo home only what a build
+        // downloads into it and its lock files: not its configuration,
+        // credentials or `bin/`, which every later build would use.
+        let cache: Vec<&std::path::Path> = self.build_cache.iter().map(|p| p.as_path()).collect();
         sandboxed
             .arg("-p")
-            .arg(confinement.profile(dir, &writable, &protected))
+            .arg(confinement.profile(dir, &cache, self.cargo_home.as_deref()))
             .arg("sh");
         sandboxed
     }
@@ -476,7 +496,7 @@ impl Confinement {
         &self,
         dir: &std::path::Path,
         build_dirs: &[&std::path::Path],
-        protected: &[std::path::PathBuf],
+        cargo_home: Option<&std::path::Path>,
     ) -> String {
         let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         let quoted = |p: &std::path::Path| {
@@ -499,16 +519,22 @@ impl Confinement {
             own.push(common.clone());
             git_dirs.push(common);
         }
-        // The build cache and the shared Cargo home are the run's to read
-        // and write, as its own `target/` and Cargo home would be.
+        // The build cache and the shared Cargo home's download directories
+        // are the run's to read and write, as its own `target/` and Cargo
+        // home would be.
         for build_dir in build_dirs {
             own.push(real(build_dir).unwrap_or_else(|| build_dir.to_path_buf()));
         }
+        // The shared Cargo home is read; of it, only what a build downloads
+        // and Cargo's lock files are written (see the rule further down).
+        let cargo_home = cargo_home.map(|d| real(d).unwrap_or_else(|| d.to_path_buf()));
+        let read_only: Vec<std::path::PathBuf> = cargo_home.iter().cloned().collect();
         // Git resolves every directory component even when the worktree itself
         // is readable. A private ancestor (the daemon's data directory) must
         // expose its directory metadata, but not its entries or file contents.
         let ancestors: std::collections::BTreeSet<String> = own
             .iter()
+            .chain(&read_only)
             .flat_map(|p| p.ancestors().skip(1))
             .map(|p| {
                 let path = p
@@ -518,6 +544,7 @@ impl Confinement {
                 format!("(literal \"{path}\")")
             })
             .collect();
+        let readable: Vec<String> = own.iter().chain(&read_only).map(|p| quoted(p)).collect();
         let own: Vec<String> = own.iter().map(|p| quoted(p)).collect();
         let private: Vec<String> = self
             .private
@@ -535,7 +562,7 @@ impl Confinement {
         );
         if !private.is_empty() {
             profile.push_str(&format!("(deny file-read* {})", private.join(" ")));
-            profile.push_str(&format!("(allow file-read* {})", own.join(" ")));
+            profile.push_str(&format!("(allow file-read* {})", readable.join(" ")));
             if !ancestors.is_empty() {
                 profile.push_str(&format!(
                     "(allow file-read-metadata {})",
@@ -556,24 +583,29 @@ impl Confinement {
         if !git.is_empty() {
             profile.push_str(&format!("(deny file-write* {})", git.join(" ")));
         }
-        // Files inside a writable directory that must not be written
-        // (the shared Cargo home's configuration and credentials).
-        let protected: Vec<String> = protected
-            .iter()
-            .filter_map(|p| {
-                let parent = real(p.parent()?)?;
-                Some(format!(
+        // The shared Cargo home, wherever it lies (temporary space is
+        // writable): its configuration, credentials and `bin/` would change
+        // every later build of every worker, so only its download
+        // directories and lock files are writable.
+        if let Some(home) = &cargo_home {
+            let literal = |p: std::path::PathBuf| {
+                format!(
                     "(literal \"{}\")",
-                    parent
-                        .join(p.file_name()?)
-                        .to_string_lossy()
+                    p.to_string_lossy()
                         .replace('\\', "\\\\")
                         .replace('"', "\\\"")
-                ))
-            })
-            .collect();
-        if !protected.is_empty() {
-            profile.push_str(&format!("(deny file-write* {})", protected.join(" ")));
+                )
+            };
+            let allowed: Vec<String> = CARGO_HOME_DOWNLOAD_DIRS
+                .iter()
+                .map(|d| quoted(&home.join(d)))
+                .chain(CARGO_HOME_LOCK_FILES.iter().map(|f| literal(home.join(f))))
+                .collect();
+            profile.push_str(&format!(
+                "(deny file-write* {})(allow file-write* {})",
+                quoted(home),
+                allowed.join(" ")
+            ));
         }
         let sockets: Vec<String> = Self::docker_sockets()
             .iter()
@@ -794,19 +826,22 @@ fn mask_expansions(line: &str) -> String {
         }
         let at = |k: usize| chars.get(k).copied();
         let region = if c == '$' && at(i + 1) == Some('(') && at(i + 2) == Some('(') {
-            Some(close_of(i + 3, '(', ')', 2))
+            // Arithmetic only when the inner `(` closes right before the
+            // outer one (see [`arithmetic_body`]).
+            let inner = close_of(i + 3, '(', ')', 1);
+            (at(inner) == Some(')')).then_some(inner + 1)
         } else if c == '$' && at(i + 1) == Some('{') {
             Some(close_of(i + 2, '{', '}', 1))
         } else if quote.is_none()
             && c == '('
             && at(i + 1) == Some('(')
-            && chars[..i]
-                .iter()
-                .rev()
-                .find(|c| !c.is_whitespace())
-                .is_none_or(|p| matches!(p, ';' | '&' | '|' | '(' | '!' | '\n'))
+            && opens_command(&chars[..i])
         {
-            Some(close_of(i + 2, '(', ')', 2))
+            // A `((…))` command only when the inner `(` closes right
+            // before the outer one: `((sleep 2 &) ; echo ran)` is a
+            // subshell holding a subshell, and its `&` is a real job.
+            let inner = close_of(i + 2, '(', ')', 1);
+            (at(inner) == Some(')')).then_some(inner + 1)
         } else {
             None
         };
@@ -827,6 +862,51 @@ fn mask_expansions(line: &str) -> String {
         i += 1;
     }
     out.into_iter().collect()
+}
+
+/// Whether a command starts after `before`: at the start of the line,
+/// after a control operator, `(`, `!` or a newline, or after a keyword
+/// that a command follows (`if (( x & 1 ))`, `while (( … ))`).
+fn opens_command(before: &[char]) -> bool {
+    let text: String = before.iter().collect();
+    let text = text.trim_end_matches([' ', '\t']);
+    match text.chars().last() {
+        None => true,
+        Some(';' | '&' | '|' | '(' | '!' | '\n') => true,
+        Some(_) => {
+            let word = text
+                .rsplit(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '('))
+                .next()
+                .unwrap_or_default();
+            matches!(
+                word,
+                "if" | "elif" | "while" | "until" | "then" | "do" | "else" | "time"
+            )
+        }
+    }
+}
+
+/// Whether `$(` + `body` + `)` is an arithmetic expansion `$((…))`: `body`
+/// opens with `(` and that parenthesis closes only at its very end.
+/// Otherwise (`$((sleep 2 &) ; echo ran)`) it is a command substitution
+/// whose command starts with a subshell, as the shell reads it.
+fn arithmetic_body(body: &str) -> bool {
+    let count = body.chars().count();
+    let mut depth = 0usize;
+    for (k, c) in body.chars().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return k + 1 == count;
+                }
+            }
+            _ if k == 0 => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A segment's words as the shell splits them: on unquoted blanks, with
@@ -1230,6 +1310,12 @@ fn expand_at(
     match (at(i), at(i + 1), at(i + 2)) {
         (Some('$'), Some('('), Some('(')) => {
             let (body, after) = substitution_body(chars, i + 2)?;
+            if !arithmetic_body(&body) {
+                // `$((sleep 2 &) ; echo ran)`: a command substitution.
+                inner.push(body);
+                outer.push_str(SUBSTITUTION);
+                return Ok(Some(after));
+            }
             if body.contains("$(") || body.contains('`') {
                 return Err("an arithmetic expansion holds a command substitution; \
                             run that command on its own first"
@@ -1940,6 +2026,12 @@ mod background_and_timeout_tests {
             "eval 'sleep 9 &'",
             // Arithmetic beside it does not hide it.
             "echo $((1 & 1)); sleep 9 &",
+            // Nor does a substitution or subshell that only starts like
+            // arithmetic: a subshell inside, closed before the end.
+            "$((sleep 2 &) ; echo ran)",
+            "echo \"$((sleep 2 &) ; echo ran)\"",
+            "((sleep 2 &) ; echo ran)",
+            "x; ((sleep 2 &) )",
         ] {
             let error = refuse_background(command).unwrap_err();
             assert!(
@@ -1970,6 +2062,18 @@ mod background_and_timeout_tests {
             "echo \"${v//&/and}\"",
             "sh -c 'a && b'",
             "cat <<'EOF'\nrun & later\nEOF",
+            "echo $(( x & 1 ))",
+            "echo $(( (a + b) & 1 ))",
+            "if (( x & 1 )); then echo odd; fi",
+            "while (( n & 1 )); do n=0; done",
+            "echo x\n(( y & 1 )) && echo odd",
+            // What the workers run every day.
+            "cargo test 2>&1 | tail -20",
+            "cargo test -p x -- --test-threads=1 2>&1 | tail -n 50",
+            "curl -s 'https://example.invalid/?a=1&b=2'",
+            "git log --format='%h & %s' -5",
+            "[[ -n a && -n b ]] && echo y",
+            "git commit -m \"$(cat <<'EOF'\nfix a & b\nEOF\n)\"",
         ] {
             refuse_background(command).unwrap_or_else(|e| panic!("{command}: {e}"));
         }
@@ -2137,6 +2241,44 @@ mod background_and_timeout_tests {
         );
     }
 
+    /// Opt-in, with the host's real Cargo and network, macOS only: a build
+    /// with one dependency succeeds in the confined shell, which may write
+    /// only the shared Cargo home's download directories and lock files.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
+    async fn real_cargo_builds_in_the_confined_shell_with_a_narrowed_home() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(
+            work.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nitoa = \"=1.0.11\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("src/lib.rs"),
+            "pub fn f() -> String { itoa::Buffer::new().format(1).into() }\n",
+        )
+        .unwrap();
+        let tool = ExecTool::in_dir(&work)
+            .confined(vec![data.path().to_path_buf()])
+            .with_build_cache(&cache);
+        let out = tool
+            .execute(json!({"command": "cargo build 2>&1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        println!("REAL_CONFINED_RECEIPT {out}");
+        assert_eq!(out["exit_code"], 0, "{out}");
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("Compiling itoa"), "{stdout}");
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(home.join("registry/src").is_dir(), "sources extracted");
+        assert!(!home.join("bin").exists());
+    }
+
     #[test]
     fn each_run_clears_configuration_and_credentials_from_the_shared_home() {
         let data = tempfile::tempdir().unwrap();
@@ -2147,7 +2289,12 @@ mod background_and_timeout_tests {
         std::fs::write(home.join("config.toml"), "[alias]\nplanted = \"version\"\n").unwrap();
         std::fs::write(home.join("credentials.toml"), "token").unwrap();
         std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin/cargo-fmt"), "#!/bin/sh\necho planted\n").unwrap();
         assert_eq!(prepare_shared_cargo_home(&cache), Some(home.clone()));
+        for dir in CARGO_HOME_DOWNLOAD_DIRS {
+            assert!(home.join(dir).is_dir(), "{dir} is created");
+        }
         for name in CARGO_HOME_CONTROL_FILES {
             assert!(!home.join(name).exists(), "{name} survived");
         }
@@ -2189,6 +2336,9 @@ mod forced_removal_tests {
             "timeout 5 rm -rf build",
             "nice -n 10 rm -rf build",
             "if true; then rm -rf build; fi",
+            // A command substitution that only starts like arithmetic.
+            "echo $((rm -rf build) )",
+            "echo \"$((rm -rf build); echo done)\"",
         ] {
             let error = refuse_forced_removal(command).unwrap_err();
             assert!(error.contains("forced removal"), "{command}: {error}");
@@ -2644,16 +2794,40 @@ mod error_typing_tests {
         )
         .await;
         assert_eq!((code, text.as_str()), (0, "fetched\n"));
-        // But not its configuration or credentials, which would change
-        // every later build of every worker.
+        // Its git checkouts and lock files are writable too.
+        for command in [
+            "mkdir -p \"$CARGO_HOME/git/db\" && echo x > \"$CARGO_HOME/git/db/entry\"",
+            "echo > \"$CARGO_HOME/.package-cache\" && echo > \"$CARGO_HOME/.global-cache\" \
+             && echo > \"$CARGO_HOME/.global-cache-journal\"",
+        ] {
+            let (code, text) = run_in(&tool, command).await;
+            assert_eq!(code, 0, "{command}: {text}");
+        }
+        // But not its configuration, credentials or `bin/`, which would
+        // change every later build of every worker, nor anything else there.
         for name in super::CARGO_HOME_CONTROL_FILES {
             let (code, _) = run_in(&tool, &format!("echo planted > \"$CARGO_HOME/{name}\"")).await;
             assert_ne!(code, 0, "{name} was writable");
         }
-        assert!(data
-            .path()
-            .join("build-cache/cargo-home/registry/entry")
-            .is_file());
+        for command in [
+            "mkdir \"$CARGO_HOME/bin\"",
+            "mkdir \"$CARGO_HOME/other\"",
+            "echo planted > \"$CARGO_HOME/env\"",
+            "echo planted > \"$CARGO_HOME/registry/entry2\" \
+             && mv \"$CARGO_HOME/registry/entry2\" \"$CARGO_HOME/config.toml\"",
+            "ln -s registry \"$CARGO_HOME/bin\"",
+        ] {
+            let (code, _) = run_in(&tool, command).await;
+            assert_ne!(code, 0, "{command} succeeded");
+        }
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(home.join("registry/entry").is_file());
+        for name in super::CARGO_HOME_CONTROL_FILES
+            .iter()
+            .chain(&["other", "env"])
+        {
+            assert!(!home.join(name).exists(), "{name} was created");
+        }
         // The cache opens nothing else in the private directory.
         let (code, text) = run_in(&tool, "cat ../../service.json").await;
         assert_ne!(code, 0);

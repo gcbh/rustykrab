@@ -1577,11 +1577,13 @@ impl Worker for ExternalWorker {
 
 /// Why a run is not completed, so its worktree is kept for the next attempt
 /// rather than removed; `None` when it is. Completed is a report with no
-/// block, no error and no questions whose worktree holds no uncommitted
-/// edit to a tracked file (whether or not the branch has a commit) and, when
-/// the branch has no commit, no untracked file either. Both the local and the external workers decide by
-/// this: a run blocked on a question with its change still uncommitted lost
-/// that change when only failed runs kept their worktrees.
+/// block, no error and no questions whose worktree holds nothing git would
+/// lose with it: no uncommitted edit to a tracked file and no untracked
+/// file git does not ignore, whether or not the branch has a commit (a new
+/// source file never staged is work too; build output and anything in
+/// `.gitignore` does not count). Both the local and the external workers
+/// decide by this: a run blocked on a question with its change still
+/// uncommitted lost that change when only failed runs kept their worktrees.
 pub(crate) async fn unfinished_reason(
     outcome: &Result<ResultReport>,
     workspace: Option<&workspace::Workspace>,
@@ -1603,8 +1605,8 @@ pub(crate) async fn unfinished_reason(
     tokio::task::spawn_blocking(move || {
         if ws.has_uncommitted_tracked_changes() {
             Some("uncommitted changes to tracked files".to_string())
-        } else if !ws.has_commits() && ws.has_uncommitted_changes() {
-            Some("uncommitted changes and no commit".to_string())
+        } else if ws.has_uncommitted_changes() {
+            Some("untracked files git does not ignore".to_string())
         } else {
             None
         }
@@ -2842,9 +2844,10 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         std::fs::write(ws.path.join("test.log"), "log\n").unwrap();
         assert_eq!(
             unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
-            Some("uncommitted changes and no commit")
+            Some("untracked files git does not ignore")
         );
-        // After a commit, a stray untracked file no longer keeps it...
+        // After a commit, an untracked file git does not ignore still keeps
+        // it: a new source file nobody staged is lost with the worktree.
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn committed() {}\n").unwrap();
         git(&ws.path, &["add", "src/lib.rs"]);
         git(
@@ -2862,6 +2865,35 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
             ],
         );
         assert!(ws.has_commits());
+        std::fs::write(ws.path.join("src/new.rs"), "pub fn new() {}\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("untracked files git does not ignore")
+        );
+        std::fs::remove_file(ws.path.join("src/new.rs")).unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("untracked files git does not ignore"),
+            "test.log is not ignored by this repository"
+        );
+        // What the repository ignores (build output, logs) does not count.
+        std::fs::write(ws.path.join(".gitignore"), "*.log\n").unwrap();
+        git(&ws.path, &["add", ".gitignore"]);
+        git(
+            &ws.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "ignore logs",
+            ],
+        );
+        assert!(ws.path.join("test.log").is_file());
         assert_eq!(unfinished_reason(&Ok(done()), Some(&ws)).await, None);
         // ...but a further edit to a tracked file does: removing the
         // worktree would lose it.
