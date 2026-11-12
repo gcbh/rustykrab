@@ -1275,7 +1275,7 @@ impl Controller {
         // A cancel stopped this item's run and is waiting to record it: a
         // result that arrives now is no longer the item's.
         if state.cancelling.contains(&item) {
-            return Err(Error::Internal(format!(
+            return Err(Error::Auth(format!(
                 "{item} is being cancelled; its result is not accepted"
             )));
         }

@@ -303,7 +303,10 @@ async fn a_result_handed_in_after_the_cancel_stopped_the_run_is_refused() {
         },
     )
     .await;
-    assert!(late.is_err(), "a stopped run's result is refused: {late:?}");
+    assert!(
+        matches!(late, Err(Error::Auth(_))),
+        "a stopped run's result is refused like a lost lease: {late:?}"
+    );
     h.ctl
         .tick_locked(Ok(None), Ok(Default::default()))
         .await
@@ -348,4 +351,45 @@ async fn a_concurrent_tick_does_not_touch_the_timed_ticks_record() {
     let done = status(&h);
     assert_eq!(done.tick_phase, None);
     assert!(done.last_tick_ms.is_some());
+}
+
+/// The loop's tick queues untimed behind a timed manual tick that is then
+/// dropped (its client went away): once it holds `loop_lock`, the loop's
+/// tick claims the free record, so its run is timed and shown.
+#[tokio::test]
+async fn a_tick_queued_behind_a_dropped_timed_tick_is_timed() {
+    let h = Harness::new(&["pinch"]);
+    let held = h.ctl.loop_lock.lock().await;
+    let mut queued = {
+        let mut manual = Box::pin(ControlHandle::tick(&h.ctl));
+        tokio::select! {
+            _ = &mut manual => panic!("the tick cannot pass loop_lock"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        let manual_started = status(&h).tick_started;
+        assert!(manual_started.is_some());
+        h.clock.advance(TimeDelta::seconds(1));
+        let mut queued = Box::pin(ControlHandle::tick(&h.ctl));
+        tokio::select! {
+            _ = &mut queued => panic!("the tick cannot pass loop_lock"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert_eq!(status(&h).tick_started, manual_started, "untimed meanwhile");
+        queued
+    };
+    // The manual tick was dropped: its record ended.
+    assert_eq!(status(&h).tick_phase, None);
+    h.ctl.state().last_timing = None;
+    let claimed_at = h.clock.now();
+    // Free the lock: the queued tick takes it and claims the record, so
+    // its pass ends with its own timing.
+    drop(held);
+    (&mut queued).await.expect("tick");
+    let done = status(&h);
+    assert!(
+        done.last_tick_ms.is_some(),
+        "the queued tick was timed once the record was free: {done:?}"
+    );
+    assert_eq!(done.tick_phase, None);
+    assert!(h.ctl.state().last_tick.is_some_and(|t| t >= claimed_at));
 }

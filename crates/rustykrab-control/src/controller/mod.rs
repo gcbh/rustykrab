@@ -836,7 +836,8 @@ impl ControlHandle for Controller {
         // lock; a concurrent answer must not wait behind that background work.
         // Ends the tick's timing however the tick ends, dropped included.
         let timing = liveness::TickTimer::begin(self, "prepare");
-        let pass = async {
+        let id = timing.id();
+        let pass = async move {
             let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
                 (Ok(None), Ok(Default::default()))
             } else {
@@ -847,14 +848,30 @@ impl ControlHandle for Controller {
             };
             self.phase("loop_lock");
             let _loop = self.loop_lock.lock().await;
-            if self.state().lock == Some(LockState::Waiting) {
-                return Err(Error::LockWaiting(format!(
-                    "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
-                )));
+            // Rebound after the guard so the record ends before loop_lock
+            // is released, however the tick ends: a tick queued on the lock
+            // then finds the record free.
+            let timing = timing;
+            // A tick that began while another was timed (the loop's tick
+            // behind a manual one) claims the record once it holds the lock.
+            let late = timing
+                .id()
+                .is_none()
+                .then(|| liveness::TickTimer::begin(self, "loop_lock"));
+            let locked = async {
+                if self.state().lock == Some(LockState::Waiting) {
+                    return Err(Error::LockWaiting(format!(
+                        "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
+                    )));
+                }
+                self.tick_locked(handoffs, upstream).await
+            };
+            match late.as_ref().and_then(liveness::TickTimer::id) {
+                Some(late) => liveness::TICK.scope(late, locked).await,
+                None => locked.await,
             }
-            self.tick_locked(handoffs, upstream).await
         };
-        match timing.id() {
+        match id {
             Some(id) => liveness::TICK.scope(id, pass).await,
             None => pass.await,
         }

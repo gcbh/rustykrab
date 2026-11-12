@@ -78,8 +78,10 @@ static NEXT_TICK: AtomicU64 = AtomicU64::new(1);
 /// Times one tick from [`TickTimer::begin`] until it is dropped, so a tick
 /// that fails, or whose future is dropped, still ends its record. A tick
 /// that begins while another is being timed (a manual `work tick` beside
-/// the loop's) is not timed: the record stays the first tick's, and only
-/// the timer that created it moves or ends it.
+/// the loop's) is not timed at first: the record stays the first tick's,
+/// and only the timer that created it moves or ends it. Once the later tick
+/// holds `loop_lock` it begins a timer again, which claims the record if it
+/// is free (`Controller::tick`).
 pub(super) struct TickTimer<'a> {
     controller: &'a Controller,
     id: Option<u64>,
