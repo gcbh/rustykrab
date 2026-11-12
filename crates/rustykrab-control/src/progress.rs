@@ -48,7 +48,7 @@ pub struct Stall {
     pub steps: u32,
     /// Steps in a row that brought nothing new.
     pub without_progress: u32,
-    /// The tool of the last step.
+    /// The tool of the last step, or of the call that kept failing.
     pub last_tool: String,
     /// When the stall is one call failing again and again: how often it
     /// failed and the kind of error. `None` for a run without new evidence.
@@ -84,10 +84,11 @@ pub struct StepLedger {
     last_tool: String,
     /// How often each (tool, arguments, error kind) has failed in the run.
     failures: HashMap<u64, u32>,
-    /// The count of the last step's failure, when the last step failed.
-    last_failure: Option<(u32, String)>,
-    /// The most any one call has failed identically.
-    most_failures: Option<(u32, String)>,
+    /// The count, error kind and tool of the last step's failure, when the
+    /// last step failed.
+    last_failure: Option<(u32, String, String)>,
+    /// The most any one call has failed identically: count, kind and tool.
+    most_failures: Option<(u32, String, String)>,
 }
 
 impl StepLedger {
@@ -130,15 +131,15 @@ impl StepLedger {
             kind.hash(&mut h);
             let count = self.failures.entry(h.finish()).or_insert(0);
             *count += 1;
-            (*count, kind.to_string())
+            (*count, kind.to_string(), tool.to_string())
         });
-        if let Some((count, kind)) = &self.last_failure {
+        if let Some(failure) = &self.last_failure {
             if self
                 .most_failures
                 .as_ref()
-                .is_none_or(|(most, _)| count > most)
+                .is_none_or(|(most, _, _)| failure.0 > *most)
             {
-                self.most_failures = Some((*count, kind.clone()));
+                self.most_failures = Some(failure.clone());
             }
         }
         let mut h = DefaultHasher::new();
@@ -160,20 +161,23 @@ impl StepLedger {
     /// Or, once the last step's call has failed the same way
     /// [`REPEATED_FAILURE_WARNING`] times in the run.
     pub fn stalled(&self) -> Option<Stall> {
-        if let Some((count, kind)) = &self.last_failure {
-            if *count >= REPEATED_FAILURE_WARNING {
-                return Some(self.stall(Some((*count, kind.clone()))));
+        if let Some(failure) = &self.last_failure {
+            if failure.0 >= REPEATED_FAILURE_WARNING {
+                return Some(self.stall(Some(failure)));
             }
         }
         (self.since_progress >= self.threshold).then(|| self.stall(None))
     }
 
-    fn stall(&self, repeated_failure: Option<(u32, String)>) -> Stall {
+    /// The stall as it stands; for a repeated failure, naming the tool
+    /// that failed rather than whichever ran last.
+    fn stall(&self, repeated_failure: Option<&(u32, String, String)>) -> Stall {
         Stall {
             steps: self.steps,
             without_progress: self.since_progress,
-            last_tool: self.last_tool.clone(),
-            repeated_failure,
+            last_tool: repeated_failure
+                .map_or_else(|| self.last_tool.clone(), |(_, _, tool)| tool.clone()),
+            repeated_failure: repeated_failure.map(|(count, kind, _)| (*count, kind.clone())),
         }
     }
 
@@ -183,9 +187,9 @@ impl StepLedger {
     /// Also due once any one call has failed the same way
     /// [`REPEATED_FAILURE_LIMIT`] times in the run.
     pub fn recovery_due(&self) -> Option<Stall> {
-        if let Some((count, kind)) = &self.most_failures {
-            if *count >= REPEATED_FAILURE_LIMIT {
-                return Some(self.stall(Some((*count, kind.clone()))));
+        if let Some(failure) = &self.most_failures {
+            if failure.0 >= REPEATED_FAILURE_LIMIT {
+                return Some(self.stall(Some(failure)));
             }
         }
         (self.since_progress >= self.threshold.saturating_mul(2)).then(|| self.stall(None))
@@ -279,9 +283,12 @@ mod tests {
                 assert!(l.stalled().is_none(), "round {round}");
             }
         }
+        // A different tool running afterwards does not change who failed.
+        l.record_call("read", &json!({"path": "x"}), "contents", None);
         let stall = l
             .recovery_due()
             .expect("six identical failures end the run");
+        assert_eq!(stall.last_tool, "exec");
         assert_eq!(stall.repeated_failure, Some((6, "timeout".into())));
         assert!(
             stall.detail().contains("progress ledger"),

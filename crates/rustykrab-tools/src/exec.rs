@@ -37,6 +37,51 @@ pub fn shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> 
     cache.parent().map(|root| root.join(SHARED_CARGO_HOME))
 }
 
+/// Files in a Cargo home that would change how every later build runs
+/// (configuration: `rustc-wrapper`, source replacement, runners, aliases) or
+/// hold registry tokens. The shared home is for what Cargo downloads; none
+/// of these belongs in it, since one run could otherwise set them for every
+/// worker's builds.
+pub const CARGO_HOME_CONTROL_FILES: [&str; 4] =
+    ["config", "config.toml", "credentials", "credentials.toml"];
+
+/// The shared Cargo home for `cache` ([`shared_cargo_home`]), created, and
+/// without any of [`CARGO_HOME_CONTROL_FILES`] an earlier run left there.
+/// Called as each run starts, for local and external workers alike.
+pub fn prepare_shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
+    let home = shared_cargo_home(cache)?;
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        tracing::warn!(
+            cargo_home = %home.display(),
+            error = %e,
+            "shared Cargo home unavailable"
+        );
+        return None;
+    }
+    for name in CARGO_HOME_CONTROL_FILES {
+        let path = home.join(name);
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        let removed = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "removed a Cargo configuration or credentials file from the shared Cargo home"
+            ),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot clear the shared Cargo home");
+                return None;
+            }
+        }
+    }
+    Some(home)
+}
+
 // Dropping wait_with_output kills only the direct child. A timed-out shell can
 // otherwise leave its actual command running after the observation is gone.
 #[cfg(unix)]
@@ -276,16 +321,7 @@ impl ExecTool {
             }
         }
         if self.build_cache.is_some() {
-            if let Some(home) = shared_cargo_home(&cache) {
-                match std::fs::create_dir_all(&home) {
-                    Ok(()) => self.cargo_home = Some(home),
-                    Err(e) => tracing::warn!(
-                        cargo_home = %home.display(),
-                        error = %e,
-                        "shared Cargo home unavailable; Cargo uses the isolated home's"
-                    ),
-                }
-            }
+            self.cargo_home = prepare_shared_cargo_home(&cache);
         }
         self
     }
@@ -321,9 +357,15 @@ impl ExecTool {
             .chain(&self.cargo_home)
             .map(|p| p.as_path())
             .collect();
+        // Writable, but not its configuration or credentials files.
+        let protected: Vec<std::path::PathBuf> = self
+            .cargo_home
+            .iter()
+            .flat_map(|home| CARGO_HOME_CONTROL_FILES.map(|name| home.join(name)))
+            .collect();
         sandboxed
             .arg("-p")
-            .arg(confinement.profile(dir, &writable))
+            .arg(confinement.profile(dir, &writable, &protected))
             .arg("sh");
         sandboxed
     }
@@ -430,7 +472,12 @@ impl Confinement {
     /// The Seatbelt profile for commands run in `dir`. Paths are resolved,
     /// since the sandbox matches real paths (`/tmp` is `/private/tmp`);
     /// a private path that does not exist is left out.
-    fn profile(&self, dir: &std::path::Path, build_dirs: &[&std::path::Path]) -> String {
+    fn profile(
+        &self,
+        dir: &std::path::Path,
+        build_dirs: &[&std::path::Path],
+        protected: &[std::path::PathBuf],
+    ) -> String {
         let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         let quoted = |p: &std::path::Path| {
             let s = p
@@ -509,6 +556,25 @@ impl Confinement {
         if !git.is_empty() {
             profile.push_str(&format!("(deny file-write* {})", git.join(" ")));
         }
+        // Files inside a writable directory that must not be written
+        // (the shared Cargo home's configuration and credentials).
+        let protected: Vec<String> = protected
+            .iter()
+            .filter_map(|p| {
+                let parent = real(p.parent()?)?;
+                Some(format!(
+                    "(literal \"{}\")",
+                    parent
+                        .join(p.file_name()?)
+                        .to_string_lossy()
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                ))
+            })
+            .collect();
+        if !protected.is_empty() {
+            profile.push_str(&format!("(deny file-write* {})", protected.join(" ")));
+        }
         let sockets: Vec<String> = Self::docker_sockets()
             .iter()
             .filter_map(|p| real(p))
@@ -586,6 +652,20 @@ pub fn host_cargo_bin() -> Option<std::path::PathBuf> {
     (bin.is_absolute() && bin.is_dir()).then_some(bin)
 }
 
+/// `path` with [`host_cargo_bin`] appended when it exists and is not on it
+/// already: a shell or worker given the shared Cargo home keeps finding
+/// Rustup's proxies and installed Cargo subcommands.
+pub fn path_with_host_cargo_bin(path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
+    match host_cargo_bin() {
+        Some(bin) if !dirs.contains(&bin) => {
+            dirs.push(bin);
+            std::env::join_paths(dirs).unwrap_or_else(|_| path.to_os_string())
+        }
+        _ => path.to_os_string(),
+    }
+}
+
 fn truncate_output(s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
         // Use floor_char_boundary to avoid panicking when the truncation
@@ -633,15 +713,24 @@ fn forced_removal_nested(command: &str, depth: usize) -> std::result::Result<(),
 
 /// Refuse a command that runs work in the background with a control `&`
 /// (`sleep 30 &`, `nohup cargo test > log & disown`), wherever it does: in
-/// any segment or inside a substitution. Every process the command starts
-/// is killed when the call returns, so the work can never survive it, and a
-/// backgrounded process holding the output open makes the call wait for its
-/// whole time limit anyway. `&&`, redirections (`2>&1`, `&>file`) and a
-/// quoted `&` are not backgrounding, and jobs the same command then `wait`s
-/// for (`a & b & wait`) finish inside the call.
+/// any segment, inside a substitution, or in the script of `sh -c`,
+/// `bash -c` or `eval`. Every process the command starts is killed when
+/// the call returns, so the work can never survive it, and a backgrounded
+/// process holding the output open makes the call wait for its whole time
+/// limit anyway. `&&`, redirections (`2>&1`, `&>file`), a quoted `&` and
+/// the `&` of arithmetic (`$((a & b))`, `(( x & 1 ))`) or of a parameter
+/// expansion (`${v//&/and}`) are not backgrounding. A `wait` does not
+/// excuse it: `disown`, a subshell or a later `&` all escape the wait.
 fn refuse_background(command: &str) -> std::result::Result<(), String> {
     background_nested(command, 0)
 }
+
+const BACKGROUND_REFUSAL: &str =
+    "running work in the background (a control `&`, as with `nohup … &` or `disown`) is \
+     refused: every process this command starts is killed when the call returns, so \
+     background work can never survive it and its output is lost. Run the command in the \
+     foreground and raise timeout_secs (up to 600) if it needs longer; a cargo build or test \
+     keeps the steps it finished, so running it again continues where it stopped.";
 
 fn background_nested(command: &str, depth: usize) -> std::result::Result<(), String> {
     if depth > MAX_SUBSTITUTION_DEPTH {
@@ -651,25 +740,246 @@ fn background_nested(command: &str, depth: usize) -> std::result::Result<(), Str
     for body in &inner {
         background_nested(body, depth + 1)?;
     }
-    let (segments, background) = scan_segments(&command)?;
-    let waits = segments.iter().any(|s| segment_program(s) == Some("wait"));
-    if background && !waits {
-        return Err(
-            "running work in the background (a control `&`, as with `nohup … &` or `disown`) \
-             is refused: every process this command starts is killed when the call returns, so \
-             background work can never survive it and its output is lost. Run the command in \
-             the foreground and raise timeout_secs (up to 600) if it needs longer; a cargo \
-             build or test keeps the steps it finished, so running it again continues where \
-             it stopped."
-                .into(),
-        );
+    let masked = mask_expansions(&command);
+    let (segments, background) = scan_segments(&masked)?;
+    if background {
+        return Err(BACKGROUND_REFUSAL.into());
+    }
+    for segment in segments {
+        for script in shell_scripts(segment) {
+            background_nested(&script, depth + 1)?;
+        }
     }
     Ok(())
 }
 
-/// Whether any command the line runs, in any segment or substitution, is
-/// Cargo (past assignments, redirects, the shell's own words and wrappers
-/// such as `env` or `nohup`). A line that cannot be parsed is not one.
+/// `line` with every `&` inside arithmetic (`$((…))`, a `((…))` command)
+/// and parameter expansions (`${…}`) replaced by a space, so the segment
+/// scan sees only the shell's control operators. Quoted text is left as it
+/// is (the scan already skips it); the length never changes.
+fn mask_expansions(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = chars.clone();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    // The end (exclusive) of the region at `from` whose `close` balances
+    // its `open`, starting at depth `depth`.
+    let close_of = |from: usize, open: char, close: char, mut depth: usize| {
+        let mut k = from;
+        while k < chars.len() {
+            if chars[k] == open {
+                depth += 1;
+            } else if chars[k] == close {
+                depth -= 1;
+                if depth == 0 {
+                    return k + 1;
+                }
+            }
+            k += 1;
+        }
+        chars.len()
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        let at = |k: usize| chars.get(k).copied();
+        let region = if c == '$' && at(i + 1) == Some('(') && at(i + 2) == Some('(') {
+            Some(close_of(i + 3, '(', ')', 2))
+        } else if c == '$' && at(i + 1) == Some('{') {
+            Some(close_of(i + 2, '{', '}', 1))
+        } else if quote.is_none()
+            && c == '('
+            && at(i + 1) == Some('(')
+            && chars[..i]
+                .iter()
+                .rev()
+                .find(|c| !c.is_whitespace())
+                .is_none_or(|p| matches!(p, ';' | '&' | '|' | '(' | '!' | '\n'))
+        {
+            Some(close_of(i + 2, '(', ')', 2))
+        } else {
+            None
+        };
+        if let Some(end) = region {
+            for slot in &mut out[i..end] {
+                if *slot == '&' {
+                    *slot = ' ';
+                }
+            }
+            i = end;
+            continue;
+        }
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('"'), '"') => quote = None,
+            _ => {}
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+/// A segment's words as the shell splits them: on unquoted blanks, with
+/// quotes removed and backslash escapes resolved.
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = segment.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                }
+            }
+            Some(_) => word.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                }
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether option `opt` of wrapper `wrapper` takes the next word as its
+/// value (`timeout -s KILL`, `env -u NAME`, `sudo -u user`).
+fn wrapper_option_takes_value(wrapper: &str, opt: &str) -> bool {
+    match wrapper {
+        "timeout" => matches!(opt, "-s" | "-k" | "--signal" | "--kill-after"),
+        "env" => matches!(opt, "-u" | "-C" | "--unset" | "--chdir"),
+        "sudo" | "doas" => matches!(
+            opt,
+            "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-r" | "-t" | "-U" | "--user" | "--group"
+        ),
+        "nice" => matches!(opt, "-n" | "--adjustment"),
+        "stdbuf" => matches!(opt, "-i" | "-o" | "-e"),
+        "xargs" => matches!(opt, "-I" | "-n" | "-P" | "-L" | "-d" | "-E" | "-s" | "-a"),
+        _ => false,
+    }
+}
+
+/// The index in `words` of the program a segment runs, past assignments,
+/// redirects and their targets, the shell's own words, and wrappers with
+/// their options and values.
+fn program_index(words: &[String]) -> Option<usize> {
+    let mut i = 0;
+    let mut target_next = false;
+    while i < words.len() {
+        let token = words[i]
+            .trim_start_matches(['(', '{'])
+            .trim_end_matches([')', '}']);
+        if std::mem::take(&mut target_next) {
+            i += 1;
+            continue;
+        }
+        if let Some(needs_target) = redirect(token) {
+            target_next = needs_target;
+            i += 1;
+            continue;
+        }
+        if token.is_empty()
+            || (token.contains('=') && !token.starts_with('='))
+            || SHELL_WORDS.contains(&token)
+        {
+            i += 1;
+            continue;
+        }
+        let name = token.rsplit('/').next().unwrap_or(token);
+        if WRAPPERS.contains(&name) {
+            i += 1;
+            while i < words.len() {
+                let word = words[i].as_str();
+                if wrapper_option_takes_value(name, word) {
+                    i += 2;
+                } else if word.starts_with('-')
+                    || word.contains('=')
+                    || (matches!(name, "timeout" | "nice")
+                        && word.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// The name of the program a segment runs (see [`program_index`]).
+fn segment_program(segment: &str) -> Option<String> {
+    let words = shell_words(segment);
+    let i = program_index(&words)?;
+    let token = words[i]
+        .trim_start_matches(['(', '{'])
+        .trim_end_matches([')', '}']);
+    Some(token.rsplit('/').next().unwrap_or(token).to_string())
+}
+
+/// The scripts a segment hands to another shell to run: the argument of
+/// `sh -c` (or `bash`, `zsh`, `dash`, `ksh`, with `-c` alone or in a flag
+/// group such as `-ec`), or the words of `eval`.
+fn shell_scripts(segment: &str) -> Vec<String> {
+    let words = shell_words(segment);
+    let Some(i) = program_index(&words) else {
+        return Vec::new();
+    };
+    let token = words[i]
+        .trim_start_matches(['(', '{'])
+        .trim_end_matches([')', '}']);
+    let name = token.rsplit('/').next().unwrap_or(token);
+    match name {
+        "eval" => vec![words[i + 1..].join(" ")],
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => words[i + 1..]
+            .iter()
+            .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+            .and_then(|k| words.get(i + 2 + k))
+            .cloned()
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether any command the line runs, in any segment, substitution or
+/// `sh -c`/`eval` script, is Cargo (past assignments, redirects, the
+/// shell's own words and wrappers such as `env` or `nohup`). A line that
+/// cannot be parsed is not one.
 fn runs_cargo(command: &str) -> bool {
     fn nested(command: &str, depth: usize) -> bool {
         if depth > MAX_SUBSTITUTION_DEPTH {
@@ -682,51 +992,14 @@ fn runs_cargo(command: &str) -> bool {
             || command_segments(&command)
                 .unwrap_or_default()
                 .into_iter()
-                .any(|segment| segment_program(segment) == Some("cargo"))
+                .any(|segment| {
+                    segment_program(segment).as_deref() == Some("cargo")
+                        || shell_scripts(segment)
+                            .iter()
+                            .any(|script| nested(script, depth + 1))
+                })
     }
     nested(command, 0)
-}
-
-/// The name of the program a segment runs, past assignments, redirects and
-/// their targets, the shell's own words and wrappers with their flags.
-fn segment_program(segment: &str) -> Option<&str> {
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-    let mut i = 0;
-    let mut target_next = false;
-    while i < tokens.len() {
-        let token = tokens[i]
-            .trim_matches(|c| c == '"' || c == '\'')
-            .trim_start_matches('(')
-            .trim_end_matches(')');
-        i += 1;
-        if std::mem::take(&mut target_next) {
-            continue;
-        }
-        if let Some(needs_target) = redirect(token) {
-            target_next = needs_target;
-            continue;
-        }
-        if token.is_empty()
-            || (token.contains('=') && !token.starts_with('='))
-            || SHELL_WORDS.contains(&token)
-        {
-            continue;
-        }
-        let name = token.rsplit('/').next().unwrap_or(token);
-        if WRAPPERS.contains(&name) {
-            while i < tokens.len()
-                && (tokens[i].starts_with('-')
-                    || tokens[i].contains('=')
-                    || (matches!(name, "timeout" | "nice")
-                        && tokens[i].chars().next().is_some_and(|c| c.is_ascii_digit())))
-            {
-                i += 1;
-            }
-            continue;
-        }
-        return Some(name);
-    }
-    None
 }
 
 /// The time limit a call gets: what it asks for (or the default), at most
@@ -1436,7 +1709,10 @@ impl Tool for ExecTool {
                 .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
         }
         if let Some(home) = &self.cargo_home {
-            process.env("CARGO_HOME", home);
+            process.env("CARGO_HOME", home).env(
+                "PATH",
+                path_with_host_cargo_bin(std::ffi::OsStr::new(&path)),
+            );
         }
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
@@ -1652,6 +1928,18 @@ mod background_and_timeout_tests {
             "(cargo test &)",
             "echo $(sleep 5 & echo started)",
             "cargo test 2>&1 & echo launched",
+            // A wait does not excuse it: each of these leaves work behind.
+            "sleep 1 & sleep 2 & wait",
+            "nohup cargo test > log 2>&1 & disown; wait",
+            "(cargo test &); wait",
+            "sleep 1 & wait; sleep 100 &",
+            // Nor does handing the line to another shell.
+            "sh -c 'cargo test &'",
+            "bash -c \"nohup cargo test &\"",
+            "bash -ec 'sleep 9 & echo x'",
+            "eval 'sleep 9 &'",
+            // Arithmetic beside it does not hide it.
+            "echo $((1 & 1)); sleep 9 &",
         ] {
             let error = refuse_background(command).unwrap_err();
             assert!(
@@ -1675,7 +1963,12 @@ mod background_and_timeout_tests {
             "echo \"a & b\"",
             r"echo a \& b",
             "make || echo failed",
-            "sleep 1 & sleep 2 & wait",
+            "echo $((5 & 3))",
+            "x=$(( a & 1 ))",
+            "(( x & 1 )) && echo odd",
+            "echo ${v//&/and}",
+            "echo \"${v//&/and}\"",
+            "sh -c 'a && b'",
             "cat <<'EOF'\nrun & later\nEOF",
         ] {
             refuse_background(command).unwrap_or_else(|e| panic!("{command}: {e}"));
@@ -1704,6 +1997,13 @@ mod background_and_timeout_tests {
             "env CARGO_TERM_COLOR=never /usr/bin/cargo check",
             "echo $(cargo metadata --format-version 1)",
             "nohup cargo test > log",
+            "RUSTFLAGS=\"-D warnings\" cargo build",
+            "RUSTFLAGS='-D warnings' cargo build",
+            "timeout -s KILL 300 cargo test",
+            "env -u FOO cargo test",
+            "sudo -u bob cargo test",
+            "bash -c 'cargo test'",
+            "eval cargo test",
         ] {
             assert!(runs_cargo(command), "{command}");
         }
@@ -1835,6 +2135,23 @@ mod background_and_timeout_tests {
             home.join("registry").is_dir(),
             "sources live in the shared home"
         );
+    }
+
+    #[test]
+    fn each_run_clears_configuration_and_credentials_from_the_shared_home() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let home = prepare_shared_cargo_home(&cache).unwrap();
+        std::fs::create_dir_all(home.join("registry/src")).unwrap();
+        std::fs::write(home.join("registry/src/kept"), "kept").unwrap();
+        std::fs::write(home.join("config.toml"), "[alias]\nplanted = \"version\"\n").unwrap();
+        std::fs::write(home.join("credentials.toml"), "token").unwrap();
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        assert_eq!(prepare_shared_cargo_home(&cache), Some(home.clone()));
+        for name in CARGO_HOME_CONTROL_FILES {
+            assert!(!home.join(name).exists(), "{name} survived");
+        }
+        assert!(home.join("registry/src/kept").is_file(), "downloads stay");
     }
 
     #[cfg(unix)]
@@ -2251,7 +2568,9 @@ mod error_typing_tests {
         let dir = tempfile::tempdir().unwrap();
         let output = ExecTool::in_dir(dir.path())
             .confined(Vec::new())
-            .execute(json!({"command": "sleep 30 & rk_owned_child=$!; kill -0 \"$rk_owned_child\" && kill -TERM \"$rk_owned_child\"; wait \"$rk_owned_child\"; rk_owned_status=$?; test \"$rk_owned_status\" -ge 128"}))
+            // The child is started without `&`, which exec refuses: a
+            // process spawned inside the same sandbox invocation.
+            .execute(json!({"command": "rk_owned_child=$(python3 -c \"import subprocess; print(subprocess.Popen(['sleep','30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)\"); kill -0 \"$rk_owned_child\" && kill -TERM \"$rk_owned_child\" || exit 1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do kill -0 \"$rk_owned_child\" 2>/dev/null || exit 0; sleep 0.1; done; exit 1"}))
             .await
             .unwrap();
         assert_eq!(output["exit_code"], 0, "{output}");
@@ -2325,6 +2644,12 @@ mod error_typing_tests {
         )
         .await;
         assert_eq!((code, text.as_str()), (0, "fetched\n"));
+        // But not its configuration or credentials, which would change
+        // every later build of every worker.
+        for name in super::CARGO_HOME_CONTROL_FILES {
+            let (code, _) = run_in(&tool, &format!("echo planted > \"$CARGO_HOME/{name}\"")).await;
+            assert_ne!(code, 0, "{name} was writable");
+        }
         assert!(data
             .path()
             .join("build-cache/cargo-home/registry/entry")

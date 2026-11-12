@@ -138,7 +138,8 @@ pub use write::WriteTool;
 // Runtime
 pub use code_execution::CodeExecutionTool;
 pub use exec::{
-    host_cargo_bin, rustup_home, shared_cargo_home, Confinement, ExecTool, CARGO_BUILD_JOBS,
+    path_with_host_cargo_bin, prepare_shared_cargo_home, rustup_home, shared_cargo_home,
+    Confinement, ExecTool, CARGO_BUILD_JOBS, CARGO_HOME_CONTROL_FILES,
     MAX_TIMEOUT_SECS as EXEC_MAX_TIMEOUT_SECS,
 };
 pub use process::ProcessTool;

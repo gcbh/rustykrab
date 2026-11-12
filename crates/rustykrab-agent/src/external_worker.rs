@@ -861,10 +861,11 @@ impl ExternalWorker {
             .filter(|cache| std::fs::create_dir_all(cache.join("target")).is_ok());
         // Beside it, the Cargo home every worker shares, so one copy of
         // each dependency serves them all (the local workers' shells too).
+        // Any configuration or credentials file an earlier run left in it
+        // is removed first.
         let cargo_home = build_cache
             .as_deref()
-            .and_then(rustykrab_tools::shared_cargo_home)
-            .filter(|home| std::fs::create_dir_all(home).is_ok());
+            .and_then(rustykrab_tools::prepare_shared_cargo_home);
         match c.kind {
             WorkerKind::Codex => {
                 if c.require_chatgpt {
@@ -1019,15 +1020,8 @@ impl ExternalWorker {
             if let Some(rustup) = rustykrab_tools::rustup_home() {
                 cmd.env("RUSTUP_HOME", rustup);
             }
-            if let Some(bin) = rustykrab_tools::host_cargo_bin() {
-                let path = std::env::var_os("PATH").unwrap_or_default();
-                let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-                if !dirs.contains(&bin) {
-                    dirs.push(bin);
-                    if let Ok(joined) = std::env::join_paths(dirs) {
-                        cmd.env("PATH", joined);
-                    }
-                }
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", rustykrab_tools::path_with_host_cargo_bin(&path));
             }
         }
         cmd
