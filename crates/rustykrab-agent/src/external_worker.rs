@@ -1577,8 +1577,9 @@ impl Worker for ExternalWorker {
 
 /// Why a run is not completed, so its worktree is kept for the next attempt
 /// rather than removed; `None` when it is. Completed is a report with no
-/// block, no error and no questions whose changes are committed (or that
-/// changed nothing). Both the local and the external workers decide by
+/// block, no error and no questions whose worktree holds no uncommitted
+/// edit to a tracked file (whether or not the branch has a commit) and, when
+/// the branch has no commit, no untracked file either. Both the local and the external workers decide by
 /// this: a run blocked on a question with its change still uncommitted lost
 /// that change when only failed runs kept their worktrees.
 pub(crate) async fn unfinished_reason(
@@ -1600,8 +1601,13 @@ pub(crate) async fn unfinished_reason(
     }
     let ws = workspace?.clone();
     tokio::task::spawn_blocking(move || {
-        (!ws.has_commits() && ws.has_uncommitted_changes())
-            .then(|| "uncommitted changes and no commit".to_string())
+        if ws.has_uncommitted_tracked_changes() {
+            Some("uncommitted changes to tracked files".to_string())
+        } else if !ws.has_commits() && ws.has_uncommitted_changes() {
+            Some("uncommitted changes and no commit".to_string())
+        } else {
+            None
+        }
     })
     .await
     .unwrap_or_else(|e| Some(format!("the worktree could not be inspected: {e}")))
@@ -2829,7 +2835,40 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
         assert_eq!(
             unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("uncommitted changes to tracked files")
+        );
+        // Only an untracked file and no commit: kept too.
+        git(&ws.path, &["checkout", "--", "src/lib.rs"]);
+        std::fs::write(ws.path.join("test.log"), "log\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
             Some("uncommitted changes and no commit")
+        );
+        // After a commit, a stray untracked file no longer keeps it...
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn committed() {}\n").unwrap();
+        git(&ws.path, &["add", "src/lib.rs"]);
+        git(
+            &ws.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "c",
+            ],
+        );
+        assert!(ws.has_commits());
+        assert_eq!(unfinished_reason(&Ok(done()), Some(&ws)).await, None);
+        // ...but a further edit to a tracked file does: removing the
+        // worktree would lose it.
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn after_commit() {}\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("uncommitted changes to tracked files")
         );
         // Without a worktree only the report decides.
         assert_eq!(unfinished_reason(&Ok(done()), None).await, None);

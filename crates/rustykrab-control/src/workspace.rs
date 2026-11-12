@@ -236,13 +236,21 @@ impl Workspace {
     /// or untracked files git does not ignore. A worktree git cannot read
     /// counts as holding some, so it is kept rather than removed.
     pub fn has_uncommitted_changes(&self) -> bool {
+        self.status_lists_changes("--untracked-files=all")
+    }
+
+    /// Whether files git tracks are modified or staged but not committed,
+    /// leaving untracked files aside. Such edits are lost when the worktree
+    /// is removed, whatever the branch already holds.
+    pub fn has_uncommitted_tracked_changes(&self) -> bool {
+        self.status_lists_changes("--untracked-files=no")
+    }
+
+    fn status_lists_changes(&self, untracked: &str) -> bool {
         if !self.path.exists() {
             return false;
         }
-        match git(
-            &self.path,
-            &["status", "--porcelain", "--untracked-files=all"],
-        ) {
+        match git(&self.path, &["status", "--porcelain", untracked]) {
             Ok(out) if out.status.success() => !out.stdout.iter().all(u8::is_ascii_whitespace),
             _ => true,
         }
@@ -1032,6 +1040,15 @@ pub(crate) mod tests {
         assert!(!ws.has_uncommitted_changes());
         std::fs::write(ws.path.join("new.txt"), "untracked\n").unwrap();
         assert!(ws.has_uncommitted_changes(), "an untracked file");
+        assert!(
+            !ws.has_uncommitted_tracked_changes(),
+            "untracked is not tracked"
+        );
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn after() {}\n").unwrap();
+        assert!(
+            ws.has_uncommitted_tracked_changes(),
+            "a tracked edit after a commit"
+        );
         ws.remove().unwrap();
         assert!(!ws.path.exists(), "the worktree directory goes");
         assert_eq!(ws.tip().unwrap().as_deref(), Some(commit.as_str()));
