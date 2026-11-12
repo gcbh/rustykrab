@@ -1159,8 +1159,23 @@ async fn cancel(
 ) -> Result<Json<CancelReply>, WorkApiError> {
     let control = control(&state)?;
     let reason = reason_of(&body)?;
-    let before = control.graph(&id).await.ok();
-    let cancelled = match control.cancel(&id, reason, &actor_of(principal)).await {
+    // The cancel runs on its own task: it waits for the control loop, which
+    // a slow tick holds, and must complete even if the client stops waiting
+    // and this request's future is dropped.
+    let task = {
+        let control = control.clone();
+        let id = id.clone();
+        let actor = actor_of(principal);
+        tokio::spawn(async move {
+            let before = control.graph(&id).await.ok();
+            let cancelled = control.cancel(&id, reason, &actor).await;
+            (before, cancelled)
+        })
+    };
+    let (before, cancelled) = task
+        .await
+        .map_err(|e| WorkApiError::from(Error::Internal(format!("cancel task ended: {e}"))))?;
+    let cancelled = match cancelled {
         Ok(ids) => ids,
         Err(e) => return Err(control_error(&state, &id, e).await),
     };

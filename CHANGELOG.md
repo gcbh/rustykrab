@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.28] - 2026-11-12
+
+- Keep the controller observable, its leases alive and cancels prompt while a tick is slow (#757)
+
 ## [6.6.27] - 2026-11-12
 
 - Keep worker builds alive: refuse backgrounding, share a persistent Cargo home, stop repeated identical failures, keep unfinished worktrees (#756)

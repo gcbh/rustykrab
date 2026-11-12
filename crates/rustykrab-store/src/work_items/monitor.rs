@@ -151,7 +151,9 @@ fn latest_json(
 ) -> Result<Option<serde_json::Value>, WorkStoreError> {
     let value: Option<String> = conn
         .query_row(
-            "SELECT ref FROM work_item_evidence WHERE item = ?1 AND kind = ?2
+            // `+kind`: search by item; an older SQLite may otherwise pick the
+            // per-kind index and scan every row of a common kind.
+            "SELECT ref FROM work_item_evidence WHERE item = ?1 AND +kind = ?2
          AND (?3 IS NULL OR verified_by = ?3)
          AND (?2 <> 'workspace' OR (verified_by IS NULL AND hash IS NOT NULL))
          ORDER BY id DESC LIMIT 1",

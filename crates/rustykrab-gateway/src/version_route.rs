@@ -32,7 +32,10 @@ struct VersionReply {
 /// the data directory's `controller.lock` and ticks, `"waiting"` while
 /// another process holds it, and `None` before the loop first tries it.
 /// `draining` is set once the daemon is shutting down: nothing new is
-/// leased while the runs in flight finish.
+/// leased while the runs in flight finish. `tick_started` and `tick_phase`
+/// say when the tick in progress began and where it is now (`None` between
+/// ticks), so a slow tick shows which phase holds it; `last_tick_ms` and
+/// `last_tick_slowest_phase` (with `_ms`) describe the previous tick.
 #[derive(Debug, Serialize)]
 struct ControllerReply {
     wired: bool,
@@ -43,6 +46,11 @@ struct ControllerReply {
     consecutive_failed_ticks: Option<u32>,
     lock: Option<LockState>,
     draining: Option<bool>,
+    tick_started: Option<DateTime<Utc>>,
+    tick_phase: Option<String>,
+    last_tick_ms: Option<u64>,
+    last_tick_slowest_phase: Option<String>,
+    last_tick_slowest_phase_ms: Option<u64>,
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionReply> {
@@ -59,6 +67,13 @@ async fn version(State(state): State<AppState>) -> Json<VersionReply> {
             lock: status.as_ref().and_then(|s| s.lock),
             last_failed_tick: status.as_ref().and_then(|s| s.last_failed_tick),
             consecutive_failed_ticks: status.as_ref().map(|s| s.consecutive_failed_ticks),
+            tick_started: status.as_ref().and_then(|s| s.tick_started),
+            tick_phase: status.as_ref().and_then(|s| s.tick_phase.clone()),
+            last_tick_ms: status.as_ref().and_then(|s| s.last_tick_ms),
+            last_tick_slowest_phase: status
+                .as_ref()
+                .and_then(|s| s.last_tick_slowest_phase.clone()),
+            last_tick_slowest_phase_ms: status.as_ref().and_then(|s| s.last_tick_slowest_phase_ms),
             last_failure_class: status.and_then(|s| s.last_failure_class),
         },
     })
@@ -263,6 +278,34 @@ mod tests {
         assert_eq!(failed, failed_at);
         let last: DateTime<Utc> = controller["last_tick"].as_str().unwrap().parse().unwrap();
         assert_eq!(last, at());
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_tick_in_progress_and_the_last_tick_timing() {
+        let started = at() + chrono::TimeDelta::seconds(5);
+        let base = serve(state().with_control(Arc::new(StubControl(Some(LoopStatus {
+            last_tick: Some(at()),
+            tick_started: Some(started),
+            tick_phase: Some("observe_execution".into()),
+            last_tick_ms: Some(42_000),
+            last_tick_slowest_phase: Some("prepare".into()),
+            last_tick_slowest_phase_ms: Some(31_000),
+            ..LoopStatus::default()
+        })))))
+        .await;
+        let (status, body) = get_version(&base).await;
+        assert_eq!(status, Http::OK, "{body}");
+        let controller = &body["controller"];
+        let since: DateTime<Utc> = controller["tick_started"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(since, started);
+        assert_eq!(controller["tick_phase"], "observe_execution");
+        assert_eq!(controller["last_tick_ms"], 42_000);
+        assert_eq!(controller["last_tick_slowest_phase"], "prepare");
+        assert_eq!(controller["last_tick_slowest_phase_ms"], 31_000);
     }
 
     #[tokio::test]

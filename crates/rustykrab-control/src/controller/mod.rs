@@ -72,6 +72,7 @@ mod dispatchability;
 mod execution_progress;
 mod filing;
 mod investigation;
+mod liveness;
 mod load;
 mod merge_recovery;
 mod notice;
@@ -421,7 +422,11 @@ struct Run {
     /// The run already handed in its result through `result_report`; what
     /// its task returns is ignored.
     reported: bool,
-    activity: Option<u64>,
+    /// The worker's last observed activity, shared with the run's
+    /// heartbeat task (`liveness.rs`).
+    liveness: Arc<liveness::Liveness>,
+    /// Stops the run's heartbeat task when the run is dropped.
+    _heartbeat: liveness::HeartbeatGuard,
     merge_progress: Option<execution_progress::MergeProgress>,
 }
 
@@ -476,6 +481,14 @@ struct State {
     /// The standing judgment in force (section 7), reloaded after a grant
     /// changes.
     judgment: Option<Arc<Judgment>>,
+    /// Items a cancel has stopped and not yet recorded (it waits for
+    /// `loop_lock`): the tick neither leases them, nor returns them to
+    /// `ready` when their lease lapses, nor judges their runs.
+    cancelling: HashSet<WorkItemId>,
+    /// The tick in progress, for [`LoopStatus`] (`liveness.rs`).
+    tick: Option<liveness::TickProgress>,
+    /// What the last tick that ended took, and its slowest phase.
+    last_timing: Option<liveness::TickTiming>,
     /// The daemon's own source checkout as last looked for, with the
     /// candidate repositories it was looked for among: asked again only
     /// when the candidates change.
@@ -503,6 +516,14 @@ pub struct Controller {
     /// Controller-recorded project bindings read so far
     /// ([`project_context::RecordedBindings`]).
     recorded_bindings: tokio::sync::Mutex<project_context::RecordedBindings>,
+    /// Each repository's upstream default-branch commit as last fetched
+    /// (`tick.rs`, [`Controller::upstream_base`]): shared by the handoff
+    /// rechecks and the lease preparation, and reused for a few minutes so
+    /// most ticks run no network Git.
+    upstream_cache: tokio::sync::Mutex<HashMap<PathBuf, tick::CachedBase>>,
+    /// Test seam: how many times the controller listed projects.
+    #[cfg(test)]
+    project_lists: std::sync::atomic::AtomicUsize,
     /// Set on the way down ([`ControlHandle::set_draining`]): ticks lease
     /// nothing new.
     draining: AtomicBool,
@@ -546,8 +567,14 @@ impl Controller {
                 lock: None,
                 judgment: None,
                 source: None,
+                cancelling: HashSet::new(),
+                tick: None,
+                last_timing: None,
             }),
             recorded_bindings: tokio::sync::Mutex::new(Default::default()),
+            upstream_cache: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            project_lists: std::sync::atomic::AtomicUsize::new(0),
             draining: AtomicBool::new(false),
         }
     }
@@ -781,14 +808,23 @@ impl ControlHandle for Controller {
         self.reject_locked(root, reason, actor).await
     }
 
+    /// Stops the item's runs (and its open subtree's) at once, before
+    /// waiting for `loop_lock`, which a slow tick can hold for minutes; the
+    /// cancellation itself is recorded under the lock as before
+    /// (`filing.rs`, [`Controller::stop_for_cancel`]).
     async fn cancel(
         &self,
         item: &str,
         reason: Option<String>,
         actor: &str,
     ) -> Result<Vec<WorkItemId>, Error> {
-        let _loop = self.loop_lock.lock().await;
-        self.cancel_locked(item, reason, actor).await
+        let stopping = self.stop_for_cancel(item).await;
+        let result = {
+            let _loop = self.loop_lock.lock().await;
+            self.cancel_locked(item, reason, actor).await
+        };
+        self.finish_cancel(stopping, result.is_ok()).await;
+        result
     }
 
     /// Refuses with [`Error::LockWaiting`] while the loop last found
@@ -798,21 +834,47 @@ impl ControlHandle for Controller {
     async fn tick(&self) -> Result<TickReport, Error> {
         // Read/reconstruct expensive project history before taking the command
         // lock; a concurrent answer must not wait behind that background work.
-        let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
-            (Ok(None), Ok(Default::default()))
-        } else {
-            tokio::join!(
-                self.prepare_handoff_rechecks(),
-                self.prepare_upstream_bases()
-            )
+        // Ends the tick's timing however the tick ends, dropped included.
+        let timing = liveness::TickTimer::begin(self, "prepare");
+        let id = timing.id();
+        let pass = async move {
+            let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
+                (Ok(None), Ok(Default::default()))
+            } else {
+                tokio::join!(
+                    self.prepare_handoff_rechecks(),
+                    self.prepare_upstream_bases()
+                )
+            };
+            self.phase("loop_lock");
+            let _loop = self.loop_lock.lock().await;
+            // Rebound after the guard so the record ends before loop_lock
+            // is released, however the tick ends: a tick queued on the lock
+            // then finds the record free.
+            let timing = timing;
+            // A tick that began while another was timed (the loop's tick
+            // behind a manual one) claims the record once it holds the lock.
+            let late = timing
+                .id()
+                .is_none()
+                .then(|| liveness::TickTimer::begin(self, "loop_lock"));
+            let locked = async {
+                if self.state().lock == Some(LockState::Waiting) {
+                    return Err(Error::LockWaiting(format!(
+                        "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
+                    )));
+                }
+                self.tick_locked(handoffs, upstream).await
+            };
+            match late.as_ref().and_then(liveness::TickTimer::id) {
+                Some(late) => liveness::TICK.scope(late, locked).await,
+                None => locked.await,
+            }
         };
-        let _loop = self.loop_lock.lock().await;
-        if self.state().lock == Some(LockState::Waiting) {
-            return Err(Error::LockWaiting(format!(
-                "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
-            )));
+        match id {
+            Some(id) => liveness::TICK.scope(id, pass).await,
+            None => pass.await,
         }
-        self.tick_locked(handoffs, upstream).await
     }
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {
@@ -828,7 +890,18 @@ impl ControlHandle for Controller {
 
     fn loop_status(&self) -> Option<LoopStatus> {
         let state = self.state();
+        let (tick_started, tick_phase) = Self::tick_in_progress(&state);
+        let previous = state.last_timing;
         Some(LoopStatus {
+            tick_started,
+            tick_phase: tick_phase.map(str::to_string),
+            last_tick_ms: previous.map(|t| liveness::millis(t.total)),
+            last_tick_slowest_phase: previous
+                .and_then(|t| t.slowest)
+                .map(|(name, _)| name.to_string()),
+            last_tick_slowest_phase_ms: previous
+                .and_then(|t| t.slowest)
+                .map(|(_, took)| liveness::millis(took)),
             last_tick: state.last_tick,
             runs_in_flight: state.runs.len(),
             last_failed_tick: state.last_failure.map(|(at, _)| at),

@@ -1168,3 +1168,61 @@ async fn an_unreadable_recorded_context_fails_every_reconstruction() {
         );
     }
 }
+
+/// Reconstructing a project's history walks every item in the store. It
+/// once listed the projects again for each item without an explicit
+/// binding: hundreds of project queries per pass, each through the store's
+/// one connection. One reconstruction lists them once.
+#[tokio::test]
+async fn reconstruction_lists_projects_once_however_many_items_there_are() {
+    use std::sync::atomic::Ordering;
+    let repo = Repo::new();
+    let h = Harness::with_fleet(ControllerConfig::default(), vec![]);
+    let project = project(&h, &repo).await;
+    let mut members = Vec::new();
+    for n in 0..40 {
+        members.push(
+            h.file_one(code(&repo, WorkerKind::Codex, &format!("member {n}"), None))
+                .await,
+        );
+    }
+    for n in 0..260 {
+        h.file_one(draft("job", &format!("unrelated {n}"))).await;
+    }
+    let snap = h.ctl.load().await.unwrap();
+    assert!(snap.items().len() >= 300);
+    let item = snap.item(&members[0]).unwrap().clone();
+
+    let before = h.ctl.project_lists.load(Ordering::Relaxed);
+    let context = h
+        .ctl
+        .project_context(&snap, &item)
+        .await
+        .unwrap()
+        .expect("the repository names the project");
+    let lists = h.ctl.project_lists.load(Ordering::Relaxed) - before;
+    assert_eq!(context.snapshot.project.id, project.project.id);
+    assert_eq!(context.work.len(), members.len());
+    assert_eq!(
+        lists,
+        1,
+        "one project listing for {} items",
+        snap.items().len()
+    );
+
+    let before = h.ctl.project_lists.load(Ordering::Relaxed);
+    let mut contexts = std::collections::BTreeMap::new();
+    for id in &members {
+        let row = snap.item(id).unwrap();
+        h.ctl
+            .cached_project_context(&snap, row, &mut contexts)
+            .await
+            .unwrap()
+            .expect("a member's context");
+    }
+    let lists = h.ctl.project_lists.load(Ordering::Relaxed) - before;
+    assert!(
+        lists <= members.len(),
+        "at most one listing per cached lookup, not one per item: {lists}"
+    );
+}

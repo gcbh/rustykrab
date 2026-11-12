@@ -725,6 +725,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_work_item_evidence_item
                 ON work_item_evidence (item);
 
+            -- Evidence of one kind across every item (merge recoveries,
+            -- recorded project contexts, learned rules), read on every
+            -- tick: without it each read scans the whole table.
+            CREATE INDEX IF NOT EXISTS idx_work_item_evidence_kind
+                ON work_item_evidence (kind, id);
+
             -- Notices written in the transaction that caused them and
             -- delivered from here, so a restart neither drops nor repeats
             -- one. `parent` and `origin` are unenforced: the notice must
@@ -1760,6 +1766,63 @@ mod tests {
         Store::run_migrations(&conn).unwrap();
         Store::run_migrations(&conn).unwrap();
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM payment_requests"), 1);
+    }
+
+    /// A store whose evidence table predates the per-kind index gets it on
+    /// open, keeps its rows, and the controller's per-kind reads (every
+    /// tick) search the index instead of scanning the table.
+    #[test]
+    fn upgrading_indexes_work_evidence_by_kind() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_item_evidence (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 item        TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 ref         TEXT NOT NULL,
+                 hash        TEXT,
+                 verified_by TEXT,
+                 at          TEXT NOT NULL
+             );
+             CREATE INDEX idx_work_item_evidence_item ON work_item_evidence (item);
+             INSERT INTO work_item_evidence (item, kind, ref, at)
+             VALUES ('a', 'merge_recovery', '{}', '2026-11-01T00:00:00Z'),
+                    ('b', 'summary', 'done', '2026-11-01T00:00:01Z');",
+        )
+        .unwrap();
+        let index = "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'index' AND name = 'idx_work_item_evidence_kind'";
+        assert_eq!(count(&conn, index), 0);
+
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, index), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM work_item_evidence"), 2);
+        for query in [
+            "SELECT id FROM work_item_evidence WHERE kind = 'merge_recovery' ORDER BY at, id",
+            "SELECT id FROM work_item_evidence WHERE kind = 'project_context' AND id > 1 ORDER BY id",
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_work_item_evidence_kind")),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step == "SCAN work_item_evidence"),
+                "{query}: {plan:?}"
+            );
+        }
+
+        // Idempotent.
+        Store::run_migrations(&conn).unwrap();
+        assert_eq!(count(&conn, index), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM work_item_evidence"), 2);
     }
 
     #[test]

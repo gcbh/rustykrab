@@ -219,7 +219,52 @@ pub(super) fn failure_class(err: &Error) -> &'static str {
     }
 }
 
+/// How long a fetched upstream commit is reused before the controller asks
+/// the remote again. A reconcile that writes a transition clears the cache,
+/// since landed work may have moved an upstream.
+pub(super) const UPSTREAM_FRESH: TimeDelta = TimeDelta::minutes(3);
+/// How long a failed upstream observation (an unreachable remote) is
+/// reused: short, so a transient failure delays work by seconds, not
+/// minutes, while an outage is not retried on every tick.
+pub(super) const UPSTREAM_FAILED: TimeDelta = TimeDelta::seconds(30);
+
+/// One repository's upstream observation and when it was made, on the
+/// controller's clock.
+pub(super) struct CachedBase {
+    at: DateTime<Utc>,
+    base: Result<String, String>,
+}
+
 impl Controller {
+    /// `repo`'s upstream default-branch commit ([`workspace::fresh_base`]),
+    /// reused for [`UPSTREAM_FRESH`] (a failure for [`UPSTREAM_FAILED`]).
+    /// One observation serves the handoff rechecks and the lease
+    /// preparation alike: the cache's lock is held across the fetch, so two
+    /// callers asking for one repository at once share one fetch.
+    pub(super) async fn upstream_base(&self, repo: &std::path::Path) -> Result<String, String> {
+        let mut cache = self.upstream_cache.lock().await;
+        let now = self.clock.now();
+        if let Some(cached) = cache.get(repo) {
+            let keep = if cached.base.is_ok() {
+                UPSTREAM_FRESH
+            } else {
+                UPSTREAM_FAILED
+            };
+            if now >= cached.at && now - cached.at < keep {
+                return cached.base.clone();
+            }
+        }
+        let base = workspace::fresh_base(repo).await;
+        cache.insert(
+            repo.to_path_buf(),
+            CachedBase {
+                at: now,
+                base: base.clone(),
+            },
+        );
+        base
+    }
+
     /// One upstream observation per repository per pass, outside loop_lock.
     /// Selection rechecks current authority, scope and state under the lock;
     /// these Git objects are data, never authorization to start an item.
@@ -240,7 +285,8 @@ impl Controller {
             if bases.contains_key(&repo) {
                 continue;
             }
-            bases.insert(repo.clone(), workspace::fresh_base(&repo).await);
+            let base = self.upstream_base(&repo).await;
+            bases.insert(repo, base);
         }
         Ok(bases)
     }
@@ -289,6 +335,7 @@ impl Controller {
         handoffs: Option<super::project_context::HandoffChecks>,
         upstream: &UpstreamBases,
     ) -> Result<TickReport, Error> {
+        self.phase("answers");
         self.apply_pending_answers_locked().await?;
         self.retire_execution_budget_holds().await?;
         let now = self.clock.now();
@@ -300,15 +347,23 @@ impl Controller {
         self.judgment().await?;
         let mut report = TickReport::default();
         let mut noticed: HashSet<WorkItemId> = HashSet::new();
+        self.phase("sweep");
         self.sweep(now, first, &mut report, &mut noticed, handoffs)
             .await?;
         self.state().resumed = true;
+        self.phase("reconcile");
         self.reconcile_all(now, &mut report, &mut noticed).await?;
+        if !report.reconciled.is_empty() {
+            // Landed work may have moved an upstream: look again next pass.
+            self.upstream_cache.lock().await.clear();
+        }
         // Draining for shutdown: nothing new starts, what runs finishes.
         if !self.is_draining() {
+            self.phase("lease");
             self.start_matching_templates_locked().await?;
             self.select_and_lease(&mut report, upstream).await?;
         }
+        self.phase("age");
         self.age(now, &mut report).await?;
         Ok(report)
     }
@@ -394,7 +449,9 @@ impl Controller {
 
         // Liveness renews an inactivity lease. Trusted merge repairs also
         // need observed changes to the conflicted work, not just more output.
+        self.phase("observe_execution");
         let mut merge_stalls = self.observe_execution().await?;
+        self.phase("sweep");
         let ttl = i64::try_from(self.config.lease_ttl_seconds)
             .ok()
             .and_then(TimeDelta::try_seconds)
@@ -413,7 +470,9 @@ impl Controller {
             .map(|(id, r)| (id.clone(), r.worker.clone(), r.since))
             .collect();
         for (id, worker, _since) in stalled {
-            if !b.status(&id).is_some_and(|s| s.is_active()) {
+            if !b.status(&id).is_some_and(|s| s.is_active())
+                || self.state().cancelling.contains(&id)
+            {
                 continue;
             }
             let Some(item) = b.snap.item(&id).cloned() else {
@@ -459,9 +518,13 @@ impl Controller {
             if !b.status(&lease.item).is_some_and(|s| s.is_active()) {
                 continue;
             }
+            // A cancel that stopped the run and waits for loop_lock records
+            // the item's end itself.
             let ours = {
                 let state = self.state();
-                state.runs.contains_key(&lease.item) || state.finished.contains_key(&lease.item)
+                state.runs.contains_key(&lease.item)
+                    || state.finished.contains_key(&lease.item)
+                    || state.cancelling.contains(&lease.item)
             };
             if ours {
                 continue;
@@ -490,6 +553,7 @@ impl Controller {
                             && !b.snap.has_children(&i.id)
                             && !state.runs.contains_key(&i.id)
                             && !state.finished.contains_key(&i.id)
+                            && !state.cancelling.contains(&i.id)
                     })
                     .map(|i| i.id.clone())
                     .collect()
@@ -615,6 +679,10 @@ impl Controller {
         }
         ready.sort_by(|a, b| a.0.cmp(&b.0));
         for (id, finished) in ready {
+            if self.state().cancelling.contains(&id) {
+                // A cancel stopped this run; its result is not judged.
+                continue;
+            }
             let mut b = Batch::new(self.load().await?, now);
             if !b.status(&id).is_some_and(|s| s.is_active()) {
                 // Cancelled, expired or returned meanwhile: the result is
@@ -1973,6 +2041,11 @@ impl Controller {
             .collect();
         let (mut load, mut occupied) = self.load_by_worker();
         for item in ready {
+            // A cancel in flight stopped this item's run, or is about to
+            // close it: never lease it again meanwhile.
+            if self.state().cancelling.contains(&item.id) {
+                continue;
+            }
             // A newly filed repository not observed during preparation waits
             // for the next pass. Never perform remote I/O under the command lock.
             if self.config.worktree_root.is_some()
@@ -2131,7 +2204,7 @@ impl Controller {
                 continue;
             }
             let name = worker.name().to_string();
-            let mut run = spawn(worker.clone(), brief, self.clock.now());
+            let mut run = self.spawn_run(worker.clone(), brief);
             run.merge_progress = merge_progress;
             let isolated_repo = run.isolated_repo.clone();
             self.state().runs.insert(item.id.clone(), run);
@@ -2467,9 +2540,33 @@ pub(super) struct Occupied {
     pub(super) slots: HashSet<String>,
 }
 
+impl Controller {
+    /// Start `worker` on `brief` under tokio, with the run binding the work
+    /// tools read their provenance from, and the run's heartbeat task
+    /// (`liveness.rs`), which renews its lease from the worker's activity
+    /// without waiting for a tick.
+    pub(super) fn spawn_run(&self, worker: Arc<dyn Worker>, brief: Brief) -> Run {
+        let item = brief.item.clone();
+        let mut run = spawn(worker.clone(), brief, self.clock.now());
+        run._heartbeat = super::liveness::Heartbeat {
+            item,
+            run_id: run.run_id.clone(),
+            worker,
+            store: self.store.clone(),
+            clock: self.clock.clone(),
+            liveness: run.liveness.clone(),
+            every: super::liveness::heartbeat_interval(self.config.lease_ttl_seconds),
+            run: run.handle.abort_handle(),
+        }
+        .spawn();
+        run
+    }
+}
+
 /// Start `worker` on `brief` under tokio, with the run binding the work
-/// tools read their provenance from.
-pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
+/// tools read their provenance from. Its heartbeat is
+/// [`Controller::spawn_run`]'s to start.
+fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
     let run_id = brief.run.clone().unwrap_or_default();
     let isolated_repo = if worker.isolates_worktree() {
@@ -2494,7 +2591,8 @@ pub(super) fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>)
         handle,
         since,
         reported: false,
-        activity: None,
+        liveness: Default::default(),
+        _heartbeat: super::liveness::HeartbeatGuard::none(),
         merge_progress: None,
     }
 }

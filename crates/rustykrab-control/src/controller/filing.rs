@@ -1175,6 +1175,76 @@ impl Controller {
         Ok(cancelled)
     }
 
+    /// The part of a cancel that cannot wait for `loop_lock`: stop every
+    /// run in the item's open subtree now, as a written cancel would
+    /// (`commit.rs`, `apply_in_memory`), drop any result they handed in, and
+    /// mark the subtree so the tick neither leases it, nor returns it to
+    /// `ready` when its lease lapses, nor judges a stopped run as a
+    /// failure. Reads the store, never the lock; an unreadable store stops
+    /// nothing here and the cancel stops the runs under the lock as before.
+    pub(super) async fn stop_for_cancel(&self, item: &str) -> CancelStop<'_> {
+        let mut ids: Vec<WorkItemId> = match self.load().await {
+            Ok(snap) if snap.contains(item) => {
+                let mut ids = vec![item.to_string()];
+                ids.extend(
+                    snap.descendants(item)
+                        .into_iter()
+                        .filter(|d| snap.status(d).is_some_and(|s| !s.is_closed())),
+                );
+                ids
+            }
+            _ => Vec::new(),
+        };
+        ids.sort();
+        ids.dedup();
+        let mut stopped = Vec::new();
+        {
+            let mut state = self.state();
+            for id in &ids {
+                state.cancelling.insert(id.clone());
+                if let Some(run) = state.runs.remove(id) {
+                    run.handle.abort();
+                    if let Some(worker) = self.worker(&run.worker) {
+                        worker.stop(&run.run_id);
+                    }
+                    stopped.push((id.clone(), run));
+                }
+                state.finished.remove(id);
+            }
+        }
+        if !stopped.is_empty() {
+            tracing::info!(
+                item = %item,
+                runs = stopped.len(),
+                "cancel stopped runs before waiting for the control loop"
+            );
+        }
+        CancelStop {
+            controller: self,
+            marked: ids,
+            stopped,
+        }
+    }
+
+    /// After the cancel was recorded (or refused): record the stopped
+    /// runs' spend as a written cancel does, then lift the marks. A refused
+    /// cancel leaves a stopped item's lease to lapse, which returns it to
+    /// `ready` with a repair note; nothing counts as a failed attempt.
+    pub(super) async fn finish_cancel(&self, mut stop: CancelStop<'_>, recorded: bool) {
+        let stopped = std::mem::take(&mut stop.stopped);
+        if !recorded && !stopped.is_empty() {
+            tracing::warn!(
+                runs = stopped.len(),
+                "cancel was not recorded after its runs stopped; their leases will lapse and \
+                 return the items to ready"
+            );
+        }
+        for (id, run) in &stopped {
+            self.record_run(id, run, "stopped").await;
+        }
+        drop(stop);
+    }
+
     /// Hand a worker's result to the reconcile step (section 5), only from
     /// the run that holds the item's lease.
     pub(super) async fn accept_report(
@@ -1202,8 +1272,16 @@ impl Controller {
             }
         }
         let mut state = self.state();
+        // A cancel stopped this item's run and is waiting to record it: a
+        // result that arrives now is no longer the item's.
+        if state.cancelling.contains(&item) {
+            return Err(Error::Auth(format!(
+                "{item} is being cancelled; its result is not accepted"
+            )));
+        }
         if let Some(run) = state.runs.get_mut(&item) {
             run.reported = true;
+            run.liveness.reported();
         }
         state.finished.insert(
             item,
@@ -1540,5 +1618,23 @@ fn archived_node(a: &ArchivedItem, depth: u32) -> GraphNode {
         children_done: 0,
         children_total: 0,
         archived_summary: Some(a.summary.clone()),
+    }
+}
+
+/// The runs a cancel stopped before it took `loop_lock`, and the items it
+/// marked. Dropping it lifts the marks, so a cancel whose future is dropped
+/// while it waits never leaves an item unleasable.
+pub(super) struct CancelStop<'a> {
+    controller: &'a Controller,
+    marked: Vec<WorkItemId>,
+    stopped: Vec<(WorkItemId, super::Run)>,
+}
+
+impl Drop for CancelStop<'_> {
+    fn drop(&mut self) {
+        let mut state = self.controller.state();
+        for id in &self.marked {
+            state.cancelling.remove(id);
+        }
     }
 }
