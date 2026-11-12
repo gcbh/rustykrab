@@ -706,3 +706,57 @@ async fn accepted_proposal_preserves_tools_and_recovery_policy_without_execution
     assert_eq!(execution.budget, budget.without_execution_limits());
     assert_eq!(execution.required_tools, vec!["web_fetch"]);
 }
+
+/// The automatic-start check runs every tick. With 30+ items waiting for
+/// consent it loads one snapshot and lists projects at most once, however
+/// many items it considers; with no allowance left today it reads no work
+/// at all.
+#[tokio::test]
+async fn template_check_reads_the_store_once_however_many_items_wait() {
+    use std::sync::atomic::Ordering;
+    let h = Harness::new(&["pinch"]);
+    let d = proposal("Bounded cleanup", None, None);
+    let first = accepted_root(file_rest(&h, d.clone()).await);
+    ControlHandle::start_work(
+        &h.ctl,
+        &first,
+        WorkStartMode::Automatic,
+        1,
+        "One a day",
+        "user:master",
+    )
+    .await
+    .unwrap();
+    let mut waiting = Vec::new();
+    for n in 0..32 {
+        waiting.push(accepted_root(
+            file_rest(&h, proposal(&format!("Other change {n}"), None, None)).await,
+        ));
+    }
+    let (loads, lists) = (
+        h.ctl.loads.load(Ordering::Relaxed),
+        h.ctl.project_lists.load(Ordering::Relaxed),
+    );
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(h.ctl.loads.load(Ordering::Relaxed) - loads, 1);
+    assert!(h.ctl.project_lists.load(Ordering::Relaxed) - lists <= 1);
+    for id in &waiting {
+        assert_eq!(
+            h.item(id).await.status,
+            Status::Blocked(BlockedReason::NeedsConsent)
+        );
+    }
+    // One matching item uses the day's allowance.
+    let matching = accepted_root(file_rest(&h, d.clone()).await);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(h.item(&matching).await.status, Status::Done);
+    // Allowance used: the next pass stops before reading any work.
+    let later = accepted_root(file_rest(&h, d).await);
+    let loads = h.ctl.loads.load(Ordering::Relaxed);
+    h.ctl.start_matching_templates_locked().await.unwrap();
+    assert_eq!(h.ctl.loads.load(Ordering::Relaxed), loads);
+    assert_eq!(
+        h.item(&later).await.status,
+        Status::Blocked(BlockedReason::NeedsConsent)
+    );
+}

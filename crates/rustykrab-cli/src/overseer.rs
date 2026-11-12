@@ -295,13 +295,14 @@ impl Overseer {
                 {
                     continue;
                 }
-                let Ok(work) = store.work_monitor_snapshot(500, 0).await else {
-                    continue;
-                };
-                for row in rows
-                    .into_iter()
-                    .filter(|r| recovery_allowed(r, &work, Utc::now()))
-                {
+                let due = recoveries_due(rows, || async {
+                    store
+                        .observer()
+                        .work_items_with_artifact_kind(SERVICE_ACTION)
+                        .await
+                })
+                .await;
+                for row in due {
                     let a = ServiceAction {
                         resource: row.id.clone(),
                         action: "ensure_running".into(),
@@ -347,33 +348,64 @@ fn action_of(refs: &[ArtifactRef]) -> Option<ServiceAction> {
     (actions.next().is_none() && action.valid()).then_some(action)
 }
 
+/// Whether `row` is a managed service that is down and safe to restart:
+/// the observation alone decides, so a healthy or unmanaged service never
+/// costs a store read.
+fn needs_recovery(row: &ServiceObservation) -> bool {
+    row.ensure_running
+        && row.healthy == Some(false)
+        && row.process_id.is_none()
+        && row.lifecycle_safe
+}
+
+/// The observations a recovery should be filed for now. The store is read
+/// (through `service_actions`: the items carrying a service action) only
+/// when some observed service needs recovery; with no services configured,
+/// or all of them up, it is not touched. A failed read files nothing.
+async fn recoveries_due<F, Fut>(
+    rows: Vec<ServiceObservation>,
+    service_actions: F,
+) -> Vec<ServiceObservation>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<Vec<WorkItem>, rustykrab_store::WorkStoreError>,
+    >,
+{
+    let rows: Vec<_> = rows.into_iter().filter(needs_recovery).collect();
+    if rows.is_empty() {
+        return rows;
+    }
+    let Ok(items) = service_actions().await else {
+        return Vec::new();
+    };
+    let now = Utc::now();
+    rows.into_iter()
+        .filter(|r| recovery_allowed(r, &items, now))
+        .collect()
+}
+
 fn recovery_allowed(
     row: &ServiceObservation,
-    work: &rustykrab_store::WorkMonitorSnapshot,
+    service_actions: &[WorkItem],
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    if work.items_truncated
-        || !row.ensure_running
-        || row.healthy != Some(false)
-        || row.process_id.is_some()
-        || !row.lifecycle_safe
-    {
+    if !needs_recovery(row) {
         return false;
     }
-    let recent: Vec<_> = work
-        .items
+    let recent: Vec<_> = service_actions
         .iter()
-        .filter(|w| action_of(&w.item.artifact_refs).is_some_and(|a| a.resource == row.id))
+        .filter(|w| action_of(&w.artifact_refs).is_some_and(|a| a.resource == row.id))
         .collect();
     // Open actions survive controller restart; failed/closed attempts impose
     // backoff and a finite hourly ceiling rather than an invisible restart loop.
-    !recent.iter().any(|w| !w.item.status.is_closed())
+    !recent.iter().any(|w| !w.status.is_closed())
         && !recent
             .iter()
-            .any(|w| now - w.item.created_at < TimeDelta::seconds(120))
+            .any(|w| now - w.created_at < TimeDelta::seconds(120))
         && recent
             .iter()
-            .filter(|w| now - w.item.created_at < TimeDelta::hours(1))
+            .filter(|w| now - w.created_at < TimeDelta::hours(1))
             .count()
             < 3
 }
@@ -796,6 +828,50 @@ mod tests {
             "health refresh must not apply a lifecycle action"
         );
     }
+    fn observation(healthy: Option<bool>) -> ServiceObservation {
+        ServiceObservation {
+            id: "fixture".into(),
+            role: "service".into(),
+            version: None,
+            healthy,
+            checked_at: Some(Utc::now()),
+            process_id: None,
+            supervised: true,
+            identity_verified: true,
+            lifecycle_safe: true,
+            supervisor: "launchd".into(),
+            ensure_running: true,
+            detail: String::new(),
+        }
+    }
+
+    /// With no services configured, or every service up or unmanaged, the
+    /// recovery check reads nothing from the store; only a managed service
+    /// that is down costs the one narrow read.
+    #[tokio::test]
+    async fn the_recovery_check_reads_the_store_only_for_a_service_that_is_down() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = || async {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        };
+        assert!(recoveries_due(vec![], read).await.is_empty());
+        let mut unmanaged = observation(Some(false));
+        unmanaged.ensure_running = false;
+        let up = vec![observation(Some(true)), observation(None), unmanaged];
+        assert!(recoveries_due(up, read).await.is_empty());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let due = recoveries_due(vec![observation(Some(false))], read).await;
+        assert_eq!(due.len(), 1);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A failed read files nothing.
+        let failed = recoveries_due(vec![observation(Some(false))], || async {
+            Err(rustykrab_store::WorkStoreError::Storage("locked".into()))
+        })
+        .await;
+        assert!(failed.is_empty());
+    }
+
     #[tokio::test]
     async fn automatic_recovery_uses_durable_open_attempts_backoff_and_hourly_ceiling() {
         let f = fixture().await;
@@ -803,7 +879,10 @@ mod tests {
         let ctl = Controller::new(store.clone(), vec![], ControllerConfig::default());
         let row = f.owner.probe(&f.owner.specs[0]).await;
         let now = Utc::now();
-        let snap = store.work_monitor_snapshot(500, 0).await.unwrap();
+        let snap = store
+            .work_items_with_artifact_kind(SERVICE_ACTION)
+            .await
+            .unwrap();
         assert!(recovery_allowed(&row, &snap, now));
         for attempt in 0..3 {
             let PlanOutcome::Accepted(a) = ctl
@@ -824,7 +903,10 @@ mod tests {
             else {
                 panic!("recovery rejected")
             };
-            let snap = store.work_monitor_snapshot(500, 0).await.unwrap();
+            let snap = store
+                .work_items_with_artifact_kind(SERVICE_ACTION)
+                .await
+                .unwrap();
             assert!(
                 !recovery_allowed(&row, &snap, now + TimeDelta::minutes(3)),
                 "an open recovery must prevent duplicate dispatch"
@@ -833,7 +915,10 @@ mod tests {
                 .await
                 .unwrap();
             let fresh = Store::open(f.dir.path().join("db"), vec![7; 32]).unwrap();
-            let mut snap = fresh.work_monitor_snapshot(500, 0).await.unwrap();
+            let snap = fresh
+                .work_items_with_artifact_kind(SERVICE_ACTION)
+                .await
+                .unwrap();
             assert!(
                 !recovery_allowed(&row, &snap, now + TimeDelta::seconds(60)),
                 "restart must retain backoff"
@@ -842,10 +927,11 @@ mod tests {
                 recovery_allowed(&row, &snap, now + TimeDelta::minutes(3)),
                 attempt < 2
             );
-            snap.items_truncated = true;
-            assert!(!recovery_allowed(&row, &snap, now + TimeDelta::hours(2)));
         }
-        let snap = store.work_monitor_snapshot(500, 0).await.unwrap();
+        let snap = store
+            .work_items_with_artifact_kind(SERVICE_ACTION)
+            .await
+            .unwrap();
         assert!(recovery_allowed(&row, &snap, now + TimeDelta::hours(2)));
     }
     #[tokio::test]

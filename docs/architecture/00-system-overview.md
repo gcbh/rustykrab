@@ -194,7 +194,9 @@ standing judgment, planning and progress-ledger repair. Planner work is a
 separate definition in the shared local model slot.
 
 The monitor is a transport observer, not a second scheduler:
-`Store::work_monitor_snapshot` → read-only `WorkerRegistry` views and
+`Store::work_monitor_snapshot` (on the store's read-only observer
+connection; recorded project contexts only for items with a live lease) →
+read-only `WorkerRegistry` views and
 `ControlHandle::loop_status` → `/api/monitor`, `/api/monitor/metrics`,
 `rustykrab monitor` and the static browser dashboard. Durable work counts
 and assignments cover all rows, while histories are bounded. Verification

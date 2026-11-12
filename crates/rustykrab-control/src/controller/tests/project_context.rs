@@ -508,10 +508,10 @@ async fn archived_project_history_is_context_not_an_implicit_code_dependency() {
     let monitor = reopened.work_monitor_snapshot(200, 50).await.unwrap();
     let observed = monitor.items.iter().find(|r| r.item.id == next).unwrap();
     assert_eq!(observed.workspace.as_ref().unwrap()["base"], original);
-    assert_eq!(
-        observed.project_context.as_ref().unwrap()["base_sources"],
-        serde_json::json!(ctx.base_sources)
-    );
+    // The monitor shows a recorded context only for a live run; this run
+    // has finished, and its receipt stays in the evidence above.
+    assert!(observed.lease.is_none());
+    assert!(observed.project_context.is_none());
 }
 #[tokio::test]
 async fn missing_or_ambiguous_project_does_not_start_a_worker() {
@@ -1225,4 +1225,93 @@ async fn reconstruction_lists_projects_once_however_many_items_there_are() {
         lists <= members.len(),
         "at most one listing per cached lookup, not one per item: {lists}"
     );
+}
+
+/// An item leased again on the same project revision records its execution
+/// slice, not the whole history again: the first lease's row is the
+/// complete receipt, each repeat is bounded by the slice. The recorded
+/// bindings still resolve the item to its project with its own work entry,
+/// and the slice shows the worker the same view.
+#[tokio::test]
+async fn repeated_leases_record_the_execution_slice_and_bindings_still_resolve() {
+    use rustykrab_store::TransitionSpec;
+    let repo = Repo::new();
+    let h = Harness::with(
+        ControllerConfig::default(),
+        super::StaticCatalog::default(),
+        &["history"],
+    );
+    let project = project(&h, &repo).await;
+    let bind = |d: &mut WorkItemDraft| {
+        d.artifact_refs.push(ArtifactRef {
+            kind: "project".into(),
+            value: project.project.id.to_string(),
+        })
+    };
+    for i in 0..8 {
+        let title = format!("Earlier report {i}");
+        h.script.push(
+            &title,
+            super::report(ResultReport {
+                summary: format!("Historical report {i}: {}", "detail ".repeat(4_000)),
+                ..Default::default()
+            }),
+        );
+        let mut old = draft("old", &title);
+        bind(&mut old);
+        h.file_one(old).await;
+        h.drain_settled().await;
+    }
+    let title = "leased again";
+    for _ in 0..3 {
+        h.script.push(
+            title,
+            super::Step::Hang(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
+    }
+    h.script.push(title, super::report(super::done(title)));
+    let mut d = draft("again", title);
+    bind(&mut d);
+    let id = h.file_one(d).await;
+    for _ in 0..3 {
+        assert_eq!(h.tick().await.leased, vec![id.clone()]);
+        // The lease lapses: the run is gone and the item is ready again.
+        let run = h.ctl.state().runs.remove(&id).expect("a run");
+        run.handle.abort();
+        h.store().work_lease_release(&id).await.unwrap();
+        let mut back = TransitionSpec::new(&id, Status::Ready, "controller");
+        back.expected_from = Some(Status::Running);
+        h.store().work_transition_many(&[back]).await.unwrap();
+    }
+    h.drain_settled().await;
+    assert_eq!(h.status(&id).await, Status::Done);
+    let rows: Vec<_> = h
+        .store()
+        .work_evidence_list(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == PROJECT_CONTEXT)
+        .collect();
+    assert_eq!(rows.len(), 4);
+    let full: crate::handoff::ProjectContext = serde_json::from_str(&rows[0].reference).unwrap();
+    assert_eq!(full.history_items, None);
+    assert!(rows[0].reference.len() > 128 * 1024);
+    for row in &rows[1..] {
+        assert!(row.reference.len() < 16 * 1024, "{}", row.reference.len());
+        assert_eq!(row.hash, rows[0].hash);
+        let slice: crate::handoff::ProjectContext = serde_json::from_str(&row.reference).unwrap();
+        assert_eq!(slice.history_items, Some(full.work.len()));
+        let view = slice.execution_view();
+        assert_eq!(view.history_items, full.work.len());
+        assert_eq!(view.work.len(), 1);
+        assert_eq!(view.work[0].item, id);
+        assert_eq!(view.snapshot, &project);
+    }
+    // A cold controller rebuilds the bindings from these rows alone.
+    let cold = Controller::new(h.store().clone(), vec![], ControllerConfig::default());
+    let bindings = cold.recorded_bindings().await.unwrap();
+    let (bound, own) = &bindings[&id];
+    assert_eq!(bound, &project.project.id.to_string());
+    assert_eq!(own.as_ref().unwrap().item, id);
 }

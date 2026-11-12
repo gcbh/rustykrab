@@ -508,6 +508,19 @@ impl Store {
 
     /// Every live child of `parent`, closed ones included, oldest first:
     /// what a roll-up reads.
+    /// Every live item, closed included, with an artifact ref of `kind`,
+    /// oldest first: what the overseer's recovery check reads instead of a
+    /// whole monitor snapshot. Unbounded by a display limit, so it never
+    /// reports a truncated view.
+    pub async fn work_items_with_artifact_kind(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<WorkItem>, WorkStoreError> {
+        let kind = kind.to_string();
+        self.work_call(move |conn| ops::items_with_artifact_kind(conn, &kind))
+            .await
+    }
+
     pub async fn work_children(&self, parent: &str) -> Result<Vec<WorkItem>, WorkStoreError> {
         self.work_list(&WorkFilter {
             parent: Some(parent.to_string()),

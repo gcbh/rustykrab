@@ -274,36 +274,64 @@ pub(super) struct Heartbeat {
 
 impl Heartbeat {
     /// Renew the lease whenever the worker's activity moves, until the run
-    /// ends or its lease is gone. Uses the shared store connection: the
-    /// connection's mutex is taken per statement, never for a whole tick,
-    /// so a heartbeat waits for at most the statement in flight, and a
-    /// second writer connection would only trade that wait for SQLite's
-    /// own writer lock (and `SQLITE_BUSY` handling) on the same file.
+    /// ends or its lease is gone.
+    ///
+    /// The write goes through the shared store connection, in a task of its
+    /// own, and the loop never waits for it: while one write is still queued
+    /// behind other store work, the loop keeps watching the run (so it ends
+    /// with it) and queues no second write, then picks up the result and
+    /// renews again on the next interval with activity. A heartbeat is late
+    /// at worst, never stuck.
+    ///
+    /// It deliberately has no connection of its own, although the store is
+    /// in WAL mode. A second connection that writes would make the shared
+    /// connection's deferred transactions (each reads, then writes: every
+    /// `work_apply`) fail with `SQLITE_BUSY` at once whenever a heartbeat
+    /// committed between their read and their write; SQLite's busy timeout
+    /// does not apply to that case. Taking the long readers off the shared
+    /// connection ([`rustykrab_store::Store::observer`]) is what keeps the
+    /// wait short.
     pub(super) fn spawn(self) -> HeartbeatGuard {
         let task = tokio::spawn(async move {
             let mut every = tokio::time::interval(self.every);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             every.tick().await;
+            let mut pending: Option<tokio::task::JoinHandle<_>> = None;
             loop {
                 every.tick().await;
                 if self.run.is_finished() || self.liveness.is_reported() {
+                    if let Some(write) = pending {
+                        write.abort();
+                    }
                     return;
+                }
+                if let Some(write) = pending.take() {
+                    if !write.is_finished() {
+                        // Still waiting for the connection: observe the
+                        // activity once it has landed, not now.
+                        pending = Some(write);
+                        continue;
+                    }
+                    match write.await {
+                        Ok(Err(rustykrab_store::WorkStoreError::NotFound(_))) => {
+                            // Released: the run was reconciled, stopped or
+                            // cancelled. Nothing left to renew.
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(item = %self.item, error = %e, "run heartbeat not recorded");
+                        }
+                        Ok(Ok(_)) | Err(_) => {}
+                    }
                 }
                 let activity = self.worker.activity(&self.run_id);
                 if !self.liveness.observe(activity, self.clock.now()) {
                     continue;
                 }
-                match self.store.work_lease_heartbeat(&self.item).await {
-                    Ok(_) => {}
-                    Err(rustykrab_store::WorkStoreError::NotFound(_)) => {
-                        // Released: the run was reconciled, stopped or
-                        // cancelled. Nothing left to renew.
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(item = %self.item, error = %e, "run heartbeat not recorded");
-                    }
-                }
+                let (store, item) = (self.store.clone(), self.item.clone());
+                pending = Some(tokio::spawn(async move {
+                    store.work_lease_heartbeat(&item).await
+                }));
             }
         });
         HeartbeatGuard(Some(task.abort_handle()))

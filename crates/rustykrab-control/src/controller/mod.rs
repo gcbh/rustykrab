@@ -442,6 +442,11 @@ struct Run {
     /// Stops the run's heartbeat task when the run is dropped.
     _heartbeat: liveness::HeartbeatGuard,
     merge_progress: Option<execution_progress::MergeProgress>,
+    /// The item's ancestors when the run started, nearest first: what lets
+    /// a cancel of any of them stop this run from memory, before it reads
+    /// the store (`filing.rs`, [`Controller::stop_for_cancel`]). Parents
+    /// do not change while an item runs.
+    ancestors: Vec<WorkItemId>,
 }
 
 /// A result waiting for the reconcile step: a report handed in through
@@ -540,9 +545,16 @@ pub struct Controller {
     /// rechecks and the lease preparation, and reused for a few minutes so
     /// most ticks run no network Git.
     upstream_cache: tokio::sync::Mutex<HashMap<PathBuf, tick::CachedBase>>,
+    /// (item, project revision) pairs whose complete project context a
+    /// lease recorded since this controller started; later leases of the
+    /// pair record the execution slice (`tick.rs`).
+    recorded_full_contexts: Mutex<HashSet<(WorkItemId, String)>>,
     /// Test seam: how many times the controller listed projects.
     #[cfg(test)]
     project_lists: std::sync::atomic::AtomicUsize,
+    /// Test seam: how many times the controller loaded a snapshot.
+    #[cfg(test)]
+    loads: std::sync::atomic::AtomicUsize,
     /// Set on the way down ([`ControlHandle::set_draining`]): ticks lease
     /// nothing new.
     draining: AtomicBool,
@@ -593,8 +605,11 @@ impl Controller {
             }),
             recorded_bindings: tokio::sync::Mutex::new(Default::default()),
             upstream_cache: tokio::sync::Mutex::new(HashMap::new()),
+            recorded_full_contexts: Mutex::new(HashSet::new()),
             #[cfg(test)]
             project_lists: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            loads: std::sync::atomic::AtomicUsize::new(0),
             draining: AtomicBool::new(false),
         }
     }
@@ -708,6 +723,12 @@ impl Controller {
 
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn recorded_full_contexts(&self) -> MutexGuard<'_, HashSet<(WorkItemId, String)>> {
+        self.recorded_full_contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn worker(&self, name: &str) -> Option<Arc<dyn Worker>> {

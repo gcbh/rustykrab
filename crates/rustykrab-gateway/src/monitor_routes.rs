@@ -315,9 +315,10 @@ pub fn health_of(alerts: &[Alert]) -> &'static str {
 }
 
 async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, String> {
-    let work = state
-        .agent
-        .store
+    // Every read here is observation: on the store's read-only observer
+    // connection, never queued with the controller's writes.
+    let store = state.agent.store.observer();
+    let work = store
         .work_monitor_snapshot(query.limit, query.events)
         .await
         .map_err(|e| e.to_string())?;
@@ -406,18 +407,10 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
             ));
         }
     }
-    let schedules = state
-        .agent
-        .store
-        .jobs()
-        .list_jobs()
-        .await
-        .map_err(|e| e.to_string())?;
+    let schedules = store.jobs().list_jobs().await.map_err(|e| e.to_string())?;
     let mut scheduled_deliveries = vec![];
     for job in schedules.iter().take(100) {
-        let Some(item) = state
-            .agent
-            .store
+        let Some(item) = store
             .jobs()
             .work_item_id(&job.id)
             .await
@@ -425,9 +418,7 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         else {
             continue;
         };
-        let evidence = state
-            .agent
-            .store
+        let evidence = store
             .work_evidence_list(&item)
             .await
             .map_err(|e| e.to_string())?;
@@ -482,9 +473,7 @@ async fn observe(state: &AppState, query: MonitorQuery) -> Result<MonitorReply, 
         health,
         stale_after_seconds: STALE_SECONDS,
         dreaming,
-        expectation_metrics: state
-            .agent
-            .store
+        expectation_metrics: store
             .expectation_metrics_latest()
             .await
             .map_err(|e| e.to_string())?,

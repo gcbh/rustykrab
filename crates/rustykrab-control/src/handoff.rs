@@ -22,6 +22,11 @@ pub struct ProjectContext {
     /// Work relevant to this execution slice. The complete history remains in this receipt.
     #[serde(default)]
     pub execution_items: Vec<String>,
+    /// Set on an execution slice ([`ProjectContext::execution_slice`]): how
+    /// many work entries the complete context held, which the prompt view
+    /// reports. `None` on a complete context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_items: Option<usize>,
 }
 
 /// The prompt view: exact project intent and the current task's dependencies,
@@ -59,7 +64,24 @@ impl ProjectContext {
                             || q.decision.is_some())
                 })
                 .collect(),
-            history_items: self.work.len(),
+            history_items: self.history_items.unwrap_or(self.work.len()),
+        }
+    }
+
+    /// This context cut to its execution slice: the work and questions the
+    /// prompt view shows, with the same snapshot and base sources. Its
+    /// [`Self::execution_view`] is this context's, entry for entry; it is
+    /// what a repeated lease records in place of the complete history,
+    /// which the item's first lease on this project revision recorded.
+    pub fn execution_slice(&self) -> ProjectContext {
+        let view = self.execution_view();
+        ProjectContext {
+            snapshot: self.snapshot.clone(),
+            work: view.work.into_iter().cloned().collect(),
+            base_sources: self.base_sources.clone(),
+            questions: view.questions.into_iter().cloned().collect(),
+            execution_items: self.execution_items.clone(),
+            history_items: Some(view.history_items),
         }
     }
 }
