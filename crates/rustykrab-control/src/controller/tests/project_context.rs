@@ -1273,8 +1273,19 @@ async fn repeated_leases_record_the_execution_slice_and_bindings_still_resolve()
     let mut d = draft("again", title);
     bind(&mut d);
     let id = h.file_one(d).await;
-    for _ in 0..3 {
+    for n in 1..=3 {
         assert_eq!(h.tick().await.leased, vec![id.clone()]);
+        // Let the worker take its hanging step before the run is aborted:
+        // aborted before its first poll, the run would leave the step for
+        // the final lease, which would then hang.
+        let started = tokio::time::Instant::now();
+        while h.script.briefs_for(title).len() < n {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "run {n} never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         // The lease lapses: the run is gone and the item is ready again.
         let run = h.ctl.state().runs.remove(&id).expect("a run");
         run.handle.abort();
