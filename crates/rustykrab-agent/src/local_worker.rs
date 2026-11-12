@@ -2085,7 +2085,8 @@ impl Tool for LedgerTool {
         // call failing again and again stalls the run whatever comes between.
         // Except a Cargo build stopped at the longest exec limit: it kept
         // what it built, and running it again continues it, as its error
-        // says. Each such step counts towards neither window.
+        // says. Each such step counts towards neither window; the ledger
+        // ends the attempt at `RESUMABLE_TIMEOUT_LIMIT` of one command.
         let failure = result.as_ref().err().map(|e| e.kind().as_str());
         let resumable = self.inner.name() == "exec"
             && matches!(
@@ -2097,7 +2098,7 @@ impl Tool for LedgerTool {
         let stalled = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
             if resumable {
-                ledger.record_resumable(self.inner.name());
+                ledger.record_resumable(self.inner.name(), &args);
             } else {
                 ledger.record_call(self.inner.name(), &args, &outcome, failure);
             }
@@ -4368,11 +4369,13 @@ mod tests {
         }
     }
 
-    /// Twelve identical calls (two whole no-progress windows) through the
-    /// ledger, each failing with `error`: the first call the ledger
-    /// refused and its error, if any, and whether any call carried the
-    /// repeated-failure warning.
-    async fn identical_failures(error: rustykrab_core::ToolError) -> (Option<(u32, Error)>, bool) {
+    /// `calls` identical calls through the ledger, each failing with
+    /// `error`: the first call the ledger refused and its error, if any,
+    /// and whether any call carried the repeated-failure warning.
+    async fn identical_failures(
+        error: rustykrab_core::ToolError,
+        calls: u32,
+    ) -> (Option<(u32, Error)>, bool) {
         let tool = LedgerTool {
             inner: Arc::new(FailingExec(error)),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
@@ -4380,7 +4383,7 @@ mod tests {
         };
         let call = json!({"command": "cargo test -p rustykrab-control --lib", "timeout_secs": 600});
         let mut warned = false;
-        for n in 1..=12u32 {
+        for n in 1..=calls {
             let err = tool.execute(call.clone()).await.unwrap_err();
             if err.to_string().contains("progress ledger") {
                 return (Some((n, err)), warned);
@@ -4396,9 +4399,11 @@ mod tests {
     /// built, and the run was told to run it again: the same timeout six
     /// times (in the live run, a build waiting on another worker's lock)
     /// does not end the attempt as a loop, nor warn that repeating it
-    /// cannot help. A shorter timeout or a refusal still does.
+    /// cannot help. A shorter timeout or a refusal still does. It is still
+    /// bounded: the thirteenth is refused (`RESUMABLE_TIMEOUT_LIMIT`).
     #[tokio::test]
     async fn identical_cargo_timeouts_at_the_longest_limit_do_not_end_the_run() {
+        use rustykrab_control::progress::RESUMABLE_TIMEOUT_LIMIT;
         let at = |secs: u64| {
             rustykrab_core::ToolError::timeout(format!(
                 "command timed out after {secs}s and was stopped. Cargo keeps the build steps \
@@ -4407,7 +4412,18 @@ mod tests {
                  where it stopped."
             ))
         };
-        assert!(matches!(identical_failures(at(600)).await, (None, false)));
+        // Twelve (two whole no-progress windows) neither warn nor end it.
+        assert!(matches!(
+            identical_failures(at(600), RESUMABLE_TIMEOUT_LIMIT).await,
+            (None, false)
+        ));
+        // But a build that never finishes is bounded: the call after the
+        // twelfth is refused.
+        let (refused, warned) = identical_failures(at(600), RESUMABLE_TIMEOUT_LIMIT + 1).await;
+        let (n, err) = refused.expect("the resumable bound ends the attempt");
+        assert!(!warned);
+        assert_eq!(n, RESUMABLE_TIMEOUT_LIMIT + 1, "{err}");
+        assert!(err.to_string().contains("failed 12 times"), "{err}");
         for error in [
             at(120),
             rustykrab_core::ToolError::timeout(
@@ -4415,7 +4431,7 @@ mod tests {
             ),
             rustykrab_core::ToolError::invalid_input("command rejected: not allowed"),
         ] {
-            let (refused, warned) = identical_failures(error.clone()).await;
+            let (refused, warned) = identical_failures(error.clone(), 12).await;
             let (n, err) = refused.unwrap_or_else(|| panic!("{error:?} never ended the attempt"));
             assert!(warned, "{error:?} warned first");
             assert_eq!(n, 7, "the call after the sixth failure is refused: {err}");

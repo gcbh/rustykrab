@@ -20,8 +20,9 @@
 //! count never sees it. A call that ran into its time limit while doing
 //! work the next identical call continues (a Cargo build at the longest
 //! exec limit) is recorded with [`StepLedger::record_resumable`] and counts
-//! towards neither. Deterministic and pure: the same steps always give
-//! the same verdict.
+//! towards neither; its own bound, [`RESUMABLE_TIMEOUT_LIMIT`] such
+//! timeouts of one call, ends the attempt. Deterministic and pure: the
+//! same steps always give the same verdict.
 //!
 //! The subtree half of step 7 (a parent with nothing moving beneath it) is
 //! the controller's, over the graph: `controller::stalled_parents`.
@@ -43,6 +44,13 @@ pub const REPEATED_FAILURE_WARNING: u32 = 3;
 
 /// Identical failures of one call in a run that end the attempt.
 pub const REPEATED_FAILURE_LIMIT: u32 = 6;
+
+/// Resumable timeouts of one call in a run ([`StepLedger::record_resumable`]:
+/// the same Cargo command stopped at the longest exec limit) that end the
+/// attempt. Twelve is two hours of one build making no visible headway;
+/// without a bound such a run would never end, since these steps count
+/// towards neither other rule.
+pub const RESUMABLE_TIMEOUT_LIMIT: u32 = 12;
 
 /// A run that stopped making progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +100,8 @@ pub struct StepLedger {
     last_failure: Option<(u32, String, String)>,
     /// The most any one call has failed identically: count, kind and tool.
     most_failures: Option<(u32, String, String)>,
+    /// How often each (tool, arguments) has timed out resumably in the run.
+    resumable: HashMap<u64, u32>,
 }
 
 impl StepLedger {
@@ -107,6 +117,7 @@ impl StepLedger {
             failures: HashMap::new(),
             last_failure: None,
             most_failures: None,
+            resumable: HashMap::new(),
         }
     }
 
@@ -167,10 +178,26 @@ impl StepLedger {
     /// the run was told to do). It is a step, but adds nothing to the
     /// identical-failure count or the window without new evidence, and
     /// resets neither: whatever stalled the run before it still stands.
-    pub fn record_resumable(&mut self, tool: &str) {
+    /// The [`RESUMABLE_TIMEOUT_LIMIT`]th such timeout of one call (`tool`
+    /// with `args`) in the run makes [`StepLedger::recovery_due`] true, so
+    /// a build that never finishes still ends the attempt.
+    pub fn record_resumable(&mut self, tool: &str, args: &Value) {
         self.last_failure = None;
         self.steps += 1;
         self.last_tool = tool.to_string();
+        let mut h = DefaultHasher::new();
+        tool.hash(&mut h);
+        args.to_string().hash(&mut h);
+        let count = self.resumable.entry(h.finish()).or_insert(0);
+        *count += 1;
+        if *count >= RESUMABLE_TIMEOUT_LIMIT
+            && self
+                .most_failures
+                .as_ref()
+                .is_none_or(|(most, _, _)| *count > *most)
+        {
+            self.most_failures = Some((*count, "timeout".to_string(), tool.to_string()));
+        }
     }
 
     /// The stall, once `threshold` steps in a row brought nothing new.
@@ -339,5 +366,27 @@ mod tests {
         let stall = l.stalled().expect("the third identical failure warns");
         assert_eq!(stall.repeated_failure, Some((3, "timeout".into())));
         assert!(l.recovery_due().is_none(), "a warning, not the end");
+    }
+
+    #[test]
+    fn resumable_timeouts_count_towards_neither_rule_but_have_their_own_bound() {
+        let mut l = StepLedger::new(DEFAULT_STALL_STEPS);
+        let build = json!({"command": "cargo test --workspace", "timeout_secs": 600});
+        for _ in 1..RESUMABLE_TIMEOUT_LIMIT {
+            l.record_resumable("exec", &build);
+            assert!(l.stalled().is_none(), "no warning");
+            assert!(l.recovery_due().is_none(), "not yet");
+        }
+        // Another command's timeouts are counted on their own.
+        let other = json!({"command": "cargo check", "timeout_secs": 600});
+        l.record_resumable("exec", &other);
+        assert!(l.recovery_due().is_none());
+        l.record_resumable("exec", &build);
+        let stall = l.recovery_due().expect("the limit ends the attempt");
+        assert_eq!(
+            stall.repeated_failure,
+            Some((RESUMABLE_TIMEOUT_LIMIT, "timeout".into()))
+        );
+        assert_eq!(stall.last_tool, "exec");
     }
 }
