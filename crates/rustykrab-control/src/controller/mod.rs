@@ -835,27 +835,29 @@ impl ControlHandle for Controller {
         // Read/reconstruct expensive project history before taking the command
         // lock; a concurrent answer must not wait behind that background work.
         // Ends the tick's timing however the tick ends, dropped included.
-        let _timing = liveness::TickTimer::begin(self, "prepare");
-        let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
-            (Ok(None), Ok(Default::default()))
-        } else {
-            tokio::join!(
-                self.prepare_handoff_rechecks(),
-                self.prepare_upstream_bases()
-            )
-        };
-        self.phase("loop_lock");
-        let result = {
+        let timing = liveness::TickTimer::begin(self, "prepare");
+        let pass = async {
+            let (handoffs, upstream) = if self.state().lock == Some(LockState::Waiting) {
+                (Ok(None), Ok(Default::default()))
+            } else {
+                tokio::join!(
+                    self.prepare_handoff_rechecks(),
+                    self.prepare_upstream_bases()
+                )
+            };
+            self.phase("loop_lock");
             let _loop = self.loop_lock.lock().await;
             if self.state().lock == Some(LockState::Waiting) {
-                Err(Error::LockWaiting(format!(
+                return Err(Error::LockWaiting(format!(
                     "another process holds {LOCK_FILE}; this controller is waiting on it and does not tick"
-                )))
-            } else {
-                self.tick_locked(handoffs, upstream).await
+                )));
             }
+            self.tick_locked(handoffs, upstream).await
         };
-        result
+        match timing.id() {
+            Some(id) => liveness::TICK.scope(id, pass).await,
+            None => pass.await,
+        }
     }
 
     async fn graph(&self, root: &str) -> Result<GraphView, Error> {

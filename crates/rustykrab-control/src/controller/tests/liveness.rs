@@ -278,3 +278,74 @@ async fn a_cancel_dropped_while_waiting_leaves_nothing_marked() {
     // lease returns it to ready when it lapses, with no failure counted.
     assert_eq!(h.status(&id).await, Status::Running);
 }
+
+/// A worker whose stop is not immediate (a peer) may still hand in its
+/// result after the cancel stopped its run: the result is refused and the
+/// tick that holds the lock meanwhile does not judge it, so the cancel wins.
+#[tokio::test]
+async fn a_result_handed_in_after_the_cancel_stopped_the_run_is_refused() {
+    use rustykrab_tools::work_backend::{Provenance, WorkBackend};
+    let (h, _worker, id) = running().await;
+    let held = h.ctl.loop_lock.lock().await;
+    let mut cancel = pin!(ControlHandle::cancel(&h.ctl, &id, None, "user:master"));
+    tokio::select! {
+        _ = &mut cancel => panic!("the cancel records under loop_lock"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let late = WorkBackend::report(
+        &h.ctl,
+        id.clone(),
+        crate::controller::tests::done("inspect repository"),
+        Provenance {
+            conversation_id: None,
+            filed_by_item: Some(id.clone()),
+            actor: "worker:pulsing".into(),
+        },
+    )
+    .await;
+    assert!(late.is_err(), "a stopped run's result is refused: {late:?}");
+    h.ctl
+        .tick_locked(Ok(None), Ok(Default::default()))
+        .await
+        .expect("tick");
+    assert_eq!(h.status(&id).await, Status::Running);
+    drop(held);
+    assert_eq!(cancel.await.expect("cancel"), vec![id.clone()]);
+    assert!(matches!(h.status(&id).await, Status::Cancelled(_)));
+}
+
+/// A second tick beside the timed one (a manual `work tick` while the loop
+/// ticks) neither replaces nor ends the first tick's record, even when it
+/// is dropped.
+#[tokio::test]
+async fn a_concurrent_tick_does_not_touch_the_timed_ticks_record() {
+    let h = Harness::new(&["pinch"]);
+    let held = h.ctl.loop_lock.lock().await;
+    h.clock.advance(TimeDelta::seconds(1));
+    let started = h.clock.now();
+    let mut first = pin!(ControlHandle::tick(&h.ctl));
+    tokio::select! {
+        _ = &mut first => panic!("the tick cannot pass loop_lock"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    h.clock.advance(TimeDelta::seconds(1));
+    {
+        let mut second = pin!(ControlHandle::tick(&h.ctl));
+        tokio::select! {
+            _ = &mut second => panic!("the tick cannot pass loop_lock"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        let during = status(&h);
+        assert_eq!(during.tick_started, Some(started));
+        assert_eq!(during.tick_phase.as_deref(), Some("loop_lock"));
+    }
+    let after_drop = status(&h);
+    assert_eq!(after_drop.tick_started, Some(started), "{after_drop:?}");
+    assert_eq!(after_drop.tick_phase.as_deref(), Some("loop_lock"));
+    assert_eq!(after_drop.last_tick_ms, None);
+    drop(held);
+    first.await.expect("tick");
+    let done = status(&h);
+    assert_eq!(done.tick_phase, None);
+    assert!(done.last_tick_ms.is_some());
+}

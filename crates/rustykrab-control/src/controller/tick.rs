@@ -470,7 +470,9 @@ impl Controller {
             .map(|(id, r)| (id.clone(), r.worker.clone(), r.since))
             .collect();
         for (id, worker, _since) in stalled {
-            if !b.status(&id).is_some_and(|s| s.is_active()) {
+            if !b.status(&id).is_some_and(|s| s.is_active())
+                || self.state().cancelling.contains(&id)
+            {
                 continue;
             }
             let Some(item) = b.snap.item(&id).cloned() else {
@@ -677,6 +679,10 @@ impl Controller {
         }
         ready.sort_by(|a, b| a.0.cmp(&b.0));
         for (id, finished) in ready {
+            if self.state().cancelling.contains(&id) {
+                // A cancel stopped this run; its result is not judged.
+                continue;
+            }
             let mut b = Batch::new(self.load().await?, now);
             if !b.status(&id).is_some_and(|s| s.is_active()) {
                 // Cancelled, expired or returned meanwhile: the result is

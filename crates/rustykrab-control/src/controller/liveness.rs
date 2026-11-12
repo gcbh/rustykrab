@@ -9,6 +9,7 @@
 //! in-memory state the tick writes, and the heartbeat task reads only the
 //! worker's activity counter and writes only the lease's `heartbeat_at`.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,8 @@ pub(super) const SLOW_TICK: Duration = Duration::from_secs(30);
 /// The tick in progress: when it started, the phase it is in, and how long
 /// each phase it has left took so far.
 pub(super) struct TickProgress {
+    /// Which tick owns this record: only it moves its phase or ends it.
+    id: u64,
     /// On the controller's clock, as `last_tick` is.
     started: DateTime<Utc>,
     began: Instant,
@@ -65,41 +68,74 @@ pub(super) fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+tokio::task_local! {
+    /// The id of the timed tick this task is running, if any.
+    pub(super) static TICK: u64;
+}
+
+static NEXT_TICK: AtomicU64 = AtomicU64::new(1);
+
 /// Times one tick from [`TickTimer::begin`] until it is dropped, so a tick
-/// that fails, or whose future is dropped, still ends its record.
-pub(super) struct TickTimer<'a>(&'a Controller);
+/// that fails, or whose future is dropped, still ends its record. A tick
+/// that begins while another is being timed (a manual `work tick` beside
+/// the loop's) is not timed: the record stays the first tick's, and only
+/// the timer that created it moves or ends it.
+pub(super) struct TickTimer<'a> {
+    controller: &'a Controller,
+    id: Option<u64>,
+}
 
 impl<'a> TickTimer<'a> {
     pub(super) fn begin(controller: &'a Controller, phase: &'static str) -> Self {
-        controller.begin_tick(phase);
-        TickTimer(controller)
+        let id = controller.begin_tick(phase);
+        TickTimer { controller, id }
+    }
+
+    /// The record's id when this tick owns it: run the tick inside
+    /// [`TICK`]`.scope(id, ..)` so its phases land on its own record.
+    pub(super) fn id(&self) -> Option<u64> {
+        self.id
     }
 }
 
 impl Drop for TickTimer<'_> {
     fn drop(&mut self) {
-        self.0.end_tick();
+        if let Some(id) = self.id {
+            self.controller.end_tick(id);
+        }
     }
 }
 
 impl Controller {
-    /// A tick begins in `phase`.
-    pub(super) fn begin_tick(&self, phase: &'static str) {
+    /// A tick begins in `phase`; its record's id, or `None` when another
+    /// tick is being timed.
+    fn begin_tick(&self, phase: &'static str) -> Option<u64> {
+        let mut state = self.state();
+        if state.tick.is_some() {
+            return None;
+        }
         let now = Instant::now();
-        self.state().tick = Some(TickProgress {
+        let id = NEXT_TICK.fetch_add(1, Ordering::Relaxed);
+        state.tick = Some(TickProgress {
+            id,
             started: self.clock.now(),
             began: now,
             phase,
             phase_began: now,
             spent: Vec::new(),
         });
+        Some(id)
     }
 
-    /// The tick in progress moves to `phase`. Nothing when no tick is being
-    /// timed (a test driving a pass directly).
+    /// The timed tick this task runs moves to `phase`. Nothing when this
+    /// task runs no timed tick (an untimed concurrent tick, a test driving
+    /// a pass directly).
     pub(super) fn phase(&self, phase: &'static str) {
+        let Ok(id) = TICK.try_with(|id| *id) else {
+            return;
+        };
         let mut state = self.state();
-        if let Some(tick) = state.tick.as_mut() {
+        if let Some(tick) = state.tick.as_mut().filter(|t| t.id == id) {
             if tick.phase == phase {
                 return;
             }
@@ -111,8 +147,11 @@ impl Controller {
 
     /// The tick in progress ended, completed or failed: its duration and
     /// slowest phase become the previous tick's.
-    pub(super) fn end_tick(&self) {
+    fn end_tick(&self, id: u64) {
         let mut state = self.state();
+        if state.tick.as_ref().is_none_or(|t| t.id != id) {
+            return;
+        }
         let Some(mut tick) = state.tick.take() else {
             return;
         };
@@ -150,6 +189,9 @@ impl Controller {
 #[derive(Debug, Default)]
 pub(super) struct Liveness {
     inner: Mutex<Seen>,
+    /// The run handed in its result: as `observe_execution` does, the
+    /// heartbeat task renews nothing more for it.
+    reported: AtomicBool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -171,6 +213,15 @@ impl Liveness {
         } else {
             false
         }
+    }
+
+    /// The run handed in its result (`accept_report`).
+    pub(super) fn reported(&self) {
+        self.reported.store(true, Ordering::SeqCst);
+    }
+
+    fn is_reported(&self) -> bool {
+        self.reported.load(Ordering::SeqCst)
     }
 
     /// When activity last changed, on the controller's clock.
@@ -233,7 +284,7 @@ impl Heartbeat {
             every.tick().await;
             loop {
                 every.tick().await;
-                if self.run.is_finished() {
+                if self.run.is_finished() || self.liveness.is_reported() {
                     return;
                 }
                 let activity = self.worker.activity(&self.run_id);

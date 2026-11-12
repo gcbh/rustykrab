@@ -1272,8 +1272,16 @@ impl Controller {
             }
         }
         let mut state = self.state();
+        // A cancel stopped this item's run and is waiting to record it: a
+        // result that arrives now is no longer the item's.
+        if state.cancelling.contains(&item) {
+            return Err(Error::Internal(format!(
+                "{item} is being cancelled; its result is not accepted"
+            )));
+        }
         if let Some(run) = state.runs.get_mut(&item) {
             run.reported = true;
+            run.liveness.reported();
         }
         state.finished.insert(
             item,

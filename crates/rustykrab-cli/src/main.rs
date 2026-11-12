@@ -2392,8 +2392,9 @@ async fn main() -> anyhow::Result<()> {
         infra_handles.push(tokio::spawn(async move {
             use rustykrab_control::handle::LockState;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
-            // A tick slower than the interval is followed by one tick a full
-            // interval later, not a burst of the ticks it missed.
+            // A tick slower than the interval is followed by one catch-up
+            // tick at once and then ticks a full interval apart, not by a
+            // burst of every tick it missed.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut waiting_logged = false;
             let mut held = false;
