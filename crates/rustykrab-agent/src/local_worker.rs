@@ -1246,20 +1246,35 @@ impl Worker for LocalWorker {
                 Err(e)
             }
         };
-        let completed = result.as_ref().is_ok_and(|report| {
-            report.blocked.is_none() && report.error.is_none() && report.questions.is_empty()
-        });
         if let Some(ws) = brief.workspace {
-            if completed {
-                if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()))
-                {
-                    tracing::warn!(worker = %self.name, %why, "worktree not removed");
+            let unfinished = crate::external_worker::unfinished_reason(&result, Some(&ws)).await;
+            match unfinished {
+                None => {
+                    tracing::info!(
+                        worker = %self.name,
+                        item = %brief.item,
+                        dir = %ws.path.display(),
+                        reason = "the run completed",
+                        "worktree removed"
+                    );
+                    if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    {
+                        tracing::warn!(worker = %self.name, %why, "worktree not removed");
+                    }
                 }
-            } else {
-                // Kept for diagnosis: its source and branch, not its build.
-                let _ = tokio::task::spawn_blocking(move || ws.drop_build_output()).await;
+                Some(reason) => {
+                    tracing::info!(
+                        worker = %self.name,
+                        item = %brief.item,
+                        dir = %ws.path.display(),
+                        %reason,
+                        "worktree kept"
+                    );
+                    // Kept for diagnosis: its source and branch, not its build.
+                    let _ = tokio::task::spawn_blocking(move || ws.drop_build_output()).await;
+                }
             }
         }
         result
@@ -1978,6 +1993,15 @@ struct LedgerTool {
 /// What a call that repeats an earlier call and its result carries back,
 /// once the ledger calls the run stalled: one more window to change course.
 fn repeat_notice(stall: &rustykrab_control::progress::Stall) -> String {
+    if let Some((times, kind)) = &stall.repeated_failure {
+        return format!(
+            "Note: this exact call has now failed {times} times in this run with a {kind} \
+             error, so repeating it will not help. Change the approach (other arguments, a \
+             different command, or a longer timeout in the foreground), or finish with what \
+             you have. If the same call keeps failing, this attempt ends and is preserved for \
+             recovery."
+        );
+    }
     format!(
         "Note: this is call {} in a row that repeats an earlier call with the same result, so \
          it tells you nothing new. Change the approach, or finish with what you have. \
@@ -2049,9 +2073,12 @@ impl Tool for LedgerTool {
             Ok(v) => v.to_string(),
             Err(e) => format!("error: {e}"),
         };
+        // A failed call is also counted by its kind of error, so the same
+        // call failing again and again stalls the run whatever comes between.
+        let failure = result.as_ref().err().map(|e| e.kind().as_str());
         let stalled = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-            ledger.record(self.inner.name(), &args, &outcome);
+            ledger.record_call(self.inner.name(), &args, &outcome, failure);
             ledger.stalled()
         };
         // The first window is advisory, giving the worker room to change its
@@ -4266,6 +4293,38 @@ mod tests {
         assert!(
             matches!(backend.calls().as_slice(),[rustykrab_tools::work_backend::WorkCall::Report { report,.. }] if report==&returned)
         );
+    }
+
+    /// The live run's loop through the tool a run sees: the same failing
+    /// exec call relaunched between calls whose output differs each time.
+    #[tokio::test]
+    async fn the_same_failing_call_between_new_results_warns_then_ends_the_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = LedgerTool {
+            inner: Arc::new(rustykrab_tools::ExecTool::in_dir(dir.path())),
+            ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
+            commands: Arc::new(Mutex::new(Vec::new())),
+        };
+        let launch = json!({"command": "cargo test > test.log 2>&1 & echo started"});
+        for round in 1..=6u32 {
+            let error = tool.execute(launch.clone()).await.unwrap_err();
+            assert_eq!(
+                error.to_string().contains("failed"),
+                round >= 3,
+                "round {round}: {error}"
+            );
+            let poll = tool
+                .execute(json!({"command": format!("echo poll {round}")}))
+                .await;
+            if round < 6 {
+                let poll = poll.unwrap();
+                assert!(poll.get("notice").is_none(), "round {round}: {poll}");
+            } else {
+                let err = poll.expect_err("the sixth identical failure ends the attempt");
+                assert!(err.to_string().contains("progress ledger"), "{err}");
+                assert!(err.to_string().contains("failed 6 times"), "{err}");
+            }
+        }
     }
 
     /// `r` as if it cost `tokens` (prompt and completion together).

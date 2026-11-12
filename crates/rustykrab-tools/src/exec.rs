@@ -13,6 +13,102 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// The longest a call may ask for. The runner's own limit on an exec call
 /// sits just above it, so the command's limit is the one that applies.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// The shortest limit a command that runs Cargo gets, whatever it asks for.
+/// A build stopped after a few seconds finishes nothing worth keeping, and a
+/// model that picked 15 s relaunched one 156 times in a live run.
+pub const MIN_CARGO_TIMEOUT_SECS: u64 = 120;
+
+/// The Cargo home every worker's builds share, beside the repositories'
+/// build caches under the daemon's build-cache directory: one copy of each
+/// downloaded dependency's sources and registry index for every worker, kept
+/// across reboots. A Cargo home under the isolated `/tmp` HOME was wiped on
+/// reboot, and re-extracted sources carry new modification times, which
+/// invalidate every dependency already built in the shared target directory.
+pub const SHARED_CARGO_HOME: &str = "cargo-home";
+
+/// Rustc jobs one Cargo build may run on this machine. Without a limit each
+/// build ran as many as the machine has cores, beside a local model that
+/// holds most of its memory.
+pub const CARGO_BUILD_JOBS: &str = "6";
+
+/// The shared Cargo home for a repository's build cache `cache`
+/// (`<data>/build-cache/<repo>`): `<data>/build-cache/cargo-home`.
+pub fn shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
+    cache.parent().map(|root| root.join(SHARED_CARGO_HOME))
+}
+
+/// Entries in a Cargo home that would change how every later build runs
+/// (configuration: `rustc-wrapper`, source replacement, runners, aliases;
+/// `bin/`, where Cargo looks for `cargo-<name>` subcommands before the
+/// PATH) or hold registry tokens. The shared home is for what Cargo
+/// downloads; none of these belongs in it, since one run could otherwise
+/// set them for every worker's builds.
+pub const CARGO_HOME_CONTROL_FILES: [&str; 5] = [
+    "config",
+    "config.toml",
+    "credentials",
+    "credentials.toml",
+    "bin",
+];
+
+/// The directories of the shared Cargo home a build writes: downloaded
+/// registry indexes, crate archives and their extracted sources, and git
+/// dependencies. Created by [`prepare_shared_cargo_home`]; the only
+/// directories of that home a confined shell may write.
+pub const CARGO_HOME_DOWNLOAD_DIRS: [&str; 2] = ["registry", "git"];
+
+/// The files at the top of the shared Cargo home a build writes: Cargo's
+/// package-cache locks and its global cache tracker (an SQLite database
+/// with its journal files). The only files there a confined shell may write.
+pub const CARGO_HOME_LOCK_FILES: [&str; 6] = [
+    ".package-cache",
+    ".package-cache-mutate",
+    ".global-cache",
+    ".global-cache-journal",
+    ".global-cache-wal",
+    ".global-cache-shm",
+];
+
+/// The shared Cargo home for `cache` ([`shared_cargo_home`]), created with
+/// its [`CARGO_HOME_DOWNLOAD_DIRS`], and without any of
+/// [`CARGO_HOME_CONTROL_FILES`] an earlier run left there. Called as each
+/// run starts, for local and external workers alike.
+pub fn prepare_shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
+    let home = shared_cargo_home(cache)?;
+    if let Err(e) = CARGO_HOME_DOWNLOAD_DIRS
+        .iter()
+        .try_for_each(|dir| std::fs::create_dir_all(home.join(dir)))
+    {
+        tracing::warn!(
+            cargo_home = %home.display(),
+            error = %e,
+            "shared Cargo home unavailable"
+        );
+        return None;
+    }
+    for name in CARGO_HOME_CONTROL_FILES {
+        let path = home.join(name);
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        let removed = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "removed a Cargo configuration, credentials or bin entry from the shared Cargo home"
+            ),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot clear the shared Cargo home");
+                return None;
+            }
+        }
+    }
+    Some(home)
+}
 
 // Dropping wait_with_output kills only the direct child. A timed-out shell can
 // otherwise leave its actual command running after the observation is gone.
@@ -201,6 +297,8 @@ pub struct ExecTool {
     /// Where Cargo builds go instead of the directory's own `target/`
     /// (see [`ExecTool::with_build_cache`]).
     build_cache: Option<std::path::PathBuf>,
+    /// The Cargo home shared beside the build cache ([`shared_cargo_home`]).
+    cargo_home: Option<std::path::PathBuf>,
 }
 
 /// macOS's sandbox runner (Seatbelt).
@@ -212,6 +310,7 @@ impl ExecTool {
             dir: None,
             confinement: None,
             build_cache: None,
+            cargo_home: None,
         }
     }
 
@@ -221,6 +320,7 @@ impl ExecTool {
             dir: Some(dir.into()),
             confinement: None,
             build_cache: None,
+            cargo_home: None,
         }
     }
 
@@ -232,17 +332,24 @@ impl ExecTool {
     /// output. One directory per repository keeps the dependencies built
     /// across runs, and Cargo's lock on it runs one build at a time. Only
     /// for an instance with a directory; the directory is created.
+    ///
+    /// Cargo also gets the persistent Cargo home shared by every worker
+    /// ([`shared_cargo_home`], created here and writable in the sandbox)
+    /// and at most [`CARGO_BUILD_JOBS`] jobs.
     pub fn with_build_cache(mut self, cache: impl Into<std::path::PathBuf>) -> Self {
         let cache = cache.into();
         if self.dir.is_some() && cache.is_absolute() {
             match std::fs::create_dir_all(cache.join("target")) {
-                Ok(()) => self.build_cache = Some(cache),
+                Ok(()) => self.build_cache = Some(cache.clone()),
                 Err(e) => tracing::warn!(
                     cache = %cache.display(),
                     error = %e,
                     "build cache unavailable; builds use the directory's own target"
                 ),
             }
+        }
+        if self.build_cache.is_some() {
+            self.cargo_home = prepare_shared_cargo_home(&cache);
         }
         self
     }
@@ -272,9 +379,13 @@ impl ExecTool {
             return tokio::process::Command::new("sh");
         };
         let mut sandboxed = tokio::process::Command::new(SANDBOX);
+        // The build cache, and of the shared Cargo home only what a build
+        // downloads into it and its lock files: not its configuration,
+        // credentials or `bin/`, which every later build would use.
+        let cache: Vec<&std::path::Path> = self.build_cache.iter().map(|p| p.as_path()).collect();
         sandboxed
             .arg("-p")
-            .arg(confinement.profile(dir, self.build_cache.as_deref()))
+            .arg(confinement.profile(dir, &cache, self.cargo_home.as_deref()))
             .arg("sh");
         sandboxed
     }
@@ -381,7 +492,12 @@ impl Confinement {
     /// The Seatbelt profile for commands run in `dir`. Paths are resolved,
     /// since the sandbox matches real paths (`/tmp` is `/private/tmp`);
     /// a private path that does not exist is left out.
-    fn profile(&self, dir: &std::path::Path, build_cache: Option<&std::path::Path>) -> String {
+    fn profile(
+        &self,
+        dir: &std::path::Path,
+        build_dirs: &[&std::path::Path],
+        cargo_home: Option<&std::path::Path>,
+    ) -> String {
         let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         let quoted = |p: &std::path::Path| {
             let s = p
@@ -403,16 +519,22 @@ impl Confinement {
             own.push(common.clone());
             git_dirs.push(common);
         }
-        // The build cache is the run's to read and write, as its own
-        // `target/` would be.
-        if let Some(cache) = build_cache {
-            own.push(real(cache).unwrap_or_else(|| cache.to_path_buf()));
+        // The build cache and the shared Cargo home's download directories
+        // are the run's to read and write, as its own `target/` and Cargo
+        // home would be.
+        for build_dir in build_dirs {
+            own.push(real(build_dir).unwrap_or_else(|| build_dir.to_path_buf()));
         }
+        // The shared Cargo home is read; of it, only what a build downloads
+        // and Cargo's lock files are written (see the rule further down).
+        let cargo_home = cargo_home.map(|d| real(d).unwrap_or_else(|| d.to_path_buf()));
+        let read_only: Vec<std::path::PathBuf> = cargo_home.iter().cloned().collect();
         // Git resolves every directory component even when the worktree itself
         // is readable. A private ancestor (the daemon's data directory) must
         // expose its directory metadata, but not its entries or file contents.
         let ancestors: std::collections::BTreeSet<String> = own
             .iter()
+            .chain(&read_only)
             .flat_map(|p| p.ancestors().skip(1))
             .map(|p| {
                 let path = p
@@ -422,6 +544,7 @@ impl Confinement {
                 format!("(literal \"{path}\")")
             })
             .collect();
+        let readable: Vec<String> = own.iter().chain(&read_only).map(|p| quoted(p)).collect();
         let own: Vec<String> = own.iter().map(|p| quoted(p)).collect();
         let private: Vec<String> = self
             .private
@@ -439,7 +562,7 @@ impl Confinement {
         );
         if !private.is_empty() {
             profile.push_str(&format!("(deny file-read* {})", private.join(" ")));
-            profile.push_str(&format!("(allow file-read* {})", own.join(" ")));
+            profile.push_str(&format!("(allow file-read* {})", readable.join(" ")));
             if !ancestors.is_empty() {
                 profile.push_str(&format!(
                     "(allow file-read-metadata {})",
@@ -459,6 +582,30 @@ impl Confinement {
             .collect();
         if !git.is_empty() {
             profile.push_str(&format!("(deny file-write* {})", git.join(" ")));
+        }
+        // The shared Cargo home, wherever it lies (temporary space is
+        // writable): its configuration, credentials and `bin/` would change
+        // every later build of every worker, so only its download
+        // directories and lock files are writable.
+        if let Some(home) = &cargo_home {
+            let literal = |p: std::path::PathBuf| {
+                format!(
+                    "(literal \"{}\")",
+                    p.to_string_lossy()
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                )
+            };
+            let allowed: Vec<String> = CARGO_HOME_DOWNLOAD_DIRS
+                .iter()
+                .map(|d| quoted(&home.join(d)))
+                .chain(CARGO_HOME_LOCK_FILES.iter().map(|f| literal(home.join(f))))
+                .collect();
+            profile.push_str(&format!(
+                "(deny file-write* {})(allow file-write* {})",
+                quoted(home),
+                allowed.join(" ")
+            ));
         }
         let sockets: Vec<String> = Self::docker_sockets()
             .iter()
@@ -510,7 +657,8 @@ impl Default for ExecTool {
 /// command's isolated HOME. Resolve relative host configuration before binding
 /// the command to a different worktree. Cargo configuration/credentials and
 /// other ambient environment variables are deliberately not forwarded.
-fn rustup_home() -> Option<std::path::PathBuf> {
+/// External workers get the same location beside the shared Cargo home.
+pub fn rustup_home() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -520,6 +668,33 @@ fn rustup_home() -> Option<std::path::PathBuf> {
         Some(home)
     } else {
         std::env::current_dir().ok().map(|cwd| cwd.join(home))
+    }
+}
+
+/// The `bin/` of the Cargo home the daemon's user has (`$CARGO_HOME`, else
+/// `~/.cargo`), when it exists: where Rustup's proxies and installed Cargo
+/// subcommands live. A worker given the shared Cargo home keeps finding
+/// them on its PATH. Nothing else of that home (its configuration or
+/// credentials) is used.
+pub fn host_cargo_bin() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo")))?;
+    let bin = home.join("bin");
+    (bin.is_absolute() && bin.is_dir()).then_some(bin)
+}
+
+/// `path` with [`host_cargo_bin`] appended when it exists and is not on it
+/// already: a shell or worker given the shared Cargo home keeps finding
+/// Rustup's proxies and installed Cargo subcommands.
+pub fn path_with_host_cargo_bin(path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
+    match host_cargo_bin() {
+        Some(bin) if !dirs.contains(&bin) => {
+            dirs.push(bin);
+            std::env::join_paths(dirs).unwrap_or_else(|_| path.to_os_string())
+        }
+        _ => path.to_os_string(),
     }
 }
 
@@ -566,6 +741,386 @@ fn forced_removal_nested(command: &str, depth: usize) -> std::result::Result<(),
         }
     }
     Ok(())
+}
+
+/// Refuse a command that runs work in the background with a control `&`
+/// (`sleep 30 &`, `nohup cargo test > log & disown`), wherever it does: in
+/// any segment, inside a substitution, or in the script of `sh -c`,
+/// `bash -c` or `eval`. Every process the command starts is killed when
+/// the call returns, so the work can never survive it, and a backgrounded
+/// process holding the output open makes the call wait for its whole time
+/// limit anyway. `&&`, redirections (`2>&1`, `&>file`), a quoted `&` and
+/// the `&` of arithmetic (`$((a & b))`, `(( x & 1 ))`) or of a parameter
+/// expansion (`${v//&/and}`) are not backgrounding. A `wait` does not
+/// excuse it: `disown`, a subshell or a later `&` all escape the wait.
+fn refuse_background(command: &str) -> std::result::Result<(), String> {
+    background_nested(command, 0)
+}
+
+const BACKGROUND_REFUSAL: &str =
+    "running work in the background (a control `&`, as with `nohup … &` or `disown`) is \
+     refused: every process this command starts is killed when the call returns, so \
+     background work can never survive it and its output is lost. Run the command in the \
+     foreground and raise timeout_secs (up to 600) if it needs longer; a cargo build or test \
+     keeps the steps it finished, so running it again continues where it stopped.";
+
+fn background_nested(command: &str, depth: usize) -> std::result::Result<(), String> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return Err("command substitutions nest too deeply".into());
+    }
+    let (command, inner) = substitutions(command)?;
+    for body in &inner {
+        background_nested(body, depth + 1)?;
+    }
+    let masked = mask_expansions(&command);
+    let (segments, background) = scan_segments(&masked)?;
+    if background {
+        return Err(BACKGROUND_REFUSAL.into());
+    }
+    for segment in segments {
+        for script in shell_scripts(segment) {
+            background_nested(&script, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// `line` with every `&` inside arithmetic (`$((…))`, a `((…))` command)
+/// and parameter expansions (`${…}`) replaced by a space, so the segment
+/// scan sees only the shell's control operators. Quoted text is left as it
+/// is (the scan already skips it); the length never changes.
+fn mask_expansions(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = chars.clone();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    // The end (exclusive) of the region at `from` whose `close` balances
+    // its `open`, starting at depth `depth`.
+    let close_of = |from: usize, open: char, close: char, mut depth: usize| {
+        let mut k = from;
+        while k < chars.len() {
+            if chars[k] == open {
+                depth += 1;
+            } else if chars[k] == close {
+                depth -= 1;
+                if depth == 0 {
+                    return k + 1;
+                }
+            }
+            k += 1;
+        }
+        chars.len()
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        let at = |k: usize| chars.get(k).copied();
+        let region = if c == '$' && at(i + 1) == Some('(') && at(i + 2) == Some('(') {
+            // Arithmetic only when the inner `(` closes right before the
+            // outer one (see [`arithmetic_body`]).
+            let inner = close_of(i + 3, '(', ')', 1);
+            (at(inner) == Some(')')).then_some(inner + 1)
+        } else if c == '$' && at(i + 1) == Some('{') {
+            Some(close_of(i + 2, '{', '}', 1))
+        } else if quote.is_none()
+            && c == '('
+            && at(i + 1) == Some('(')
+            && opens_command(&chars[..i])
+        {
+            // A `((…))` command only when the inner `(` closes right
+            // before the outer one: `((sleep 2 &) ; echo ran)` is a
+            // subshell holding a subshell, and its `&` is a real job.
+            let inner = close_of(i + 2, '(', ')', 1);
+            (at(inner) == Some(')')).then_some(inner + 1)
+        } else {
+            None
+        };
+        if let Some(end) = region {
+            for slot in &mut out[i..end] {
+                if *slot == '&' {
+                    *slot = ' ';
+                }
+            }
+            i = end;
+            continue;
+        }
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('"'), '"') => quote = None,
+            _ => {}
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+/// Whether a command starts after `before`: at the start of the line,
+/// after a control operator, `(`, `!` or a newline, or after a keyword
+/// that a command follows (`if (( x & 1 ))`, `while (( … ))`).
+fn opens_command(before: &[char]) -> bool {
+    let text: String = before.iter().collect();
+    let text = text.trim_end_matches([' ', '\t']);
+    match text.chars().last() {
+        None => true,
+        Some(';' | '&' | '|' | '(' | '!' | '\n') => true,
+        Some(_) => {
+            let word = text
+                .rsplit(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '('))
+                .next()
+                .unwrap_or_default();
+            matches!(
+                word,
+                "if" | "elif" | "while" | "until" | "then" | "do" | "else" | "time"
+            )
+        }
+    }
+}
+
+/// Whether `$(` + `body` + `)` is an arithmetic expansion `$((…))`: `body`
+/// opens with `(` and that parenthesis closes only at its very end.
+/// Otherwise (`$((sleep 2 &) ; echo ran)`) it is a command substitution
+/// whose command starts with a subshell, as the shell reads it.
+fn arithmetic_body(body: &str) -> bool {
+    let count = body.chars().count();
+    let mut depth = 0usize;
+    for (k, c) in body.chars().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return k + 1 == count;
+                }
+            }
+            _ if k == 0 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A segment's words as the shell splits them: on unquoted blanks, with
+/// quotes removed and backslash escapes resolved.
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = segment.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                }
+            }
+            Some(_) => word.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c == '\\' => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                }
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether option `opt` of wrapper `wrapper` takes the next word as its
+/// value (`timeout -s KILL`, `env -u NAME`, `sudo -u user`).
+fn wrapper_option_takes_value(wrapper: &str, opt: &str) -> bool {
+    match wrapper {
+        "timeout" => matches!(opt, "-s" | "-k" | "--signal" | "--kill-after"),
+        "env" => matches!(opt, "-u" | "-C" | "--unset" | "--chdir"),
+        "sudo" | "doas" => matches!(
+            opt,
+            "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-r" | "-t" | "-U" | "--user" | "--group"
+        ),
+        "nice" => matches!(opt, "-n" | "--adjustment"),
+        "stdbuf" => matches!(opt, "-i" | "-o" | "-e"),
+        "xargs" => matches!(opt, "-I" | "-n" | "-P" | "-L" | "-d" | "-E" | "-s" | "-a"),
+        _ => false,
+    }
+}
+
+/// The index in `words` of the program a segment runs, past assignments,
+/// redirects and their targets, the shell's own words, and wrappers with
+/// their options and values.
+fn program_index(words: &[String]) -> Option<usize> {
+    let mut i = 0;
+    let mut target_next = false;
+    while i < words.len() {
+        let token = words[i]
+            .trim_start_matches(['(', '{'])
+            .trim_end_matches([')', '}']);
+        if std::mem::take(&mut target_next) {
+            i += 1;
+            continue;
+        }
+        if let Some(needs_target) = redirect(token) {
+            target_next = needs_target;
+            i += 1;
+            continue;
+        }
+        if token.is_empty()
+            || (token.contains('=') && !token.starts_with('='))
+            || SHELL_WORDS.contains(&token)
+        {
+            i += 1;
+            continue;
+        }
+        let name = token.rsplit('/').next().unwrap_or(token);
+        if WRAPPERS.contains(&name) {
+            i += 1;
+            while i < words.len() {
+                let word = words[i].as_str();
+                if wrapper_option_takes_value(name, word) {
+                    i += 2;
+                } else if word.starts_with('-')
+                    || word.contains('=')
+                    || (matches!(name, "timeout" | "nice")
+                        && word.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// The name of the program a segment runs (see [`program_index`]).
+fn segment_program(segment: &str) -> Option<String> {
+    let words = shell_words(segment);
+    let i = program_index(&words)?;
+    let token = words[i]
+        .trim_start_matches(['(', '{'])
+        .trim_end_matches([')', '}']);
+    Some(token.rsplit('/').next().unwrap_or(token).to_string())
+}
+
+/// The scripts a segment hands to another shell to run: the argument of
+/// `sh -c` (or `bash`, `zsh`, `dash`, `ksh`, with `-c` alone or in a flag
+/// group such as `-ec`), or the words of `eval`.
+fn shell_scripts(segment: &str) -> Vec<String> {
+    let words = shell_words(segment);
+    let Some(i) = program_index(&words) else {
+        return Vec::new();
+    };
+    let token = words[i]
+        .trim_start_matches(['(', '{'])
+        .trim_end_matches([')', '}']);
+    let name = token.rsplit('/').next().unwrap_or(token);
+    match name {
+        "eval" => vec![words[i + 1..].join(" ")],
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => words[i + 1..]
+            .iter()
+            .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+            .and_then(|k| words.get(i + 2 + k))
+            .cloned()
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether any command the line runs, in any segment, substitution or
+/// `sh -c`/`eval` script, is Cargo (past assignments, redirects, the
+/// shell's own words and wrappers such as `env` or `nohup`). A line that
+/// cannot be parsed is not one.
+fn runs_cargo(command: &str) -> bool {
+    fn nested(command: &str, depth: usize) -> bool {
+        if depth > MAX_SUBSTITUTION_DEPTH {
+            return false;
+        }
+        let Ok((command, inner)) = substitutions(command) else {
+            return false;
+        };
+        inner.iter().any(|body| nested(body, depth + 1))
+            || command_segments(&command)
+                .unwrap_or_default()
+                .into_iter()
+                .any(|segment| {
+                    segment_program(segment).as_deref() == Some("cargo")
+                        || shell_scripts(segment)
+                            .iter()
+                            .any(|script| nested(script, depth + 1))
+                })
+    }
+    nested(command, 0)
+}
+
+/// The time limit a call gets: what it asks for (or the default), at most
+/// [`MAX_TIMEOUT_SECS`], and at least [`MIN_CARGO_TIMEOUT_SECS`] when the
+/// command runs Cargo.
+fn resolve_timeout(requested: Option<u64>, cargo: bool) -> u64 {
+    let secs = requested
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .min(MAX_TIMEOUT_SECS);
+    if cargo {
+        secs.max(MIN_CARGO_TIMEOUT_SECS)
+    } else {
+        secs
+    }
+}
+
+/// What a timed-out call tells the model: that its processes were stopped,
+/// that backgrounding cannot outlive the call, and for Cargo, that the work
+/// already done is kept and how to continue it.
+fn timeout_message(secs: u64, cargo: bool, shared_cache: bool) -> String {
+    let background = "Background processes (`&`, `nohup`, `disown`) are killed when the call \
+                      returns, so backgrounding cannot make a command outlive it.";
+    if cargo {
+        let kept = if shared_cache {
+            "in the shared build cache"
+        } else {
+            "in the target directory"
+        };
+        format!(
+            "command timed out after {secs}s and was stopped. Cargo keeps the build steps it \
+             finished {kept}, so nothing done so far is lost: run the same command again in \
+             the foreground with timeout_secs=600 and it continues where it stopped. \
+             {background}"
+        )
+    } else {
+        format!(
+            "command timed out after {secs}s and was stopped. {background} Run it in the \
+             foreground with a larger timeout_secs (up to {MAX_TIMEOUT_SECS}), or narrow the \
+             work."
+        )
+    }
 }
 
 /// Programs that run the command that follows them.
@@ -755,6 +1310,12 @@ fn expand_at(
     match (at(i), at(i + 1), at(i + 2)) {
         (Some('$'), Some('('), Some('(')) => {
             let (body, after) = substitution_body(chars, i + 2)?;
+            if !arithmetic_body(&body) {
+                // `$((sleep 2 &) ; echo ran)`: a command substitution.
+                inner.push(body);
+                outer.push_str(SUBSTITUTION);
+                return Ok(Some(after));
+            }
             if body.contains("$(") || body.contains('`') {
                 return Err("an arithmetic expansion holds a command substitution; \
                             run that command on its own first"
@@ -875,6 +1436,13 @@ fn heredoc_body(
 /// boundary, and a here-document's body (`<<EOF` … `EOF`) is the input of
 /// its command, not commands of its own.
 fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
+    scan_segments(command).map(|(segments, _)| segments)
+}
+
+/// [`command_segments`], and whether any boundary was a control `&` that
+/// runs the command before it in the background: a lone `&`, not either
+/// half of `&&`, not part of a redirect, and not bash's `|&`.
+fn scan_segments(command: &str) -> std::result::Result<(Vec<&str>, bool), String> {
     #[derive(Clone, Copy)]
     enum Quote {
         Single,
@@ -882,6 +1450,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
     }
     let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut segments = Vec::new();
+    let mut background = false;
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
@@ -920,6 +1489,9 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                     continue;
                 }
                 '|' | ';' | '&' => {
+                    if ch == '&' && !matches!(prev, Some('&' | '|' | ';')) && next != Some('&') {
+                        background = true;
+                    }
                     segments.push(&command[start..index]);
                     start = index + ch.len_utf8();
                 }
@@ -932,7 +1504,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
                         loop {
                             let Some(&(line_start, _)) = chars.get(i + 1) else {
                                 // Unterminated: the rest is input, not commands.
-                                return Ok(segments);
+                                return Ok((segments, background));
                             };
                             let line_end = command[line_start..]
                                 .find('\n')
@@ -965,7 +1537,7 @@ fn command_segments(command: &str) -> std::result::Result<Vec<&str>, String> {
         return Err("command contains an unterminated quote".into());
     }
     segments.push(&command[start..]);
-    Ok(segments)
+    Ok((segments, background))
 }
 
 /// Read a here-document's delimiter word starting at `chars[at]` (just past
@@ -1161,7 +1733,7 @@ impl Tool for ExecTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 120, max: 600). Raise it for a long build or test run."
+                        "description": "Timeout in seconds (default: 120, max: 600; a cargo command gets at least 120). Raise it for a long build or test run: processes run in the background are killed when the call returns."
                     }
                 },
                 "required": ["command"]
@@ -1177,21 +1749,22 @@ impl Tool for ExecTool {
         // In the sandbox, the sandbox is the boundary and any program runs;
         // unsandboxed, the allowlist still decides. Forced removal is refused
         // either way.
+        // Backgrounded work never outlives the call, so it is refused too.
         let checked = if self.sandbox().is_some() {
             refuse_forced_removal(command)
         } else {
             validate_command(command).and_then(|()| refuse_forced_removal(command))
         };
-        checked.map_err(|e| {
-            rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
-                "command rejected: {e}"
-            )))
-        })?;
+        checked
+            .and_then(|()| refuse_background(command))
+            .map_err(|e| {
+                rustykrab_core::Error::ToolExecution(ToolError::invalid_input(format!(
+                    "command rejected: {e}"
+                )))
+            })?;
 
-        let timeout_secs = args["timeout_secs"]
-            .as_u64()
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS);
+        let cargo = runs_cargo(command);
+        let timeout_secs = resolve_timeout(args["timeout_secs"].as_u64(), cargo);
 
         // Inherit the user's PATH so tools installed via homebrew, cargo,
         // pip, nvm, etc. are available. Fall back to a sensible default.
@@ -1217,7 +1790,15 @@ impl Tool for ExecTool {
             process.env("RUSTUP_HOME", home);
         }
         if let Some(cache) = &self.build_cache {
-            process.env("CARGO_TARGET_DIR", cache.join("target"));
+            process
+                .env("CARGO_TARGET_DIR", cache.join("target"))
+                .env("CARGO_BUILD_JOBS", CARGO_BUILD_JOBS);
+        }
+        if let Some(home) = &self.cargo_home {
+            process.env("CARGO_HOME", home).env(
+                "PATH",
+                path_with_host_cargo_bin(std::ffi::OsStr::new(&path)),
+            );
         }
         if let Some(dir) = &self.dir {
             process.current_dir(dir);
@@ -1234,8 +1815,10 @@ impl Tool for ExecTool {
         let output = timeout(Duration::from_secs(timeout_secs), future)
             .await
             .map_err(|_| {
-                rustykrab_core::Error::ToolExecution(ToolError::timeout(format!(
-                    "command timed out after {timeout_secs}s"
+                rustykrab_core::Error::ToolExecution(ToolError::timeout(timeout_message(
+                    timeout_secs,
+                    cargo,
+                    self.build_cache.is_some(),
                 )))
             })?
             .map_err(|e| {
@@ -1418,6 +2001,319 @@ mod environment_tests {
 }
 
 #[cfg(test)]
+mod background_and_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn backgrounded_work_is_refused_with_why_and_what_to_do() {
+        for command in [
+            "sleep 30 & echo x",
+            "sleep 30 &",
+            "nohup cargo test > test.log 2>&1 & disown",
+            "cd sub && cargo build &",
+            "(cargo test &)",
+            "echo $(sleep 5 & echo started)",
+            "cargo test 2>&1 & echo launched",
+            // A wait does not excuse it: each of these leaves work behind.
+            "sleep 1 & sleep 2 & wait",
+            "nohup cargo test > log 2>&1 & disown; wait",
+            "(cargo test &); wait",
+            "sleep 1 & wait; sleep 100 &",
+            // Nor does handing the line to another shell.
+            "sh -c 'cargo test &'",
+            "bash -c \"nohup cargo test &\"",
+            "bash -ec 'sleep 9 & echo x'",
+            "eval 'sleep 9 &'",
+            // Arithmetic beside it does not hide it.
+            "echo $((1 & 1)); sleep 9 &",
+            // Nor does a substitution or subshell that only starts like
+            // arithmetic: a subshell inside, closed before the end.
+            "$((sleep 2 &) ; echo ran)",
+            "echo \"$((sleep 2 &) ; echo ran)\"",
+            "((sleep 2 &) ; echo ran)",
+            "x; ((sleep 2 &) )",
+        ] {
+            let error = refuse_background(command).unwrap_err();
+            assert!(
+                error.contains("background")
+                    && error.contains("killed when the call returns")
+                    && error.contains("foreground")
+                    && error.contains("timeout_secs"),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn and_lists_redirections_quotes_and_waited_jobs_are_not_backgrounding() {
+        for command in [
+            "a && b",
+            "cargo test 2>&1",
+            "cargo build &> build.log",
+            "cargo build >& build.log",
+            "echo 'a & b'",
+            "echo \"a & b\"",
+            r"echo a \& b",
+            "make || echo failed",
+            "echo $((5 & 3))",
+            "x=$(( a & 1 ))",
+            "(( x & 1 )) && echo odd",
+            "echo ${v//&/and}",
+            "echo \"${v//&/and}\"",
+            "sh -c 'a && b'",
+            "cat <<'EOF'\nrun & later\nEOF",
+            "echo $(( x & 1 ))",
+            "echo $(( (a + b) & 1 ))",
+            "if (( x & 1 )); then echo odd; fi",
+            "while (( n & 1 )); do n=0; done",
+            "echo x\n(( y & 1 )) && echo odd",
+            // What the workers run every day.
+            "cargo test 2>&1 | tail -20",
+            "cargo test -p x -- --test-threads=1 2>&1 | tail -n 50",
+            "curl -s 'https://example.invalid/?a=1&b=2'",
+            "git log --format='%h & %s' -5",
+            "[[ -n a && -n b ]] && echo y",
+            "git commit -m \"$(cat <<'EOF'\nfix a & b\nEOF\n)\"",
+        ] {
+            refuse_background(command).unwrap_or_else(|e| panic!("{command}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backgrounding_command_is_refused_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = ExecTool::in_dir(dir.path())
+            .execute(json!({"command": "touch ran & echo x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), rustykrab_core::ToolErrorKind::InvalidInput);
+        assert!(error.to_string().contains("background"), "{error}");
+        assert!(!dir.path().join("ran").exists(), "the command ran");
+    }
+
+    #[test]
+    fn commands_that_run_cargo_are_recognised_wherever_cargo_runs() {
+        for command in [
+            "cargo test",
+            "cd crates/x && cargo test -p x",
+            "RUSTFLAGS=-Dwarnings cargo build",
+            "timeout 300 cargo test",
+            "env CARGO_TERM_COLOR=never /usr/bin/cargo check",
+            "echo $(cargo metadata --format-version 1)",
+            "nohup cargo test > log",
+            "RUSTFLAGS=\"-D warnings\" cargo build",
+            "RUSTFLAGS='-D warnings' cargo build",
+            "timeout -s KILL 300 cargo test",
+            "env -u FOO cargo test",
+            "sudo -u bob cargo test",
+            "bash -c 'cargo test'",
+            "eval cargo test",
+        ] {
+            assert!(runs_cargo(command), "{command}");
+        }
+        for command in ["echo cargo", "grep cargo Cargo.toml", "ls target", "make"] {
+            assert!(!runs_cargo(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_cargo_command_gets_at_least_the_cargo_minimum() {
+        assert_eq!(resolve_timeout(Some(5), true), MIN_CARGO_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout(Some(15), true), 120);
+        assert_eq!(resolve_timeout(Some(300), true), 300);
+        assert_eq!(resolve_timeout(Some(5000), true), MAX_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout(None, true), DEFAULT_TIMEOUT_SECS);
+        // Other commands keep what they ask for.
+        assert_eq!(resolve_timeout(Some(5), false), 5);
+        assert_eq!(resolve_timeout(Some(0), false), 0);
+        assert_eq!(resolve_timeout(Some(5000), false), MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_cargo_timeout_says_the_work_is_kept_and_how_to_continue() {
+        let message = timeout_message(
+            resolve_timeout(Some(5), runs_cargo("cargo test")),
+            true,
+            true,
+        );
+        for wanted in [
+            "timed out after 120s",
+            "shared build cache",
+            "run the same command again in the foreground with timeout_secs=600",
+            "Background processes",
+            "killed when the call returns",
+        ] {
+            assert!(message.contains(wanted), "{wanted:?} missing: {message}");
+        }
+        let message = timeout_message(30, false, true);
+        assert!(
+            message.contains("killed when the call returns"),
+            "{message}"
+        );
+        assert!(!message.contains("build cache"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_is_told_backgrounding_cannot_outlive_the_call() {
+        let error = ExecTool::new()
+            .execute(json!({"command": "sleep 1", "timeout_secs": 0}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), rustykrab_core::ToolErrorKind::Timeout);
+        let message = error.to_string();
+        assert!(message.contains("timed out after 0s"), "{message}");
+        assert!(
+            message.contains("killed when the call returns"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn builds_share_a_persistent_cargo_home_beside_the_cache_with_limited_jobs() {
+        let data = tempfile::tempdir().unwrap();
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(&work).unwrap();
+        let cache = data.path().join("build-cache/source");
+        let tool = ExecTool::in_dir(&work).with_build_cache(&cache);
+        let out = tool.execute(json!({"command": "env"})).await.unwrap();
+        assert_eq!(out["exit_code"], 0, "{out}");
+        let vars: std::collections::BTreeMap<_, _> = out["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let home = vars.get("CARGO_HOME").expect("CARGO_HOME is set");
+        let shared = data.path().join("build-cache").join(SHARED_CARGO_HOME);
+        assert_eq!(std::path::Path::new(home), shared);
+        assert!(shared.is_dir(), "the shared Cargo home is created");
+        assert!(
+            !home.starts_with(vars.get("HOME").unwrap()),
+            "Cargo's home is not under the isolated, temporary HOME: {home}"
+        );
+        assert_eq!(vars.get("CARGO_BUILD_JOBS"), Some(&CARGO_BUILD_JOBS));
+        assert_eq!(
+            vars.get("CARGO_TARGET_DIR").map(std::path::Path::new),
+            Some(cache.join("target").as_path())
+        );
+    }
+
+    /// Opt-in, with the host's real Cargo and network: two worktrees of one
+    /// repository build through `exec`, and the second compiles none of the
+    /// dependencies the first fetched into the shared Cargo home and built.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
+    async fn real_cargo_reuses_the_shared_home_and_cache_across_worktrees() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let mut outputs = Vec::new();
+        for run in ["run-1", "run-2"] {
+            let work = data.path().join("worktrees").join(run);
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::write(
+                work.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nitoa = \"=1.0.11\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                work.join("src/lib.rs"),
+                "pub fn f() -> String { itoa::Buffer::new().format(1).into() }\n",
+            )
+            .unwrap();
+            let tool = ExecTool::in_dir(&work).with_build_cache(&cache);
+            let out = tool
+                .execute(json!({"command": "cargo build 2>&1", "timeout_secs": 600}))
+                .await
+                .unwrap();
+            assert_eq!(out["exit_code"], 0, "{out}");
+            outputs.push(out["stdout"].as_str().unwrap().to_string());
+        }
+        println!("REAL_SHARED_HOME_RECEIPT {}", json!({"builds": outputs}));
+        assert!(outputs[0].contains("Compiling itoa"), "{}", outputs[0]);
+        assert!(!outputs[1].contains("Compiling itoa"), "{}", outputs[1]);
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(
+            home.join("registry").is_dir(),
+            "sources live in the shared home"
+        );
+    }
+
+    /// Opt-in, with the host's real Cargo and network, macOS only: a build
+    /// with one dependency succeeds in the confined shell, which may write
+    /// only the shared Cargo home's download directories and lock files.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
+    async fn real_cargo_builds_in_the_confined_shell_with_a_narrowed_home() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(
+            work.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nitoa = \"=1.0.11\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("src/lib.rs"),
+            "pub fn f() -> String { itoa::Buffer::new().format(1).into() }\n",
+        )
+        .unwrap();
+        let tool = ExecTool::in_dir(&work)
+            .confined(vec![data.path().to_path_buf()])
+            .with_build_cache(&cache);
+        let out = tool
+            .execute(json!({"command": "cargo build 2>&1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        println!("REAL_CONFINED_RECEIPT {out}");
+        assert_eq!(out["exit_code"], 0, "{out}");
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("Compiling itoa"), "{stdout}");
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(home.join("registry/src").is_dir(), "sources extracted");
+        assert!(!home.join("bin").exists());
+    }
+
+    #[test]
+    fn each_run_clears_configuration_and_credentials_from_the_shared_home() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("build-cache/source");
+        let home = prepare_shared_cargo_home(&cache).unwrap();
+        std::fs::create_dir_all(home.join("registry/src")).unwrap();
+        std::fs::write(home.join("registry/src/kept"), "kept").unwrap();
+        std::fs::write(home.join("config.toml"), "[alias]\nplanted = \"version\"\n").unwrap();
+        std::fs::write(home.join("credentials.toml"), "token").unwrap();
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin/cargo-fmt"), "#!/bin/sh\necho planted\n").unwrap();
+        assert_eq!(prepare_shared_cargo_home(&cache), Some(home.clone()));
+        for dir in CARGO_HOME_DOWNLOAD_DIRS {
+            assert!(home.join(dir).is_dir(), "{dir} is created");
+        }
+        for name in CARGO_HOME_CONTROL_FILES {
+            assert!(!home.join(name).exists(), "{name} survived");
+        }
+        assert!(home.join("registry/src/kept").is_file(), "downloads stay");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_without_a_build_cache_sets_no_cargo_home_or_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = ExecTool::in_dir(dir.path())
+            .execute(json!({"command": "printf '%s/%s' \"${CARGO_HOME:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\""}))
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"], "unset/unset");
+    }
+}
+
+#[cfg(test)]
 mod forced_removal_tests {
     use super::refuse_forced_removal;
 
@@ -1440,6 +2336,9 @@ mod forced_removal_tests {
             "timeout 5 rm -rf build",
             "nice -n 10 rm -rf build",
             "if true; then rm -rf build; fi",
+            // A command substitution that only starts like arithmetic.
+            "echo $((rm -rf build) )",
+            "echo \"$((rm -rf build); echo done)\"",
         ] {
             let error = refuse_forced_removal(command).unwrap_err();
             assert!(error.contains("forced removal"), "{command}: {error}");
@@ -1819,7 +2718,9 @@ mod error_typing_tests {
         let dir = tempfile::tempdir().unwrap();
         let output = ExecTool::in_dir(dir.path())
             .confined(Vec::new())
-            .execute(json!({"command": "sleep 30 & rk_owned_child=$!; kill -0 \"$rk_owned_child\" && kill -TERM \"$rk_owned_child\"; wait \"$rk_owned_child\"; rk_owned_status=$?; test \"$rk_owned_status\" -ge 128"}))
+            // The child is started without `&`, which exec refuses: a
+            // process spawned inside the same sandbox invocation.
+            .execute(json!({"command": "rk_owned_child=$(python3 -c \"import subprocess; print(subprocess.Popen(['sleep','30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)\"); kill -0 \"$rk_owned_child\" && kill -TERM \"$rk_owned_child\" || exit 1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do kill -0 \"$rk_owned_child\" 2>/dev/null || exit 0; sleep 0.1; done; exit 1"}))
             .await
             .unwrap();
         assert_eq!(output["exit_code"], 0, "{output}");
@@ -1885,6 +2786,48 @@ mod error_typing_tests {
             std::fs::canonicalize(text.trim_start_matches("built\n")).unwrap(),
             target
         );
+        // So does the Cargo home every worker shares, beside the cache.
+        let (code, text) = run_in(
+            &tool,
+            "mkdir -p \"$CARGO_HOME/registry\" && echo fetched > \"$CARGO_HOME/registry/entry\" \
+             && cat \"$CARGO_HOME/registry/entry\"",
+        )
+        .await;
+        assert_eq!((code, text.as_str()), (0, "fetched\n"));
+        // Its git checkouts and lock files are writable too.
+        for command in [
+            "mkdir -p \"$CARGO_HOME/git/db\" && echo x > \"$CARGO_HOME/git/db/entry\"",
+            "echo > \"$CARGO_HOME/.package-cache\" && echo > \"$CARGO_HOME/.global-cache\" \
+             && echo > \"$CARGO_HOME/.global-cache-journal\"",
+        ] {
+            let (code, text) = run_in(&tool, command).await;
+            assert_eq!(code, 0, "{command}: {text}");
+        }
+        // But not its configuration, credentials or `bin/`, which would
+        // change every later build of every worker, nor anything else there.
+        for name in super::CARGO_HOME_CONTROL_FILES {
+            let (code, _) = run_in(&tool, &format!("echo planted > \"$CARGO_HOME/{name}\"")).await;
+            assert_ne!(code, 0, "{name} was writable");
+        }
+        for command in [
+            "mkdir \"$CARGO_HOME/bin\"",
+            "mkdir \"$CARGO_HOME/other\"",
+            "echo planted > \"$CARGO_HOME/env\"",
+            "echo planted > \"$CARGO_HOME/registry/entry2\" \
+             && mv \"$CARGO_HOME/registry/entry2\" \"$CARGO_HOME/config.toml\"",
+            "ln -s registry \"$CARGO_HOME/bin\"",
+        ] {
+            let (code, _) = run_in(&tool, command).await;
+            assert_ne!(code, 0, "{command} succeeded");
+        }
+        let home = data.path().join("build-cache/cargo-home");
+        assert!(home.join("registry/entry").is_file());
+        for name in super::CARGO_HOME_CONTROL_FILES
+            .iter()
+            .chain(&["other", "env"])
+        {
+            assert!(!home.join(name).exists(), "{name} was created");
+        }
         // The cache opens nothing else in the private directory.
         let (code, text) = run_in(&tool, "cat ../../service.json").await;
         assert_ne!(code, 0);

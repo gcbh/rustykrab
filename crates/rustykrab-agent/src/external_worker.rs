@@ -859,6 +859,13 @@ impl ExternalWorker {
             .filter(|_| !review)
             .and_then(|ws| ws.build_cache(&c.data_dir.join(workspace::BUILD_CACHE_DIR)))
             .filter(|cache| std::fs::create_dir_all(cache.join("target")).is_ok());
+        // Beside it, the Cargo home every worker shares, so one copy of
+        // each dependency serves them all (the local workers' shells too).
+        // Any configuration or credentials file an earlier run left in it
+        // is removed first.
+        let cargo_home = build_cache
+            .as_deref()
+            .and_then(rustykrab_tools::prepare_shared_cargo_home);
         match c.kind {
             WorkerKind::Codex => {
                 if c.require_chatgpt {
@@ -901,6 +908,9 @@ impl ExternalWorker {
                 if let Some(cache) = &build_cache {
                     cmd.arg("--add-dir").arg(cache);
                 }
+                if let Some(home) = &cargo_home {
+                    cmd.arg("--add-dir").arg(home);
+                }
                 // An investigation's inputs (its bundle, the session logs,
                 // the failed runs' kept worktrees, the daemon's source) are
                 // named in the brief and need no flag here: Codex's sandbox
@@ -929,6 +939,9 @@ impl ExternalWorker {
                 }
                 if let Some(cache) = &build_cache {
                     cmd.arg("--add-dir").arg(cache);
+                }
+                if let Some(home) = &cargo_home {
+                    cmd.arg("--add-dir").arg(home);
                 }
                 // A fix item reads outside its worktree: its investigation
                 // bundle, the failed runs' session logs and kept worktrees,
@@ -995,7 +1008,21 @@ impl ExternalWorker {
         cmd.env("RUSTYKRAB_DATA_DIR", &c.data_dir)
             .env("RUSTYKRAB_SKILLS_DIR", &c.skills_dir);
         if let Some(cache) = &build_cache {
-            cmd.env("CARGO_TARGET_DIR", cache.join("target"));
+            cmd.env("CARGO_TARGET_DIR", cache.join("target"))
+                .env("CARGO_BUILD_JOBS", rustykrab_tools::CARGO_BUILD_JOBS);
+        }
+        if let Some(home) = &cargo_home {
+            cmd.env("CARGO_HOME", home);
+            // Rustup's toolchains stay where the daemon's user has them, and
+            // the user's Cargo `bin/` (Rustup's proxies, installed
+            // subcommands) stays on the PATH; that home's configuration and
+            // credentials are not used.
+            if let Some(rustup) = rustykrab_tools::rustup_home() {
+                cmd.env("RUSTUP_HOME", rustup);
+            }
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", rustykrab_tools::path_with_host_cargo_bin(&path));
+            }
         }
         cmd
     }
@@ -1490,21 +1517,47 @@ impl Worker for ExternalWorker {
             Ok(report)
         });
 
-        // Retention: a run with a result gives its directory back; one
-        // without (an interrupted one included) keeps it for diagnosis
-        // unless policy says otherwise.
-        let keep = outcome.is_err() && matches!(self.config.retention, Retention::KeepFailed(_));
+        // Retention: a completed run gives its directory back; one that is
+        // not (no result, an interrupted one included, or a report that is
+        // blocked, has an error or questions, or left changes uncommitted)
+        // keeps it for the next attempt unless policy says otherwise.
+        let unfinished = unfinished_reason(&outcome, workspace.as_ref()).await;
+        let keep =
+            unfinished.is_some() && matches!(self.config.retention, Retention::KeepFailed(_));
         if keep {
+            tracing::info!(
+                worker = %self.name,
+                item = %brief.item,
+                dir = %dir.display(),
+                reason = unfinished.as_deref().unwrap_or_default(),
+                "run directory kept"
+            );
             // Kept for diagnosis: its source and branch, not its build.
             if let Some(ws) = workspace.clone() {
                 let _ = tokio::task::spawn_blocking(move || ws.drop_build_output()).await;
             }
         }
         if !keep {
+            let reason = match &unfinished {
+                Some(why) => format!("retention policy removes every run's directory ({why})"),
+                None => "the run completed".to_string(),
+            };
+            tracing::info!(
+                worker = %self.name,
+                item = %brief.item,
+                dir = %dir.display(),
+                %reason,
+                "run directory removed"
+            );
             let _ = std::fs::remove_dir_all(&context_dir);
             match workspace {
                 Some(ws) => {
-                    let _ = tokio::task::spawn_blocking(move || ws.remove()).await;
+                    if let Err(why) = tokio::task::spawn_blocking(move || ws.remove())
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    {
+                        tracing::warn!(worker = %self.name, %why, "worktree not removed");
+                    }
                 }
                 None => {
                     let _ = std::fs::remove_dir_all(&dir);
@@ -1520,6 +1573,46 @@ impl Worker for ExternalWorker {
         );
         outcome
     }
+}
+
+/// Why a run is not completed, so its worktree is kept for the next attempt
+/// rather than removed; `None` when it is. Completed is a report with no
+/// block, no error and no questions whose worktree holds nothing git would
+/// lose with it: no uncommitted edit to a tracked file and no untracked
+/// file git does not ignore, whether or not the branch has a commit (a new
+/// source file never staged is work too; build output and anything in
+/// `.gitignore` does not count). Both the local and the external workers
+/// decide by this: a run blocked on a question with its change still
+/// uncommitted lost that change when only failed runs kept their worktrees.
+pub(crate) async fn unfinished_reason(
+    outcome: &Result<ResultReport>,
+    workspace: Option<&workspace::Workspace>,
+) -> Option<String> {
+    let report = match outcome {
+        Err(e) => return Some(format!("no result: {}", tail(&e.to_string(), 300))),
+        Ok(report) => report,
+    };
+    if let Some(blocked) = &report.blocked {
+        return Some(format!("blocked: {}", blocked.reason.as_str()));
+    }
+    if let Some(error) = &report.error {
+        return Some(format!("reported an error: {}", tail(&error.detail, 300)));
+    }
+    if !report.questions.is_empty() {
+        return Some(format!("{} open question(s)", report.questions.len()));
+    }
+    let ws = workspace?.clone();
+    tokio::task::spawn_blocking(move || {
+        if ws.has_uncommitted_tracked_changes() {
+            Some("uncommitted changes to tracked files".to_string())
+        } else if ws.has_uncommitted_changes() {
+            Some("untracked files git does not ignore".to_string())
+        } else {
+            None
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Some(format!("the worktree could not be inspected: {e}")))
 }
 
 /// Drop model-authored host proof; replace command records with observed commands.
@@ -2600,7 +2693,9 @@ echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turn
     const BUILDS_THEN_FAILS: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$RUSTYKRAB_DATA_DIR/args.txt"
 printf '%s' "$CARGO_TARGET_DIR" > "$RUSTYKRAB_DATA_DIR/target-dir.txt"
+printf '%s\n%s\n%s' "$CARGO_HOME" "$CARGO_BUILD_JOBS" "$RUSTUP_HOME" > "$RUSTYKRAB_DATA_DIR/cargo-env.txt"
 echo built > "$CARGO_TARGET_DIR/artifact"
+echo fetched > "$CARGO_HOME/registry-entry"
 mkdir -p target/debug && echo tag > target/CACHEDIR.TAG && echo big > target/debug/bin
 mkdir -p notes && echo keep > notes/target
 exit 3
@@ -2608,8 +2703,17 @@ exit 3
 
     #[tokio::test]
     async fn a_worktree_run_builds_into_the_shared_cache_and_a_kept_one_drops_its_target() {
+        for (kind, name) in [
+            (WorkerKind::ClaudeCode, "claude"),
+            (WorkerKind::Codex, "codex"),
+        ] {
+            worktree_run_builds_into_the_shared_cache(kind, name).await;
+        }
+    }
+
+    async fn worktree_run_builds_into_the_shared_cache(kind: WorkerKind, name: &str) {
         let f = Fixture::new();
-        let mut worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", BUILDS_THEN_FAILS));
+        let mut worker = f.worker(kind, f.agent(name, BUILDS_THEN_FAILS));
         worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
         let ws = f.workspace();
         assert!(worker.run(brief(Some(ws.clone()))).await.is_err());
@@ -2622,19 +2726,184 @@ exit 3
         let told = std::fs::read_to_string(f.data.path().join("target-dir.txt")).unwrap();
         assert_eq!(Path::new(&told), cache.join("target"));
         assert!(cache.join("target/artifact").is_file());
+        // Beside it, the one Cargo home every worker shares (the local
+        // workers' shells get the same one), with a bounded number of jobs.
+        let home = rustykrab_tools::shared_cargo_home(&cache).unwrap();
+        assert_eq!(
+            home,
+            f.data
+                .path()
+                .join(workspace::BUILD_CACHE_DIR)
+                .join("cargo-home")
+        );
+        let env = std::fs::read_to_string(f.data.path().join("cargo-env.txt")).unwrap();
+        let env: Vec<&str> = env.lines().collect();
+        assert_eq!(Path::new(env[0]), home, "{kind:?}: {env:?}");
+        assert_eq!(env[1], rustykrab_tools::CARGO_BUILD_JOBS, "{kind:?}");
+        if let Some(rustup) = rustykrab_tools::rustup_home() {
+            assert_eq!(Path::new(env[2]), rustup, "{kind:?}: {env:?}");
+        }
+        assert!(home.join("registry-entry").is_file(), "{kind:?}");
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
         let lines: Vec<&str> = args.lines().collect();
-        assert!(
-            lines
-                .windows(2)
-                .any(|pair| pair[0] == "--add-dir" && Path::new(pair[1]) == cache),
-            "{args}"
-        );
+        for wanted in [&cache, &home] {
+            assert!(
+                lines
+                    .windows(2)
+                    .any(|pair| pair[0] == "--add-dir" && Path::new(pair[1]) == wanted),
+                "{kind:?}: {wanted:?} not added: {args}"
+            );
+        }
         // The failed run's worktree is kept for diagnosis, without the
         // build output Cargo marked as its own.
         assert!(ws.path.join("src/lib.rs").is_file());
         assert!(ws.path.join("notes/target").is_file());
         assert!(!ws.path.join("target").exists());
+        let _ = ws.remove();
+    }
+
+    /// A stand-in that changes a file, commits nothing, and hands in a
+    /// report blocked on a decision.
+    const BLOCKED_UNCOMMITTED: &str = r#"#!/bin/sh
+echo 'pub fn half_done() {}' >> src/lib.rs
+echo 'draft' > notes.md
+contract="Blocked. {\\\"summary\\\":\\\"needs a decision\\\",\\\"blocked\\\":{\\\"reason\\\":\\\"needs_decision\\\",\\\"detail\\\":\\\"which API?\\\"}}"
+echo '{"type":"system","subtype":"init"}'
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0.01,\"usage\":{\"input_tokens\":10,\"output_tokens\":2},\"result\":\"$contract\"}"
+"#;
+
+    #[tokio::test]
+    async fn a_blocked_run_with_uncommitted_changes_keeps_its_worktree() {
+        let f = Fixture::new();
+        let mut worker = f.worker(
+            WorkerKind::ClaudeCode,
+            f.agent("claude", BLOCKED_UNCOMMITTED),
+        );
+        worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+        let ws = f.workspace();
+        let report = worker.run(brief(Some(ws.clone()))).await.unwrap();
+        assert_eq!(
+            report.blocked.as_ref().map(|b| b.reason.as_str()),
+            Some("needs_decision"),
+            "{report:?}"
+        );
+        assert!(report.commit.is_none());
+        // The run handed in a report, but it is not complete: the change
+        // nobody committed is still there for the next attempt.
+        assert!(ws.path.exists(), "the worktree was removed");
+        let lib = std::fs::read_to_string(ws.path.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("half_done"), "{lib}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path.join("notes.md")).unwrap(),
+            "draft\n"
+        );
+        let _ = ws.remove();
+    }
+
+    #[tokio::test]
+    async fn completion_needs_a_clean_unblocked_report_and_committed_changes() {
+        let f = Fixture::new();
+        let ws = f.workspace();
+        ws.create().unwrap();
+        let done = || ResultReport {
+            summary: "done".into(),
+            ..ResultReport::default()
+        };
+        assert_eq!(unfinished_reason(&Ok(done()), Some(&ws)).await, None);
+        let blocked = ResultReport {
+            blocked: Some(rustykrab_core::work::BlockedReport {
+                reason: rustykrab_core::work::BlockedReason::NeedsDecision,
+                detail: String::new(),
+                needs: Vec::new(),
+            }),
+            ..done()
+        };
+        assert_eq!(
+            unfinished_reason(&Ok(blocked), Some(&ws)).await.as_deref(),
+            Some("blocked: needs_decision")
+        );
+        let asked = ResultReport {
+            questions: vec![rustykrab_core::work::Question {
+                text: "which?".into(),
+                class: String::new(),
+                options: Vec::new(),
+            }],
+            ..done()
+        };
+        assert!(unfinished_reason(&Ok(asked), Some(&ws)).await.is_some());
+        let failed: Result<ResultReport> = Err(Error::Internal("boom".into()));
+        assert!(unfinished_reason(&failed, Some(&ws)).await.is_some());
+        // A clean report that left its change uncommitted is not complete.
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("uncommitted changes to tracked files")
+        );
+        // Only an untracked file and no commit: kept too.
+        git(&ws.path, &["checkout", "--", "src/lib.rs"]);
+        std::fs::write(ws.path.join("test.log"), "log\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("untracked files git does not ignore")
+        );
+        // After a commit, an untracked file git does not ignore still keeps
+        // it: a new source file nobody staged is lost with the worktree.
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn committed() {}\n").unwrap();
+        git(&ws.path, &["add", "src/lib.rs"]);
+        git(
+            &ws.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "c",
+            ],
+        );
+        assert!(ws.has_commits());
+        std::fs::write(ws.path.join("src/new.rs"), "pub fn new() {}\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("untracked files git does not ignore")
+        );
+        std::fs::remove_file(ws.path.join("src/new.rs")).unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("untracked files git does not ignore"),
+            "test.log is not ignored by this repository"
+        );
+        // What the repository ignores (build output, logs) does not count.
+        std::fs::write(ws.path.join(".gitignore"), "*.log\n").unwrap();
+        git(&ws.path, &["add", ".gitignore"]);
+        git(
+            &ws.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "ignore logs",
+            ],
+        );
+        assert!(ws.path.join("test.log").is_file());
+        assert_eq!(unfinished_reason(&Ok(done()), Some(&ws)).await, None);
+        // ...but a further edit to a tracked file does: removing the
+        // worktree would lose it.
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn after_commit() {}\n").unwrap();
+        assert_eq!(
+            unfinished_reason(&Ok(done()), Some(&ws)).await.as_deref(),
+            Some("uncommitted changes to tracked files")
+        );
+        // Without a worktree only the report decides.
+        assert_eq!(unfinished_reason(&Ok(done()), None).await, None);
         let _ = ws.remove();
     }
 
@@ -3263,25 +3532,30 @@ exit 9
 
         worker.run(b).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        // The worktree's build cache first, then the kit's directories.
+        // The worktree's build cache and the shared Cargo home first, then
+        // the kit's directories.
         let cache = f
             .workspace()
             .build_cache(&f.data.path().join(workspace::BUILD_CACHE_DIR))
+            .unwrap();
+        let cargo_home = rustykrab_tools::shared_cargo_home(&cache)
             .unwrap()
             .display()
             .to_string();
-        let want: Vec<String> = std::iter::once(cache.clone())
+        let cache = cache.display().to_string();
+        let want: Vec<String> = [cache.clone(), cargo_home.clone()]
+            .into_iter()
             .chain(kit.read_dirs.iter().map(|d| d.display().to_string()))
             .collect();
         assert_eq!(added_dirs(&args), want, "{args}");
         // Its toolset is what every Claude Code worker gets: nothing gated.
         assert!(args.contains(&allowed_list(&[])), "{args}");
 
-        // Without a kit, only the build cache is added.
+        // Without a kit, only the build cache and the Cargo home are added.
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
         worker.run(brief(Some(f.workspace()))).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert_eq!(added_dirs(&args), [cache], "{args}");
+        assert_eq!(added_dirs(&args), [cache, cargo_home], "{args}");
     }
 
     /// Codex reads the whole disk from inside its sandbox, and its

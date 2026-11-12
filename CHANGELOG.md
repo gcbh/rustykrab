@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.27] - 2026-11-12
+
+- Keep worker builds alive: refuse backgrounding, share a persistent Cargo home, stop repeated identical failures, keep unfinished worktrees (#756)
+
 ## [6.6.26] - 2026-11-11
 
 - Read project-context receipts incrementally, lease one item per shared model slot, and never close a run that did not report (#755)
