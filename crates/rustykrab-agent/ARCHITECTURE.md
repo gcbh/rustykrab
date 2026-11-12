@@ -562,7 +562,13 @@ could move to a crate of its own if the adapters grow.
   temporary files while building `ring` and `aws-lc-sys` until the model
   set `TMPDIR=/private/tmp` itself. The local confined shell leaves
   `TMPDIR` unset (its environment is cleared), so its tools fall back to
-  `/tmp`, which its sandbox profile allows.
+  their defaults (`/tmp` for Rust's `temp_dir`, the per-user
+  `/var/folders/...` directory for clang on macOS), both of which its
+  Seatbelt profile allows (`exec.rs`). The path is long (about 120 bytes
+  under the live data directory), past macOS's 104-byte limit for a Unix
+  socket address: a tool that binds a socket in `TMPDIR` (Python's
+  `multiprocessing`, for one) fails there with "AF_UNIX path too long".
+  Cargo, rustc and clang create no sockets there.
 
 `LocalWorker::planner_definition()` is the control layer's `planner`
 (plan section 6.1): `work_plan`, `work_status`, `recall_search` and
