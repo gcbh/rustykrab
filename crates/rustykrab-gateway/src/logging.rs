@@ -20,8 +20,8 @@ pub struct TraceId(pub Uuid);
 /// Uses `info!` for successful responses and `warn!` for 4xx/5xx.
 ///
 /// A completed request is logged when it completes, so a request that
-/// never does would leave no trace: a mutating request (anything but
-/// `GET`, `HEAD` and `OPTIONS`) is also logged when it starts, and any
+/// never does would leave no trace: a mutating `/api/` request (anything
+/// but `GET`, `HEAD` and `OPTIONS`) is also logged when it starts, and any
 /// request whose client stops waiting before the response (its future is
 /// dropped) is logged as abandoned, with how long it had run.
 ///
@@ -57,7 +57,8 @@ pub async fn request_logging_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    if !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+    if path.starts_with("/api/") && !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
+    {
         tracing::info!(%trace_id, %method, %path, %client_ip, "request started");
     }
 

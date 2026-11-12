@@ -110,6 +110,8 @@ async fn a_tick_waiting_in_a_phase_reports_its_start_and_phase() {
     assert_eq!(during.tick_phase.as_deref(), Some("loop_lock"));
     assert_eq!(during.tick_started, Some(started));
     assert_eq!(during.last_tick, None, "nothing has completed yet");
+    // At least 100 ms in loop_lock, counted from when the phase began.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     drop(held);
     tick.await

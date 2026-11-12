@@ -3329,6 +3329,37 @@ async fn two_daemons_one_data_dir(shared: &Ctx) -> Result<()> {
         waited["lock"] == "waiting" && waited["last_tick"].is_null(),
         "the waiting daemon ticked while another held controller.lock: {waited}"
     );
+    // Tick timing: the holder reports how long its last tick took and the
+    // phase that took longest; the waiting daemon has timed no tick.
+    const PHASES: [&str; 8] = [
+        "prepare",
+        "loop_lock",
+        "answers",
+        "sweep",
+        "observe_execution",
+        "reconcile",
+        "lease",
+        "age",
+    ];
+    ensure!(
+        held["last_tick_ms"].is_u64()
+            && held["last_tick_slowest_phase_ms"].is_u64()
+            && held["last_tick_slowest_phase"]
+                .as_str()
+                .is_some_and(|p| PHASES.contains(&p)),
+        "the holder reports no tick timing: {held}"
+    );
+    ensure!(
+        held["tick_phase"].is_null()
+            || held["tick_phase"]
+                .as_str()
+                .is_some_and(|p| PHASES.contains(&p)),
+        "the holder reports an unknown phase: {held}"
+    );
+    ensure!(
+        waited["last_tick_ms"].is_null() && waited["tick_phase"].is_null(),
+        "the waiting daemon reports tick timing: {waited}"
+    );
 
     first.stop().await;
     second.wait_lock(shared, "held").await?;
