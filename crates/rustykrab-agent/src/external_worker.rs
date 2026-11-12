@@ -1727,9 +1727,9 @@ impl Worker for ExternalWorker {
             short(&run_id),
             uuid::Uuid::new_v4()
         ));
-        // The run's own temporary directory, beside its context files and
-        // removed when the run ends however it ends. A read-only review
-        // writes nothing, temporary files included.
+        // The run's own temporary directory, at a short path (see
+        // [`run_tmp_root`]) and removed when the run ends however it ends.
+        // A read-only review writes nothing, temporary files included.
         let review = brief
             .artifact_refs
             .iter()
@@ -1737,7 +1737,7 @@ impl Worker for ExternalWorker {
         let tmp = if review {
             None
         } else {
-            Some(RunTmp::create(&context_dir).map_err(|e| {
+            Some(RunTmp::create().map_err(|e| {
                 process_failure(
                     None,
                     &format!("cannot create a temporary directory for the run: {e}"),
@@ -1973,26 +1973,69 @@ fn attest(report: &mut ResultReport, commands: &[String]) {
 /// tools' fallbacks.
 const TMP_ENV: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 
-/// An external run's own temporary directory, `tmp-<uuid>` under the run's
-/// directory of this worker's (`workers/<name>/runs/<run>`), given to the
-/// agent's sandbox as writable and as its `TMPDIR`. Removed when dropped:
-/// when the run ends, completed, failed, cancelled or interrupted. A
-/// directory a crash left behind goes with the run's directory under the
-/// retention window.
+/// Where external runs' temporary directories are made: a short path, so
+/// that a Unix socket bound under `TMPDIR` fits the 104-byte `sun_path` of
+/// macOS (108 on Linux). The run's own directory under the data dir is far
+/// longer (122 bytes on the live machine), and anything that binds a socket
+/// there (Python `multiprocessing`, many test suites) fails with "AF_UNIX
+/// path too long". macOS names the real path, `/private/tmp`, because the
+/// Seatbelt sandbox matches real paths and `/tmp` is a symlink to it.
+fn run_tmp_root() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/private/tmp")
+    } else if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// The name prefix of a run's temporary directory under [`run_tmp_root`].
+const RUN_TMP_PREFIX: &str = "rk-";
+
+/// An external run's own temporary directory, `rk-<12 hex>` under
+/// [`run_tmp_root`] (`/private/tmp` on macOS, `/tmp` on other Unix), given
+/// to the agent's sandbox as writable (`--add-dir`) and as its `TMPDIR`.
+///
+/// It is made with an exclusive `mkdir`, mode 0700, under a name drawn from
+/// a random UUID: a path that already exists, a symlink included, is never
+/// used or followed; another name is drawn instead. So no other user can
+/// guess it in advance, pre-create it or read what the run writes there.
+/// Removed when dropped: when the run ends, completed, failed, cancelled or
+/// interrupted (removing a symlink put in its place removes only the link).
+/// A directory a crash left behind is left to the system's own cleaning of
+/// its temporary directory.
 struct RunTmp(PathBuf);
 
 impl RunTmp {
-    fn create(run_dir: &Path) -> std::io::Result<Self> {
-        let path = run_dir.join(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+    /// Names tried before giving up; a clash of 48 random bits is already
+    /// improbable, so a second failure means something else is wrong.
+    const ATTEMPTS: usize = 8;
+
+    fn create() -> std::io::Result<Self> {
+        Self::create_in(&run_tmp_root())
+    }
+
+    fn create_in(root: &Path) -> std::io::Result<Self> {
+        let mut last = None;
+        for _ in 0..Self::ATTEMPTS {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let path = root.join(format!("{RUN_TMP_PREFIX}{}", &id[..12]));
+            // Not recursive: `mkdir` itself fails if anything, a symlink
+            // included, is already at the path.
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
         }
-        builder.create(&path)?;
-        Ok(Self(path))
+        Err(last.unwrap_or_else(|| std::io::Error::other("no temporary directory name")))
     }
 }
 
@@ -2906,8 +2949,13 @@ printf '{"type":"result","subtype":"success","result":"%s"}\n' "$escaped"
             let tmp = PathBuf::from(tmp);
             assert_eq!(
                 tmp.parent(),
-                Some(worker.runs_root().join("run1").as_path()),
-                "{kind:?}: the run's own directory"
+                Some(run_tmp_root().as_path()),
+                "{kind:?}: a short path, not under the run's directory"
+            );
+            assert!(
+                tmp.as_os_str().len() <= RUN_TMP_MAX_LEN,
+                "{kind:?}: {}",
+                tmp.display()
             );
             assert_eq!(lines[1], format!("TMP={}", tmp.display()), "{kind:?}");
             assert_eq!(lines[2], format!("TEMP={}", tmp.display()), "{kind:?}");
@@ -4212,22 +4260,93 @@ exit 9
     }
 
     /// The run's own temporary directory among the `--add-dir`s of `args`:
-    /// `tmp-<id>` under `worker`'s directory for run `run-1`.
-    fn run_tmp(worker: &ExternalWorker, args: &str) -> String {
-        let runs = worker.runs_root().join("run1");
+    /// `rk-<12 hex>` under [`run_tmp_root`].
+    fn run_tmp(args: &str) -> String {
+        let root = run_tmp_root();
         let found: Vec<String> = added_dirs(args)
             .into_iter()
-            .filter(|dir| {
-                let dir = Path::new(dir);
-                dir.parent() == Some(runs.as_path())
-                    && dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("tmp-"))
-            })
+            .filter(|dir| is_run_tmp(&root, Path::new(dir)))
             .collect();
         assert_eq!(found.len(), 1, "one temporary directory: {args}");
         found[0].clone()
+    }
+
+    /// Whether `dir` is named as a run's temporary directory under `root`.
+    fn is_run_tmp(root: &Path, dir: &Path) -> bool {
+        dir.parent() == Some(root)
+            && dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(RUN_TMP_PREFIX))
+                .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// The longest a run's temporary directory may be: leaves 64 of macOS's
+    /// 104 bytes of a Unix socket address for the names under it.
+    const RUN_TMP_MAX_LEN: usize = 40;
+
+    /// 12 November 2026: the run's temporary directory under the data dir
+    /// was 122 bytes on the live machine, past the 104 bytes macOS allows a
+    /// Unix socket address, so anything binding a socket under `TMPDIR`
+    /// failed. It is now short, private to this user, made fresh and gone
+    /// when dropped.
+    #[test]
+    fn a_run_temporary_directory_is_short_private_and_fresh() {
+        let a = RunTmp::create().unwrap();
+        let b = RunTmp::create().unwrap();
+        let root = run_tmp_root();
+        for tmp in [&a.0, &b.0] {
+            assert!(is_run_tmp(&root, tmp), "{}", tmp.display());
+            assert!(
+                tmp.as_os_str().len() <= RUN_TMP_MAX_LEN,
+                "{} is {} bytes",
+                tmp.display(),
+                tmp.as_os_str().len()
+            );
+            let meta = std::fs::symlink_metadata(tmp).unwrap();
+            assert!(meta.is_dir(), "a real directory, not a link");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+            }
+        }
+        assert_ne!(a.0, b.0, "each run its own");
+        let (pa, pb) = (a.0.clone(), b.0.clone());
+        drop(a);
+        drop(b);
+        assert!(!pa.exists() && !pb.exists(), "removed when dropped");
+    }
+
+    /// The directory is made by an exclusive `mkdir`: a name already taken,
+    /// by a directory or by a symlink another user planted, is never reused
+    /// or followed; and a link put in its place is removed, not followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_temporary_directory_never_reuses_or_follows_what_is_there() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("keep"), "x").unwrap();
+        // The exclusive create the name relies on refuses both.
+        let taken = root.path().join("rk-000000000000");
+        std::fs::create_dir(&taken).unwrap();
+        let planted = root.path().join("rk-111111111111");
+        std::os::unix::fs::symlink(target.path(), &planted).unwrap();
+        for path in [&taken, &planted] {
+            let err = std::fs::DirBuilder::new().create(path).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        let tmp = RunTmp::create_in(root.path()).unwrap();
+        assert!(is_run_tmp(root.path(), &tmp.0));
+        assert!(tmp.0 != taken && tmp.0 != planted);
+        // The agent swaps its directory for a link: dropping removes the
+        // link and leaves what it points at.
+        let path = tmp.0.clone();
+        std::fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink(target.path(), &path).unwrap();
+        drop(tmp);
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert!(target.path().join("keep").is_file());
     }
 
     #[tokio::test]
@@ -4284,7 +4403,7 @@ exit 9
             .display()
             .to_string();
         let cache = cache.display().to_string();
-        let tmp = run_tmp(&worker, &args);
+        let tmp = run_tmp(&args);
         let want: Vec<String> = [cache.clone(), cargo_home.clone(), tmp]
             .into_iter()
             .chain(kit.read_dirs.iter().map(|d| d.display().to_string()))
@@ -4298,7 +4417,7 @@ exit 9
         let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
         worker.run(brief(Some(f.workspace()))).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        let tmp = run_tmp(&worker, &args);
+        let tmp = run_tmp(&args);
         assert_eq!(added_dirs(&args), [cache, cargo_home, tmp], "{args}");
     }
 
@@ -4328,7 +4447,7 @@ printf '{"summary":"looked"}' > "$out"
         b.investigation = Some(kit.clone());
         worker.run(b).await.unwrap();
         let args = std::fs::read_to_string(f.data.path().join("args.txt")).unwrap();
-        assert_eq!(added_dirs(&args), [run_tmp(&worker, &args)], "{args}");
+        assert_eq!(added_dirs(&args), [run_tmp(&args)], "{args}");
         assert!(args.contains(&kit.bundle.display().to_string()), "{args}");
         assert!(
             args.contains("readable outside your working directory"),
