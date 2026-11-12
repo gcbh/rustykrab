@@ -3359,12 +3359,12 @@ wait
     }
 
     /// An agent that starts a long-lived child in a process group of its
-    /// own (as Codex runs its shell commands, `set -m` here), records both
-    /// pids, and then waits: killing the agent's group alone leaves the
-    /// child running.
+    /// own (as Codex runs its shell commands; `setpgrp` here, since a
+    /// non-interactive `set -m` moves nothing without a terminal on
+    /// Linux's `dash`), records both pids, and then waits: killing the
+    /// agent's group alone leaves the child running.
     const ESCAPER: &str = r#"#!/bin/sh
-set -m
-sleep 300 &
+perl -e 'setpgrp(0, 0); exec @ARGV' sleep 300 &
 echo $! > "$RUSTYKRAB_DATA_DIR/child.pid.tmp"
 mv "$RUSTYKRAB_DATA_DIR/child.pid.tmp" "$RUSTYKRAB_DATA_DIR/child.pid"
 echo $$ > "$RUSTYKRAB_DATA_DIR/agent.pid.tmp"
