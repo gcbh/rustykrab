@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.32] - 2026-11-12
+
+- Give external runs a short TMPDIR, report the build slot only for takeable items (#761)
+
 ## [6.6.31] - 2026-11-12
 
 - Serialise builds by workspace, give external runs a TMPDIR, keep local leases alive during long tool calls (#760)

@@ -122,13 +122,18 @@ impl Controller {
             } else {
                 let events = self.store.work_events(&item.id).await?;
                 let history = history(&events);
-                if self.waits_for_build(item, &occupied) {
+                // `build_slot` only for an item a worker could otherwise
+                // take now: one no worker could take waits for that, not for
+                // the build in progress, and is counted as such. (The tick
+                // checks the slot first; which check comes first changes
+                // what is reported, never what leases.)
+                if self.pick(item, &history, &load, &occupied, &busy).is_none() {
+                    Some("matcher_unavailable".to_string())
+                } else if self.waits_for_build(item, &occupied) {
                     Some("build_slot".to_string())
-                } else if self.pick(item, &history, &load, &occupied, &busy).is_some() {
+                } else {
                     dispatchable += 1;
                     None
-                } else {
-                    Some("matcher_unavailable".to_string())
                 }
             };
             if let Some(reason) = reason {

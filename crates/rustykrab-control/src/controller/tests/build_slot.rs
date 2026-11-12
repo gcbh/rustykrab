@@ -286,3 +286,69 @@ async fn a_code_item_filed_in_process_still_takes_the_slot() {
     assert_eq!(f.h.status(&b).await, Status::Done);
     assert_eq!(f.peak.load(Ordering::SeqCst), 1, "never two builds at once");
 }
+
+/// The dispatchability count (`/api/dreaming`, the dashboard) reports
+/// `build_slot` only for an item a worker could otherwise take now. On
+/// 12 November 2026 five old items whose required worker was unavailable
+/// were counted as waiting for the build slot, hiding their real reason.
+/// Leasing is unchanged: neither leases while the slot is held, and once
+/// it is free the takeable one leases and the other still waits.
+#[tokio::test]
+async fn the_build_slot_is_reported_only_for_items_a_worker_could_take() {
+    let f = fleet(true);
+    let mut lock = crate::lock::LoopLock::in_data_dir(&f.h.dir.0);
+    assert_eq!(
+        f.h.ctl.claim_loop_lock(&mut lock).0,
+        crate::handle::LockState::Held
+    );
+    let build = f.h.file_one(change("Fix the progress test", &f.repo)).await;
+    assert_eq!(f.h.tick().await.leased, vec![build.clone()]);
+    // One that a free worker could take but for the slot, and one that no
+    // worker could take: it needs what no worker in the fleet has.
+    let takeable = f.h.file_one(change("Fix the cancel reply", &f.repo)).await;
+    let mut d = change("Fix the tide table", &f.repo);
+    d.required_tools = vec!["not-in-any-worker-ceiling".into()];
+    let unmatched = f.h.file_one(d).await;
+    let (_, occupied) = f.h.ctl.load_by_worker();
+    assert!(occupied.build, "the first build holds the slot");
+    for id in [&takeable, &unmatched] {
+        assert!(
+            f.h.ctl.waits_for_build(&f.h.item(id).await, &occupied),
+            "the tick's gate holds both: {id}"
+        );
+    }
+
+    let demand = f.h.ctl.foreground_dispatchability().await.unwrap().unwrap();
+    assert_eq!(demand.active_foreground_runs, 1);
+    assert_eq!(demand.dispatchable_foreground_leaves, 0);
+    assert_eq!(demand.waiting.get("build_slot"), Some(&1), "{demand:?}");
+    assert_eq!(
+        demand.waiting.get("matcher_unavailable"),
+        Some(&1),
+        "{demand:?}"
+    );
+
+    // Neither leases while the slot is held.
+    for _ in 0..3 {
+        assert!(f.h.step().await.leased.is_empty());
+    }
+    assert_eq!(f.h.status(&takeable).await, Status::Ready);
+    assert_eq!(f.h.status(&unmatched).await, Status::Ready);
+    // Once the build ends, the takeable one leases; the other still waits.
+    f.gate.add_permits(1);
+    let mut leased = Vec::new();
+    for _ in 0..20 {
+        leased.extend(f.h.step().await.leased);
+        if leased.contains(&takeable) {
+            break;
+        }
+    }
+    assert_eq!(leased, vec![takeable.clone()]);
+    assert_eq!(f.h.status(&unmatched).await, Status::Ready);
+    assert_eq!(f.h.leases(&unmatched).await, 0);
+    f.gate.add_permits(4);
+    f.h.drain_settled().await;
+    assert_eq!(f.h.status(&build).await, Status::Done);
+    assert_eq!(f.h.status(&takeable).await, Status::Done);
+    assert_eq!(f.peak.load(Ordering::SeqCst), 1, "never two builds at once");
+}

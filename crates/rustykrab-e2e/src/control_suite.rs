@@ -2313,21 +2313,26 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
     // build cache for the repository (`build-cache/<repo>/worker-<name>`,
     // never another worker's), the Cargo home every worker shares, and the
     // run's own temporary directory, which is its TMPDIR and which it
-    // could write (`workers/<name>/runs/<run>/tmp-<id>`).
-    let runs = ctx.data_dir.join("workers").join("pinch-inv").join("runs");
+    // could write: `rk-<12 hex>` directly under `/private/tmp` on macOS or
+    // `/tmp` elsewhere, short enough (at most 40 bytes) that a Unix socket
+    // bound under it fits macOS's 104-byte address.
+    let tmp_root = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
     ensure!(
-        std::path::Path::new(tmp)
-            .parent()
-            .and_then(std::path::Path::parent)
-            == Some(runs.as_path())
+        std::path::Path::new(tmp).parent() == Some(std::path::Path::new(tmp_root))
             && std::path::Path::new(tmp)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("tmp-"))
+                .and_then(|n| n.strip_prefix("rk-"))
+                .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            && tmp.len() <= 40
             && tmp_lines.next() == Some("writable")
             && added.contains(&tmp),
-        "the investigator's TMPDIR is a writable directory of the run's own, given with \
-         --add-dir: {tmpdir} {added:?}"
+        "the investigator's TMPDIR is a short writable directory of the run's own, given \
+         with --add-dir: {tmpdir} {added:?}"
     );
     ensure!(
         !std::path::Path::new(tmp).exists(),

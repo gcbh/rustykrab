@@ -31,6 +31,15 @@ pub const SHARED_CARGO_HOME: &str = "cargo-home";
 /// holds most of its memory.
 pub const CARGO_BUILD_JOBS: &str = "6";
 
+/// An external run's temporary directory is `<RUN_TMP_PREFIX><12 hex>`
+/// directly under the system's temporary directory (`/private/tmp` on
+/// macOS); see `rustykrab_agent`'s `RunTmp`. A confined shell
+/// ([`Confinement`]) may not reach into one.
+pub const RUN_TMP_PREFIX: &str = "rk-";
+
+/// The hex digits after [`RUN_TMP_PREFIX`] in a run's temporary directory.
+pub const RUN_TMP_ID_LEN: usize = 12;
+
 /// The shared Cargo home for a builder's build cache `cache` in a
 /// repository (`<data>/build-cache/<repo>/<builder>`, see
 /// `rustykrab_control::workspace::Workspace::build_cache`):
@@ -428,7 +437,9 @@ impl ExecTool {
 /// as Claude Code's own sandbox is): it writes only in its directory, the
 /// git directory a worktree commits into, and temporary space, and it reads
 /// everything but `private` (credential stores, the daemon's data, where
-/// its secrets file is), its own directory always excepted. Ancestors of
+/// its secrets file is), its own directory always excepted. External runs'
+/// temporary directories in temporary space ([`RUN_TMP_PREFIX`]) it may
+/// neither read, write nor connect to a socket in. Ancestors of
 /// the working and git directories expose metadata only for path resolution;
 /// their contents remain private. Reads elsewhere
 /// stay open, as tools need the system, their caches and the network.
@@ -635,6 +646,18 @@ impl Confinement {
                 allowed.join(" ")
             ));
         }
+        // External runs' temporary directories (`/private/tmp/rk-<12 hex>`,
+        // their `TMPDIR`) lie in temporary space but are not this shell's:
+        // no reading, writing or connecting to a socket in one. Seatbelt's
+        // regular expressions have no `{n}`, so the digits are spelled out.
+        let run_tmp = format!(
+            "^/private/tmp/{RUN_TMP_PREFIX}{}",
+            "[0-9a-f]".repeat(RUN_TMP_ID_LEN)
+        );
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (regex #\"{run_tmp}(/|$)\"))\
+             (deny network-outbound (remote unix-socket (path-regex #\"{run_tmp}/\")))"
+        ));
         let sockets: Vec<String> = Self::docker_sockets()
             .iter()
             .filter_map(|p| real(p))
@@ -2802,6 +2825,56 @@ mod error_typing_tests {
         let (code, text) = run_in(&tool, "cat ../../../service.json").await;
         assert_ne!(code, 0);
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    /// 12 November 2026: external runs' temporary directories moved from
+    /// the daemon's data directory, which a confined shell cannot read, to
+    /// `/private/tmp/rk-<12 hex>`, which it could read and write as
+    /// temporary space. They stay out of its reach there too: no reading,
+    /// writing or connecting to a socket inside one. The rest of temporary
+    /// space stays writable.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_reach_an_external_runs_temporary_directory() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = format!(
+            "{:012x}",
+            (nanos ^ u128::from(std::process::id())) & 0xffff_ffff_ffff
+        );
+        let theirs =
+            std::path::Path::new("/private/tmp").join(format!("{}{id}", super::RUN_TMP_PREFIX));
+        std::fs::create_dir(&theirs).unwrap();
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _gone = Gone(theirs.clone());
+        std::fs::write(theirs.join("secret"), "theirs").unwrap();
+        let socket = theirs.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let tool = ExecTool::in_dir(work.path()).confined(Vec::new());
+        let dir = theirs.display();
+        let (code, text) = run_in(&tool, &format!("cat {dir}/secret")).await;
+        assert_ne!(code, 0, "{text}");
+        assert!(!text.contains("theirs"), "{text}");
+        let (code, text) = run_in(&tool, &format!("ls {dir}")).await;
+        assert_ne!(code, 0, "{text}");
+        let (code, text) = run_in(&tool, &format!("echo x > {dir}/planted")).await;
+        assert_ne!(code, 0, "{text}");
+        assert!(!theirs.join("planted").exists());
+        let (code, text) = run_in(&tool, &format!("nc -U {} < /dev/null", socket.display())).await;
+        assert_ne!(code, 0, "{text}");
+        // Temporary space beside it stays writable, a longer name included.
+        let own = format!("/private/tmp/{}{id}0", super::RUN_TMP_PREFIX);
+        let _own = Gone(own.clone().into());
+        let (code, text) = run_in(&tool, &format!("mkdir {own} && echo x > {own}/f")).await;
+        assert_eq!(code, 0, "{text}");
     }
 
     #[cfg(target_os = "macos")]
