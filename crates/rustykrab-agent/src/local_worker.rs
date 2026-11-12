@@ -597,9 +597,13 @@ impl LocalWorker {
         self
     }
 
-    /// Build a worktree run's Cargo projects into `<root>/<repository>`
-    /// (`rustykrab_tools::ExecTool::with_build_cache`), shared by every
-    /// run of that repository, instead of a `target/` per worktree.
+    /// Build a worktree run's Cargo projects into
+    /// `<root>/<repository>/<builder>`
+    /// (`rustykrab_tools::ExecTool::with_build_cache`), instead of a
+    /// `target/` per worktree. The builder is this worker's resource slot
+    /// when it shares one ([`LocalWorker::with_slot`]), so every worker on
+    /// that slot (which run one at a time) shares the directory, else its
+    /// name (`rustykrab_control::workspace::builder_key`).
     pub fn with_build_cache(mut self, root: std::path::PathBuf) -> Self {
         self.build_cache = Some(root);
         self
@@ -1320,11 +1324,15 @@ impl LocalWorker {
                     let mut exec = rustykrab_tools::ExecTool::in_dir(dir.clone())
                         .confined(self.private_paths.clone())
                         .deny_local_ports(self.private_ports.clone());
+                    // Workers sharing a resource slot run one at a time,
+                    // so they share a build directory; any other gets its own.
+                    let builder =
+                        rustykrab_control::workspace::builder_key(self.slot.key(), &self.name);
                     if let Some(cache) = self
                         .build_cache
                         .as_deref()
                         .zip(brief.workspace.as_ref())
-                        .and_then(|(root, ws)| ws.build_cache(root))
+                        .and_then(|(root, ws)| ws.build_cache(root, &builder))
                     {
                         exec = exec.with_build_cache(cache);
                     }
@@ -2075,10 +2083,24 @@ impl Tool for LedgerTool {
         };
         // A failed call is also counted by its kind of error, so the same
         // call failing again and again stalls the run whatever comes between.
+        // Except a Cargo build stopped at the longest exec limit: it kept
+        // what it built, and running it again continues it, as its error
+        // says. Each such step counts towards neither window.
         let failure = result.as_ref().err().map(|e| e.kind().as_str());
+        let resumable = self.inner.name() == "exec"
+            && matches!(
+                &result,
+                Err(Error::ToolExecution(e))
+                    if e.kind == rustykrab_core::ToolErrorKind::Timeout
+                        && rustykrab_tools::is_resumable_build_timeout(&e.message)
+            );
         let stalled = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-            ledger.record_call(self.inner.name(), &args, &outcome, failure);
+            if resumable {
+                ledger.record_resumable(self.inner.name());
+            } else {
+                ledger.record_call(self.inner.name(), &args, &outcome, failure);
+            }
             ledger.stalled()
         };
         // The first window is advisory, giving the worker room to change its
@@ -4324,6 +4346,80 @@ mod tests {
                 assert!(err.to_string().contains("progress ledger"), "{err}");
                 assert!(err.to_string().contains("failed 6 times"), "{err}");
             }
+        }
+    }
+
+    /// An `exec` that fails every call with one error.
+    struct FailingExec(rustykrab_core::ToolError);
+
+    #[async_trait]
+    impl Tool for FailingExec {
+        fn name(&self) -> &str {
+            "exec"
+        }
+        fn description(&self) -> &str {
+            "fails"
+        }
+        fn schema(&self) -> rustykrab_core::types::ToolSchema {
+            rustykrab_tools::ExecTool::new().schema()
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Err(Error::ToolExecution(self.0.clone()))
+        }
+    }
+
+    /// Twelve identical calls (two whole no-progress windows) through the
+    /// ledger, each failing with `error`: the first call the ledger
+    /// refused and its error, if any, and whether any call carried the
+    /// repeated-failure warning.
+    async fn identical_failures(error: rustykrab_core::ToolError) -> (Option<(u32, Error)>, bool) {
+        let tool = LedgerTool {
+            inner: Arc::new(FailingExec(error)),
+            ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
+            commands: Arc::new(Mutex::new(Vec::new())),
+        };
+        let call = json!({"command": "cargo test -p rustykrab-control --lib", "timeout_secs": 600});
+        let mut warned = false;
+        for n in 1..=12u32 {
+            let err = tool.execute(call.clone()).await.unwrap_err();
+            if err.to_string().contains("progress ledger") {
+                return (Some((n, err)), warned);
+            }
+            warned |= err
+                .to_string()
+                .contains("Note: this exact call has now failed");
+        }
+        (None, warned)
+    }
+
+    /// A Cargo build stopped at the longest exec limit (600 s) kept what it
+    /// built, and the run was told to run it again: the same timeout six
+    /// times (in the live run, a build waiting on another worker's lock)
+    /// does not end the attempt as a loop, nor warn that repeating it
+    /// cannot help. A shorter timeout or a refusal still does.
+    #[tokio::test]
+    async fn identical_cargo_timeouts_at_the_longest_limit_do_not_end_the_run() {
+        let at = |secs: u64| {
+            rustykrab_core::ToolError::timeout(format!(
+                "command timed out after {secs}s and was stopped. Cargo keeps the build steps \
+                 it finished in the shared build cache, so nothing done so far is lost: run the \
+                 same command again in the foreground with timeout_secs=600 and it continues \
+                 where it stopped."
+            ))
+        };
+        assert!(matches!(identical_failures(at(600)).await, (None, false)));
+        for error in [
+            at(120),
+            rustykrab_core::ToolError::timeout(
+                "command timed out after 15s and was stopped. Run it in the foreground",
+            ),
+            rustykrab_core::ToolError::invalid_input("command rejected: not allowed"),
+        ] {
+            let (refused, warned) = identical_failures(error.clone()).await;
+            let (n, err) = refused.unwrap_or_else(|| panic!("{error:?} never ended the attempt"));
+            assert!(warned, "{error:?} warned first");
+            assert_eq!(n, 7, "the call after the sixth failure is refused: {err}");
+            assert!(err.to_string().contains("failed 6 times"), "{err}");
         }
     }
 

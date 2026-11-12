@@ -318,6 +318,16 @@ pub struct ControllerConfig {
     /// 12.1: at most one running item per local worker, and per local
     /// model, so scheduled and interactive work never share a KV slot.
     pub serialise_local: bool,
+    /// One building run at a time on this machine: a `code` item with a
+    /// repository workspace is not leased while another such item's run is
+    /// live, whichever workers would run them (`tick.rs`,
+    /// [`Controller::waits_for_build`]). The daemon sets it when a worker's
+    /// model runs on this machine, the same condition that shares the
+    /// local model slot: two workspace builds beside a resident local model
+    /// pushed a 36 GB machine into 27 GB of swap (12 November 2026). It
+    /// trades throughput for finishing. Off (the default, and with no local
+    /// model) leasing is as before.
+    pub serialise_builds: bool,
     /// Default finite recovery policy; execution estimates are ignored.
     pub default_budget: Budget,
     /// Items a fingerprint must fail on before the ladder files the
@@ -383,6 +393,7 @@ impl Default for ControllerConfig {
             supersede_limit: caps.max_replans_per_parent,
             supersede_window: TimeDelta::hours(1),
             serialise_local: true,
+            serialise_builds: false,
             default_budget: Budget::default(),
             promote_threshold: DEFAULT_PROMOTE_THRESHOLD,
             recurrence_window: month,
@@ -409,6 +420,9 @@ struct Run {
     worker: String,
     /// Repository resource isolated by this run; other writes remain exclusive.
     isolated_repo: Option<String>,
+    /// Whether the run builds: a `code` item in a repository workspace,
+    /// not a read-only review ([`ControllerConfig::serialise_builds`]).
+    builds: bool,
     /// The id the controller gave the run (the brief's `run`), which the
     /// worker's [`Worker::usage`] answers for.
     run_id: String,
@@ -485,6 +499,11 @@ struct State {
     /// `loop_lock`): the tick neither leases them, nor returns them to
     /// `ready` when their lease lapses, nor judges their runs.
     cancelling: HashSet<WorkItemId>,
+    /// What recent cancel requests cancelled, newest last, with when: a
+    /// request for items an earlier one (still in flight, or abandoned by
+    /// its client) already cancelled answers with those ids rather than
+    /// none (`Controller::cancel_locked`).
+    recent_cancels: std::collections::VecDeque<(DateTime<Utc>, Vec<WorkItemId>)>,
     /// The tick in progress, for [`LoopStatus`] (`liveness.rs`).
     tick: Option<liveness::TickProgress>,
     /// What the last tick that ended took, and its slowest phase.
@@ -568,6 +587,7 @@ impl Controller {
                 judgment: None,
                 source: None,
                 cancelling: HashSet::new(),
+                recent_cancels: Default::default(),
                 tick: None,
                 last_timing: None,
             }),

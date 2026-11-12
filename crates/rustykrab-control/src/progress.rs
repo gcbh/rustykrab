@@ -17,7 +17,10 @@
 //! warning, and the [`REPEATED_FAILURE_LIMIT`]th ends the attempt the same
 //! way. A loop that relaunches one failing command between polls whose
 //! output changes brings something new every other step, so the first
-//! count never sees it. Deterministic and pure: the same steps always give
+//! count never sees it. A call that ran into its time limit while doing
+//! work the next identical call continues (a Cargo build at the longest
+//! exec limit) is recorded with [`StepLedger::record_resumable`] and counts
+//! towards neither. Deterministic and pure: the same steps always give
 //! the same verdict.
 //!
 //! The subtree half of step 7 (a parent with nothing moving beneath it) is
@@ -155,6 +158,19 @@ impl StepLedger {
             self.since_progress += 1;
         }
         fresh
+    }
+
+    /// Record a step that neither counts as a failure nor as a repeat: a
+    /// call that ran into its time limit while doing work the next
+    /// identical call continues (a Cargo build stopped at the longest exec
+    /// limit keeps every step it finished, and running it again is what
+    /// the run was told to do). It is a step, but adds nothing to the
+    /// identical-failure count or the window without new evidence, and
+    /// resets neither: whatever stalled the run before it still stands.
+    pub fn record_resumable(&mut self, tool: &str) {
+        self.last_failure = None;
+        self.steps += 1;
+        self.last_tool = tool.to_string();
     }
 
     /// The stall, once `threshold` steps in a row brought nothing new.

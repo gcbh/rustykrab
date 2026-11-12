@@ -31,10 +31,16 @@ pub const SHARED_CARGO_HOME: &str = "cargo-home";
 /// holds most of its memory.
 pub const CARGO_BUILD_JOBS: &str = "6";
 
-/// The shared Cargo home for a repository's build cache `cache`
-/// (`<data>/build-cache/<repo>`): `<data>/build-cache/cargo-home`.
+/// The shared Cargo home for a builder's build cache `cache` in a
+/// repository (`<data>/build-cache/<repo>/<builder>`, see
+/// `rustykrab_control::workspace::Workspace::build_cache`):
+/// `<data>/build-cache/cargo-home`, the same for every repository and
+/// builder.
 pub fn shared_cargo_home(cache: &std::path::Path) -> Option<std::path::PathBuf> {
-    cache.parent().map(|root| root.join(SHARED_CARGO_HOME))
+    cache
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| root.join(SHARED_CARGO_HOME))
 }
 
 /// Entries in a Cargo home that would change how every later build runs
@@ -325,13 +331,15 @@ impl ExecTool {
     }
 
     /// Build Cargo projects into `cache/target` rather than a `target/`
-    /// of the directory's own, and let the confined shell write there.
-    /// Every run of a repository is a fresh worktree; with a target
-    /// directory each, every run compiles all dependencies from nothing
-    /// (minutes, past this tool's time limit) and keeps gigabytes of
-    /// output. One directory per repository keeps the dependencies built
-    /// across runs, and Cargo's lock on it runs one build at a time. Only
-    /// for an instance with a directory; the directory is created.
+    /// of the directory's own, and let the confined shell write there
+    /// (and no other builder's directory). Every run of a repository is a
+    /// fresh worktree; with a target directory each, every run compiles all
+    /// dependencies from nothing (minutes, past this tool's time limit)
+    /// and keeps gigabytes of output. One directory per repository and
+    /// builder (`<data>/build-cache/<repo>/<builder>`) keeps the
+    /// dependencies built across that builder's runs, and no other
+    /// builder's build ever holds its lock. Only for an instance with a
+    /// directory; the directory is created.
     ///
     /// Cargo also gets the persistent Cargo home shared by every worker
     /// ([`shared_cargo_home`], created here and writable in the sandbox)
@@ -522,9 +530,20 @@ impl Confinement {
         // The build cache and the shared Cargo home's download directories
         // are the run's to read and write, as its own `target/` and Cargo
         // home would be.
-        for build_dir in build_dirs {
-            own.push(real(build_dir).unwrap_or_else(|| build_dir.to_path_buf()));
-        }
+        let build_dirs: Vec<std::path::PathBuf> = build_dirs
+            .iter()
+            .map(|d| real(d).unwrap_or_else(|| d.to_path_buf()))
+            .collect();
+        own.extend(build_dirs.iter().cloned());
+        // Other builders' directories beside it
+        // (`<data>/build-cache/<repo>/<builder>`) are not, wherever they
+        // lie (temporary space is writable): a build there would take that
+        // builder's lock and could change what its next build reuses.
+        let cache_roots: Vec<std::path::PathBuf> = build_dirs
+            .iter()
+            .filter_map(|d| d.parent().and_then(std::path::Path::parent))
+            .map(std::path::Path::to_path_buf)
+            .collect();
         // The shared Cargo home is read; of it, only what a build downloads
         // and Cargo's lock files are written (see the rule further down).
         let cargo_home = cargo_home.map(|d| real(d).unwrap_or_else(|| d.to_path_buf()));
@@ -582,6 +601,15 @@ impl Confinement {
             .collect();
         if !git.is_empty() {
             profile.push_str(&format!("(deny file-write* {})", git.join(" ")));
+        }
+        if !cache_roots.is_empty() {
+            let roots: Vec<String> = cache_roots.iter().map(|p| quoted(p)).collect();
+            let mine: Vec<String> = build_dirs.iter().map(|p| quoted(p)).collect();
+            profile.push_str(&format!(
+                "(deny file-write* {})(allow file-write* {})",
+                roots.join(" "),
+                mine.join(" ")
+            ));
         }
         // The shared Cargo home, wherever it lies (temporary space is
         // writable): its configuration, credentials and `bin/` would change
@@ -1096,6 +1124,21 @@ fn resolve_timeout(requested: Option<u64>, cargo: bool) -> u64 {
     }
 }
 
+/// How [`timeout_message`] begins for a Cargo command stopped at a limit.
+const CARGO_TIMEOUT_KEEPS: &str = "and was stopped. Cargo keeps the build steps it finished";
+
+/// Whether `message`, an `exec` timeout's text, says a Cargo command was
+/// stopped at the longest limit a call may ask for ([`MAX_TIMEOUT_SECS`]):
+/// its build steps are kept, and running the same command again continues
+/// it, which is what the message tells the model to do. A worker's loop
+/// rule does not count such a timeout as a repeated failure. A Cargo
+/// command stopped earlier, at a limit it chose, is not one.
+pub fn is_resumable_build_timeout(message: &str) -> bool {
+    message.starts_with(&format!(
+        "command timed out after {MAX_TIMEOUT_SECS}s {CARGO_TIMEOUT_KEEPS}"
+    ))
+}
+
 /// What a timed-out call tells the model: that its processes were stopped,
 /// that backgrounding cannot outlive the call, and for Cargo, that the work
 /// already done is kept and how to continue it.
@@ -1109,10 +1152,9 @@ fn timeout_message(secs: u64, cargo: bool, shared_cache: bool) -> String {
             "in the target directory"
         };
         format!(
-            "command timed out after {secs}s and was stopped. Cargo keeps the build steps it \
-             finished {kept}, so nothing done so far is lost: run the same command again in \
-             the foreground with timeout_secs=600 and it continues where it stopped. \
-             {background}"
+            "command timed out after {secs}s {CARGO_TIMEOUT_KEEPS} {kept}, so nothing done so \
+             far is lost: run the same command again in the foreground with \
+             timeout_secs={MAX_TIMEOUT_SECS} and it continues where it stopped. {background}"
         )
     } else {
         format!(
@@ -2174,7 +2216,7 @@ mod background_and_timeout_tests {
         let data = tempfile::tempdir().unwrap();
         let work = data.path().join("worktrees/run-1");
         std::fs::create_dir_all(&work).unwrap();
-        let cache = data.path().join("build-cache/source");
+        let cache = data.path().join("build-cache/source/worker-w");
         let tool = ExecTool::in_dir(&work).with_build_cache(&cache);
         let out = tool.execute(json!({"command": "env"})).await.unwrap();
         assert_eq!(out["exit_code"], 0, "{out}");
@@ -2207,7 +2249,7 @@ mod background_and_timeout_tests {
     #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
     async fn real_cargo_reuses_the_shared_home_and_cache_across_worktrees() {
         let data = tempfile::tempdir().unwrap();
-        let cache = data.path().join("build-cache/source");
+        let cache = data.path().join("build-cache/source/worker-w");
         let mut outputs = Vec::new();
         for run in ["run-1", "run-2"] {
             let work = data.path().join("worktrees").join(run);
@@ -2249,7 +2291,7 @@ mod background_and_timeout_tests {
     #[ignore = "needs a real Cargo toolchain and crates.io; run explicitly"]
     async fn real_cargo_builds_in_the_confined_shell_with_a_narrowed_home() {
         let data = tempfile::tempdir().unwrap();
-        let cache = data.path().join("build-cache/source");
+        let cache = data.path().join("build-cache/source/worker-w");
         let work = data.path().join("worktrees/run-1");
         std::fs::create_dir_all(work.join("src")).unwrap();
         std::fs::write(
@@ -2282,7 +2324,7 @@ mod background_and_timeout_tests {
     #[test]
     fn each_run_clears_configuration_and_credentials_from_the_shared_home() {
         let data = tempfile::tempdir().unwrap();
-        let cache = data.path().join("build-cache/source");
+        let cache = data.path().join("build-cache/source/worker-w");
         let home = prepare_shared_cargo_home(&cache).unwrap();
         std::fs::create_dir_all(home.join("registry/src")).unwrap();
         std::fs::write(home.join("registry/src/kept"), "kept").unwrap();
@@ -2769,7 +2811,7 @@ mod error_typing_tests {
         std::fs::write(data.path().join("service.json"), "s3cret").unwrap();
         let work = data.path().join("worktrees/run-1");
         std::fs::create_dir_all(&work).unwrap();
-        let cache = data.path().join("build-cache/source");
+        let cache = data.path().join("build-cache/source/worker-w");
         let tool = ExecTool::in_dir(&work)
             .confined(vec![data.path().to_path_buf()])
             .with_build_cache(&cache);
@@ -2832,6 +2874,91 @@ mod error_typing_tests {
         let (code, text) = run_in(&tool, "cat ../../service.json").await;
         assert_ne!(code, 0);
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    /// Each builder writes its own build directory and no other's, even
+    /// where the data directory lies in writable temporary space.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_confined_shell_cannot_write_another_builders_target_directory() {
+        let data = tempfile::tempdir().unwrap();
+        let work = data.path().join("worktrees/run-1");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = data.path().join("build-cache/source");
+        let other = repo.join("worker-codex-primary/target");
+        std::fs::create_dir_all(&other).unwrap();
+        let tool = ExecTool::in_dir(&work)
+            .confined(vec![data.path().to_path_buf()])
+            .with_build_cache(repo.join("slot-model-daemon"));
+        let (code, text) = run_in(&tool, "echo built > \"$CARGO_TARGET_DIR/artifact\"").await;
+        assert_eq!(code, 0, "its own target is writable: {text}");
+        for command in [
+            format!("echo planted > '{}/artifact'", other.display()),
+            format!("mkdir '{}/debug'", other.display()),
+            format!("mkdir '{}/worker-new'", repo.display()),
+        ] {
+            let (code, _) = run_in(&tool, &command).await;
+            assert_ne!(code, 0, "{command} succeeded");
+        }
+        assert!(!other.join("artifact").exists());
+        assert!(!other.join("debug").exists());
+        assert!(repo.join("slot-model-daemon/target/artifact").is_file());
+        // The shared Cargo home's download directories stay writable.
+        let (code, text) = run_in(
+            &tool,
+            "echo fetched > \"$CARGO_HOME/registry/entry\" && echo > \"$CARGO_HOME/.package-cache\"",
+        )
+        .await;
+        assert_eq!(code, 0, "{text}");
+    }
+
+    #[test]
+    fn the_sandbox_profile_denies_other_builders_directories_and_allows_its_own() {
+        let confinement = super::Confinement {
+            private: Vec::new(),
+            ports: Vec::new(),
+        };
+        let mine = std::path::Path::new("/nonexistent-data/build-cache/repo/worker-a");
+        let profile = confinement.profile(
+            std::path::Path::new("/nonexistent-data/worktrees/run"),
+            &[mine],
+            Some(std::path::Path::new(
+                "/nonexistent-data/build-cache/cargo-home",
+            )),
+        );
+        let deny = "(deny file-write* (subpath \"/nonexistent-data/build-cache\"))";
+        let allow = "(allow file-write* (subpath \"/nonexistent-data/build-cache/repo/worker-a\"))";
+        let home = "(deny file-write* (subpath \"/nonexistent-data/build-cache/cargo-home\"))";
+        let (d, a, h) = (
+            profile.find(deny).expect(deny),
+            profile.find(allow).expect(allow),
+            profile.find(home).expect(home),
+        );
+        assert!(d < a && a < h, "{profile}");
+    }
+
+    #[test]
+    fn only_a_cargo_timeout_at_the_longest_limit_is_resumable() {
+        assert!(super::is_resumable_build_timeout(&super::timeout_message(
+            super::MAX_TIMEOUT_SECS,
+            true,
+            true
+        )));
+        assert!(super::is_resumable_build_timeout(&super::timeout_message(
+            super::MAX_TIMEOUT_SECS,
+            true,
+            false
+        )));
+        assert!(!super::is_resumable_build_timeout(&super::timeout_message(
+            super::MIN_CARGO_TIMEOUT_SECS,
+            true,
+            true
+        )));
+        assert!(!super::is_resumable_build_timeout(&super::timeout_message(
+            super::MAX_TIMEOUT_SECS,
+            false,
+            true
+        )));
     }
 
     #[tokio::test]

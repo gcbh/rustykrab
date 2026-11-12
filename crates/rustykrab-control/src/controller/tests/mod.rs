@@ -6,6 +6,7 @@
 //! return canned [`ResultReport`]s per item title.
 
 mod bounds;
+mod build_slot;
 mod capability_recovery;
 mod checks;
 mod closeout;

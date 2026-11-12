@@ -393,3 +393,66 @@ async fn a_tick_queued_behind_a_dropped_timed_tick_is_timed() {
     assert_eq!(done.tick_phase, None);
     assert!(h.ctl.state().last_tick.is_some_and(|t| t >= claimed_at));
 }
+
+/// Two cancels of the same item, the second arriving while the first waits
+/// for the loop (a client that timed out and asked again; its first
+/// request still completes on its own task): both answer with the item
+/// the cancel closed. Before, the second answered `"cancelled": []`
+/// although the item ended cancelled.
+#[tokio::test]
+async fn a_second_cancel_while_the_first_is_in_flight_names_what_was_cancelled() {
+    let (h, _worker, id) = running().await;
+    let held = h.ctl.loop_lock.lock().await;
+    let mut first = pin!(ControlHandle::cancel(&h.ctl, &id, None, "user:master"));
+    let mut second = pin!(ControlHandle::cancel(&h.ctl, &id, None, "user:master"));
+    for cancel in [&mut first, &mut second] {
+        tokio::select! {
+            _ = cancel => panic!("the cancel records under loop_lock"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    drop(held);
+    let (first, second) = tokio::join!(first, second);
+    let (first, second) = (first.expect("first cancel"), second.expect("second cancel"));
+    assert_eq!(first, vec![id.clone()]);
+    assert_eq!(second, vec![id.clone()]);
+    assert!(matches!(h.status(&id).await, Status::Cancelled(_)));
+    // A later request for it still says what was cancelled.
+    assert_eq!(
+        ControlHandle::cancel(&h.ctl, &id, None, "user:master")
+            .await
+            .unwrap(),
+        vec![id.clone()]
+    );
+}
+
+/// What one cancel request closed answers a repeated request for the same
+/// item, and never one for another item.
+#[tokio::test]
+async fn a_repeated_cancel_names_only_items_under_the_one_asked_for() {
+    let h = Harness::new(&["pinch"]);
+    let parent = h.file_one(draft("p", "Parent")).await;
+    let cancelled = ControlHandle::cancel(&h.ctl, &parent, None, "user:master")
+        .await
+        .unwrap();
+    assert_eq!(cancelled, vec![parent.clone()]);
+    let other = h.file_one(draft("o", "Other")).await;
+    h.ctl
+        .cancel_locked(&other, None, "user:master")
+        .await
+        .unwrap();
+    // `other` was cancelled by its own request: the parent's record does
+    // not leak into its answer, nor the reverse.
+    assert_eq!(
+        ControlHandle::cancel(&h.ctl, &other, None, "user:master")
+            .await
+            .unwrap(),
+        vec![other.clone()]
+    );
+    assert_eq!(
+        ControlHandle::cancel(&h.ctl, &parent, None, "user:master")
+            .await
+            .unwrap(),
+        vec![parent]
+    );
+}

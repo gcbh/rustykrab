@@ -122,7 +122,9 @@ impl Controller {
             } else {
                 let events = self.store.work_events(&item.id).await?;
                 let history = history(&events);
-                if self.pick(item, &history, &load, &occupied, &busy).is_some() {
+                if self.waits_for_build(item, &occupied) {
+                    Some("build_slot".to_string())
+                } else if self.pick(item, &history, &load, &occupied, &busy).is_some() {
                     dispatchable += 1;
                     None
                 } else {

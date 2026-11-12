@@ -2068,6 +2068,11 @@ impl Controller {
                 WorkKind::Capability => self.capability_mode(&item.id).await?,
                 _ => None,
             };
+            // One building run at a time beside a local model: a build
+            // waits for the one in progress, whichever worker would take it.
+            if self.waits_for_build(&item, &occupied) {
+                continue;
+            }
             let Some(worker) = self.pick(&item, &hist, &load, &occupied, &busy) else {
                 // No eligible/free resource: keep the ready item queued.
                 // No attempt has started, so spend no failure/retry budget.
@@ -2207,6 +2212,7 @@ impl Controller {
             let mut run = self.spawn_run(worker.clone(), brief);
             run.merge_progress = merge_progress;
             let isolated_repo = run.isolated_repo.clone();
+            occupied.build |= run.builds;
             self.state().runs.insert(item.id.clone(), run);
             let mut spec = TransitionSpec::new(&item.id, Status::Running, format!("worker:{name}"));
             spec.expected_from = Some(Status::Leased);
@@ -2411,7 +2417,22 @@ impl Controller {
                 self.occupy(w.as_ref(), &mut occupied);
             }
         }
+        occupied.build = state.runs.values().any(|run| run.builds);
         (load, occupied)
+    }
+
+    /// Whether `item` waits for the machine's build slot
+    /// ([`ControllerConfig::serialise_builds`]): it would build (a `code`
+    /// item with a repository workspace, not a read-only review) and
+    /// another building run holds the slot. It stays `ready`, as an item
+    /// waits for a busy worker: no attempt starts, so nothing is spent,
+    /// stalled or failed.
+    pub(super) fn waits_for_build(&self, item: &WorkItem, occupied: &Occupied) -> bool {
+        self.config.serialise_builds
+            && occupied.build
+            && self.config.worktree_root.is_some()
+            && Workspace::repo_of(&item.writable_resources).is_some()
+            && builds(item.kind, &item.artifact_refs)
     }
 
     /// Record what a run or probe on `worker` holds: its resource slot,
@@ -2538,6 +2559,17 @@ impl Controller {
 pub(super) struct Occupied {
     pub(super) models: HashSet<String>,
     pub(super) slots: HashSet<String>,
+    /// A live run builds ([`Controller::waits_for_build`]).
+    pub(super) build: bool,
+}
+
+/// Whether work of `kind` with these references builds when it runs in a
+/// repository workspace: a `code` item, unless it is a read-only review.
+fn builds(kind: WorkKind, refs: &[rustykrab_core::work::ArtifactRef]) -> bool {
+    kind == WorkKind::Code
+        && !refs
+            .iter()
+            .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true")
 }
 
 impl Controller {
@@ -2569,6 +2601,7 @@ impl Controller {
 fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     let name = worker.name().to_string();
     let run_id = brief.run.clone().unwrap_or_default();
+    let builds = brief.workspace.is_some() && builds(brief.kind, &brief.artifact_refs);
     let isolated_repo = if worker.isolates_worktree() {
         brief
             .workspace
@@ -2586,6 +2619,7 @@ fn spawn(worker: Arc<dyn Worker>, brief: Brief, since: DateTime<Utc>) -> Run {
     Run {
         worker: name,
         isolated_repo,
+        builds,
         run_id,
         started: std::time::Instant::now(),
         handle,

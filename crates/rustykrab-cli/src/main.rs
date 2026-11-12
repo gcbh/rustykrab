@@ -1652,6 +1652,19 @@ async fn main() -> anyhow::Result<()> {
         }),
         ..Default::default()
     });
+    // One building run at a time when a worker's model runs on this
+    // machine: the daemon's own provider is a local server here, or the
+    // local-resources workers are configured (their server always is). The
+    // same condition that shares the model slot (`local_resources_slot`).
+    // Concurrent workspace builds beside a resident model exhausted memory.
+    control_config.serialise_builds = local_resources.is_some()
+        || local_resources::provider_on_this_machine(
+            provider.name(),
+            std::env::var("OLLAMA_BASE_URL").ok().as_deref(),
+        );
+    if control_config.serialise_builds {
+        tracing::info!("a local model shares this machine: one building run at a time");
+    }
     // How long aging may wait for an idle tick before it runs anyway
     // (plan 4.6); the evaluation harness shortens it.
     if let Some(secs) = std::env::var("RUSTYKRAB_AGING_MAX_GAP_SECS")
