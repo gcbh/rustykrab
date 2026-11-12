@@ -1350,8 +1350,10 @@ impl LocalWorker {
         if review {
             tools.retain(|tool| tool.name() == "result_report");
         }
-        // Every call is a step in the progress ledger (section 6, step 7).
+        // Every call is a step in the progress ledger (section 6, step 7),
+        // and a sign of life while it runs ([`LedgerTool::pulse`]).
         let ledger = Arc::new(Mutex::new(StepLedger::new(self.stall_steps)));
+        let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let tools: Vec<Arc<dyn Tool>> = tools
             .into_iter()
             .map(|inner| {
@@ -1359,6 +1361,8 @@ impl LocalWorker {
                     inner,
                     ledger: ledger.clone(),
                     commands: recorder.commands.clone(),
+                    activity: activity.clone(),
+                    pulse: TOOL_PULSE,
                 }) as Arc<dyn Tool>
             })
             .collect();
@@ -1378,7 +1382,7 @@ impl LocalWorker {
 
         // What the run spends, kept for the controller whatever happens to it.
         let spending = Arc::new(Spending {
-            activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            activity,
             meter: Arc::new(Meter::new()),
             tracer: Arc::new(ExecutionTracer::new()),
             started: Instant::now(),
@@ -1996,6 +2000,57 @@ struct LedgerTool {
     inner: Arc<dyn Tool>,
     ledger: Arc<Mutex<StepLedger>>,
     commands: Arc<Mutex<Vec<String>>>,
+    /// The run's activity counter ([`Worker::activity`]), the one its
+    /// messages bump.
+    activity: Arc<std::sync::atomic::AtomicU64>,
+    /// How often a call in flight bumps it ([`TOOL_PULSE`]).
+    pulse: Duration,
+}
+
+/// How often a tool call still in flight counts as activity for the run's
+/// lease heartbeat ([`LedgerTool::pulse`]).
+///
+/// The controller renews a run's lease only when the worker's activity
+/// moves, and a local run's activity moved only when a message (a model
+/// turn or a tool result) was added. A 600 s `cargo test` therefore showed
+/// no sign of life for its whole length (12 November 2026: `heartbeat_at`
+/// reached 600 s old against an 1800 s TTL, three times in one run), and a
+/// shorter TTL or a slower machine would have declared a working run
+/// stalled. Thirty seconds is well inside any lease TTL and the heartbeat's
+/// own 15 s reading interval at most doubles it.
+const TOOL_PULSE: Duration = Duration::from_secs(30);
+
+impl LedgerTool {
+    /// Run `call`, bumping the run's activity every [`Self::pulse`] while
+    /// it is in flight, and never after.
+    ///
+    /// This cannot hide a stall. The pulse lives in the call's own future:
+    /// it stops when the call returns, fails or times out, and when the
+    /// future is dropped (the run was cancelled or ended). Every call is
+    /// bounded by the runner's per-tool timeout (`tool_cap_secs`: `exec`
+    /// at its own 600 s limit plus 5 s, every other tool 300 s at most),
+    /// and `exec` kills its child process group when its own timeout
+    /// fires, so a call in flight is a bounded piece of work, normally a
+    /// live child process. A model request that hangs has no tool call in
+    /// flight and bumps nothing, so it shows as a stall exactly as before.
+    /// The ledger sees none of it: a pulse is a sign of life, not a step,
+    /// so it neither counts as progress nor resets a loop.
+    async fn pulse<F: std::future::Future>(&self, call: F) -> F::Output {
+        tokio::pin!(call);
+        let start = tokio::time::Instant::now() + self.pulse;
+        let mut every = tokio::time::interval_at(start, self.pulse);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                out = &mut call => return out,
+                _ = every.tick() => {
+                    self.activity
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// What a call that repeats an earlier call and its result carries back,
@@ -2059,7 +2114,7 @@ impl Tool for LedgerTool {
             }
             .into_error());
         }
-        let result = self.inner.execute(args.clone()).await;
+        let result = self.pulse(self.inner.execute(args.clone())).await;
         // Only a host-dispatched exec with a process result attests a command.
         // Rejected/tool-error calls and model-authored artifacts are not proof.
         if self.inner.name() == "exec"
@@ -4276,6 +4331,8 @@ mod tests {
             inner: Arc::new(rustykrab_tools::ExecTool::new()),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
             commands: recorder.commands.clone(),
+            activity: Default::default(),
+            pulse: TOOL_PULSE,
         };
         tool.execute(json!({"command":"echo observed"}))
             .await
@@ -4328,6 +4385,8 @@ mod tests {
             inner: Arc::new(rustykrab_tools::ExecTool::in_dir(dir.path())),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
             commands: Arc::new(Mutex::new(Vec::new())),
+            activity: Default::default(),
+            pulse: TOOL_PULSE,
         };
         let launch = json!({"command": "cargo test > test.log 2>&1 & echo started"});
         for round in 1..=6u32 {
@@ -4381,6 +4440,8 @@ mod tests {
             inner: Arc::new(FailingExec(error)),
             ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
             commands: Arc::new(Mutex::new(Vec::new())),
+            activity: Default::default(),
+            pulse: TOOL_PULSE,
         };
         let call = json!({"command": "cargo test -p rustykrab-control --lib", "timeout_secs": 600});
         let mut warned = false;
@@ -4394,6 +4455,115 @@ mod tests {
                 .contains("Note: this exact call has now failed");
         }
         (None, warned)
+    }
+
+    /// A tool call that takes `0` to return, as a long `cargo test` does.
+    struct Slow(Duration);
+
+    #[async_trait]
+    impl Tool for Slow {
+        fn name(&self) -> &str {
+            "exec"
+        }
+        fn description(&self) -> &str {
+            "takes a while"
+        }
+        fn schema(&self) -> ToolSchema {
+            rustykrab_tools::ExecTool::new().schema()
+        }
+        async fn execute(&self, _: Value) -> Result<Value> {
+            tokio::time::sleep(self.0).await;
+            Ok(json!({"exit_code": 0, "stdout": "ok", "stderr": ""}))
+        }
+    }
+
+    /// 12 November 2026: a local run's lease heartbeat did not move during
+    /// a 600 s `cargo test`, because activity moved only per message. A
+    /// call in flight longer than two pulses now advances the run's
+    /// activity while it runs, and stops when it returns. The ledger sees
+    /// one step per call, as before: a pulse is not progress.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_tool_call_keeps_the_run_alive_until_it_returns() {
+        let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ledger = Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS)));
+        let tool = Arc::new(LedgerTool {
+            inner: Arc::new(Slow(TOOL_PULSE * 5 / 2)),
+            ledger: ledger.clone(),
+            commands: Arc::new(Mutex::new(Vec::new())),
+            activity: activity.clone(),
+            pulse: TOOL_PULSE,
+        });
+        let read = || activity.load(std::sync::atomic::Ordering::Relaxed);
+        let call = tokio::spawn({
+            let tool = tool.clone();
+            async move { tool.execute(json!({"command": "cargo test"})).await }
+        });
+        tokio::time::sleep(TOOL_PULSE / 2).await;
+        assert_eq!(read(), 0, "no pulse before the first interval");
+        tokio::time::sleep(TOOL_PULSE).await;
+        let once = read();
+        assert_eq!(once, 1, "a pulse while the call runs");
+        tokio::time::sleep(TOOL_PULSE).await;
+        assert_eq!(read(), 2, "and another");
+        call.await.unwrap().unwrap();
+        let ended = read();
+        tokio::time::sleep(TOOL_PULSE * 4).await;
+        assert_eq!(read(), ended, "nothing once the call returned");
+
+        // A quick call adds no pulse at all.
+        let quick = LedgerTool {
+            inner: Arc::new(Slow(TOOL_PULSE / 3)),
+            ledger: ledger.clone(),
+            commands: Arc::new(Mutex::new(Vec::new())),
+            activity: activity.clone(),
+            pulse: TOOL_PULSE,
+        };
+        quick
+            .execute(json!({"command": "cargo check"}))
+            .await
+            .unwrap();
+        assert_eq!(read(), ended);
+
+        // A dropped call (its run cancelled) stops pulsing too.
+        let dropped = tokio::spawn({
+            let tool = tool.clone();
+            async move { tool.execute(json!({"command": "cargo build"})).await }
+        });
+        tokio::time::sleep(TOOL_PULSE + TOOL_PULSE / 2).await;
+        let at_drop = read();
+        assert_eq!(at_drop, ended + 1);
+        dropped.abort();
+        let _ = dropped.await;
+        tokio::time::sleep(TOOL_PULSE * 4).await;
+        assert_eq!(read(), at_drop, "nothing once the call was dropped");
+    }
+
+    /// Pulses are not steps: identical slow calls that return the same
+    /// result stall the ledger after exactly as many calls as quick ones.
+    #[tokio::test(start_paused = true)]
+    async fn pulses_do_not_count_as_progress() {
+        async fn calls_until_refused(took: Duration) -> u32 {
+            let tool = LedgerTool {
+                inner: Arc::new(Slow(took)),
+                ledger: Arc::new(Mutex::new(StepLedger::new(DEFAULT_STALL_STEPS))),
+                commands: Arc::new(Mutex::new(Vec::new())),
+                activity: Default::default(),
+                pulse: TOOL_PULSE,
+            };
+            for n in 1..=50 {
+                if tool
+                    .execute(json!({"command": "cargo test"}))
+                    .await
+                    .is_err()
+                {
+                    return n;
+                }
+            }
+            panic!("never refused");
+        }
+        let quick = calls_until_refused(Duration::from_millis(1)).await;
+        let slow = calls_until_refused(TOOL_PULSE * 3).await;
+        assert_eq!(slow, quick);
     }
 
     /// A Cargo build stopped at the longest exec limit (600 s) kept what it

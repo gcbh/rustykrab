@@ -2134,7 +2134,8 @@ async fn wait_fix_item(ctx: &Ctx, failing: &str, not: Option<&str>) -> Result<St
 ///   portions, and its CLI was given the bundle and the session logs with
 ///   `--add-dir` (a failed run's kept worktree too, when one is kept; these
 ///   runs handed in a result, so theirs were removed and their commits stay
-///   on their branches);
+///   on their branches), and a temporary directory of its own as its
+///   `TMPDIR`, which it could write and which goes with the run;
 /// - the bundle holds all three occurrences run by run, the same records
 ///   `rustykrab work investigate` prints, and the daemon's log for a failed
 ///   run's window with the bot token redacted;
@@ -2298,17 +2299,44 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
         "a failed run's commit stays on its branch: {}",
         third_run["workspace"]
     );
+    // Its temporary directory is the one that goes with the run (below).
+    let tmpdir = read("tmpdir.txt")?;
+    let mut tmp_lines = tmpdir.lines();
+    let tmp = tmp_lines.next().unwrap_or_default();
     ensure!(
-        !added.iter().any(|dir| !std::path::Path::new(dir).exists()),
+        !added
+            .iter()
+            .any(|dir| *dir != tmp && !std::path::Path::new(dir).exists()),
         "the investigator was offered a directory that does not exist: {added:?}"
     );
     // Beside those, only where its worktree builds: this worker's own
     // build cache for the repository (`build-cache/<repo>/worker-<name>`,
-    // never another worker's) and the Cargo home every worker shares.
+    // never another worker's), the Cargo home every worker shares, and the
+    // run's own temporary directory, which is its TMPDIR and which it
+    // could write (`workers/<name>/runs/<run>/tmp-<id>`).
+    let runs = ctx.data_dir.join("workers").join("pinch-inv").join("runs");
+    ensure!(
+        std::path::Path::new(tmp)
+            .parent()
+            .and_then(std::path::Path::parent)
+            == Some(runs.as_path())
+            && std::path::Path::new(tmp)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tmp-"))
+            && tmp_lines.next() == Some("writable")
+            && added.contains(&tmp),
+        "the investigator's TMPDIR is a writable directory of the run's own, given with \
+         --add-dir: {tmpdir} {added:?}"
+    );
+    ensure!(
+        !std::path::Path::new(tmp).exists(),
+        "the run's temporary directory went with the run: {tmp}"
+    );
     let build_cache = ctx.data_dir.join("build-cache");
     let cargo_home = build_cache.join("cargo-home");
     ensure!(
-        added.len() == 4
+        added.len() == 5
             && added.iter().any(|dir| {
                 let dir = std::path::Path::new(dir);
                 dir.parent().and_then(std::path::Path::parent) == Some(build_cache.as_path())
@@ -2514,6 +2542,7 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
         for file in [
             "brief.txt",
             "args.txt",
+            "tmpdir.txt",
             "head.txt",
             "working-directory.txt",
             "read-index.txt",
