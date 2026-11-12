@@ -688,9 +688,13 @@ compaction. Two things about it live on disk beside the store, both under the
 daemon's data directory and both pointed at by evidence rows rather than
 stored in them: `run-logs/<run id>.jsonl` (every run's session log, 30 days)
 and `investigations/<item>-<run>/` (a fix item's bundle for one run, 30 days).
-`build-cache/<repository>/` is also there and recorded nowhere: Cargo's
-build output for that repository's worktree runs, shared across them and
-safe to delete whenever no run is building. So is `build-cache/cargo-home/`,
+`build-cache/<repository>/<builder>/` is also there and recorded nowhere:
+Cargo's build output for that repository's worktree runs by one builder
+(`slot-<key>` for the workers sharing a resource slot, `worker-<name>` for
+any other), shared across its runs and safe to delete whenever no run is
+building. A `build-cache/<repository>/target/` left from before per-builder directories, when
+every worker shared one target directory, is no longer used and can be
+deleted. So is `build-cache/cargo-home/`,
 the Cargo home every worker's builds share (downloaded registry index and
 sources, no credentials), equally safe to delete when nothing is building.
 

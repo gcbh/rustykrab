@@ -1169,10 +1169,36 @@ impl Controller {
         if !b.snap.contains(item) {
             return Err(Error::NotFound(format!("work item {item}")));
         }
+        let mut subtree = b.snap.descendants(item);
+        subtree.push(item.to_string());
         let (changed, cancelled) = b.cancel_tree(item, actor, reason);
         b.settle(changed);
         self.commit(b, &mut HashSet::new()).await?;
-        Ok(cancelled)
+        let mut state = self.state();
+        let recent = &mut state.recent_cancels;
+        while recent
+            .front()
+            .is_some_and(|(at, _)| now - *at > RECENT_CANCEL_WINDOW)
+            || recent.len() >= RECENT_CANCELS
+        {
+            recent.pop_front();
+        }
+        if !cancelled.is_empty() {
+            recent.push_back((now, cancelled.clone()));
+            return Ok(cancelled);
+        }
+        // Nothing left to cancel: an earlier request for these items got
+        // there first (a retry while it waited for the loop, or after its
+        // client gave up). Answer with what that request cancelled here.
+        let mut earlier: Vec<WorkItemId> = recent
+            .iter()
+            .flat_map(|(_, ids)| ids)
+            .filter(|id| subtree.contains(id))
+            .cloned()
+            .collect();
+        earlier.sort();
+        earlier.dedup();
+        Ok(earlier)
     }
 
     /// The part of a cancel that cannot wait for `loop_lock`: stop every
@@ -1620,6 +1646,11 @@ fn archived_node(a: &ArchivedItem, depth: u32) -> GraphNode {
         archived_summary: Some(a.summary.clone()),
     }
 }
+
+/// How long, and how many, cancel requests' results are kept to answer a
+/// repeated request for the same items (`State::recent_cancels`).
+const RECENT_CANCEL_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+const RECENT_CANCELS: usize = 64;
 
 /// The runs a cancel stopped before it took `loop_lock`, and the items it
 /// marked. Dropping it lifts the marks, so a cancel whose future is dropped

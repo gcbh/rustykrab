@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.6.29] - 2026-11-12
+
+- Give each worker its own build directory and one build at a time beside a local model (#758)
+
 ## [6.6.28] - 2026-11-12
 
 - Keep the controller observable, its leases alive and cancels prompt while a tick is slow (#757)

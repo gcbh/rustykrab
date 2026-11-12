@@ -91,11 +91,39 @@ pub(crate) fn shared_resources<'a>(
 }
 
 /// Under the daemon's data directory: Cargo's build output for worktree
-/// runs, one directory per repository ([`Workspace::build_cache`]). A
-/// fresh worktree with a `target/` of its own compiles every dependency
-/// again; a shared one keeps them built across runs, and Cargo's lock on
-/// it runs one build at a time.
+/// runs, one directory per repository and builder
+/// ([`Workspace::build_cache`]). A fresh worktree with a `target/` of its
+/// own compiles every dependency again; a shared one keeps them built
+/// across runs. Cargo's lock on a target directory runs one build in it at
+/// a time, so builders that run side by side each get their own: one
+/// worker's build never waits on another's lock.
 pub const BUILD_CACHE_DIR: &str = "build-cache";
+
+/// The name of a builder's directory in a repository's build cache
+/// ([`Workspace::build_cache`]): `slot-<key>` for workers that share an
+/// exclusive resource slot (the local-model workers, which run one at a
+/// time between them and so can share one target directory), else
+/// `worker-<name>` (each external worker, which may build while another
+/// does). Characters other than ASCII letters, digits, `-`, `_` and `.`
+/// become `-`, so a slot key such as `model:daemon` is one path component.
+pub fn builder_key(slot: Option<&str>, worker: &str) -> String {
+    let (prefix, name) = match slot.filter(|s| !s.trim().is_empty()) {
+        Some(slot) => ("slot", slot),
+        None => ("worker", worker),
+    };
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('.');
+    format!("{prefix}-{}", if name.is_empty() { "-" } else { name })
+}
 
 /// One run's isolated checkout of a repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,11 +211,14 @@ impl Workspace {
         require(out, "git worktree add")
     }
 
-    /// This repository's build cache under `root` (the daemon's
-    /// [`BUILD_CACHE_DIR`]): named for the repository's directory, so
-    /// every run of it shares one and two repositories never do.
-    pub fn build_cache(&self, root: &Path) -> Option<PathBuf> {
-        Some(root.join(self.repo.file_name()?))
+    /// The build cache under `root` (the daemon's [`BUILD_CACHE_DIR`]) of
+    /// this repository for one builder ([`builder_key`]):
+    /// `<root>/<repository directory>/<builder>`, whose `target/` is the
+    /// run's `CARGO_TARGET_DIR`. Every run of a builder in a repository
+    /// shares one; two repositories, or two builders that may build at
+    /// the same time, never do.
+    pub fn build_cache(&self, root: &Path, builder: &str) -> Option<PathBuf> {
+        Some(root.join(self.repo.file_name()?).join(builder))
     }
 
     /// Delete the worktree's own Cargo `target/`, when a kept worktree
@@ -1348,10 +1379,46 @@ pub(crate) mod tests {
         assert!(ws.path.join("src/lib.rs").is_file());
         assert!(!ws.drop_build_output());
         assert_eq!(
-            ws.build_cache(Path::new("/data/build-cache")),
-            Some(Path::new("/data/build-cache").join(repo.path().file_name().unwrap()))
+            ws.build_cache(Path::new("/data/build-cache"), "worker-codex"),
+            Some(
+                Path::new("/data/build-cache")
+                    .join(repo.path().file_name().unwrap())
+                    .join("worker-codex")
+            )
         );
         ws.remove().unwrap();
+    }
+
+    #[test]
+    fn builders_sharing_a_slot_share_a_build_directory_and_others_do_not() {
+        let repo = Repo::new();
+        let root = tempfile::tempdir().unwrap();
+        let ws = workspace(&repo, root.path());
+        let cache = Path::new("/data/build-cache");
+        let dir = |slot: Option<&str>, worker: &str| {
+            ws.build_cache(cache, &builder_key(slot, worker)).unwrap()
+        };
+        // Two local workers on the daemon's model slot: one directory.
+        assert_eq!(
+            dir(Some("model:daemon"), "planner"),
+            dir(Some("model:daemon"), "qwen-code")
+        );
+        assert!(dir(Some("model:daemon"), "planner").ends_with("slot-model-daemon"));
+        // Different slots, or workers without one, never share.
+        assert_ne!(
+            dir(Some("model:daemon"), "planner"),
+            dir(Some("model:local-resources"), "qwen-code")
+        );
+        assert_ne!(dir(None, "codex-primary"), dir(None, "claude-review"));
+        assert_ne!(dir(None, "codex-primary"), dir(Some("model:daemon"), "x"));
+        // A worker named like a slot cannot land in that slot's directory.
+        assert_ne!(dir(None, "model-daemon"), dir(Some("model:daemon"), "x"));
+        // Whatever the name, the key is one path component.
+        for name in ["../escape", "a/b", "..", "", "."] {
+            let key = builder_key(None, name);
+            assert_eq!(Path::new(&key).components().count(), 1, "{name:?} -> {key}");
+            assert!(!key.contains('/') && key != ".." && key != ".", "{key}");
+        }
     }
 
     #[test]

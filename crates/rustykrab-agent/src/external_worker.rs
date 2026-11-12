@@ -274,6 +274,194 @@ fn signal_group(_group: i32, _signal: i32) -> bool {
     false
 }
 
+/// The environment variable every external run's agent is started with,
+/// set to a token of that one invocation. The agent's own commands inherit
+/// it, including those it starts in a process group or session of their
+/// own (Codex runs each shell command so), which killing the agent's group
+/// misses: a cancelled run's `cargo` builds kept running for hours after
+/// its group was gone (12 November 2026). [`kill_marked`] finds them by it.
+pub const RUN_TOKEN_ENV: &str = "RUSTYKRAB_RUN_TOKEN";
+
+/// One row of the process table: a process, its parent, and whether its
+/// environment carries the run token asked for.
+#[derive(Debug, Clone, Copy)]
+struct Proc {
+    pid: i32,
+    ppid: i32,
+    marked: bool,
+}
+
+/// This user's processes as the system lists them, with whether each one's
+/// environment carries `RUN_TOKEN_ENV=<token>` (only read when a token is
+/// given). From `ps` on macOS, whose `-E` shows the environment of the
+/// user's own processes except Apple's platform binaries (`/bin/sh`,
+/// `sleep`; `cargo` and `rustc` show theirs), and from `/proc` on Linux.
+fn process_table(token: Option<&str>) -> Vec<Proc> {
+    let wanted = token.map(|t| format!("{RUN_TOKEN_ENV}={t}"));
+    let mut table = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return table;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            // `pid (comm) state ppid ...`: the parent follows the last `)`.
+            let Some(ppid) = std::fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = stat.get(stat.rfind(')')? + 1..)?.to_string();
+                    rest.split_whitespace().nth(1)?.parse::<i32>().ok()
+                })
+            else {
+                continue;
+            };
+            let marked = wanted.as_ref().is_some_and(|wanted| {
+                std::fs::read(entry.path().join("environ")).is_ok_and(|environ| {
+                    environ
+                        .split(|b| *b == 0)
+                        .any(|var| var == wanted.as_bytes())
+                })
+            });
+            table.push(Proc { pid, ppid, marked });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut ps = std::process::Command::new("ps");
+        ps.arg("-A");
+        if wanted.is_some() {
+            ps.arg("-E");
+        }
+        let Ok(out) = ps
+            .args(["-ww", "-o", "pid=,ppid=,command="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return table;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut words = line.split_whitespace();
+            let (Some(pid), Some(ppid)) = (
+                words.next().and_then(|w| w.parse::<i32>().ok()),
+                words.next().and_then(|w| w.parse::<i32>().ok()),
+            ) else {
+                continue;
+            };
+            // The environment follows the command, separated by spaces.
+            let marked = wanted
+                .as_ref()
+                .is_some_and(|wanted| words.any(|word| word == wanted));
+            table.push(Proc { pid, ppid, marked });
+        }
+    }
+    table
+}
+
+/// Every process in `table` below one of `roots` (children, theirs, and
+/// so on), whatever process group or session it moved to. Never this
+/// process, `init`, or a root itself.
+fn descendants(table: &[Proc], roots: &HashSet<i32>) -> Vec<i32> {
+    let me = std::process::id() as i32;
+    let mut below: HashSet<i32> = HashSet::new();
+    let mut frontier: Vec<i32> = roots.iter().copied().collect();
+    while let Some(parent) = frontier.pop() {
+        for p in table.iter().filter(|p| p.ppid == parent && p.pid > 1) {
+            if p.pid != me && !roots.contains(&p.pid) && below.insert(p.pid) {
+                frontier.push(p.pid);
+            }
+        }
+    }
+    let mut below: Vec<i32> = below.into_iter().collect();
+    below.sort_unstable();
+    below
+}
+
+/// SIGKILL each of `pids`; how many it reached.
+fn kill_pids(pids: &[i32]) -> usize {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let me = std::process::id() as i32;
+        pids.iter()
+            .filter(|pid| **pid > 1 && **pid != me)
+            // SAFETY: kill(2) takes plain integers and touches no memory of
+            // ours; the pid is a single positive process, never this one.
+            .filter(|pid| unsafe { kill(**pid, SIGKILL) } == 0)
+            .count()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pids;
+        0
+    }
+}
+
+/// The processes carrying `token` ([`RUN_TOKEN_ENV`]) and everything below
+/// them, other than this process.
+fn marked_processes(token: &str) -> Vec<i32> {
+    let me = std::process::id() as i32;
+    let table = process_table(Some(token));
+    let marked: HashSet<i32> = table
+        .iter()
+        .filter(|p| p.marked && p.pid > 1 && p.pid != me)
+        .map(|p| p.pid)
+        .collect();
+    let mut all: Vec<i32> = marked.iter().copied().collect();
+    all.extend(descendants(&table, &marked));
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// SIGKILL every process [`marked_processes`] finds for `token`, again
+/// until none is left (a dying shell may have just forked) or a few rounds
+/// have passed. Returns how many it signalled.
+fn kill_marked(token: &str) -> usize {
+    let mut killed = 0;
+    for _ in 0..5 {
+        let found = marked_processes(token);
+        if found.is_empty() {
+            break;
+        }
+        killed += kill_pids(&found);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    killed
+}
+
+/// End what an external run left outside its process group
+/// ([`kill_marked`]), off the calling thread: listing the processes with
+/// their environments takes tens of milliseconds, and the caller may be a
+/// dropped future on the controller's runtime. Logged when it found any.
+fn sweep_marked(token: String) {
+    let sweep = move || {
+        let killed = kill_marked(&token);
+        if killed > 0 {
+            tracing::warn!(
+                processes = killed,
+                "killed processes an external run left outside its process group"
+            );
+        }
+    };
+    if std::thread::Builder::new()
+        .name("rustykrab-run-sweep".into())
+        .spawn(sweep)
+        .is_err()
+    {
+        tracing::warn!("cannot start the external run sweep");
+    }
+}
+
 /// The process groups of the external runs alive right now, so daemon
 /// shutdown can end them. Every [`ExternalWorker`] records into
 /// [`RunGroups::global`] unless given its own
@@ -281,16 +469,22 @@ fn signal_group(_group: i32, _signal: i32) -> bool {
 #[derive(Debug, Default)]
 pub struct RunGroups {
     live: Mutex<HashSet<i32>>,
+    /// Each live group's run token ([`RUN_TOKEN_ENV`]).
+    tokens: Mutex<HashMap<i32, String>>,
     /// Groups [`RunGroups::terminate_all`] ended: their runs report an
     /// interruption, not a failure.
     interrupted: Mutex<HashSet<i32>>,
 }
 
 /// One run's membership in a [`RunGroups`]: dropping it forgets the group
-/// and kills whatever is left in it.
+/// and kills whatever is left in it, and every process carrying its run
+/// token that left the group ([`sweep_marked`]). Every way a run ends drops
+/// it: the agent exiting, its timeout, a cancel or stop (which drops the
+/// run's future) and shutdown.
 struct GroupGuard {
     groups: Arc<RunGroups>,
     group: i32,
+    token: String,
 }
 
 impl Drop for GroupGuard {
@@ -301,11 +495,23 @@ impl Drop for GroupGuard {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.group);
         self.groups
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.group);
+        self.groups
             .interrupted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.group);
+        // Everything below the agent, read before its group is killed:
+        // once the agent is gone, a child that left its group (Codex runs
+        // each shell command so) is the init process's, and only its run
+        // token, where the system shows it, still ties it to this run.
+        let tree = descendants(&process_table(None), &HashSet::from([self.group]));
         signal_group(self.group, SIGKILL);
+        kill_pids(&tree);
+        sweep_marked(std::mem::take(&mut self.token));
     }
 }
 
@@ -340,14 +546,19 @@ impl RunGroups {
         live
     }
 
-    fn enter(self: &Arc<Self>, group: i32) -> GroupGuard {
+    fn enter(self: &Arc<Self>, group: i32, token: &str) -> GroupGuard {
         self.live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(group);
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(group, token.to_string());
         GroupGuard {
             groups: self.clone(),
             group,
+            token: token.to_string(),
         }
     }
 
@@ -362,6 +573,19 @@ impl RunGroups {
             return 0;
         }
         tracing::info!(groups = ?groups, "terminating external worker runs");
+        let tokens: Vec<String> = {
+            let tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            groups
+                .iter()
+                .filter_map(|g| tokens.get(g).cloned())
+                .collect()
+        };
+        // What sits below each agent, before SIGTERM lets any of it be
+        // orphaned (see `GroupGuard`'s drop).
+        let roots: HashSet<i32> = groups.iter().copied().collect();
+        let tree = tokio::task::spawn_blocking(move || descendants(&process_table(None), &roots))
+            .await
+            .unwrap_or_default();
         self.interrupted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -390,6 +614,15 @@ impl RunGroups {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // And what the runs started outside their groups, before the daemon
+        // exits and no run's guard is left to do it.
+        let _ = tokio::task::spawn_blocking(move || {
+            kill_pids(&tree);
+            for token in tokens {
+                kill_marked(&token);
+            }
+        })
+        .await;
         groups.len()
     }
 }
@@ -850,14 +1083,21 @@ impl ExternalWorker {
             .artifact_refs
             .iter()
             .any(|r| r.kind == rustykrab_core::dream_review::REVIEW_ONLY && r.value == "true");
-        // A worktree run builds into its repository's shared cache, not a
-        // `target/` of its own that compiles every dependency again. A
-        // review writes nothing, a build included.
+        // A worktree run builds into this worker's cache for its
+        // repository, not a `target/` of its own that compiles every
+        // dependency again, and not one another worker may be building in
+        // at the same time (whose lock it would wait on). A review writes
+        // nothing, a build included.
         let build_cache = brief
             .workspace
             .as_ref()
             .filter(|_| !review)
-            .and_then(|ws| ws.build_cache(&c.data_dir.join(workspace::BUILD_CACHE_DIR)))
+            .and_then(|ws| {
+                ws.build_cache(
+                    &c.data_dir.join(workspace::BUILD_CACHE_DIR),
+                    &workspace::builder_key(None, &self.name),
+                )
+            })
             .filter(|cache| std::fs::create_dir_all(cache.join("target")).is_ok());
         // Beside it, the Cargo home every worker shares, so one copy of
         // each dependency serves them all (the local workers' shells too).
@@ -1047,6 +1287,10 @@ impl ExternalWorker {
         // Starting a busy executable is still bounded. Once it starts, the
         // configured timeout measures silence, not the whole work duration.
         let deadline = tokio::time::Instant::now() + limit;
+        // This invocation's token, inherited by everything the agent starts,
+        // so what leaves its group is still found and ended with it.
+        let token = uuid::Uuid::new_v4().to_string();
+        cmd.env(RUN_TOKEN_ENV, &token);
         let mut child = match rustykrab_providers::cli_process::spawn(&mut cmd, deadline).await {
             Ok(child) => child,
             Err(e) => {
@@ -1058,7 +1302,7 @@ impl ExternalWorker {
         let group = child
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
-            .map(|pid| self.groups.enter(pid));
+            .map(|pid| self.groups.enter(pid, &token));
         let (last_output, mut output_events) =
             tokio::sync::watch::channel(tokio::time::Instant::now());
         let (stdout, mut stdout_task) =
@@ -1083,13 +1327,14 @@ impl ExternalWorker {
                 }
             }
         };
+        let interrupted = group.as_ref().is_some_and(GroupGuard::interrupted);
+        // Whatever the agent left running in its group goes with it, which
+        // also closes the pipes it held; on a timeout the agent too. The
+        // guard reads what is below the agent before anything is killed.
+        drop(group);
         if finished.is_err() {
             let _ = child.start_kill();
         }
-        let interrupted = group.as_ref().is_some_and(GroupGuard::interrupted);
-        // Whatever the agent left running in its group goes with it, which
-        // also closes the pipes it held.
-        drop(group);
         // Stop descendants before joining the readers: an exited CLI must not
         // be kept alive by a background child retaining its output pipes.
         let drain_timed_out = tokio::time::timeout(DRAIN_GRACE, async {
@@ -1375,14 +1620,35 @@ impl Worker for ExternalWorker {
                 (dir, None)
             }
         };
+        // Until the retention decision below is made, a run that ends
+        // early (a cancel or stop drops this future; an error returns) keeps
+        // its directory, and says so.
+        let mut unlogged = KeptUnlessDecided {
+            worker: self.name.clone(),
+            item: brief.item.clone(),
+            dir: dir.clone(),
+            decided: false,
+        };
         if let Retention::KeepFailed(window) = self.config.retention {
             if let Some(ws) = &workspace {
                 let root = ws.path.parent().map(Path::to_path_buf);
                 if let Some(root) = root {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let pruned = tokio::task::spawn_blocking(move || {
                         workspace::prune_older_than(&root, window)
                     })
-                    .await;
+                    .await
+                    .unwrap_or_default();
+                    for old in pruned {
+                        tracing::info!(
+                            worker = %self.name,
+                            dir = %old.display(),
+                            reason = %format!(
+                                "kept longer than the retention window ({}s)",
+                                window.as_secs()
+                            ),
+                            "run directory removed"
+                        );
+                    }
                 }
             }
             prune_dirs(&self.runs_root(), window);
@@ -1522,6 +1788,7 @@ impl Worker for ExternalWorker {
         // blocked, has an error or questions, or left changes uncommitted)
         // keeps it for the next attempt unless policy says otherwise.
         let unfinished = unfinished_reason(&outcome, workspace.as_ref()).await;
+        unlogged.decided = true;
         let keep =
             unfinished.is_some() && matches!(self.config.retention, Retention::KeepFailed(_));
         if keep {
@@ -1572,6 +1839,33 @@ impl Worker for ExternalWorker {
             "external worker run ended"
         );
         outcome
+    }
+}
+
+/// Logs an external run's directory as kept when the run ends before its
+/// retention decision: a cancel, stop or shutdown that drops the run's
+/// future, or an error on the way. That directory stays for the next
+/// attempt and retention prunes it later; before this, nothing said so.
+struct KeptUnlessDecided {
+    worker: String,
+    item: String,
+    dir: PathBuf,
+    decided: bool,
+}
+
+impl Drop for KeptUnlessDecided {
+    fn drop(&mut self) {
+        if self.decided {
+            return;
+        }
+        tracing::info!(
+            worker = %self.worker,
+            item = %self.item,
+            dir = %self.dir.display(),
+            reason = "the run ended before its outcome was known (cancelled, stopped, shut \
+                      down or failed on the way); retention prunes it",
+            "run directory kept"
+        );
     }
 }
 
@@ -2718,11 +3012,19 @@ exit 3
         let ws = f.workspace();
         assert!(worker.run(brief(Some(ws.clone()))).await.is_err());
 
-        // One cache per repository under the data directory, writable by
-        // the agent and where Cargo builds.
+        // One cache per repository and worker under the data directory,
+        // writable by the agent and where Cargo builds.
         let cache = ws
-            .build_cache(&f.data.path().join(workspace::BUILD_CACHE_DIR))
+            .build_cache(
+                &f.data.path().join(workspace::BUILD_CACHE_DIR),
+                &workspace::builder_key(None, worker.name()),
+            )
             .unwrap();
+        assert!(
+            cache.ends_with(format!("worker-{}", worker.name())),
+            "{}",
+            cache.display()
+        );
         let told = std::fs::read_to_string(f.data.path().join("target-dir.txt")).unwrap();
         assert_eq!(Path::new(&told), cache.join("target"));
         assert!(cache.join("target/artifact").is_file());
@@ -3054,6 +3356,271 @@ wait
         }
         // The worktree is kept for retention.
         assert!(ws.path.exists());
+    }
+
+    /// An agent that starts a long-lived child in a process group of its
+    /// own (as Codex runs its shell commands; `setpgrp` here, since a
+    /// non-interactive `set -m` moves nothing without a terminal on
+    /// Linux's `dash`), records both pids, and then waits: killing the
+    /// agent's group alone leaves the child running.
+    const ESCAPER: &str = r#"#!/bin/sh
+perl -e 'setpgrp(0, 0); exec @ARGV' sleep 300 &
+echo $! > "$RUSTYKRAB_DATA_DIR/child.pid.tmp"
+mv "$RUSTYKRAB_DATA_DIR/child.pid.tmp" "$RUSTYKRAB_DATA_DIR/child.pid"
+echo $$ > "$RUSTYKRAB_DATA_DIR/agent.pid.tmp"
+mv "$RUSTYKRAB_DATA_DIR/agent.pid.tmp" "$RUSTYKRAB_DATA_DIR/agent.pid"
+wait
+"#;
+
+    /// Whether process `pid` exists (a zombie awaiting its parent counts
+    /// as gone).
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    /// Start `worker` on a workspace brief with an [`ESCAPER`] agent, wait
+    /// for its pids, and check the child left the agent's group.
+    #[cfg(unix)]
+    async fn start_escaper(
+        f: &Fixture,
+        worker: Arc<ExternalWorker>,
+    ) -> (tokio::task::JoinHandle<Result<ResultReport>>, i32, i32) {
+        let ws = f.workspace();
+        let run = tokio::spawn(async move { worker.run(brief(Some(ws))).await });
+        let read_pid = |name: &str| {
+            std::fs::read_to_string(f.data.path().join(name))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+        };
+        let started = std::time::Instant::now();
+        let (agent, child) = loop {
+            if let (Some(a), Some(c)) = (read_pid("agent.pid"), read_pid("child.pid")) {
+                break (a, c);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "agent never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_ne!(
+            group_of(child),
+            Some(agent),
+            "the child left the agent's group"
+        );
+        (run, agent, child)
+    }
+
+    #[cfg(unix)]
+    async fn assert_gone(pid: i32, what: &str) {
+        let started = std::time::Instant::now();
+        while alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{what} {pid} outlived its run"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_run_ends_what_its_agent_started_outside_its_group() {
+        for kind in [WorkerKind::ClaudeCode, WorkerKind::Codex] {
+            let f = Fixture::new();
+            let groups = Arc::new(RunGroups::default());
+            let mut worker = f
+                .worker(kind, f.agent("agent", ESCAPER))
+                .with_groups(groups.clone());
+            worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+            let (run, agent, child) = start_escaper(&f, Arc::new(worker)).await;
+            assert!(alive(child));
+            // A cancel or stop drops the run's future.
+            run.abort();
+            let _ = run.await;
+            assert_gone(agent, "the agent").await;
+            assert_gone(child, &format!("{kind:?}: a child in its own group")).await;
+            assert!(groups.live().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_run_and_shutdown_end_what_the_agent_started_outside_its_group() {
+        // Its inactivity timeout.
+        let f = Fixture::new();
+        let mut worker = f
+            .worker(WorkerKind::Codex, f.agent("codex", ESCAPER))
+            .with_groups(Arc::new(RunGroups::default()));
+        worker.config.timeout = Duration::from_secs(2);
+        let (run, _, child) = start_escaper(&f, Arc::new(worker)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the run ends at its timeout")
+            .unwrap();
+        assert!(outcome.is_err());
+        assert_gone(child, "after a timeout, a child in its own group").await;
+
+        // Daemon shutdown.
+        let f = Fixture::new();
+        let groups = Arc::new(RunGroups::default());
+        let worker = f
+            .worker(WorkerKind::ClaudeCode, f.agent("claude", ESCAPER))
+            .with_groups(groups.clone());
+        let (run, _, child) = start_escaper(&f, Arc::new(worker)).await;
+        assert_eq!(groups.terminate_all(Duration::from_secs(2)).await, 1);
+        assert_gone(child, "after shutdown, a child in its own group").await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+    }
+
+    /// Not a test: what [`the_sweep_kills_only_processes_carrying_its_token`]
+    /// runs this binary as, a process that waits. This binary, unlike
+    /// Apple's `sleep`, shows its environment to `ps` on macOS, as `cargo`
+    /// and `rustc` do.
+    #[test]
+    #[ignore = "a helper process for the sweep test"]
+    fn sweep_helper_waits() {
+        if std::env::var_os(RUN_TOKEN_ENV).is_some() {
+            std::thread::sleep(Duration::from_secs(300));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_kills_only_processes_carrying_its_token() {
+        let spawn = |token: &str| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "external_worker::tests::sweep_helper_waits",
+                    "--nocapture",
+                ])
+                .env(RUN_TOKEN_ENV, token)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mine = format!("mine-{}", uuid::Uuid::new_v4());
+        let other = format!("other-{}", uuid::Uuid::new_v4());
+        let (mut a, mut b) = (spawn(&mine), spawn(&other));
+        // A token that only begins like another is not that token.
+        let mut c = spawn(&format!("{mine}x"));
+        let started = std::time::Instant::now();
+        while marked_processes(&mine).is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "never listed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(marked_processes(&mine), vec![a.id() as i32]);
+        assert!(kill_marked(&mine) >= 1);
+        assert!(a.wait().is_ok());
+        assert!(
+            b.try_wait().unwrap().is_none(),
+            "another run's process survives"
+        );
+        assert!(c.try_wait().unwrap().is_none());
+        let _ = b.kill();
+        let _ = c.kill();
+        let _ = b.wait();
+        let _ = c.wait();
+    }
+
+    /// Everything logged in this test process from the first call on, as
+    /// text: a process-wide subscriber, since a thread-local one misses
+    /// callsites other tests' threads reached first. Tests pick their own
+    /// lines out by a path only they use.
+    fn capture_logs() -> ((), Arc<Mutex<Vec<u8>>>) {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        let buf = LOGS
+            .get_or_init(|| {
+                let buf = Arc::new(Mutex::new(Vec::new()));
+                let sink = Sink(buf.clone());
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || sink.clone())
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                buf
+            })
+            .clone();
+        ((), buf)
+    }
+
+    /// The lines of `logs` with `message` for directory `dir`.
+    fn logged(logs: &Arc<Mutex<Vec<u8>>>, message: &str, dir: &Path) -> Vec<String> {
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
+        let dir = dir.display().to_string();
+        text.lines()
+            .filter(|l| l.contains(message) && l.contains(&dir))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every way an external run's worktree is kept or removed is logged
+    /// with its reason: a completed run, a failed one, and a cancelled one
+    /// (whose future is dropped before any decision, which said nothing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_external_worktree_kept_or_removed_is_logged_with_a_reason() {
+        let ((), logs) = capture_logs();
+
+        let f = Fixture::new();
+        let worker = f.worker(WorkerKind::ClaudeCode, f.agent("claude", CLAUDE));
+        let ws = f.workspace();
+        worker.run(brief(Some(ws.clone()))).await.unwrap();
+        let removed = logged(&logs, "run directory removed", &ws.path);
+        assert!(
+            removed.len() == 1
+                && removed[0].contains("reason=")
+                && removed[0].contains("the run completed"),
+            "{removed:?}"
+        );
+
+        let f = Fixture::new();
+        let mut worker = f.worker(WorkerKind::Codex, f.agent("codex", BUILDS_THEN_FAILS));
+        worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+        let ws = f.workspace();
+        assert!(worker.run(brief(Some(ws.clone()))).await.is_err());
+        let kept = logged(&logs, "run directory kept", &ws.path);
+        assert!(
+            kept.len() == 1 && kept[0].contains("reason=") && kept[0].contains("no result"),
+            "{kept:?}"
+        );
+
+        let f = Fixture::new();
+        let mut worker = f.worker(WorkerKind::Codex, f.agent("codex", ESCAPER));
+        worker.config.retention = Retention::KeepFailed(Duration::from_secs(3600));
+        let ws = f.workspace();
+        let (run, _, child) = start_escaper(&f, Arc::new(worker)).await;
+        run.abort();
+        let _ = run.await;
+        let kept = logged(&logs, "run directory kept", &ws.path);
+        assert!(
+            kept.len() == 1 && kept[0].contains("ended before its outcome was known"),
+            "{kept:?}"
+        );
+        assert!(ws.path.exists(), "a cancelled run's worktree is kept");
+        assert_gone(child, "a cancelled run's child").await;
     }
 
     /// An agent that prints two assistant turns (the first as two content
@@ -3536,7 +4103,10 @@ exit 9
         // the kit's directories.
         let cache = f
             .workspace()
-            .build_cache(&f.data.path().join(workspace::BUILD_CACHE_DIR))
+            .build_cache(
+                &f.data.path().join(workspace::BUILD_CACHE_DIR),
+                &workspace::builder_key(None, worker.name()),
+            )
             .unwrap();
         let cargo_home = rustykrab_tools::shared_cargo_home(&cache)
             .unwrap()

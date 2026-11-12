@@ -2302,15 +2302,20 @@ async fn investigation_kit(shared: &Ctx) -> Result<()> {
         !added.iter().any(|dir| !std::path::Path::new(dir).exists()),
         "the investigator was offered a directory that does not exist: {added:?}"
     );
-    // Beside those, only where its worktree builds: the repository's
-    // shared build cache and the Cargo home every worker shares.
+    // Beside those, only where its worktree builds: this worker's own
+    // build cache for the repository (`build-cache/<repo>/worker-<name>`,
+    // never another worker's) and the Cargo home every worker shares.
     let build_cache = ctx.data_dir.join("build-cache");
     let cargo_home = build_cache.join("cargo-home");
     ensure!(
         added.len() == 4
             && added.iter().any(|dir| {
                 let dir = std::path::Path::new(dir);
-                dir.parent() == Some(build_cache.as_path()) && dir != cargo_home
+                dir.parent().and_then(std::path::Path::parent) == Some(build_cache.as_path())
+                    && dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("worker-"))
             })
             && added.contains(&cargo_home.display().to_string().as_str())
             && !args.contains("--tools"),
